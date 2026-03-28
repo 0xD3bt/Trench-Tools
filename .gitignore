@@ -13,6 +13,7 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 .vscode/
+.cursor/
 .idea/
 .cache/
 target/

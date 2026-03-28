@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde::Serialize;
 use serde_json::Value;
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_sdk::{
@@ -17,6 +18,7 @@ use crate::{
     config::{NormalizedConfig, NormalizedRecipient},
     report::{LaunchReport, build_report, render_report},
     rpc::{CompiledTransaction, fetch_account_data, fetch_account_exists, fetch_latest_blockhash},
+    transport::TransportPlan,
 };
 
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -39,6 +41,16 @@ pub struct NativePumpArtifacts {
     pub compiled_transactions: Vec<CompiledTransaction>,
     pub report: Value,
     pub text: String,
+}
+
+#[allow(dead_code, non_snake_case)]
+#[derive(Debug, Clone, Serialize)]
+pub struct LaunchQuote {
+    pub mode: String,
+    pub input: String,
+    pub estimatedTokens: String,
+    pub estimatedSol: String,
+    pub estimatedSupplyPercent: String,
 }
 
 pub fn supports_native_pump_compile(config: &NormalizedConfig) -> bool {
@@ -78,6 +90,7 @@ pub fn supports_native_pump_compile(config: &NormalizedConfig) -> bool {
 pub async fn try_compile_native_pump(
     rpc_url: &str,
     config: &NormalizedConfig,
+    transport_plan: &TransportPlan,
     wallet_secret: &[u8],
     built_at: String,
     creator_public_key: String,
@@ -94,7 +107,9 @@ pub async fn try_compile_native_pump(
     let mint = mint_keypair.pubkey();
     let (launch_creator, launch_pre_instructions) =
         resolve_launch_creator_and_pre_instructions(rpc_url, config, &creator).await?;
-    let bundle_jito_tip = config.tx.jitoTipLamports > 0 && config.mode != "agent-unlocked";
+    let separate_tip_transaction =
+        transport_plan.separateTipTransaction && config.tx.jitoTipLamports > 0;
+    let has_follow_up_transaction = native_follow_up_label(config).is_some();
     let lookup_tables = load_lookup_table_accounts(rpc_url, config).await?;
     let tx_format = select_native_format(&config.execution.txFormat, !lookup_tables.is_empty())?;
     let global = if config.devBuy.is_some() {
@@ -102,18 +117,26 @@ pub async fn try_compile_native_pump(
     } else {
         None
     };
+    let creation_compute_unit_price_micro_lamports =
+        effective_creation_compute_unit_price_micro_lamports(
+            config,
+            transport_plan,
+            has_follow_up_transaction,
+        );
 
     let launch_tx_config = NativeTxConfig {
-        compute_unit_price_micro_lamports: config.tx.computeUnitPriceMicroLamports.unwrap_or(0),
-        jito_tip_lamports: if bundle_jito_tip {
-            0
-        } else {
+        compute_unit_price_micro_lamports: creation_compute_unit_price_micro_lamports,
+        jito_tip_lamports: if transport_plan.requiresInlineTip || !separate_tip_transaction {
             config.tx.jitoTipLamports
-        },
-        jito_tip_account: if bundle_jito_tip {
-            String::new()
         } else {
+            0
+        },
+        jito_tip_account: if (transport_plan.requiresInlineTip || !separate_tip_transaction)
+            && !config.tx.jitoTipAccount.is_empty()
+        {
             config.tx.jitoTipAccount.clone()
+        } else {
+            String::new()
         },
     };
 
@@ -127,6 +150,7 @@ pub async fn try_compile_native_pump(
         agent_authority.as_ref(),
         global.as_ref(),
     )?);
+    let launch_tx_instructions = with_tx_settings(launch_instructions, &launch_tx_config, &creator)?;
     let mut compiled_transactions = vec![compile_transaction(
         "launch",
         tx_format,
@@ -134,9 +158,11 @@ pub async fn try_compile_native_pump(
         last_valid_block_height,
         &creator_keypair,
         Some(&mint_keypair),
-        with_tx_settings(launch_instructions, &launch_tx_config, &creator)?,
+        launch_tx_instructions.clone(),
+        &launch_tx_config,
         &lookup_tables,
     )?];
+    let mut instruction_summaries = vec![summarize_instructions(&launch_tx_instructions)];
 
     if let Some(follow_up_label) = native_follow_up_label(config) {
         let follow_up_instructions = build_native_follow_up_instructions(
@@ -147,6 +173,26 @@ pub async fn try_compile_native_pump(
             agent_authority.as_ref(),
         )
         .await?;
+        let follow_up_tx_instructions = with_tx_settings(
+            follow_up_instructions,
+            &NativeTxConfig {
+                compute_unit_price_micro_lamports: effective_follow_up_compute_unit_price_micro_lamports(
+                    config,
+                    transport_plan,
+                ),
+                jito_tip_lamports: if transport_plan.requiresInlineTip {
+                    config.tx.jitoTipLamports
+                } else {
+                    0
+                },
+                jito_tip_account: if transport_plan.requiresInlineTip {
+                    config.tx.jitoTipAccount.clone()
+                } else {
+                    String::new()
+                },
+            },
+            &creator,
+        )?;
         compiled_transactions.push(compile_transaction(
             follow_up_label,
             tx_format,
@@ -154,24 +200,31 @@ pub async fn try_compile_native_pump(
             last_valid_block_height,
             &creator_keypair,
             None,
-            with_tx_settings(
-                follow_up_instructions,
-                &NativeTxConfig {
-                    compute_unit_price_micro_lamports: config
-                        .tx
-                        .computeUnitPriceMicroLamports
-                        .unwrap_or(0),
-                    jito_tip_lamports: 0,
-                    jito_tip_account: String::new(),
+            follow_up_tx_instructions.clone(),
+            &NativeTxConfig {
+                compute_unit_price_micro_lamports: effective_follow_up_compute_unit_price_micro_lamports(
+                    config,
+                    transport_plan,
+                ),
+                jito_tip_lamports: if transport_plan.requiresInlineTip {
+                    config.tx.jitoTipLamports
+                } else {
+                    0
                 },
-                &creator,
-            )?,
+                jito_tip_account: if transport_plan.requiresInlineTip {
+                    config.tx.jitoTipAccount.clone()
+                } else {
+                    String::new()
+                },
+            },
             &lookup_tables,
         )?);
+        instruction_summaries.push(summarize_instructions(&follow_up_tx_instructions));
     }
 
-    if bundle_jito_tip {
+    if separate_tip_transaction {
         let tip_instruction = build_jito_tip_instruction(config, creator)?;
+        let tip_tx_instructions = vec![tip_instruction];
         compiled_transactions.push(compile_transaction(
             "jito-tip",
             tx_format,
@@ -179,19 +232,27 @@ pub async fn try_compile_native_pump(
             last_valid_block_height,
             &creator_keypair,
             None,
-            vec![tip_instruction],
+            tip_tx_instructions.clone(),
+            &NativeTxConfig {
+                compute_unit_price_micro_lamports: 0,
+                jito_tip_lamports: config.tx.jitoTipLamports,
+                jito_tip_account: config.tx.jitoTipAccount.clone(),
+            },
             &lookup_tables,
         )?);
+        instruction_summaries.push(summarize_instructions(&tip_tx_instructions));
     }
 
     let mut report = build_report(
         config,
+        transport_plan,
         built_at,
         rpc_url.to_string(),
         creator_public_key,
         mint.to_string(),
         agent_authority.map(|authority| authority.to_string()),
         config_path,
+        lookup_tables.iter().map(|table| table.key.to_string()).collect(),
     );
     if let Some(first_warning) = report.execution.warnings.first_mut() {
         *first_warning =
@@ -202,7 +263,7 @@ pub async fn try_compile_native_pump(
         "Native Pump assembly now includes compute-budget and priority-fee instructions for supported launch shapes."
             .to_string(),
     );
-    apply_transaction_details(&mut report, &compiled_transactions, config)?;
+    apply_transaction_details(&mut report, &compiled_transactions, &instruction_summaries)?;
     let text = render_report(&report);
     let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
 
@@ -217,6 +278,27 @@ struct NativeTxConfig {
     compute_unit_price_micro_lamports: i64,
     jito_tip_lamports: i64,
     jito_tip_account: String,
+}
+
+fn effective_creation_compute_unit_price_micro_lamports(
+    config: &NormalizedConfig,
+    transport_plan: &TransportPlan,
+    has_follow_up_transaction: bool,
+) -> i64 {
+    if transport_plan.transportType == "jito-bundle" && has_follow_up_transaction {
+        return 0;
+    }
+    config.tx.computeUnitPriceMicroLamports.unwrap_or(0)
+}
+
+fn effective_follow_up_compute_unit_price_micro_lamports(
+    config: &NormalizedConfig,
+    transport_plan: &TransportPlan,
+) -> i64 {
+    if transport_plan.transportType == "jito-bundle" {
+        return 0;
+    }
+    config.tx.computeUnitPriceMicroLamports.unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,6 +598,37 @@ fn compute_total_fee_basis_points(global: &PumpGlobalState, include_creator_fee:
         }
 }
 
+#[allow(dead_code)]
+fn format_decimal_u128(value: u128, decimals: u32, max_fraction_digits: u32) -> String {
+    let base = 10u128.pow(decimals);
+    let whole = value / base;
+    let fraction = value % base;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let width = decimals as usize;
+    let mut fraction_text = format!("{fraction:0width$}");
+    fraction_text.truncate(max_fraction_digits.min(decimals) as usize);
+    while fraction_text.ends_with('0') {
+        fraction_text.pop();
+    }
+    if fraction_text.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction_text}")
+    }
+}
+
+#[allow(dead_code)]
+fn format_supply_percent(raw_token_amount: u64) -> String {
+    if raw_token_amount == 0 {
+        return "0".to_string();
+    }
+    const TOTAL_SUPPLY_RAW: u128 = 1_000_000_000u128 * 1_000_000u128;
+    let scaled = (u128::from(raw_token_amount) * 1_000_000u128) / TOTAL_SUPPLY_RAW;
+    format_decimal_u128(scaled, 4, 4)
+}
+
 fn quote_buy_tokens_from_sol(global: &PumpGlobalState, spendable_sol: u64) -> u64 {
     if spendable_sol == 0 {
         return 0;
@@ -523,6 +636,9 @@ fn quote_buy_tokens_from_sol(global: &PumpGlobalState, spendable_sol: u64) -> u6
     let total_fee_basis_points = compute_total_fee_basis_points(global, true);
     let input_amount = ((u128::from(spendable_sol).saturating_sub(1)) * 10_000)
         / (10_000 + total_fee_basis_points);
+    if input_amount == 0 {
+        return 0;
+    }
     let virtual_token_reserves = u128::from(global.initial_virtual_token_reserves);
     let virtual_sol_reserves = u128::from(global.initial_virtual_sol_reserves);
     let tokens = (input_amount * virtual_token_reserves) / (virtual_sol_reserves + input_amount);
@@ -576,6 +692,60 @@ fn resolve_dev_buy_quote(
         "Unsupported devBuy.mode for native Pump compile: {}",
         dev_buy.mode
     ))
+}
+
+#[allow(dead_code)]
+pub async fn quote_launch(
+    rpc_url: &str,
+    mode: &str,
+    amount: &str,
+) -> Result<Option<LaunchQuote>, String> {
+    let trimmed_mode = mode.trim().to_lowercase();
+    let trimmed_amount = amount.trim();
+    if trimmed_mode.is_empty() || trimmed_amount.is_empty() {
+        return Ok(None);
+    }
+    if trimmed_mode != "sol" && trimmed_mode != "tokens" {
+        return Err(format!(
+            "Unsupported dev buy quote mode: {mode}. Expected sol or tokens."
+        ));
+    }
+    let global = fetch_global_state(rpc_url).await?;
+    if trimmed_mode == "sol" {
+        let spendable_sol = parse_decimal_u64(trimmed_amount, 9, "buy amount")?;
+        if spendable_sol == 0 {
+            return Ok(None);
+        }
+        let tokens_out = quote_buy_tokens_from_sol(&global, spendable_sol);
+        return Ok(Some(LaunchQuote {
+            mode: trimmed_mode,
+            input: trimmed_amount.to_string(),
+            estimatedTokens: format_decimal_u128(u128::from(tokens_out), TOKEN_DECIMALS, 6),
+            estimatedSol: format_decimal_u128(u128::from(spendable_sol), 9, 6),
+            estimatedSupplyPercent: format_supply_percent(tokens_out),
+        }));
+    }
+
+    let token_amount = parse_decimal_u64(trimmed_amount, TOKEN_DECIMALS, "buy amount")?;
+    if token_amount == 0 || token_amount >= global.initial_virtual_token_reserves {
+        return Ok(None);
+    }
+    Ok(Some(LaunchQuote {
+        mode: trimmed_mode,
+        input: trimmed_amount.to_string(),
+        estimatedTokens: format_decimal_u128(u128::from(token_amount), TOKEN_DECIMALS, 6),
+        estimatedSol: format_decimal_u128(
+            u128::from(quote_buy_sol_from_tokens(&global, token_amount)),
+            9,
+            6,
+        ),
+        estimatedSupplyPercent: format_supply_percent(token_amount),
+    }))
+}
+
+fn apply_atomic_buy_buffer(sol_amount: u64) -> u64 {
+    ceil_div(u128::from(sol_amount) * 10_100, 10_000)
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn select_buy_fee_recipient(global: &PumpGlobalState, mayhem_mode: bool) -> Pubkey {
@@ -687,15 +857,18 @@ fn build_launch_instructions(
                 &mint,
                 &launch_creator,
                 &creator,
-                sol_amount,
+                apply_atomic_buy_buffer(sol_amount),
                 token_amount,
                 config.token.mayhemMode,
             )?);
         }
     }
-    if config.mode == "agent-unlocked" {
+    if config.mode == "agent-unlocked"
+        || config.mode == "agent-locked"
+        || config.mode == "agent-custom"
+    {
         let authority = agent_authority
-            .ok_or_else(|| "agent authority is required for agent-unlocked mode.".to_string())?;
+            .ok_or_else(|| format!("agent authority is required for {} mode.", config.mode))?;
         instructions.push(build_agent_initialize_instruction(
             &mint,
             &creator,
@@ -868,9 +1041,9 @@ fn build_buy_instruction(
             AccountMeta::new_readonly(pump_program, false),
             AccountMeta::new_readonly(global_volume_accumulator_pda()?, false),
             AccountMeta::new(user_volume_accumulator_pda(user)?, false),
-            AccountMeta::new_readonly(bonding_curve_v2_pda(mint)?, false),
             AccountMeta::new_readonly(fee_config_pda()?, false),
             AccountMeta::new_readonly(pump_fee_program_id()?, false),
+            AccountMeta::new_readonly(bonding_curve_v2_pda(mint)?, false),
         ],
         data,
     })
@@ -921,6 +1094,9 @@ fn build_create_fee_sharing_config_instruction(
             AccountMeta::new(bonding_curve_pda(mint)?, false),
             AccountMeta::new_readonly(pump_program_id()?, false),
             AccountMeta::new_readonly(event_authority_pda(&pump_program_id()?), false),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new_readonly(pump_amm_program_id()?, false),
+            AccountMeta::new_readonly(program_id, false),
         ],
         data: vec![195, 78, 86, 76, 111, 52, 251, 213],
     })
@@ -929,6 +1105,7 @@ fn build_create_fee_sharing_config_instruction(
 fn build_update_fee_shares_instruction(
     mint: &Pubkey,
     authority: &Pubkey,
+    current_shareholders: &[Pubkey],
     recipients: &[crate::config::NormalizedRecipient],
 ) -> Result<Instruction, String> {
     let program_id = pump_fee_program_id()?;
@@ -959,30 +1136,15 @@ fn build_update_fee_shares_instruction(
             false,
         ),
     ];
-    accounts.push(AccountMeta::new(*authority, false));
+    accounts.extend(
+        current_shareholders
+            .iter()
+            .map(|shareholder| AccountMeta::new(*shareholder, false)),
+    );
     Ok(Instruction {
         program_id,
         accounts,
         data,
-    })
-}
-
-fn build_revoke_fee_sharing_authority_instruction(
-    mint: &Pubkey,
-    payer: &Pubkey,
-) -> Result<Instruction, String> {
-    let program_id = pump_fee_program_id()?;
-    Ok(Instruction {
-        program_id,
-        accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(global_pda()?, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(fee_sharing_config_pda(mint)?, false),
-            AccountMeta::new_readonly(event_authority_pda(&program_id), false),
-            AccountMeta::new_readonly(program_id, false),
-        ],
-        data: vec![18, 233, 158, 39, 185, 207, 58, 104],
     })
 }
 
@@ -1045,8 +1207,8 @@ async fn build_fee_sharing_follow_up_instructions(
         rpc_url,
         mint,
         creator,
+        std::slice::from_ref(&creator),
         &config.feeSharing.recipients,
-        true,
     )
     .await
 }
@@ -1055,8 +1217,8 @@ async fn build_fee_sharing_setup_instructions(
     rpc_url: &str,
     mint: Pubkey,
     creator: Pubkey,
+    current_shareholders: &[Pubkey],
     recipients: &[NormalizedRecipient],
-    lock: bool,
 ) -> Result<Vec<Instruction>, String> {
     if recipients.is_empty() {
         return Err("fee sharing recipients are required for native follow-up setup.".to_string());
@@ -1067,13 +1229,11 @@ async fn build_fee_sharing_setup_instructions(
     instructions
         .extend(build_social_fee_pda_create_instructions(rpc_url, recipients, &creator).await?);
     instructions.push(build_update_fee_shares_instruction(
-        &mint, &creator, recipients,
+        &mint,
+        &creator,
+        current_shareholders,
+        recipients,
     )?);
-    if lock {
-        instructions.push(build_revoke_fee_sharing_authority_instruction(
-            &mint, &creator,
-        )?);
-    }
     Ok(instructions)
 }
 
@@ -1145,37 +1305,24 @@ async fn build_native_follow_up_instructions(
     config: &NormalizedConfig,
     mint: Pubkey,
     creator: Pubkey,
-    agent_authority: Option<&Pubkey>,
+    _agent_authority: Option<&Pubkey>,
 ) -> Result<Vec<Instruction>, String> {
     match config.mode.as_str() {
         "regular" | "cashback" => {
             build_fee_sharing_follow_up_instructions(rpc_url, config, mint, creator).await
         }
         "agent-custom" => {
-            let authority = agent_authority
-                .ok_or_else(|| "agent authority is required for agent-custom mode.".to_string())?;
-            let mut instructions = vec![build_agent_initialize_instruction(
-                &mint,
-                &creator,
-                authority,
-                config.agent.buybackBps.unwrap_or(0) as u16,
-            )?];
             let recipients = resolve_agent_fee_recipients(config, &mint, &creator)?;
-            instructions.extend(
-                build_fee_sharing_setup_instructions(rpc_url, mint, creator, &recipients, false)
-                    .await?,
-            );
-            Ok(instructions)
+            build_fee_sharing_setup_instructions(
+                rpc_url,
+                mint,
+                creator,
+                std::slice::from_ref(&creator),
+                &recipients,
+            )
+            .await
         }
         "agent-locked" => {
-            let authority = agent_authority
-                .ok_or_else(|| "agent authority is required for agent-locked mode.".to_string())?;
-            let mut instructions = vec![build_agent_initialize_instruction(
-                &mint,
-                &creator,
-                authority,
-                config.agent.buybackBps.unwrap_or(0) as u16,
-            )?];
             let recipients = vec![NormalizedRecipient {
                 r#type: Some("wallet".to_string()),
                 address: token_agent_payments_pda(&mint)?.to_string(),
@@ -1183,11 +1330,14 @@ async fn build_native_follow_up_instructions(
                 githubUsername: String::new(),
                 shareBps: 10_000,
             }];
-            instructions.extend(
-                build_fee_sharing_setup_instructions(rpc_url, mint, creator, &recipients, true)
-                    .await?,
-            );
-            Ok(instructions)
+            build_fee_sharing_setup_instructions(
+                rpc_url,
+                mint,
+                creator,
+                std::slice::from_ref(&creator),
+                &recipients,
+            )
+            .await
         }
         unsupported => Err(format!(
             "Native Pump follow-up builder does not support mode={unsupported}."
@@ -1314,6 +1464,7 @@ fn compile_transaction(
     payer: &Keypair,
     mint_signer: Option<&Keypair>,
     instructions: Vec<Instruction>,
+    tx_config: &NativeTxConfig,
     lookup_tables: &[AddressLookupTableAccount],
 ) -> Result<CompiledTransaction, String> {
     let hash = Hash::from_str(blockhash).map_err(|error| error.to_string())?;
@@ -1371,13 +1522,45 @@ fn compile_transaction(
         lastValidBlockHeight: last_valid_block_height,
         serializedBase64: BASE64.encode(serialized),
         lookupTablesUsed: lookup_tables_used,
+        computeUnitLimit: Some(u64::from(FIXED_COMPUTE_UNIT_LIMIT)),
+        computeUnitPriceMicroLamports: if tx_config.compute_unit_price_micro_lamports > 0 {
+            Some(tx_config.compute_unit_price_micro_lamports as u64)
+        } else {
+            None
+        },
+        inlineTipLamports: if tx_config.jito_tip_lamports > 0 {
+            Some(tx_config.jito_tip_lamports as u64)
+        } else {
+            None
+        },
+        inlineTipAccount: if tx_config.jito_tip_lamports > 0 && !tx_config.jito_tip_account.is_empty() {
+            Some(tx_config.jito_tip_account.clone())
+        } else {
+            None
+        },
     })
+}
+
+fn summarize_instructions(
+    instructions: &[Instruction],
+) -> Vec<crate::report::InstructionSummary> {
+    instructions
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| crate::report::InstructionSummary {
+            index,
+            programId: instruction.program_id.to_string(),
+            keyCount: instruction.accounts.len(),
+            writableKeys: instruction.accounts.iter().filter(|meta| meta.is_writable).count(),
+            signerKeys: instruction.accounts.iter().filter(|meta| meta.is_signer).count(),
+        })
+        .collect()
 }
 
 fn apply_transaction_details(
     report: &mut LaunchReport,
     compiled_transactions: &[CompiledTransaction],
-    config: &NormalizedConfig,
+    instruction_summaries: &[Vec<crate::report::InstructionSummary>],
 ) -> Result<(), String> {
     for (index, summary) in report.transactions.iter_mut().enumerate() {
         let Some(compiled) = compiled_transactions.get(index) else {
@@ -1408,189 +1591,7 @@ fn apply_transaction_details(
             vec![]
         };
         summary.exceedsPacketLimit = raw.len() > 1232;
-        summary.instructionSummary = if summary.label == "launch" {
-            {
-                let mut instructions = vec![crate::report::InstructionSummary {
-                    index: 0,
-                    programId: COMPUTE_BUDGET_PROGRAM_ID.to_string(),
-                    keyCount: 0,
-                    writableKeys: 0,
-                    signerKeys: 0,
-                }];
-                let next_index = if summary
-                    .feeSettings
-                    .computeUnitPriceMicroLamports
-                    .unwrap_or(0)
-                    > 0
-                {
-                    instructions.push(crate::report::InstructionSummary {
-                        index: 1,
-                        programId: COMPUTE_BUDGET_PROGRAM_ID.to_string(),
-                        keyCount: 0,
-                        writableKeys: 0,
-                        signerKeys: 0,
-                    });
-                    2
-                } else {
-                    1
-                };
-                let mut next_index = next_index;
-                instructions.push(crate::report::InstructionSummary {
-                    index: next_index,
-                    programId: PUMP_PROGRAM_ID.to_string(),
-                    keyCount: 16,
-                    writableKeys: 8,
-                    signerKeys: 2,
-                });
-                next_index += 1;
-                if config.devBuy.is_some() {
-                    instructions.push(crate::report::InstructionSummary {
-                        index: next_index,
-                        programId: PUMP_PROGRAM_ID.to_string(),
-                        keyCount: 5,
-                        writableKeys: 1,
-                        signerKeys: 1,
-                    });
-                    next_index += 1;
-                    instructions.push(crate::report::InstructionSummary {
-                        index: next_index,
-                        programId: spl_associated_token_account::id().to_string(),
-                        keyCount: 6,
-                        writableKeys: 2,
-                        signerKeys: 1,
-                    });
-                    next_index += 1;
-                    instructions.push(crate::report::InstructionSummary {
-                        index: next_index,
-                        programId: PUMP_PROGRAM_ID.to_string(),
-                        keyCount: 17,
-                        writableKeys: 8,
-                        signerKeys: 1,
-                    });
-                    next_index += 1;
-                }
-                if config.mode == "agent-unlocked" {
-                    instructions.push(crate::report::InstructionSummary {
-                        index: next_index,
-                        programId: PUMP_AGENT_PAYMENTS_PROGRAM_ID.to_string(),
-                        keyCount: 8,
-                        writableKeys: 3,
-                        signerKeys: 1,
-                    });
-                    next_index += 1;
-                }
-                if summary.feeSettings.jitoTipLamports > 0 {
-                    instructions.push(crate::report::InstructionSummary {
-                        index: next_index,
-                        programId: "11111111111111111111111111111111".to_string(),
-                        keyCount: 2,
-                        writableKeys: 2,
-                        signerKeys: 1,
-                    });
-                }
-                instructions
-            }
-        } else if summary.label == "follow-up" || summary.label == "agent-setup" {
-            let social_count = if summary.label == "follow-up" {
-                config
-                    .feeSharing
-                    .recipients
-                    .iter()
-                    .filter(|entry| !entry.githubUserId.is_empty())
-                    .count()
-            } else if config.mode == "agent-custom" {
-                config
-                    .agent
-                    .feeRecipients
-                    .iter()
-                    .filter(|entry| !entry.githubUserId.is_empty())
-                    .count()
-            } else {
-                0
-            };
-            let mut instructions = vec![crate::report::InstructionSummary {
-                index: 0,
-                programId: COMPUTE_BUDGET_PROGRAM_ID.to_string(),
-                keyCount: 0,
-                writableKeys: 0,
-                signerKeys: 0,
-            }];
-            let mut next_index = 1;
-            if summary
-                .feeSettings
-                .computeUnitPriceMicroLamports
-                .unwrap_or(0)
-                > 0
-            {
-                instructions.push(crate::report::InstructionSummary {
-                    index: 1,
-                    programId: COMPUTE_BUDGET_PROGRAM_ID.to_string(),
-                    keyCount: 0,
-                    writableKeys: 0,
-                    signerKeys: 0,
-                });
-                next_index = 2;
-            }
-            if summary.label == "agent-setup" {
-                instructions.push(crate::report::InstructionSummary {
-                    index: next_index,
-                    programId: PUMP_AGENT_PAYMENTS_PROGRAM_ID.to_string(),
-                    keyCount: 8,
-                    writableKeys: 3,
-                    signerKeys: 1,
-                });
-                next_index += 1;
-            }
-            instructions.push(crate::report::InstructionSummary {
-                index: next_index,
-                programId: PUMP_FEE_PROGRAM_ID.to_string(),
-                keyCount: 10,
-                writableKeys: 3,
-                signerKeys: 1,
-            });
-            for offset in 0..social_count {
-                instructions.push(crate::report::InstructionSummary {
-                    index: next_index + 1 + offset,
-                    programId: PUMP_FEE_PROGRAM_ID.to_string(),
-                    keyCount: 6,
-                    writableKeys: 2,
-                    signerKeys: 1,
-                });
-            }
-            instructions.push(crate::report::InstructionSummary {
-                index: next_index + 1 + social_count,
-                programId: PUMP_FEE_PROGRAM_ID.to_string(),
-                keyCount: 19,
-                writableKeys: 4,
-                signerKeys: 1,
-            });
-            if summary.label == "follow-up" || config.mode == "agent-locked" {
-                instructions.push(crate::report::InstructionSummary {
-                    index: next_index + 2 + social_count,
-                    programId: PUMP_FEE_PROGRAM_ID.to_string(),
-                    keyCount: 6,
-                    writableKeys: 2,
-                    signerKeys: 1,
-                });
-            }
-            instructions
-        } else if summary.label == "jito-tip" {
-            vec![crate::report::InstructionSummary {
-                index: 0,
-                programId: "11111111111111111111111111111111".to_string(),
-                keyCount: 2,
-                writableKeys: 2,
-                signerKeys: 1,
-            }]
-        } else {
-            vec![crate::report::InstructionSummary {
-                index: 0,
-                programId: "11111111111111111111111111111111".to_string(),
-                keyCount: 2,
-                writableKeys: 2,
-                signerKeys: 1,
-            }]
-        };
+        summary.instructionSummary = instruction_summaries.get(index).cloned().unwrap_or_default();
     }
     Ok(())
 }
@@ -1599,6 +1600,7 @@ fn apply_transaction_details(
 mod tests {
     use super::*;
     use crate::config::{RawConfig, normalize_raw_config};
+    use crate::transport::{build_transport_plan, estimate_transaction_count};
 
     fn regular_config() -> crate::config::NormalizedConfig {
         let mut raw = RawConfig {
@@ -1609,7 +1611,60 @@ mod tests {
         raw.token.name = "LaunchDeck".to_string();
         raw.token.symbol = "LDECK".to_string();
         raw.token.uri = "ipfs://fixture".to_string();
+        raw.tx.computeUnitPriceMicroLamports = Some(Value::from(1));
+        raw.tx.jitoTipLamports = Some(Value::from(200_000));
+        raw.tx.jitoTipAccount = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE".to_string();
+        raw.execution.skipPreflight = Some(Value::Bool(true));
+        raw.execution.provider = "helius-sender".to_string();
+        raw.execution.buyProvider = "helius-sender".to_string();
+        raw.execution.sellProvider = "helius-sender".to_string();
         normalize_raw_config(raw).expect("normalized config")
+    }
+
+    #[test]
+    fn jito_single_creation_keeps_priority_fee() {
+        let mut config = regular_config();
+        config.execution.provider = "jito-bundle".to_string();
+        let transport_plan =
+            build_transport_plan(&config.execution, estimate_transaction_count(&config));
+        assert_eq!(
+            effective_creation_compute_unit_price_micro_lamports(&config, &transport_plan, false),
+            config.tx.computeUnitPriceMicroLamports.unwrap_or(0)
+        );
+    }
+
+    #[test]
+    fn jito_multi_tx_creation_drops_priority_fee() {
+        let mut config = regular_config();
+        config.execution.provider = "jito-bundle".to_string();
+        config.mode = "agent-custom".to_string();
+        config.agent.buybackBps = Some(2_500);
+        config.agent.feeRecipients = vec![
+            crate::config::NormalizedRecipient {
+                r#type: Some("agent".to_string()),
+                address: String::new(),
+                githubUserId: String::new(),
+                githubUsername: String::new(),
+                shareBps: 2_500,
+            },
+            crate::config::NormalizedRecipient {
+                r#type: Some("wallet".to_string()),
+                address: Pubkey::new_unique().to_string(),
+                githubUserId: String::new(),
+                githubUsername: String::new(),
+                shareBps: 7_500,
+            },
+        ];
+        let transport_plan =
+            build_transport_plan(&config.execution, estimate_transaction_count(&config));
+        assert_eq!(
+            effective_creation_compute_unit_price_micro_lamports(&config, &transport_plan, true),
+            0
+        );
+        assert_eq!(
+            effective_follow_up_compute_unit_price_micro_lamports(&config, &transport_plan),
+            0
+        );
     }
 
     #[test]
@@ -1815,6 +1870,171 @@ mod tests {
     }
 
     #[test]
+    fn buy_instruction_keeps_fee_accounts_before_bonding_curve_v2() {
+        let global = PumpGlobalState {
+            fee_recipient: Pubkey::new_unique(),
+            initial_virtual_token_reserves: 1_073_000_000_000_000,
+            initial_virtual_sol_reserves: 30_000_000_000,
+            initial_real_token_reserves: 793_100_000_000_000,
+            fee_basis_points: 100,
+            creator_fee_basis_points: 50,
+            fee_recipients: [Pubkey::default(); 7],
+            reserved_fee_recipient: Pubkey::default(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+        };
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let instruction = build_buy_instruction(
+            &global,
+            &mint,
+            &creator,
+            &user,
+            101_000_000,
+            1_000_000,
+            false,
+        )
+        .expect("buy instruction");
+
+        assert_eq!(
+            instruction.accounts[14].pubkey,
+            fee_config_pda().expect("fee config pda")
+        );
+        assert_eq!(
+            instruction.accounts[15].pubkey,
+            pump_fee_program_id().expect("fee program id")
+        );
+        assert_eq!(
+            instruction.accounts[16].pubkey,
+            bonding_curve_v2_pda(&mint).expect("bonding curve v2 pda")
+        );
+    }
+
+    #[test]
+    fn launch_instructions_match_sdk_create_and_buy_shape_for_sol_dev_buy() {
+        let mut config = regular_config();
+        config.devBuy = Some(crate::config::NormalizedDevBuy {
+            mode: "sol".to_string(),
+            amount: "0.5".to_string(),
+            source: "test".to_string(),
+        });
+        let global = PumpGlobalState {
+            fee_recipient: Pubkey::new_unique(),
+            initial_virtual_token_reserves: 1_073_000_000_000_000,
+            initial_virtual_sol_reserves: 30_000_000_000,
+            initial_real_token_reserves: 793_100_000_000_000,
+            fee_basis_points: 100,
+            creator_fee_basis_points: 50,
+            fee_recipients: [Pubkey::default(); 7],
+            reserved_fee_recipient: Pubkey::default(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+        };
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let launch_creator = Pubkey::new_unique();
+
+        let instructions = build_launch_instructions(
+            &config,
+            mint,
+            creator,
+            launch_creator,
+            None,
+            Some(&global),
+        )
+        .expect("launch instructions");
+
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions[0].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(instructions[1].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(
+            instructions[2].program_id.to_string(),
+            spl_associated_token_account::id().to_string()
+        );
+        assert_eq!(instructions[3].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(&instructions[3].data[..8], &[102, 6, 61, 18, 1, 218, 235, 234]);
+
+        let quoted_sol_amount = quote_buy_sol_from_tokens(&global, quote_buy_tokens_from_sol(&global, 500_000_000));
+        let expected_max_sol_cost = apply_atomic_buy_buffer(quoted_sol_amount);
+        assert_eq!(
+            &instructions[3].data[16..24],
+            &expected_max_sol_cost.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn agent_locked_launch_includes_agent_initialize() {
+        let mut config = regular_config();
+        config.mode = "agent-locked".to_string();
+        config.agent.buybackBps = Some(2_500);
+        config.creatorFee.mode = "agent-escrow".to_string();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let launch_creator = Pubkey::new_unique();
+        let agent_authority = Pubkey::new_unique();
+
+        let instructions = build_launch_instructions(
+            &config,
+            mint,
+            creator,
+            launch_creator,
+            Some(&agent_authority),
+            None,
+        )
+        .expect("agent locked launch instructions");
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(
+            instructions[1].program_id.to_string(),
+            PUMP_AGENT_PAYMENTS_PROGRAM_ID
+        );
+    }
+
+    #[test]
+    fn agent_custom_launch_includes_agent_initialize() {
+        let mut config = regular_config();
+        config.mode = "agent-custom".to_string();
+        config.agent.buybackBps = Some(2_500);
+        config.agent.feeRecipients = vec![
+            crate::config::NormalizedRecipient {
+                r#type: Some("agent".to_string()),
+                address: String::new(),
+                githubUserId: String::new(),
+                githubUsername: String::new(),
+                shareBps: 2_500,
+            },
+            crate::config::NormalizedRecipient {
+                r#type: Some("wallet".to_string()),
+                address: Pubkey::new_unique().to_string(),
+                githubUserId: String::new(),
+                githubUsername: String::new(),
+                shareBps: 7_500,
+            },
+        ];
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let launch_creator = Pubkey::new_unique();
+        let agent_authority = Pubkey::new_unique();
+
+        let instructions = build_launch_instructions(
+            &config,
+            mint,
+            creator,
+            launch_creator,
+            Some(&agent_authority),
+            None,
+        )
+        .expect("agent custom launch instructions");
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(
+            instructions[1].program_id.to_string(),
+            PUMP_AGENT_PAYMENTS_PROGRAM_ID
+        );
+    }
+
+    #[test]
     fn compute_budget_instruction_layout_matches_web3() {
         let limit = build_compute_unit_limit_instruction().expect("limit instruction");
         let price = build_compute_unit_price_instruction(123_456).expect("price instruction");
@@ -1840,6 +2060,33 @@ mod tests {
     }
 
     #[test]
+    fn create_fee_sharing_config_instruction_matches_live_account_shape() {
+        let mint = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let instruction = build_create_fee_sharing_config_instruction(&mint, &payer)
+            .expect("create fee sharing config instruction");
+
+        assert_eq!(instruction.program_id.to_string(), PUMP_FEE_PROGRAM_ID);
+        assert_eq!(instruction.accounts.len(), 13);
+        assert_eq!(
+            instruction.accounts[10].pubkey,
+            pump_fee_program_id().expect("fee program id")
+        );
+        assert_eq!(
+            instruction.accounts[11].pubkey,
+            pump_amm_program_id().expect("pump amm program id")
+        );
+        assert_eq!(
+            instruction.accounts[12].pubkey,
+            pump_fee_program_id().expect("fee program id")
+        );
+        assert_eq!(
+            &instruction.data[..8],
+            &[195, 78, 86, 76, 111, 52, 251, 213]
+        );
+    }
+
+    #[test]
     fn agent_initialize_instruction_shape_matches_sdk_layout() {
         let mint = Pubkey::new_unique();
         let creator = Pubkey::new_unique();
@@ -1859,7 +2106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fee_sharing_follow_up_contains_three_instructions() {
+    async fn fee_sharing_follow_up_contains_two_instructions_without_revoke() {
         let mut config = regular_config();
         config.feeSharing.generateLaterSetup = true;
         config.feeSharing.recipients = vec![crate::config::NormalizedRecipient {
@@ -1878,42 +2125,35 @@ mod tests {
         .await
         .expect("follow-up instructions");
 
-        assert_eq!(instructions.len(), 3);
+        assert_eq!(instructions.len(), 2);
         assert_eq!(instructions[0].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
         assert_eq!(instructions[1].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
-        assert_eq!(instructions[2].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
     }
 
     #[tokio::test]
-    async fn agent_locked_follow_up_contains_agent_init_and_fee_setup() {
+    async fn agent_locked_follow_up_contains_fee_setup_only() {
         let mut config = regular_config();
         config.mode = "agent-locked".to_string();
         config.agent.buybackBps = Some(2_500);
         config.creatorFee.mode = "agent-escrow".to_string();
         let creator = Pubkey::new_unique();
-        let agent_authority = Pubkey::new_unique();
         let instructions = build_native_follow_up_instructions(
             "http://127.0.0.1:8899",
             &config,
             Pubkey::new_unique(),
             creator,
-            Some(&agent_authority),
+            None,
         )
         .await
         .expect("agent locked follow-up instructions");
 
-        assert_eq!(instructions.len(), 4);
-        assert_eq!(
-            instructions[0].program_id.to_string(),
-            PUMP_AGENT_PAYMENTS_PROGRAM_ID
-        );
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
         assert_eq!(instructions[1].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
-        assert_eq!(instructions[2].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
-        assert_eq!(instructions[3].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
     }
 
     #[tokio::test]
-    async fn agent_custom_follow_up_contains_agent_init_and_fee_setup_without_revoke() {
+    async fn agent_custom_follow_up_contains_fee_setup_without_revoke() {
         let mut config = regular_config();
         config.mode = "agent-custom".to_string();
         config.agent.buybackBps = Some(2_500);
@@ -1934,23 +2174,57 @@ mod tests {
             },
         ];
         let creator = Pubkey::new_unique();
-        let agent_authority = Pubkey::new_unique();
         let instructions = build_native_follow_up_instructions(
             "http://127.0.0.1:8899",
             &config,
             Pubkey::new_unique(),
             creator,
-            Some(&agent_authority),
+            None,
         )
         .await
         .expect("agent custom follow-up instructions");
 
-        assert_eq!(instructions.len(), 3);
-        assert_eq!(
-            instructions[0].program_id.to_string(),
-            PUMP_AGENT_PAYMENTS_PROGRAM_ID
-        );
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
         assert_eq!(instructions[1].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
-        assert_eq!(instructions[2].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
+    }
+
+    #[test]
+    fn agent_unlocked_has_no_follow_up_transaction() {
+        let mut config = regular_config();
+        config.mode = "agent-unlocked".to_string();
+        config.agent.buybackBps = Some(2_500);
+
+        assert_eq!(native_follow_up_label(&config), None);
+    }
+
+    #[test]
+    fn update_fee_shares_uses_current_shareholders_as_remaining_accounts() {
+        let mint = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let current_shareholder = Pubkey::new_unique();
+        let next_shareholder = NormalizedRecipient {
+            r#type: Some("wallet".to_string()),
+            address: Pubkey::new_unique().to_string(),
+            githubUserId: String::new(),
+            githubUsername: String::new(),
+            shareBps: 10_000,
+        };
+
+        let instruction = build_update_fee_shares_instruction(
+            &mint,
+            &authority,
+            &[current_shareholder],
+            &[next_shareholder],
+        )
+        .expect("update fee shares instruction");
+
+        assert_eq!(instruction.program_id.to_string(), PUMP_FEE_PROGRAM_ID);
+        assert_eq!(
+            instruction.accounts.last().map(|account| account.pubkey),
+            Some(current_shareholder)
+        );
+        assert!(instruction.accounts.last().map(|account| account.is_writable).unwrap_or(false));
+        assert!(!instruction.accounts.last().map(|account| account.is_signer).unwrap_or(true));
     }
 }

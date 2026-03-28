@@ -146,7 +146,11 @@ pub struct RawExecution {
     #[serde(default)]
     pub skipPreflight: Option<Value>,
     #[serde(default)]
+    pub trackSendBlockHeight: Option<Value>,
+    #[serde(default)]
     pub provider: String,
+    #[serde(default)]
+    pub endpointProfile: String,
     #[serde(default)]
     pub policy: String,
     #[serde(default)]
@@ -163,6 +167,8 @@ pub struct RawExecution {
     pub maxTipSol: String,
     #[serde(default)]
     pub buyProvider: String,
+    #[serde(default)]
+    pub buyEndpointProfile: String,
     #[serde(default)]
     pub buyPolicy: String,
     #[serde(default)]
@@ -181,6 +187,8 @@ pub struct RawExecution {
     pub buyMaxTipSol: String,
     #[serde(default)]
     pub sellProvider: String,
+    #[serde(default)]
+    pub sellEndpointProfile: String,
     #[serde(default)]
     pub sellPolicy: String,
     #[serde(default)]
@@ -328,7 +336,9 @@ pub struct NormalizedExecution {
     pub txFormat: String,
     pub commitment: String,
     pub skipPreflight: bool,
+    pub trackSendBlockHeight: bool,
     pub provider: String,
+    pub endpointProfile: String,
     pub policy: String,
     pub autoGas: bool,
     pub autoMode: String,
@@ -337,6 +347,7 @@ pub struct NormalizedExecution {
     pub maxPriorityFeeSol: String,
     pub maxTipSol: String,
     pub buyProvider: String,
+    pub buyEndpointProfile: String,
     pub buyPolicy: String,
     pub buyAutoGas: bool,
     pub buyAutoMode: String,
@@ -346,6 +357,7 @@ pub struct NormalizedExecution {
     pub buyMaxPriorityFeeSol: String,
     pub buyMaxTipSol: String,
     pub sellProvider: String,
+    pub sellEndpointProfile: String,
     pub sellPolicy: String,
     pub sellPriorityFeeSol: String,
     pub sellTipSol: String,
@@ -825,19 +837,23 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                 "confirmed",
             )?,
             skipPreflight: parse_bool(&raw.execution.skipPreflight, false),
+            trackSendBlockHeight: parse_bool(&raw.execution.trackSendBlockHeight, false),
             provider: parse_choice(
                 &raw.execution.provider,
                 "execution.provider",
-                &[
-                    "auto",
-                    "helius",
-                    "jito",
-                    "astralane",
-                    "bloxroute",
-                    "hellomoon",
-                ],
-                "auto",
+                &["standard-rpc", "helius-sender", "jito-bundle"],
+                "helius-sender",
             )?,
+            endpointProfile: if is_blank(&raw.execution.endpointProfile) {
+                String::new()
+            } else {
+                parse_choice(
+                    &raw.execution.endpointProfile,
+                    "execution.endpointProfile",
+                    &["global", "us", "eu", "west", "asia"],
+                    "global",
+                )?
+            },
             policy: parse_choice(
                 &raw.execution.policy,
                 "execution.policy",
@@ -857,16 +873,19 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             buyProvider: parse_choice(
                 &raw.execution.buyProvider,
                 "execution.buyProvider",
-                &[
-                    "auto",
-                    "helius",
-                    "jito",
-                    "astralane",
-                    "bloxroute",
-                    "hellomoon",
-                ],
-                "auto",
+                &["standard-rpc", "helius-sender", "jito-bundle"],
+                "helius-sender",
             )?,
+            buyEndpointProfile: if is_blank(&raw.execution.buyEndpointProfile) {
+                String::new()
+            } else {
+                parse_choice(
+                    &raw.execution.buyEndpointProfile,
+                    "execution.buyEndpointProfile",
+                    &["global", "us", "eu", "west", "asia"],
+                    "global",
+                )?
+            },
             buyPolicy: parse_choice(
                 &raw.execution.buyPolicy,
                 "execution.buyPolicy",
@@ -887,16 +906,19 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             sellProvider: parse_choice(
                 &raw.execution.sellProvider,
                 "execution.sellProvider",
-                &[
-                    "auto",
-                    "helius",
-                    "jito",
-                    "astralane",
-                    "bloxroute",
-                    "hellomoon",
-                ],
-                "helius",
+                &["standard-rpc", "helius-sender", "jito-bundle"],
+                "helius-sender",
             )?,
+            sellEndpointProfile: if is_blank(&raw.execution.sellEndpointProfile) {
+                String::new()
+            } else {
+                parse_choice(
+                    &raw.execution.sellEndpointProfile,
+                    "execution.sellEndpointProfile",
+                    &["global", "us", "eu", "west", "asia"],
+                    "global",
+                )?
+            },
             sellPolicy: parse_choice(
                 &raw.execution.sellPolicy,
                 "execution.sellPolicy",
@@ -995,6 +1017,26 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             "jitoTipAccount is required when jitoTipLamports is set.".to_string(),
         ));
     }
+    if normalized.execution.provider == "helius-sender" {
+        if !normalized.execution.skipPreflight {
+            return Err(ConfigError::Message(
+                "execution.skipPreflight must be true when execution.provider is helius-sender."
+                    .to_string(),
+            ));
+        }
+        if normalized.tx.computeUnitPriceMicroLamports.unwrap_or(0) <= 0 {
+            return Err(ConfigError::Message(
+                "tx.computeUnitPriceMicroLamports must be greater than 0 when execution.provider is helius-sender."
+                    .to_string(),
+            ));
+        }
+        if normalized.tx.jitoTipLamports < 200_000 {
+            return Err(ConfigError::Message(
+                "tx.jitoTipLamports must be at least 200000 when execution.provider is helius-sender."
+                    .to_string(),
+            ));
+        }
+    }
 
     // Keep variable live for future parity extensions.
     agent_fee_recipients.clear();
@@ -1022,7 +1064,9 @@ mod tests {
                 "feeRecipients": []
             },
             "tx": {
-                "jitoTipLamports": 0,
+                "computeUnitPriceMicroLamports": 1,
+                "jitoTipLamports": 200000,
+                "jitoTipAccount": "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
                 "useDefaultLookupTables": true,
                 "dumpBase64": false,
                 "writeReport": true
@@ -1039,15 +1083,19 @@ mod tests {
                 "send": false,
                 "txFormat": "auto",
                 "commitment": "confirmed",
-                "skipPreflight": false,
-                "provider": "auto",
+                "skipPreflight": true,
+                "provider": "helius-sender",
+                "endpointProfile": "global",
                 "policy": "fast",
                 "autoGas": true,
                 "autoMode": "launchAuto",
-                "buyProvider": "auto",
+                "buyProvider": "helius-sender",
+                "buyEndpointProfile": "global",
                 "buyPolicy": "fast",
                 "buyAutoGas": true,
-                "buyAutoMode": "buyAuto"
+                "buyAutoMode": "buyAuto",
+                "sellProvider": "helius-sender",
+                "sellEndpointProfile": "global"
             },
             "postLaunch": {
                 "strategy": "none",
@@ -1070,19 +1118,46 @@ mod tests {
         assert_eq!(normalized.mode, "regular");
         assert_eq!(normalized.launchpad, "pump");
         assert_eq!(normalized.token.name, "LaunchDeck");
-        assert_eq!(normalized.execution.provider, "auto");
-        assert_eq!(normalized.execution.buyProvider, "auto");
+        assert_eq!(normalized.execution.provider, "helius-sender");
+        assert_eq!(normalized.execution.endpointProfile, "global");
+        assert_eq!(normalized.execution.buyProvider, "helius-sender");
+        assert_eq!(normalized.execution.buyEndpointProfile, "global");
         assert!(normalized.devBuy.is_none());
     }
 
     #[test]
     fn requires_jito_tip_account_when_tip_is_set() {
         let mut raw = sample_raw_config();
-        raw.tx.jitoTipLamports = Some(json!(1000));
+        raw.tx.jitoTipLamports = Some(json!(200000));
+        raw.tx.jitoTipAccount = String::new();
         let error = normalize_raw_config(raw).expect_err("jito tip account should be required");
         assert_eq!(
             error.to_string(),
             "jitoTipAccount is required when jitoTipLamports is set."
         );
+    }
+
+    #[test]
+    fn helius_sender_requires_priority_tip_and_skip_preflight() {
+        let mut raw = sample_raw_config();
+        raw.tx.jitoTipLamports = Some(json!(200_000));
+        raw.tx.jitoTipAccount = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE".to_string();
+        raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
+        raw.execution.skipPreflight = Some(json!(false));
+        let error = normalize_raw_config(raw).expect_err("sender should require skipPreflight");
+        assert_eq!(
+            error.to_string(),
+            "execution.skipPreflight must be true when execution.provider is helius-sender."
+        );
+    }
+
+    #[test]
+    fn rejects_removed_auto_provider_values() {
+        let mut raw = sample_raw_config();
+        raw.execution.provider = "auto".to_string();
+        let error = normalize_raw_config(raw).expect_err("auto should be rejected");
+        assert!(error
+            .to_string()
+            .contains("execution.provider must be one of standard-rpc, helius-sender, jito-bundle"));
     }
 }

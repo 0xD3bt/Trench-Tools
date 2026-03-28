@@ -4,25 +4,53 @@ const fs = require("fs");
 const path = require("path");
 
 const PRODUCT_SLUG = "launchdeck";
-const PROVIDERS = ["helius", "jito", "astralane", "bloxroute", "hellomoon"];
-const LEGACY_PROVIDERS = ["auto", ...PROVIDERS];
-const VERIFIED_PROVIDERS = new Set(["helius", "jito", "astralane"]);
+const PROVIDERS = ["helius-sender", "standard-rpc", "jito-bundle"];
+const ENDPOINT_PROFILES = ["global", "us", "eu", "west", "asia"];
+const PROVIDER_ENDPOINT_PROFILES = {
+  "helius-sender": ENDPOINT_PROFILES,
+  "jito-bundle": ENDPOINT_PROFILES,
+  "standard-rpc": [],
+};
+const LEGACY_PROVIDER_ALIASES = {
+  auto: "helius-sender",
+  helius: "helius-sender",
+  jito: "jito-bundle",
+  astralane: "standard-rpc",
+  bloxroute: "standard-rpc",
+  hellomoon: "standard-rpc",
+};
+const VERIFIED_PROVIDERS = new Set(PROVIDERS);
 const LAUNCHPADS = ["pump", "bonk", "bagsapp"];
 const EXECUTION_POLICIES = ["fast", "safe"];
 const AUTO_GAS_MODES = ["auto", "manual"];
 const POST_LAUNCH_STRATEGIES = ["none", "dev-buy", "snipe-own-launch", "automatic-dev-sell"];
 const PRESET_IDS = ["preset1", "preset2", "preset3"];
 const DEFAULT_POLICY = "safe";
+const DEFAULT_PROVIDER = "helius-sender";
+const DEFAULT_ENDPOINT_PROFILE = "global";
 const DEFAULT_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
 const DEFAULT_CREATION_TIP_SOL = "0.01";
 const DEFAULT_TRADE_PRIORITY_FEE_SOL = "0.009";
 const DEFAULT_TRADE_TIP_SOL = "0.01";
 const DEFAULT_TRADE_SLIPPAGE_PERCENT = "90";
 
-function normalizeProvider(provider, fallback = "helius") {
+function normalizeProvider(provider, fallback = DEFAULT_PROVIDER) {
   const normalized = String(provider || "").trim().toLowerCase();
-  if (!normalized || normalized === "auto") return fallback;
-  return PROVIDERS.includes(normalized) ? normalized : fallback;
+  if (!normalized) return fallback;
+  const migrated = LEGACY_PROVIDER_ALIASES[normalized] || normalized;
+  return PROVIDERS.includes(migrated) ? migrated : fallback;
+}
+
+function providerSupportsEndpointProfiles(provider) {
+  return Array.isArray(PROVIDER_ENDPOINT_PROFILES[provider]) && PROVIDER_ENDPOINT_PROFILES[provider].length > 0;
+}
+
+function normalizeEndpointProfile(provider, profile, fallback = DEFAULT_ENDPOINT_PROFILE) {
+  const normalizedProvider = normalizeProvider(provider);
+  if (!providerSupportsEndpointProfiles(normalizedProvider)) return "";
+  const normalized = String(profile || "").trim().toLowerCase();
+  if (!normalized) return fallback;
+  return PROVIDER_ENDPOINT_PROFILES[normalizedProvider].includes(normalized) ? normalized : fallback;
 }
 
 function normalizePolicy(policy, fallback = DEFAULT_POLICY) {
@@ -53,7 +81,8 @@ function coerceNumber(value, fallback = 0) {
 }
 
 function createCreationSettings({
-  provider = "helius",
+  provider = DEFAULT_PROVIDER,
+  endpointProfile = DEFAULT_ENDPOINT_PROFILE,
   policy = DEFAULT_POLICY,
   tipSol = DEFAULT_CREATION_TIP_SOL,
   priorityFeeSol = "0.001",
@@ -61,6 +90,7 @@ function createCreationSettings({
 } = {}) {
   return {
     provider: normalizeProvider(provider),
+    endpointProfile: normalizeEndpointProfile(provider, endpointProfile),
     policy: normalizePolicy(policy),
     tipSol: normalizeDecimalString(tipSol, DEFAULT_CREATION_TIP_SOL),
     priorityFeeSol: normalizeDecimalString(priorityFeeSol, "0.001"),
@@ -69,7 +99,8 @@ function createCreationSettings({
 }
 
 function createTradeSettings({
-  provider = "helius",
+  provider = DEFAULT_PROVIDER,
+  endpointProfile = DEFAULT_ENDPOINT_PROFILE,
   policy = DEFAULT_POLICY,
   priorityFeeSol = DEFAULT_TRADE_PRIORITY_FEE_SOL,
   tipSol = DEFAULT_TRADE_TIP_SOL,
@@ -77,6 +108,7 @@ function createTradeSettings({
 } = {}) {
   return {
     provider: normalizeProvider(provider),
+    endpointProfile: normalizeEndpointProfile(provider, endpointProfile),
     policy: normalizePolicy(policy),
     priorityFeeSol: normalizeDecimalString(priorityFeeSol, DEFAULT_TRADE_PRIORITY_FEE_SOL),
     tipSol: normalizeDecimalString(tipSol, DEFAULT_TRADE_TIP_SOL),
@@ -105,6 +137,9 @@ function createDefaultPersistentConfig() {
       mode: "regular",
       activePresetId: "preset1",
       presetEditing: false,
+      misc: {
+        trackSendBlockHeight: false,
+      },
       automaticDevSell: {
         enabled: false,
         percent: 0,
@@ -168,6 +203,11 @@ function normalizePresetShape(preset, fallbackPreset, index) {
       ...fallbackPreset.creationSettings,
       ...(preset && preset.creationSettings ? preset.creationSettings : {}),
       provider: normalizeProvider(preset && preset.creationSettings && preset.creationSettings.provider, fallbackPreset.creationSettings.provider),
+      endpointProfile: normalizeEndpointProfile(
+        preset && preset.creationSettings && preset.creationSettings.provider,
+        preset && preset.creationSettings && preset.creationSettings.endpointProfile,
+        fallbackPreset.creationSettings.endpointProfile
+      ),
       policy: normalizePolicy(preset && preset.creationSettings && preset.creationSettings.policy, fallbackPreset.creationSettings.policy),
       tipSol: normalizeDecimalString(preset && preset.creationSettings && preset.creationSettings.tipSol, fallbackPreset.creationSettings.tipSol),
       priorityFeeSol: normalizeDecimalString(preset && preset.creationSettings && preset.creationSettings.priorityFeeSol, fallbackPreset.creationSettings.priorityFeeSol),
@@ -177,6 +217,11 @@ function normalizePresetShape(preset, fallbackPreset, index) {
       ...fallbackPreset.buySettings,
       ...(preset && preset.buySettings ? preset.buySettings : {}),
       provider: normalizeProvider(preset && preset.buySettings && preset.buySettings.provider, fallbackPreset.buySettings.provider),
+      endpointProfile: normalizeEndpointProfile(
+        preset && preset.buySettings && preset.buySettings.provider,
+        preset && preset.buySettings && preset.buySettings.endpointProfile,
+        fallbackPreset.buySettings.endpointProfile
+      ),
       policy: normalizePolicy(preset && preset.buySettings && preset.buySettings.policy, fallbackPreset.buySettings.policy),
       priorityFeeSol: normalizeDecimalString(preset && preset.buySettings && preset.buySettings.priorityFeeSol, fallbackPreset.buySettings.priorityFeeSol),
       tipSol: normalizeDecimalString(preset && preset.buySettings && preset.buySettings.tipSol, fallbackPreset.buySettings.tipSol),
@@ -187,6 +232,11 @@ function normalizePresetShape(preset, fallbackPreset, index) {
       ...fallbackPreset.sellSettings,
       ...(preset && preset.sellSettings ? preset.sellSettings : {}),
       provider: normalizeProvider(preset && preset.sellSettings && preset.sellSettings.provider, fallbackPreset.sellSettings.provider),
+      endpointProfile: normalizeEndpointProfile(
+        preset && preset.sellSettings && preset.sellSettings.provider,
+        preset && preset.sellSettings && preset.sellSettings.endpointProfile,
+        fallbackPreset.sellSettings.endpointProfile
+      ),
       policy: normalizePolicy(preset && preset.sellSettings && preset.sellSettings.policy, fallbackPreset.sellSettings.policy),
       priorityFeeSol: normalizeDecimalString(preset && preset.sellSettings && preset.sellSettings.priorityFeeSol, fallbackPreset.sellSettings.priorityFeeSol),
       tipSol: normalizeDecimalString(preset && preset.sellSettings && preset.sellSettings.tipSol, fallbackPreset.sellSettings.tipSol),
@@ -234,6 +284,11 @@ function migrateLegacyConfig(parsed) {
       label: launchPreset.label || sniperPreset.label || `P${index + 1}`,
       creationSettings: {
         provider: normalizeProvider(launchExecution.provider, fallbackPreset.creationSettings.provider),
+        endpointProfile: normalizeEndpointProfile(
+          launchExecution.provider,
+          launchExecution.endpointProfile,
+          fallbackPreset.creationSettings.endpointProfile
+        ),
         policy: normalizePolicy(launchExecution.policy, fallbackPreset.creationSettings.policy),
         tipSol: firstNonEmpty(launchExecution.tipSol, launchExecution.maxTipSol, legacyLaunchDefaults.tipSol, legacyLaunchDefaults.maxTipSol, fallbackPreset.creationSettings.tipSol),
         priorityFeeSol: creationPriorityFeeSol,
@@ -241,6 +296,11 @@ function migrateLegacyConfig(parsed) {
       },
       buySettings: {
         provider: normalizeProvider(buyExecution.provider, fallbackPreset.buySettings.provider),
+        endpointProfile: normalizeEndpointProfile(
+          buyExecution.provider,
+          buyExecution.endpointProfile,
+          fallbackPreset.buySettings.endpointProfile
+        ),
         policy: normalizePolicy(buyExecution.policy, fallbackPreset.buySettings.policy),
         priorityFeeSol: buyPriorityFeeSol,
         tipSol: buyTipSol,
@@ -249,6 +309,11 @@ function migrateLegacyConfig(parsed) {
       },
       sellSettings: {
         provider: normalizeProvider(buyExecution.provider, fallbackPreset.sellSettings.provider),
+        endpointProfile: normalizeEndpointProfile(
+          buyExecution.provider,
+          buyExecution.endpointProfile,
+          fallbackPreset.sellSettings.endpointProfile
+        ),
         policy: normalizePolicy(buyExecution.policy, fallbackPreset.sellSettings.policy),
         priorityFeeSol: sellPriorityFeeSol,
         tipSol: sellTipSol,
@@ -303,6 +368,12 @@ function normalizePersistentConfig(parsed) {
         ? String(merged.defaults.activePresetId)
         : "preset1",
       presetEditing: coerceBoolean(merged.defaults && merged.defaults.presetEditing, false),
+      misc: {
+        trackSendBlockHeight: coerceBoolean(
+          merged.defaults && merged.defaults.misc && merged.defaults.misc.trackSendBlockHeight,
+          base.defaults.misc.trackSendBlockHeight
+        ),
+      },
       automaticDevSell: {
         enabled: coerceBoolean(merged.defaults && merged.defaults.automaticDevSell && merged.defaults.automaticDevSell.enabled, base.defaults.automaticDevSell.enabled),
         percent: coerceNumber(merged.defaults && merged.defaults.automaticDevSell && merged.defaults.automaticDevSell.percent, base.defaults.automaticDevSell.percent),
@@ -341,8 +412,10 @@ function resolveProviderSupport(provider) {
   return {
     verified: VERIFIED_PROVIDERS.has(provider),
     supportsSingle: true,
-    supportsBundle: provider !== "helius",
-    supportsSequential: true,
+    supportsBundle: provider === "jito-bundle",
+    supportsSequential: provider !== "jito-bundle",
+    supportsEndpointProfiles: providerSupportsEndpointProfiles(provider),
+    endpointProfiles: PROVIDER_ENDPOINT_PROFILES[provider] || [],
     supportState: VERIFIED_PROVIDERS.has(provider) ? "verified" : "unverified",
   };
 }
@@ -350,6 +423,7 @@ function resolveProviderSupport(provider) {
 module.exports = {
   AUTO_GAS_MODES,
   EXECUTION_POLICIES,
+  ENDPOINT_PROFILES,
   LAUNCHPADS,
   POST_LAUNCH_STRATEGIES,
   PRODUCT_SLUG,
@@ -362,6 +436,8 @@ module.exports = {
   getPersistentConfigPath,
   normalizePersistentConfig,
   readPersistentConfig,
+  normalizeEndpointProfile,
+  providerSupportsEndpointProfiles,
   resolveProviderSupport,
   writePersistentConfig,
 };

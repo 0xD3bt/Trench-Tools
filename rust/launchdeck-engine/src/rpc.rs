@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
 
-use crate::transport::JitoBundleEndpoint;
+use crate::transport::{JitoBundleEndpoint, TransportPlan};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledTransaction {
@@ -16,6 +16,14 @@ pub struct CompiledTransaction {
     pub serializedBase64: String,
     #[serde(default)]
     pub lookupTablesUsed: Vec<String>,
+    #[serde(default)]
+    pub computeUnitLimit: Option<u64>,
+    #[serde(default)]
+    pub computeUnitPriceMicroLamports: Option<u64>,
+    #[serde(default)]
+    pub inlineTipLamports: Option<u64>,
+    #[serde(default)]
+    pub inlineTipAccount: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,6 +41,27 @@ pub struct SentResult {
     pub format: String,
     pub signature: Option<String>,
     pub explorerUrl: Option<String>,
+    pub transportType: String,
+    pub endpoint: Option<String>,
+    pub attemptedEndpoints: Vec<String>,
+    pub skipPreflight: bool,
+    pub maxRetries: u32,
+    pub confirmationStatus: Option<String>,
+    pub sendObservedBlockHeight: Option<u64>,
+    pub confirmedObservedBlockHeight: Option<u64>,
+    pub confirmedSlot: Option<u64>,
+    pub computeUnitLimit: Option<u64>,
+    pub computeUnitPriceMicroLamports: Option<u64>,
+    pub inlineTipLamports: Option<u64>,
+    pub inlineTipAccount: Option<String>,
+    pub bundleId: Option<String>,
+    pub attemptedBundleIds: Vec<String>,
+}
+
+struct ConfirmationDetails {
+    status: Value,
+    confirmed_observed_block_height: Option<u64>,
+    confirmed_slot: Option<u64>,
 }
 
 async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value, String> {
@@ -49,9 +78,19 @@ async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value
         .await
         .map_err(|error| error.to_string())?;
     let status = response.status();
-    let payload: Value = response.json().await.map_err(|error| error.to_string())?;
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    let payload: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({ "raw": body }));
     if !status.is_success() {
-        return Err(format!("RPC {} failed with status {}.", method, status));
+        let detail = payload
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("raw").and_then(Value::as_str))
+            .unwrap_or("No response body.");
+        return Err(format!(
+            "RPC {} failed with status {}: {}",
+            method, status, detail
+        ));
     }
     if let Some(error) = payload.get("error") {
         return Err(error
@@ -146,6 +185,25 @@ pub async fn fetch_account_exists(
     Ok(result.get("value").is_some_and(|value| !value.is_null()))
 }
 
+pub async fn fetch_current_block_height(
+    rpc_url: &str,
+    commitment: &str,
+) -> Result<u64, String> {
+    let result = rpc_request(
+        rpc_url,
+        "getBlockHeight",
+        json!([
+            {
+                "commitment": commitment,
+            }
+        ]),
+    )
+    .await?;
+    result
+        .as_u64()
+        .ok_or_else(|| "RPC getBlockHeight did not return a block height.".to_string())
+}
+
 pub async fn simulate_transactions(
     rpc_url: &str,
     transactions: &[CompiledTransaction],
@@ -221,7 +279,8 @@ async fn wait_for_confirmation(
     signature: &str,
     commitment: &str,
     max_attempts: u32,
-) -> Result<Value, String> {
+    track_confirmed_block_height: bool,
+) -> Result<ConfirmationDetails, String> {
     for _ in 0..max_attempts {
         let result = rpc_request(
             rpc_url,
@@ -254,7 +313,17 @@ async fn wait_for_confirmation(
                 ));
             }
             if commitment_satisfied(actual_commitment, commitment) {
-                return Ok(status);
+                let confirmed_observed_block_height = if track_confirmed_block_height {
+                    fetch_current_block_height(rpc_url, commitment).await.ok()
+                } else {
+                    None
+                };
+                let confirmed_slot = status.get("slot").and_then(Value::as_u64);
+                return Ok(ConfirmationDetails {
+                    status,
+                    confirmed_observed_block_height,
+                    confirmed_slot,
+                });
             }
         }
         sleep(Duration::from_millis(1500)).await;
@@ -270,10 +339,12 @@ pub async fn send_transactions_sequential(
     transactions: &[CompiledTransaction],
     commitment: &str,
     skip_preflight: bool,
+    track_send_block_height: bool,
 ) -> Result<(Vec<SentResult>, Vec<String>), String> {
     let mut results = Vec::new();
     let warnings = Vec::new();
     for transaction in transactions {
+        let max_retries = 3;
         let signature = rpc_request(
             rpc_url,
             "sendTransaction",
@@ -283,7 +354,7 @@ pub async fn send_transactions_sequential(
                     "encoding": "base64",
                     "skipPreflight": skip_preflight,
                     "preflightCommitment": commitment,
-                    "maxRetries": 3,
+                    "maxRetries": max_retries,
                 }
             ]),
         )
@@ -291,12 +362,151 @@ pub async fn send_transactions_sequential(
         .as_str()
         .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?
         .to_string();
-        let _ = wait_for_confirmation(rpc_url, &signature, commitment, 20).await?;
+        let send_observed_block_height = if track_send_block_height {
+            fetch_current_block_height(rpc_url, commitment).await.ok()
+        } else {
+            None
+        };
+        let confirmation =
+            wait_for_confirmation(rpc_url, &signature, commitment, 20, track_send_block_height)
+                .await?;
         results.push(SentResult {
             label: transaction.label.clone(),
             format: transaction.format.clone(),
             signature: Some(signature.clone()),
             explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
+            transportType: "standard-rpc-sequential".to_string(),
+            endpoint: Some(rpc_url.to_string()),
+            attemptedEndpoints: vec![rpc_url.to_string()],
+            skipPreflight: skip_preflight,
+            maxRetries: max_retries,
+            confirmationStatus: confirmation
+                .status
+                .get("confirmationStatus")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            sendObservedBlockHeight: send_observed_block_height,
+            confirmedObservedBlockHeight: confirmation.confirmed_observed_block_height,
+            confirmedSlot: confirmation.confirmed_slot,
+            computeUnitLimit: transaction.computeUnitLimit,
+            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+            inlineTipLamports: transaction.inlineTipLamports,
+            inlineTipAccount: transaction.inlineTipAccount.clone(),
+            bundleId: None,
+            attemptedBundleIds: vec![],
+        });
+    }
+    Ok((results, warnings))
+}
+
+fn validate_helius_sender_transaction(transaction: &CompiledTransaction) -> Result<(), String> {
+    if transaction.inlineTipLamports.unwrap_or(0) < 200_000 {
+        return Err(format!(
+            "Transaction {} is missing the required inline Helius Sender tip.",
+            transaction.label
+        ));
+    }
+    if transaction.computeUnitPriceMicroLamports.unwrap_or(0) == 0 {
+        return Err(format!(
+            "Transaction {} is missing the required compute unit price for Helius Sender.",
+            transaction.label
+        ));
+    }
+    Ok(())
+}
+
+pub async fn send_transactions_helius_sender(
+    rpc_url: &str,
+    endpoints: &[String],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>), String> {
+    let mut results = Vec::new();
+    let mut warnings = Vec::new();
+    if endpoints.is_empty() {
+        return Err("Helius Sender endpoint is not configured.".to_string());
+    }
+    for transaction in transactions {
+        validate_helius_sender_transaction(transaction)?;
+        let mut successful_endpoints = Vec::new();
+        let mut signatures = Vec::new();
+        let mut errors = Vec::new();
+        for endpoint in endpoints {
+            match rpc_request(
+                endpoint,
+                "sendTransaction",
+                json!([
+                    transaction.serializedBase64,
+                    {
+                        "encoding": "base64",
+                        "skipPreflight": true,
+                        "maxRetries": 0,
+                    }
+                ]),
+            )
+            .await
+            {
+                Ok(result) => {
+                    let signature = result
+                        .as_str()
+                        .ok_or_else(|| "Helius Sender did not return a signature.".to_string())?
+                        .to_string();
+                    successful_endpoints.push(endpoint.clone());
+                    signatures.push(signature);
+                }
+                Err(error) => errors.push(format!("{endpoint}: {error}")),
+            }
+        }
+        if signatures.is_empty() {
+            return Err(format!(
+                "Helius Sender failed for all endpoints in the selected profile: {}",
+                errors.join(" | ")
+            ));
+        }
+        if !errors.is_empty() {
+            warnings.push(format!(
+                "Helius Sender fanout had partial failures for {}: {}",
+                transaction.label,
+                errors.join(" | ")
+            ));
+        }
+        let signature = signatures
+            .first()
+            .cloned()
+            .ok_or_else(|| "Helius Sender did not return a signature.".to_string())?;
+        let send_observed_block_height = if track_send_block_height {
+            fetch_current_block_height(rpc_url, commitment).await.ok()
+        } else {
+            None
+        };
+        let confirmation =
+            wait_for_confirmation(rpc_url, &signature, commitment, 20, track_send_block_height)
+                .await?;
+        results.push(SentResult {
+            label: transaction.label.clone(),
+            format: transaction.format.clone(),
+            signature: Some(signature.clone()),
+            explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
+            transportType: "helius-sender".to_string(),
+            endpoint: successful_endpoints.first().cloned(),
+            attemptedEndpoints: endpoints.to_vec(),
+            skipPreflight: true,
+            maxRetries: 0,
+            confirmationStatus: confirmation
+                .status
+                .get("confirmationStatus")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            sendObservedBlockHeight: send_observed_block_height,
+            confirmedObservedBlockHeight: confirmation.confirmed_observed_block_height,
+            confirmedSlot: confirmation.confirmed_slot,
+            computeUnitLimit: transaction.computeUnitLimit,
+            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+            inlineTipLamports: transaction.inlineTipLamports,
+            inlineTipAccount: transaction.inlineTipAccount.clone(),
+            bundleId: None,
+            attemptedBundleIds: vec![],
         });
     }
     Ok((results, warnings))
@@ -339,9 +549,11 @@ async fn jito_request(endpoint: &str, method: &str, params: Value) -> Result<Val
 }
 
 pub async fn send_transactions_bundle(
+    rpc_url: &str,
     endpoints: &[JitoBundleEndpoint],
     transactions: &[CompiledTransaction],
     commitment: &str,
+    track_send_block_height: bool,
 ) -> Result<(Vec<SentResult>, Vec<String>), String> {
     if transactions.is_empty() {
         return Ok((vec![], vec![]));
@@ -352,98 +564,213 @@ pub async fn send_transactions_bundle(
             transactions.len()
         ));
     }
-    let active_endpoint = endpoints
-        .first()
-        .ok_or_else(|| "No Jito bundle endpoints configured.".to_string())?;
+    if endpoints.is_empty() {
+        return Err("No Jito bundle endpoints configured.".to_string());
+    }
     let encoded: Vec<String> = transactions
         .iter()
         .map(|entry| entry.serializedBase64.clone())
         .collect();
-    let bundle_id = jito_request(
-        &active_endpoint.send,
-        "sendBundle",
-        json!([encoded, { "encoding": "base64" }]),
-    )
-    .await?
-    .as_str()
-    .ok_or_else(|| "Jito sendBundle did not return a bundle id.".to_string())?
-    .to_string();
+    let mut attempts = Vec::new();
+    let mut send_errors = Vec::new();
+    for endpoint in endpoints {
+        match jito_request(
+            &endpoint.send,
+            "sendBundle",
+            json!([encoded, { "encoding": "base64" }]),
+        )
+        .await
+        {
+            Ok(result) => {
+                let bundle_id = result
+                    .as_str()
+                    .ok_or_else(|| "Jito sendBundle did not return a bundle id.".to_string())?
+                    .to_string();
+                attempts.push((endpoint.clone(), bundle_id));
+            }
+            Err(error) => send_errors.push(format!("{}: {}", endpoint.name, error)),
+        }
+    }
+    if attempts.is_empty() {
+        return Err(format!(
+            "Jito bundle submission failed for all endpoints in the selected profile: {}",
+            send_errors.join(" | ")
+        ));
+    }
+    let mut warnings = Vec::new();
+    if !send_errors.is_empty() {
+        warnings.push(format!(
+            "Jito fanout had partial submission failures: {}",
+            send_errors.join(" | ")
+        ));
+    }
+    let send_observed_block_height = if track_send_block_height {
+        fetch_current_block_height(rpc_url, commitment).await.ok()
+    } else {
+        None
+    };
 
     for _ in 0..20 {
-        let status_payload = jito_request(
-            &active_endpoint.status,
-            "getBundleStatuses",
-            json!([[bundle_id.clone()]]),
-        )
-        .await?;
-        let maybe_status = status_payload
-            .get("value")
-            .and_then(Value::as_array)
-            .and_then(|items| {
-                items.iter().find(|entry| {
-                    entry.get("bundle_id").and_then(Value::as_str) == Some(bundle_id.as_str())
-                })
-            })
-            .cloned();
-        if let Some(status) = maybe_status {
-            if let Some(err) = status.get("err") {
-                if !err.is_null() {
-                    return Err(format!("Jito bundle failed: {}", err));
-                }
-            }
-            let actual = status
-                .get("confirmation_status")
-                .and_then(Value::as_str)
-                .unwrap_or("processed");
-            if !commitment_satisfied(actual, commitment) {
-                sleep(Duration::from_millis(1500)).await;
-                continue;
-            }
-            let signatures = status
-                .get("transactions")
+        let mut observed_errors = Vec::new();
+        for (endpoint, bundle_id) in &attempts {
+            let status_payload = jito_request(
+                &endpoint.status,
+                "getBundleStatuses",
+                json!([[bundle_id.clone()]]),
+            )
+            .await?;
+            let maybe_status = status_payload
+                .get("value")
                 .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let results = transactions
-                .iter()
-                .enumerate()
-                .map(|(index, transaction)| {
-                    let signature = signatures
-                        .get(index)
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    SentResult {
-                        label: transaction.label.clone(),
-                        format: transaction.format.clone(),
-                        explorerUrl: signature
-                            .as_ref()
-                            .map(|value| format!("https://solscan.io/tx/{value}")),
-                        signature,
-                    }
+                .and_then(|items| {
+                    items.iter().find(|entry| {
+                        entry.get("bundle_id").and_then(Value::as_str) == Some(bundle_id.as_str())
+                    })
                 })
-                .collect::<Vec<_>>();
-            return Ok((
-                results,
-                vec![format!(
-                    "Sent via Jito bundle {} using {}.",
-                    bundle_id, active_endpoint.name
-                )],
-            ));
+                .cloned();
+            if let Some(status) = maybe_status {
+                if let Some(err) = status.get("err") {
+                    if !err.is_null() {
+                        observed_errors.push(format!("{}:{}={}", endpoint.name, bundle_id, err));
+                        continue;
+                    }
+                }
+                let actual = status
+                    .get("confirmation_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("processed");
+                if !commitment_satisfied(actual, commitment) {
+                    continue;
+                }
+                let signatures = status
+                    .get("transactions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let attempted_endpoints = attempts
+                    .iter()
+                    .map(|(attempt_endpoint, _)| attempt_endpoint.send.clone())
+                    .collect::<Vec<_>>();
+                let attempted_bundle_ids = attempts
+                    .iter()
+                    .map(|(_, attempt_bundle_id)| attempt_bundle_id.clone())
+                    .collect::<Vec<_>>();
+                let confirmed_observed_block_height = if track_send_block_height {
+                    fetch_current_block_height(rpc_url, commitment).await.ok()
+                } else {
+                    None
+                };
+                let confirmed_slot = status.get("slot").and_then(Value::as_u64);
+                let results = transactions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, transaction)| {
+                        let signature = signatures
+                            .get(index)
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        SentResult {
+                            label: transaction.label.clone(),
+                            format: transaction.format.clone(),
+                            explorerUrl: signature
+                                .as_ref()
+                                .map(|value| format!("https://solscan.io/tx/{value}")),
+                            signature,
+                            transportType: "jito-bundle".to_string(),
+                            endpoint: Some(endpoint.send.clone()),
+                            attemptedEndpoints: attempted_endpoints.clone(),
+                            skipPreflight: true,
+                            maxRetries: 0,
+                            confirmationStatus: Some(actual.to_string()),
+                            sendObservedBlockHeight: send_observed_block_height,
+                            confirmedObservedBlockHeight: confirmed_observed_block_height,
+                            confirmedSlot: confirmed_slot,
+                            computeUnitLimit: transaction.computeUnitLimit,
+                            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+                            inlineTipLamports: transaction.inlineTipLamports,
+                            inlineTipAccount: transaction.inlineTipAccount.clone(),
+                            bundleId: Some(bundle_id.clone()),
+                            attemptedBundleIds: attempted_bundle_ids.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                warnings.push(format!(
+                    "Sent via Jito bundle {} using {} after fanout to {} endpoints.",
+                    bundle_id,
+                    endpoint.name,
+                    attempts.len()
+                ));
+                if !observed_errors.is_empty() {
+                    warnings.push(format!(
+                        "Jito fanout observed non-winning endpoint errors: {}",
+                        observed_errors.join(" | ")
+                    ));
+                }
+                return Ok((results, warnings));
+            }
         }
         sleep(Duration::from_millis(1500)).await;
     }
     Err(format!(
-        "Timed out waiting for Jito bundle {} to reach {}.",
-        bundle_id, commitment
+        "Timed out waiting for fanout Jito bundle submissions to reach {}. Bundle ids: {}",
+        commitment,
+        attempts
+            .iter()
+            .map(|(_, bundle_id)| bundle_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
+}
+
+pub async fn send_transactions_for_transport(
+    rpc_url: &str,
+    transport_plan: &TransportPlan,
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    skip_preflight: bool,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>), String> {
+    match transport_plan.transportType.as_str() {
+        "jito-bundle" => {
+            send_transactions_bundle(
+                rpc_url,
+                &transport_plan.jitoBundleEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        "helius-sender" => {
+            send_transactions_helius_sender(
+                rpc_url,
+                &transport_plan.heliusSenderEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        _ => {
+            send_transactions_sequential(
+                rpc_url,
+                transactions,
+                commitment,
+                skip_preflight,
+                track_send_block_height,
+            )
+            .await
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, routing::post};
+    use axum::{Json, Router, extract::State, routing::post};
     use serde_json::json;
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, sync::Arc};
+    use tokio::sync::Mutex;
 
     fn compiled_tx(label: &str) -> CompiledTransaction {
         CompiledTransaction {
@@ -453,6 +780,10 @@ mod tests {
             lastValidBlockHeight: 123,
             serializedBase64: "AQID".to_string(),
             lookupTablesUsed: vec![],
+            computeUnitLimit: Some(1_000_000),
+            computeUnitPriceMicroLamports: Some(1),
+            inlineTipLamports: Some(200_000),
+            inlineTipAccount: Some("tip-account".to_string()),
         }
     }
 
@@ -463,6 +794,11 @@ mod tests {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let response = match method {
+                "getBlockHeight" => json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": 345678
+                }),
                 "simulateTransaction" => json!({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -485,7 +821,8 @@ mod tests {
                     "result": {
                         "value": [{
                             "confirmationStatus": "confirmed",
-                            "err": null
+                            "err": null,
+                            "slot": 456789
                         }]
                     }
                 }),
@@ -511,24 +848,37 @@ mod tests {
         addr
     }
 
-    async fn start_jito_server() -> (SocketAddr, SocketAddr) {
-        async fn send_handler(Json(_payload): Json<Value>) -> Json<Value> {
+    async fn start_jito_server(
+        send_calls: Arc<Mutex<Vec<Value>>>,
+        status_calls: Arc<Mutex<Vec<Value>>>,
+        bundle_id: &'static str,
+    ) -> (SocketAddr, SocketAddr) {
+        async fn send_handler(
+            State((send_calls, bundle_id)): State<(Arc<Mutex<Vec<Value>>>, &'static str)>,
+            Json(payload): Json<Value>,
+        ) -> Json<Value> {
+            send_calls.lock().await.push(payload);
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "result": "bundle-123"
+                "result": bundle_id
             }))
         }
 
-        async fn status_handler(Json(_payload): Json<Value>) -> Json<Value> {
+        async fn status_handler(
+            State((status_calls, bundle_id)): State<(Arc<Mutex<Vec<Value>>>, &'static str)>,
+            Json(payload): Json<Value>,
+        ) -> Json<Value> {
+            status_calls.lock().await.push(payload);
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "result": {
                     "value": [{
-                        "bundle_id": "bundle-123",
+                        "bundle_id": bundle_id,
                         "confirmation_status": "confirmed",
                         "err": null,
+                        "slot": 567890,
                         "transactions": ["sig-1", "sig-2"]
                     }]
                 }
@@ -540,7 +890,9 @@ mod tests {
             .expect("bind jito send listener");
         let send_addr = send_listener.local_addr().expect("read send addr");
         tokio::spawn(async move {
-            let app = Router::new().route("/api/v1/bundles", post(send_handler));
+            let app = Router::new()
+                .route("/api/v1/bundles", post(send_handler))
+                .with_state((send_calls, bundle_id));
             axum::serve(send_listener, app)
                 .await
                 .expect("serve jito send app");
@@ -551,13 +903,43 @@ mod tests {
             .expect("bind jito status listener");
         let status_addr = status_listener.local_addr().expect("read status addr");
         tokio::spawn(async move {
-            let app = Router::new().route("/api/v1/getBundleStatuses", post(status_handler));
+            let app = Router::new()
+                .route("/api/v1/getBundleStatuses", post(status_handler))
+                .with_state((status_calls, bundle_id));
             axum::serve(status_listener, app)
                 .await
                 .expect("serve jito status app");
         });
 
         (send_addr, status_addr)
+    }
+
+    async fn start_sender_server(calls: Arc<Mutex<Vec<Value>>>) -> SocketAddr {
+        async fn handler(
+            State(calls): State<Arc<Mutex<Vec<Value>>>>,
+            Json(payload): Json<Value>,
+        ) -> Json<Value> {
+            calls.lock().await.push(payload);
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": "sender-sig-123"
+            }))
+        }
+
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(calls);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sender listener");
+        let addr = listener.local_addr().expect("read sender addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sender app");
+        });
+        addr
     }
 
     #[tokio::test]
@@ -580,12 +962,21 @@ mod tests {
         let addr = start_jsonrpc_server().await;
         let rpc_url = format!("http://{addr}/");
         let (results, warnings) =
-            send_transactions_sequential(&rpc_url, &[compiled_tx("launch")], "confirmed", false)
+            send_transactions_sequential(
+                &rpc_url,
+                &[compiled_tx("launch")],
+                "confirmed",
+                false,
+                true,
+            )
                 .await
                 .expect("send should succeed");
         assert!(warnings.is_empty());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].signature.as_deref(), Some("sig-test-123"));
+        assert_eq!(results[0].sendObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].confirmedObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].confirmedSlot, Some(456789));
         assert_eq!(
             results[0].explorerUrl.as_deref(),
             Some("https://solscan.io/tx/sig-test-123")
@@ -594,20 +985,104 @@ mod tests {
 
     #[tokio::test]
     async fn sends_bundle_transactions_via_jito_endpoints() {
-        let (send_addr, status_addr) = start_jito_server().await;
-        let endpoints = vec![JitoBundleEndpoint {
-            name: "local".to_string(),
-            send: format!("http://{send_addr}/api/v1/bundles"),
-            status: format!("http://{status_addr}/api/v1/getBundleStatuses"),
-        }];
+        let send_calls_one = Arc::new(Mutex::new(Vec::new()));
+        let status_calls_one = Arc::new(Mutex::new(Vec::new()));
+        let send_calls_two = Arc::new(Mutex::new(Vec::new()));
+        let status_calls_two = Arc::new(Mutex::new(Vec::new()));
+        let (send_addr_one, status_addr_one) =
+            start_jito_server(send_calls_one.clone(), status_calls_one.clone(), "bundle-123").await;
+        let (send_addr_two, status_addr_two) =
+            start_jito_server(send_calls_two.clone(), status_calls_two.clone(), "bundle-456").await;
+        let endpoints = vec![
+            JitoBundleEndpoint {
+                name: "local-one".to_string(),
+                send: format!("http://{send_addr_one}/api/v1/bundles"),
+                status: format!("http://{status_addr_one}/api/v1/getBundleStatuses"),
+            },
+            JitoBundleEndpoint {
+                name: "local-two".to_string(),
+                send: format!("http://{send_addr_two}/api/v1/bundles"),
+                status: format!("http://{status_addr_two}/api/v1/getBundleStatuses"),
+            },
+        ];
         let transactions = vec![compiled_tx("launch"), compiled_tx("jito-tip")];
-        let (results, warnings) = send_transactions_bundle(&endpoints, &transactions, "confirmed")
-            .await
-            .expect("bundle send should succeed");
+        let rpc_addr = start_jsonrpc_server().await;
+        let rpc_url = format!("http://{rpc_addr}/");
+        let (results, warnings) =
+            send_transactions_bundle(&rpc_url, &endpoints, &transactions, "confirmed", true)
+                .await
+                .expect("bundle send should succeed");
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].signature.as_deref(), Some("sig-1"));
         assert_eq!(results[1].signature.as_deref(), Some("sig-2"));
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("Sent via Jito bundle"));
+        assert_eq!(results[0].sendObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].confirmedObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].confirmedSlot, Some(567890));
+        assert!(warnings.iter().any(|warning| warning.contains("fanout to 2 endpoints")));
+        assert!(warnings.iter().any(|warning| warning.contains("Sent via Jito bundle")));
+        assert_eq!(results[0].attemptedEndpoints.len(), 2);
+        assert_eq!(results[0].attemptedBundleIds.len(), 2);
+        assert_eq!(send_calls_one.lock().await.len(), 1);
+        assert_eq!(send_calls_two.lock().await.len(), 1);
+        assert!(!status_calls_one.lock().await.is_empty() || !status_calls_two.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sends_transactions_via_helius_sender_with_required_flags() {
+        let rpc_addr = start_jsonrpc_server().await;
+        let calls_one = Arc::new(Mutex::new(Vec::new()));
+        let calls_two = Arc::new(Mutex::new(Vec::new()));
+        let sender_addr_one = start_sender_server(calls_one.clone()).await;
+        let sender_addr_two = start_sender_server(calls_two.clone()).await;
+        let rpc_url = format!("http://{rpc_addr}/");
+        let endpoint_one = format!("http://{sender_addr_one}/");
+        let endpoint_two = format!("http://{sender_addr_two}/");
+        let (results, warnings) = send_transactions_helius_sender(
+            &rpc_url,
+            &[endpoint_one.clone(), endpoint_two.clone()],
+            &[compiled_tx("launch")],
+            "confirmed",
+            true,
+        )
+        .await
+        .expect("sender send should succeed");
+        assert!(warnings.is_empty());
+        assert_eq!(results[0].signature.as_deref(), Some("sender-sig-123"));
+        assert_eq!(results[0].sendObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].confirmedObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].confirmedSlot, Some(456789));
+        assert_eq!(results[0].attemptedEndpoints.len(), 2);
+
+        let recorded = calls_one.lock().await;
+        assert_eq!(recorded.len(), 1);
+        let params = recorded[0]
+            .get("params")
+            .and_then(Value::as_array)
+            .expect("sender params");
+        let options = params[1].as_object().expect("sender options");
+        assert_eq!(options.get("skipPreflight"), Some(&Value::Bool(true)));
+        assert_eq!(options.get("maxRetries"), Some(&Value::from(0)));
+        assert_eq!(calls_two.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn helius_sender_rejects_transactions_without_inline_tip() {
+        let rpc_addr = start_jsonrpc_server().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_addr = start_sender_server(calls).await;
+        let rpc_url = format!("http://{rpc_addr}/");
+        let endpoint = format!("http://{sender_addr}/");
+        let mut transaction = compiled_tx("launch");
+        transaction.inlineTipLamports = None;
+        let error = send_transactions_helius_sender(
+            &rpc_url,
+            &[endpoint.clone()],
+            &[transaction],
+            "confirmed",
+            false,
+        )
+        .await
+        .expect_err("sender should reject missing inline tip");
+        assert!(error.contains("required inline Helius Sender tip"));
     }
 }

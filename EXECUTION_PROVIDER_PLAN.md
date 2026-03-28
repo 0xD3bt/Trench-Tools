@@ -7,7 +7,7 @@ This is the merged in-repo execution design for `LaunchDeck`.
 The standalone product supports:
 
 - launchpads: `pump`, `bonk`, `bagsapp`
-- providers: `auto`, `helius`, `jito`, `astralane`, `bloxroute`, `hellomoon`
+- providers: `helius-sender`, `standard-rpc`, `jito-bundle`
 - policies: `fast`, `safe`
 - strategies: `none`, `dev-buy`, `snipe-own-launch`, `automatic-dev-sell`
 
@@ -15,29 +15,31 @@ The standalone product supports:
 
 The code is split into:
 
-- `rust/launchdeck-engine`: native execution engine, config normalization, transaction assembly, simulation, send path, and runtime workers
+- `rust/launchdeck-engine`: native UI/API host, config normalization, transaction assembly, simulation, send path, image/report/settings persistence, vamp import, and runtime workers
 - `rust/launchdeck-engine/src/bin/launchdeck-cli.rs`: native CLI for build/simulate/send from config files
-- `config/app-config.js`: persisted app defaults and presets
 - `providers/provider-adapters.js`: provider routing and execution-class decisions
 - `launchpads/`: launchpad registry and launchpad capability metadata
 - `strategies/`: post-launch strategy metadata
-- `ui-server.js`: UI/backend bridge
+
+The browser UI now talks directly to the Rust host on the local UI port.
 
 ## Provider Intent
 
-- `auto`: default beginner-friendly route selection
-- `helius`: default fast single-tx route
-- `jito`: primary native bundle route
-- `astralane`: advanced low-latency route
-- `bloxroute`: modeled but currently unverified
-- `hellomoon`: modeled but currently unverified
+- `helius-sender`: recommended low-latency send path with strict Sender requirements
+- `standard-rpc`: explicit standard Solana RPC send path
+- `jito-bundle`: explicit bundle-oriented Jito send path
 
-## Launch Auto vs Buy Auto
+Providers with multiple documented endpoint groups can also expose endpoint profiles such as `Global`, `US`, `EU`, `West`, and `Asia`.
 
-The product treats launch-side auto and buy-side auto differently:
+## Engine-Owned Shaping
 
-- `launchAuto` favors fastest reliable landing
-- `buyAuto` favors better MEV/slippage-aware routing where supported
+The UI captures user intent, but the engine owns final transport shaping.
+
+Examples:
+
+- `Helius Sender` hard-requires inline tip, inline priority fee, `skipPreflight=true`, and `maxRetries=0`.
+- `Standard RPC` does not use tip.
+- `Jito Bundle` creation can accept both tip and priority in the UI, but the engine may intentionally drop creation priority for multi-transaction launch flows.
 
 ## Launchpad Rules
 
@@ -74,8 +76,9 @@ The backend reports:
 ## Current Runtime Notes
 
 - Pump is the verified launch flow in the code today.
-- Jito is the main live bundle path in the current runtime.
-- Astralane, bloXroute, and Hello Moon are represented in the provider model, but only Jito currently owns the active bundle transport path.
+- `Helius Sender`, `Standard RPC`, and `Jito Bundle` are the current explicit provider choices.
+- `Standard RPC` and `Helius Sender` keep dependent launch/follow-up flows sequential.
+- `Jito Bundle` owns the current bundle transport path.
 - Bonk and Bags are represented in the launchpad model, but still require live validation before they should be treated as production-verified launch builders.
 
 ## Documentation Pointers

@@ -1,10 +1,9 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$uiScriptPath = (Join-Path $projectRoot "ui-server.js").ToLowerInvariant()
 $engineManifestPath = (Join-Path $projectRoot "rust\launchdeck-engine\Cargo.toml").ToLowerInvariant()
 
-function Get-ConfiguredUiPort {
+function Get-ConfiguredPort {
   $defaultPort = 8789
   foreach ($fileName in @(".env", ".env.local", ".env.example")) {
     $filePath = Join-Path $projectRoot $fileName
@@ -15,20 +14,9 @@ function Get-ConfiguredUiPort {
     if ($match) {
       return [int]$match.Matches[0].Groups[1].Value
     }
-  }
-  return $defaultPort
-}
-
-function Get-ConfiguredEnginePort {
-  $defaultPort = 8790
-  foreach ($fileName in @(".env", ".env.local", ".env.example")) {
-    $filePath = Join-Path $projectRoot $fileName
-    if (-not (Test-Path $filePath)) {
-      continue
-    }
-    $match = Select-String -Path $filePath -Pattern '^\s*LAUNCHDECK_ENGINE_PORT\s*=\s*(\d+)\s*$' | Select-Object -First 1
-    if ($match) {
-      return [int]$match.Matches[0].Groups[1].Value
+    $legacyMatch = Select-String -Path $filePath -Pattern '^\s*LAUNCHDECK_ENGINE_PORT\s*=\s*(\d+)\s*$' | Select-Object -First 1
+    if ($legacyMatch) {
+      return [int]$legacyMatch.Matches[0].Groups[1].Value
     }
   }
   return $defaultPort
@@ -54,30 +42,26 @@ function Stop-LaunchDeckProcess {
   }
 }
 
-function Stop-OldLaunchDeckUi {
+function Stop-OldLaunchDeckRuntime {
   $knownPids = New-Object System.Collections.Generic.HashSet[int]
 
   $processes = Get-CimInstance Win32_Process | Where-Object {
     $_.ProcessId -ne $PID -and
     $_.CommandLine -and
     (
-      (
-        $_.Name -match '^(?i:node(?:\.exe)?)$' -and
-        $_.CommandLine.ToLowerInvariant().Contains($uiScriptPath)
-      ) -or (
-        $_.CommandLine -match '(?i)npm(?:\.cmd)?\s+run\s+ui' -and
-        $_.CommandLine.ToLowerInvariant().Contains("launchdeck")
-      )
+      $_.CommandLine.ToLowerInvariant().Contains($engineManifestPath) -or
+      $_.CommandLine.ToLowerInvariant().Contains("launchdeck-engine") -or
+      $_.CommandLine.ToLowerInvariant().Contains("ui-server.js")
     )
   }
 
   foreach ($process in $processes) {
     if ($knownPids.Add([int]$process.ProcessId)) {
-      Stop-LaunchDeckProcess -ProcessId ([int]$process.ProcessId) -Reason "existing LaunchDeck UI"
+      Stop-LaunchDeckProcess -ProcessId ([int]$process.ProcessId) -Reason "existing LaunchDeck runtime"
     }
   }
 
-  $port = Get-ConfiguredUiPort
+  $port = Get-ConfiguredPort
   $netstatOutput = netstat -ano -p tcp | Select-String -Pattern "127\.0\.0\.1:$port\s+.*LISTENING\s+(\d+)$"
   foreach ($line in $netstatOutput) {
     if ($line.Matches.Count -eq 0) {
@@ -86,39 +70,6 @@ function Stop-OldLaunchDeckUi {
     $matchedPid = [int]$line.Matches[0].Groups[1].Value
     if ($knownPids.Add($matchedPid)) {
       Stop-LaunchDeckProcess -ProcessId $matchedPid -Reason "listener on port $port"
-    }
-  }
-
-  return $port
-}
-
-function Stop-OldLaunchDeckEngine {
-  $knownPids = New-Object System.Collections.Generic.HashSet[int]
-
-  $processes = Get-CimInstance Win32_Process | Where-Object {
-    $_.ProcessId -ne $PID -and
-    $_.CommandLine -and
-    (
-      $_.CommandLine.ToLowerInvariant().Contains($engineManifestPath) -or
-      $_.CommandLine.ToLowerInvariant().Contains("launchdeck-engine")
-    )
-  }
-
-  foreach ($process in $processes) {
-    if ($knownPids.Add([int]$process.ProcessId)) {
-      Stop-LaunchDeckProcess -ProcessId ([int]$process.ProcessId) -Reason "existing LaunchDeck engine"
-    }
-  }
-
-  $port = Get-ConfiguredEnginePort
-  $netstatOutput = netstat -ano -p tcp | Select-String -Pattern "127\.0\.0\.1:$port\s+.*LISTENING\s+(\d+)$"
-  foreach ($line in $netstatOutput) {
-    if ($line.Matches.Count -eq 0) {
-      continue
-    }
-    $matchedPid = [int]$line.Matches[0].Groups[1].Value
-    if ($knownPids.Add($matchedPid)) {
-      Stop-LaunchDeckProcess -ProcessId $matchedPid -Reason "engine listener on port $port"
     }
   }
 
@@ -139,15 +90,15 @@ function Wait-ForEngineHealth {
         return $true
       }
     } catch {
-      # Engine may still be starting.
+      # Server may still be starting.
     }
   }
 
   return $false
 }
 
-function Start-LaunchDeckEngine {
-  $enginePort = Stop-OldLaunchDeckEngine
+function Start-LaunchDeckHost {
+  $port = Stop-OldLaunchDeckRuntime
   $logDir = Join-Path $projectRoot ".local\launchdeck"
   New-Item -ItemType Directory -Path $logDir -Force | Out-Null
   $stdoutPath = Join-Path $logDir "engine.log"
@@ -161,15 +112,13 @@ function Start-LaunchDeckEngine {
     -RedirectStandardOutput $stdoutPath `
     -RedirectStandardError $stderrPath | Out-Null
 
-  if (Wait-ForEngineHealth -Port $enginePort) {
-    Write-Host "LaunchDeck engine ready on port $enginePort."
+  if (Wait-ForEngineHealth -Port $port) {
+    Write-Host "LaunchDeck Rust host ready on port $port."
+    Start-Process "http://127.0.0.1:$port" | Out-Null
   } else {
-    Write-Warning "LaunchDeck engine did not report healthy startup on port $enginePort. Check .local\\launchdeck\\engine-error.log if needed."
+    Write-Warning "LaunchDeck host did not report healthy startup on port $port. Check .local\\launchdeck\\engine-error.log if needed."
   }
 }
 
 Set-Location $projectRoot
-Start-LaunchDeckEngine
-$port = Stop-OldLaunchDeckUi
-Write-Host "Starting LaunchDeck UI on port $port..."
-& npm run ui
+Start-LaunchDeckHost

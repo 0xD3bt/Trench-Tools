@@ -1,5 +1,7 @@
 #![allow(non_snake_case, dead_code)]
 
+use std::{collections::BTreeMap, env};
+
 use serde::Serialize;
 
 use crate::config::NormalizedExecution;
@@ -12,64 +14,94 @@ pub struct ProviderMeta {
     pub supportsSingle: bool,
     pub supportsSequential: bool,
     pub supportsBundle: bool,
+    pub supportsEndpointProfiles: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderAvailability {
+    pub provider: String,
+    pub available: bool,
+    pub verified: bool,
+    pub supportState: String,
+    pub supportsSingle: bool,
+    pub supportsSequential: bool,
+    pub supportsBundle: bool,
+    pub supportsEndpointProfiles: bool,
+    pub reason: String,
 }
 
 pub fn provider_registry() -> Vec<ProviderMeta> {
     vec![
         ProviderMeta {
-            id: "auto",
-            label: "Auto",
-            verified: true,
-            supportsSingle: true,
-            supportsSequential: true,
-            supportsBundle: true,
-        },
-        ProviderMeta {
-            id: "helius",
-            label: "Helius",
+            id: "standard-rpc",
+            label: "Standard RPC",
             verified: true,
             supportsSingle: true,
             supportsSequential: true,
             supportsBundle: false,
+            supportsEndpointProfiles: false,
         },
         ProviderMeta {
-            id: "jito",
-            label: "Jito",
+            id: "helius-sender",
+            label: "Helius Sender",
             verified: true,
             supportsSingle: true,
             supportsSequential: true,
-            supportsBundle: true,
+            supportsBundle: false,
+            supportsEndpointProfiles: true,
         },
         ProviderMeta {
-            id: "astralane",
-            label: "Astralane",
+            id: "jito-bundle",
+            label: "Jito Bundle",
             verified: true,
             supportsSingle: true,
-            supportsSequential: true,
+            supportsSequential: false,
             supportsBundle: true,
-        },
-        ProviderMeta {
-            id: "bloxroute",
-            label: "bloXroute",
-            verified: false,
-            supportsSingle: true,
-            supportsSequential: true,
-            supportsBundle: true,
-        },
-        ProviderMeta {
-            id: "hellomoon",
-            label: "Hello Moon",
-            verified: false,
-            supportsSingle: true,
-            supportsSequential: true,
-            supportsBundle: true,
+            supportsEndpointProfiles: true,
         },
     ]
 }
 
+pub fn provider_availability_registry() -> BTreeMap<String, ProviderAvailability> {
+    let helius_configured = env::var("HELIUS_RPC_URL")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || env::var("HELIUS_API_KEY")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    provider_registry()
+        .into_iter()
+        .map(|provider| {
+            let reason = if provider.id == "helius-sender" && !helius_configured {
+                "Using the default Helius Sender endpoint; set HELIUS_API_KEY or HELIUS_RPC_URL for a dedicated confirmation RPC.".to_string()
+            } else {
+                String::new()
+            };
+            (
+                provider.id.to_string(),
+                ProviderAvailability {
+                    provider: provider.id.to_string(),
+                    available: true,
+                    verified: provider.verified,
+                    supportState: if provider.verified {
+                        "verified".to_string()
+                    } else {
+                        "unverified".to_string()
+                    },
+                    supportsSingle: provider.supportsSingle,
+                    supportsSequential: provider.supportsSequential,
+                    supportsBundle: provider.supportsBundle,
+                    supportsEndpointProfiles: provider.supportsEndpointProfiles,
+                    reason,
+                },
+            )
+        })
+        .collect()
+}
+
 pub fn get_provider_meta(provider: &str) -> ProviderMeta {
     let normalized = if provider.trim().is_empty() {
-        "auto"
+        "helius-sender"
     } else {
         provider.trim()
     }
@@ -80,37 +112,27 @@ pub fn get_provider_meta(provider: &str) -> ProviderMeta {
         .unwrap_or_else(|| {
             provider_registry()
                 .into_iter()
-                .find(|entry| entry.id == "auto")
-                .expect("auto provider must exist")
+                .find(|entry| entry.id == "helius-sender")
+                .expect("helius-sender provider must exist")
         })
 }
 
 pub fn get_resolved_provider(execution: &NormalizedExecution, transaction_count: usize) -> String {
-    let requested = if execution.provider.trim().is_empty() {
-        "auto".to_string()
+    let _ = transaction_count;
+    if execution.provider.trim().is_empty() {
+        "helius-sender".to_string()
     } else {
         execution.provider.trim().to_lowercase()
-    };
-    if requested != "auto" {
-        return requested;
     }
-    if transaction_count > 1 && execution.policy.trim().eq_ignore_ascii_case("safe") {
-        return "jito".to_string();
-    }
-    "helius".to_string()
 }
 
 pub fn get_execution_class(execution: &NormalizedExecution, transaction_count: usize) -> String {
     let resolved_provider = get_resolved_provider(execution, transaction_count);
-    let provider_meta = get_provider_meta(&resolved_provider);
+    if resolved_provider == "jito-bundle" {
+        return "bundle".to_string();
+    }
     if transaction_count <= 1 {
         return "single".to_string();
-    }
-    if execution.policy.trim().eq_ignore_ascii_case("safe")
-        && resolved_provider == "jito"
-        && provider_meta.supportsBundle
-    {
-        return "bundle".to_string();
     }
     "sequential".to_string()
 }

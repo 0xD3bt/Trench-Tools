@@ -358,8 +358,6 @@ fn find_instruction_indexes(tx: &Value) -> InstructionIndexes {
 fn detect_launch_flavor(indexes: &InstructionIndexes) -> &'static str {
     if indexes.agent_initialize == -1 {
         "pump-normal"
-    } else if indexes.extend != -1 || indexes.buy_exact_sol_in != -1 {
-        "third-party-agent"
     } else {
         "pump-agent"
     }
@@ -549,10 +547,7 @@ fn render_analyze_result(result: &Value) -> String {
                     .to_string(),
             )
         }
-        _ => lines.push(
-            "- Third-party agent launch: agent initialization is present and the wrapper adds extra launch steps."
-                .to_string(),
-        ),
+        _ => lines.push("- Launch flavor could not be classified confidently.".to_string()),
     }
     if result
         .get("extracted")
@@ -763,4 +758,35 @@ async fn trace_agent_account(args: TraceArgs) -> Result<(), String> {
         println!("{}", render_trace_report(&report));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_launch_is_classified_as_pump_agent() {
+        let indexes = InstructionIndexes {
+            create: 2,
+            extend: 3,
+            buy: 5,
+            buy_exact_sol_in: -1,
+            agent_initialize: 6,
+        };
+
+        assert_eq!(detect_launch_flavor(&indexes), "pump-agent");
+    }
+
+    #[test]
+    fn non_agent_launch_is_classified_as_pump_normal() {
+        let indexes = InstructionIndexes {
+            create: 2,
+            extend: 3,
+            buy: 5,
+            buy_exact_sol_in: -1,
+            agent_initialize: -1,
+        };
+
+        assert_eq!(detect_launch_flavor(&indexes), "pump-normal");
+    }
 }

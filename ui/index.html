@@ -30,6 +30,7 @@
   </head>
   <body>
     <main class="shell">
+      <div class="workspace-shell">
       <form id="launch-form" class="flow">
         <section class="card launch-surface">
           <div class="launch-surface-section launch-surface-wallet">
@@ -58,6 +59,7 @@
                   <button id="open-vamp-button" type="button" class="preset-chip compact wallet-chip-button">Vamp</button>
                   <button id="open-popout-button" type="button" class="preset-chip compact wallet-chip-button">Popout</button>
                   <button id="toggle-output-button" type="button" class="preset-chip compact wallet-chip-button">Output</button>
+                  <button id="toggle-reports-button" type="button" class="preset-chip compact wallet-chip-button">Reports</button>
                   <button id="toggle-theme-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Switch to white mode" aria-label="Switch to white mode">&#9728;</button>
                   <button id="open-settings-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Settings" aria-label="Settings">&#9881;</button>
                 </div>
@@ -82,7 +84,7 @@
                 <span class="launchpad-mark-wrap">
                   <img src="/pump-mark.png" alt="" class="launchpad-mark">
                 </span>
-                <span class="launchpad-title">__PUMP_LABEL__</span>
+                <span class="launchpad-title">Pump</span>
               </span>
             </label>
             <label class="launchpad-option">
@@ -91,7 +93,7 @@
                 <span class="launchpad-mark-wrap">
                   <img src="/bonk-mark.png" alt="" class="launchpad-mark">
                 </span>
-                <span class="launchpad-title">__BONK_LABEL__</span>
+                <span class="launchpad-title">Bonk</span>
               </span>
             </label>
             <label class="launchpad-option">
@@ -100,7 +102,7 @@
                 <span class="launchpad-mark-wrap">
                   <img src="/bagsapp-mark.png" alt="" class="launchpad-mark">
                 </span>
-                <span class="launchpad-title">__BAGSAPP_LABEL__</span>
+                <span class="launchpad-title">Bagsapp</span>
               </span>
             </label>
           </div>
@@ -376,6 +378,23 @@
         </section>
 
       </form>
+      <aside id="reports-terminal-section" class="card reports-terminal" hidden>
+        <div class="reports-terminal-head">
+          <div>
+            <h2>Reports Terminal</h2>
+            <div id="reports-terminal-meta" class="meta muted">Browse persisted build, simulate, and send logs.</div>
+          </div>
+          <div class="reports-terminal-actions">
+            <button id="reports-sort-button" type="button" class="button subtle output-head-button">Newest</button>
+            <button id="reports-refresh-button" type="button" class="button subtle output-head-button">Refresh</button>
+          </div>
+        </div>
+        <div class="reports-terminal-body">
+          <div id="reports-terminal-list" class="reports-terminal-list"></div>
+          <pre id="reports-terminal-output" class="console reports-console">Reports terminal hidden.</pre>
+        </div>
+      </aside>
+      </div>
     </main>
 
     <div id="settings-modal" class="modal-overlay" hidden>
@@ -405,11 +424,19 @@
               <label>
                 <span>Route</span>
                 <select name="creationProvider" id="provider-select">
-                  <option value="helius" selected>Helius</option>
-                  <option value="jito">Jito</option>
-                  <option value="astralane">Astralane</option>
-                  <option value="bloxroute">bloXroute</option>
-                  <option value="hellomoon">Hello Moon</option>
+                  <option value="helius-sender" selected>Helius Sender</option>
+                  <option value="standard-rpc">Standard RPC</option>
+                  <option value="jito-bundle">Jito Bundle</option>
+                </select>
+              </label>
+              <label>
+                <span>Endpoint Profile</span>
+                <select name="endpointProfile" id="endpoint-profile-select">
+                  <option value="global" selected>Global</option>
+                  <option value="us">US</option>
+                  <option value="eu">EU</option>
+                  <option value="west">West</option>
+                  <option value="asia">Asia</option>
                 </select>
               </label>
               <label>
@@ -417,6 +444,8 @@
                 <input name="creationTipSol" id="creation-tip-input" type="text" placeholder="0.01">
                 <div class="field-error" data-error-for="creationTipSol"></div>
               </label>
+            </div>
+            <div class="settings-grid settings-grid-three">
               <label>
                 <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
                 <input name="creationPriorityFeeSol" id="creation-priority-input" type="text" placeholder="0.001">
@@ -437,11 +466,19 @@
               <label>
                 <span>Route</span>
                 <select name="buyProvider" id="buy-provider-select">
-                  <option value="helius" selected>Helius</option>
-                  <option value="jito">Jito</option>
-                  <option value="astralane">Astralane</option>
-                  <option value="bloxroute">bloXroute</option>
-                  <option value="hellomoon">Hello Moon</option>
+                  <option value="helius-sender" selected>Helius Sender</option>
+                  <option value="standard-rpc">Standard RPC</option>
+                  <option value="jito-bundle">Jito Bundle</option>
+                </select>
+              </label>
+              <label>
+                <span>Endpoint Profile</span>
+                <select name="buyEndpointProfile" id="buy-endpoint-profile-select">
+                  <option value="global" selected>Global</option>
+                  <option value="us">US</option>
+                  <option value="eu">EU</option>
+                  <option value="west">West</option>
+                  <option value="asia">Asia</option>
                 </select>
               </label>
               <label>
@@ -476,11 +513,19 @@
               <label>
                 <span>Route</span>
                 <select name="sellProvider" id="sell-provider-select">
-                  <option value="helius" selected>Helius</option>
-                  <option value="jito">Jito</option>
-                  <option value="astralane">Astralane</option>
-                  <option value="bloxroute">bloXroute</option>
-                  <option value="hellomoon">Hello Moon</option>
+                  <option value="helius-sender" selected>Helius Sender</option>
+                  <option value="standard-rpc">Standard RPC</option>
+                  <option value="jito-bundle">Jito Bundle</option>
+                </select>
+              </label>
+              <label>
+                <span>Endpoint Profile</span>
+                <select name="sellEndpointProfile" id="sell-endpoint-profile-select">
+                  <option value="global" selected>Global</option>
+                  <option value="us">US</option>
+                  <option value="eu">EU</option>
+                  <option value="west">West</option>
+                  <option value="asia">Asia</option>
                 </select>
               </label>
               <label>
@@ -499,6 +544,25 @@
                 <span>Slippage (%)</span>
                 <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="90">
                 <div class="field-error" data-error-for="sellSlippagePercent"></div>
+              </label>
+            </div>
+          </section>
+
+          <section class="stack settings-section settings-section-modern">
+            <div class="settings-section-title-row">
+              <div>
+                <h4>Miscellaneous Settings</h4>
+                <p class="settings-section-copy">Optional diagnostics and non-routing runtime behavior.</p>
+              </div>
+              <span class="settings-section-pill">Misc</span>
+            </div>
+            <div class="settings-grid">
+              <label class="settings-checkbox-row">
+                <input name="trackSendBlockHeight" id="track-send-block-height-toggle" type="checkbox">
+                <span class="settings-checkbox-copy">
+                  <strong>Track send block height</strong>
+                  <span>Fetch the current block height after a successful submit and store it in send reports for speed tracking.</span>
+                </span>
               </label>
             </div>
           </section>
@@ -787,7 +851,6 @@
       </div>
     </div>
 
-    <script>window.__LAUNCHDECK_BOOTSTRAP__ = __LAUNCHDECK_BOOTSTRAP__;</script>
     <script src="/app.js"></script>
   </body>
 </html>

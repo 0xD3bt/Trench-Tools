@@ -1,5 +1,9 @@
 #[path = "../config.rs"]
 mod config;
+#[path = "../observability.rs"]
+mod observability;
+#[path = "../paths.rs"]
+mod paths;
 #[path = "../providers.rs"]
 mod providers;
 #[path = "../pump_native.rs"]
@@ -15,15 +19,16 @@ mod wallet;
 
 use clap::{Parser, Subcommand};
 use config::{RawConfig, normalize_raw_config};
+use observability::{new_trace_context, persist_launch_report};
 use pump_native::try_compile_native_pump;
-use rpc::{send_transactions_bundle, send_transactions_sequential, simulate_transactions};
+use rpc::{send_transactions_for_transport, simulate_transactions};
 use serde_json::{Value, json};
 use std::{
     env, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use transport::{build_transport_plan, configured_jito_bundle_endpoints};
+use transport::{build_transport_plan, estimate_transaction_count};
 use wallet::{load_solana_wallet_by_env_key, public_key_from_secret, selected_wallet_key_or_default};
 
 #[derive(Parser, Debug)]
@@ -128,6 +133,7 @@ async fn main() {
 
 async fn run_cli() -> Result<(), String> {
     let cli = Cli::parse();
+    let trace = new_trace_context();
     let (action, args) = match cli.command {
         Command::Build(args) => ("build", args),
         Command::Simulate(args) => ("simulate", args),
@@ -150,10 +156,12 @@ async fn run_cli() -> Result<(), String> {
     let wallet_secret = load_solana_wallet_by_env_key(&selected_wallet_key)?;
     let creator_public_key = public_key_from_secret(&wallet_secret)?;
     let rpc_url = configured_rpc_url();
+    let transport_plan = build_transport_plan(&normalized.execution, estimate_transaction_count(&normalized));
 
     let native = try_compile_native_pump(
         &rpc_url,
         &normalized,
+        &transport_plan,
         &wallet_secret,
         now_timestamp_string(),
         creator_public_key,
@@ -168,10 +176,10 @@ async fn run_cli() -> Result<(), String> {
     })?;
 
     let compiled_transactions = native.compiled_transactions;
-    let transport_plan = build_transport_plan(&normalized.execution, compiled_transactions.len());
     let mut report = native.report;
     let text = native.text;
     let mut extra = None;
+    let should_persist_report = normalized.tx.writeReport || action == "send";
 
     if action == "simulate" {
         let (simulation, warnings) = simulate_transactions(
@@ -193,23 +201,15 @@ async fn run_cli() -> Result<(), String> {
         }
         extra = Some(json!(simulation));
     } else if action == "send" {
-        let execution_class = transport_plan.executionClass.clone();
-        let (sent, warnings) = if execution_class == "bundle" {
-            send_transactions_bundle(
-                &configured_jito_bundle_endpoints(),
-                &compiled_transactions,
-                &normalized.execution.commitment,
-            )
-            .await
-        } else {
-            send_transactions_sequential(
-                &rpc_url,
-                &compiled_transactions,
-                &normalized.execution.commitment,
-                normalized.execution.skipPreflight,
-            )
-            .await
-        }?;
+        let (sent, warnings) = send_transactions_for_transport(
+            &rpc_url,
+            &transport_plan,
+            &compiled_transactions,
+            &normalized.execution.commitment,
+            normalized.execution.skipPreflight,
+            normalized.execution.trackSendBlockHeight,
+        )
+        .await?;
         if let Some(execution) = report.get_mut("execution") {
             execution["sent"] =
                 serde_json::to_value(&sent).map_err(|error| error.to_string())?;
@@ -224,6 +224,14 @@ async fn run_cli() -> Result<(), String> {
         extra = Some(json!(sent));
     }
 
+    let send_log_path = if should_persist_report {
+        let path = persist_launch_report(&trace.traceId, action, &transport_plan, &report)?;
+        report["outPath"] = Value::String(path.clone());
+        Some(path)
+    } else {
+        None
+    };
+
     let payload = json!({
         "ok": true,
         "service": "launchdeck-cli",
@@ -234,6 +242,7 @@ async fn run_cli() -> Result<(), String> {
         "normalizedConfig": normalized,
         "transportPlan": transport_plan,
         "report": report,
+        "sendLogPath": send_log_path,
         "text": text,
         "compiledTransactions": compiled_transactions,
     });

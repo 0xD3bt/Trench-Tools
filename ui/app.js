@@ -3,6 +3,10 @@ const output = document.getElementById("output");
 const statusNode = document.getElementById("status");
 const metaNode = document.getElementById("meta");
 const outputSection = document.getElementById("output-section");
+const reportsTerminalSection = document.getElementById("reports-terminal-section");
+const reportsTerminalList = document.getElementById("reports-terminal-list");
+const reportsTerminalOutput = document.getElementById("reports-terminal-output");
+const reportsTerminalMeta = document.getElementById("reports-terminal-meta");
 const buttons = Array.from(document.querySelectorAll("[data-action]"));
 const walletBox = document.querySelector(".wallet-box");
 const walletSelect = document.getElementById("wallet-select");
@@ -84,8 +88,12 @@ const creationTipInput = document.getElementById("creation-tip-input");
 const creationPriorityInput = document.getElementById("creation-priority-input");
 const launchpadInputs = Array.from(document.querySelectorAll('input[name="launchpad"]'));
 const providerSelect = document.getElementById("provider-select");
+const endpointProfileSelect = document.getElementById("endpoint-profile-select");
 const buyProviderSelect = document.getElementById("buy-provider-select");
+const buyEndpointProfileSelect = document.getElementById("buy-endpoint-profile-select");
 const sellProviderSelect = document.getElementById("sell-provider-select");
+const sellEndpointProfileSelect = document.getElementById("sell-endpoint-profile-select");
+const trackSendBlockHeightToggle = document.getElementById("track-send-block-height-toggle");
 const buyPriorityFeeInput = document.getElementById("buy-priority-fee-input");
 const buyTipInput = document.getElementById("buy-tip-input");
 const buySlippageInput = document.getElementById("buy-slippage-input");
@@ -127,6 +135,9 @@ const modalConfirm = document.getElementById("modal-confirm");
 const testFillButton = document.getElementById("test-fill-button");
 const openPopoutButton = document.getElementById("open-popout-button");
 const toggleOutputButton = document.getElementById("toggle-output-button");
+const toggleReportsButton = document.getElementById("toggle-reports-button");
+const reportsRefreshButton = document.getElementById("reports-refresh-button");
+const reportsSortButton = document.getElementById("reports-sort-button");
 const openSettingsButton = document.getElementById("open-settings-button");
 const saveSettingsButton = document.getElementById("save-settings-button");
 const settingsModal = document.getElementById("settings-modal");
@@ -169,12 +180,11 @@ const vampContractInput = document.getElementById("vamp-contract-input");
 const vampStatus = document.getElementById("vamp-status");
 const vampError = document.getElementById("vamp-error");
 const OUTPUT_SECTION_VISIBILITY_KEY = "launchdeck.outputSectionVisible";
+const REPORTS_TERMINAL_VISIBILITY_KEY = "launchdeck.reportsTerminalVisible";
+const REPORTS_TERMINAL_SORT_KEY = "launchdeck.reportsTerminalSort";
 const THEME_MODE_STORAGE_KEY = "launchdeck.themeMode";
 const pageSearchParams = new URLSearchParams(window.location.search);
 const isPopoutMode = pageSearchParams.get("popout") === "1";
-const bootstrapState = window.__LAUNCHDECK_BOOTSTRAP__ && typeof window.__LAUNCHDECK_BOOTSTRAP__ === "object"
-  ? window.__LAUNCHDECK_BOOTSTRAP__
-  : null;
 const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
   nameMaxLength: 32,
   symbolMaxLength: 10,
@@ -189,12 +199,8 @@ setThemeMode(getStoredThemeMode(), { persist: false });
 setOutputSectionVisible(getStoredOutputSectionVisible());
 
 let uploadedImage = null;
-let latestWalletStatus = bootstrapState && bootstrapState.config
-  ? { config: bootstrapState.config }
-  : null;
-let latestLaunchpadRegistry = bootstrapState && bootstrapState.launchpads && typeof bootstrapState.launchpads === "object"
-  ? bootstrapState.launchpads
-  : {};
+let latestWalletStatus = null;
+let latestLaunchpadRegistry = {};
 let quoteTimer = null;
 let defaultsApplied = false;
 let imageLibraryState = {
@@ -223,6 +229,13 @@ let sniperState = {
   enabled: false,
   wallets: {},
 };
+let reportsTerminalState = {
+  entries: [],
+  activeId: "",
+  sort: getStoredReportsTerminalSort(),
+};
+setReportsTerminalSort(reportsTerminalState.sort, { persist: false });
+setReportsTerminalVisible(getStoredReportsTerminalVisible(), { persist: false });
 const SPLIT_COLORS = ["#5b7cff", "#ff5d5d", "#14c38e", "#ffb020", "#7c5cff", "#00b8d9", "#ef5da8", "#8b5cf6"];
 const DEFAULT_QUICK_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
 const DEFAULT_PRESET_ID = "preset1";
@@ -233,34 +246,34 @@ const SNIPER_BALANCE_PRESETS = [
   { label: "25%", ratio: 0.25 },
 ];
 const PROVIDER_LABELS = {
-  helius: "Helius",
-  jito: "Jito",
-  astralane: "Astralane",
-  bloxroute: "bloXroute",
-  hellomoon: "Hello Moon",
+  "helius-sender": "Helius Sender",
+  "standard-rpc": "Standard RPC",
+  "jito-bundle": "Jito Bundle",
+};
+const ENDPOINT_PROFILE_LABELS = {
+  global: "Global",
+  us: "US",
+  eu: "EU",
+  west: "West",
+  asia: "Asia",
+};
+const PROVIDER_ENDPOINT_PROFILE_SUPPORT = {
+  "helius-sender": ["global", "us", "eu", "west", "asia"],
+  "jito-bundle": ["global", "us", "eu", "west", "asia"],
+  "standard-rpc": [],
 };
 const ROUTE_CAPABILITIES = {
-  helius: {
+  "helius-sender": {
     creation: { tip: true, priority: true, slippage: false },
     buy: { tip: true, priority: true, slippage: true },
     sell: { tip: true, priority: true, slippage: true },
   },
-  jito: {
-    creation: { tip: true, priority: true, slippage: false },
-    buy: { tip: true, priority: true, slippage: true },
-    sell: { tip: true, priority: true, slippage: true },
+  "standard-rpc": {
+    creation: { tip: false, priority: true, slippage: false },
+    buy: { tip: false, priority: true, slippage: true },
+    sell: { tip: false, priority: true, slippage: true },
   },
-  astralane: {
-    creation: { tip: true, priority: true, slippage: false },
-    buy: { tip: true, priority: true, slippage: true },
-    sell: { tip: true, priority: true, slippage: true },
-  },
-  bloxroute: {
-    creation: { tip: true, priority: true, slippage: false },
-    buy: { tip: true, priority: true, slippage: true },
-    sell: { tip: true, priority: true, slippage: true },
-  },
-  hellomoon: {
+  "jito-bundle": {
     creation: { tip: true, priority: true, slippage: false },
     buy: { tip: true, priority: true, slippage: true },
     sell: { tip: true, priority: true, slippage: true },
@@ -276,16 +289,7 @@ const TEST_PRESET = {
   twitter: "https://x.com/test",
   telegram: "https://t.me/test",
   devBuyMode: "sol",
-  devBuyAmount: "0.1",
-  creationTipSol: "0.01",
-  creationPriorityFeeSol: "0.001",
-  buyPriorityFeeSol: "0.009",
-  buyTipSol: "0.01",
-  buySlippagePercent: "90",
-  sellPriorityFeeSol: "0.009",
-  sellTipSol: "0.01",
-  sellSlippagePercent: "90",
-  skipPreflight: "false",
+  devBuyAmount: "0.001",
 };
 
 function setBusy(busy, label) {
@@ -517,20 +521,25 @@ function createFallbackConfig() {
       mode: "regular",
       activePresetId: DEFAULT_PRESET_ID,
       presetEditing: false,
+      misc: {
+        trackSendBlockHeight: false,
+      },
     },
     presets: {
       items: DEFAULT_QUICK_DEV_BUY_AMOUNTS.map((amount, index) => ({
         id: `preset${index + 1}`,
         label: `P${index + 1}`,
         creationSettings: {
-          provider: "helius",
+          provider: "helius-sender",
+          endpointProfile: "global",
           policy: "safe",
           tipSol: "0.01",
           priorityFeeSol: "0.001",
           devBuySol: amount,
         },
         buySettings: {
-          provider: "helius",
+          provider: "helius-sender",
+          endpointProfile: "global",
           policy: "safe",
           priorityFeeSol: "0.009",
           tipSol: "0.01",
@@ -538,7 +547,8 @@ function createFallbackConfig() {
           snipeBuyAmountSol: "",
         },
         sellSettings: {
-          provider: "helius",
+          provider: "helius-sender",
+          endpointProfile: "global",
           policy: "safe",
           priorityFeeSol: "0.009",
           tipSol: "0.01",
@@ -830,7 +840,11 @@ function getLaunchpad() {
 }
 
 function getProvider() {
-  return providerSelect ? providerSelect.value || "helius" : "helius";
+  return providerSelect ? providerSelect.value || "helius-sender" : "helius-sender";
+}
+
+function getEndpointProfile() {
+  return endpointProfileSelect ? endpointProfileSelect.value || "global" : "global";
 }
 
 function getPolicy() {
@@ -838,7 +852,11 @@ function getPolicy() {
 }
 
 function getBuyProvider() {
-  return buyProviderSelect ? buyProviderSelect.value || "helius" : "helius";
+  return buyProviderSelect ? buyProviderSelect.value || "helius-sender" : "helius-sender";
+}
+
+function getBuyEndpointProfile() {
+  return buyEndpointProfileSelect ? buyEndpointProfileSelect.value || "global" : "global";
 }
 
 function getBuyPolicy() {
@@ -846,7 +864,11 @@ function getBuyPolicy() {
 }
 
 function getSellProvider() {
-  return sellProviderSelect ? sellProviderSelect.value || "helius" : "helius";
+  return sellProviderSelect ? sellProviderSelect.value || "helius-sender" : "helius-sender";
+}
+
+function getSellEndpointProfile() {
+  return sellEndpointProfileSelect ? sellEndpointProfileSelect.value || "global" : "global";
 }
 
 function getSellPolicy() {
@@ -854,10 +876,10 @@ function getSellPolicy() {
 }
 
 function getRouteCapabilities(route, rowType) {
-  const normalizedRoute = String(route || "helius").trim().toLowerCase();
+  const normalizedRoute = String(route || "helius-sender").trim().toLowerCase();
   return ROUTE_CAPABILITIES[normalizedRoute] && ROUTE_CAPABILITIES[normalizedRoute][rowType]
     ? ROUTE_CAPABILITIES[normalizedRoute][rowType]
-    : ROUTE_CAPABILITIES.helius[rowType];
+    : ROUTE_CAPABILITIES["helius-sender"][rowType];
 }
 
 function setFieldEnabled(input, enabled) {
@@ -867,15 +889,42 @@ function setFieldEnabled(input, enabled) {
   if (label) label.classList.toggle("is-disabled", !enabled);
 }
 
+function setFieldVisibility(input, visible) {
+  if (!input) return;
+  const label = input.closest("label");
+  if (label) label.hidden = !visible;
+}
+
+function providerSupportsEndpointProfile(provider) {
+  return Array.isArray(PROVIDER_ENDPOINT_PROFILE_SUPPORT[provider]) && PROVIDER_ENDPOINT_PROFILE_SUPPORT[provider].length > 0;
+}
+
 function syncSettingsCapabilities() {
   const editing = isPresetEditing(getConfig());
   const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
   const buyCapabilities = getRouteCapabilities(getBuyProvider(), "buy");
   const sellCapabilities = getRouteCapabilities(getSellProvider(), "sell");
+  const creationSupportsEndpointProfile = providerSupportsEndpointProfile(getProvider());
+  const buySupportsEndpointProfile = providerSupportsEndpointProfile(getBuyProvider());
+  const sellSupportsEndpointProfile = providerSupportsEndpointProfile(getSellProvider());
 
   if (providerSelect) providerSelect.disabled = !editing;
+  if (endpointProfileSelect) endpointProfileSelect.disabled = !editing || !creationSupportsEndpointProfile;
   if (buyProviderSelect) buyProviderSelect.disabled = !editing;
+  if (buyEndpointProfileSelect) buyEndpointProfileSelect.disabled = !editing || !buySupportsEndpointProfile;
   if (sellProviderSelect) sellProviderSelect.disabled = !editing;
+  if (sellEndpointProfileSelect) sellEndpointProfileSelect.disabled = !editing || !sellSupportsEndpointProfile;
+  setFieldVisibility(endpointProfileSelect, creationSupportsEndpointProfile);
+  setFieldVisibility(buyEndpointProfileSelect, buySupportsEndpointProfile);
+  setFieldVisibility(sellEndpointProfileSelect, sellSupportsEndpointProfile);
+  setFieldVisibility(creationTipInput, creationCapabilities.tip);
+  setFieldVisibility(creationPriorityInput, creationCapabilities.priority);
+  setFieldVisibility(buyPriorityFeeInput, buyCapabilities.priority);
+  setFieldVisibility(buyTipInput, buyCapabilities.tip);
+  setFieldVisibility(buySlippageInput, buyCapabilities.slippage);
+  setFieldVisibility(sellPriorityFeeInput, sellCapabilities.priority);
+  setFieldVisibility(sellTipInput, sellCapabilities.tip);
+  setFieldVisibility(sellSlippageInput, sellCapabilities.slippage);
   setFieldEnabled(creationTipInput, editing && creationCapabilities.tip);
   setFieldEnabled(creationPriorityInput, editing && creationCapabilities.priority);
   setFieldEnabled(buyPriorityFeeInput, editing && buyCapabilities.priority);
@@ -890,14 +939,17 @@ function applyPresetToSettingsInputs(preset, options = {}) {
   if (!preset) return;
   const { syncToMainForm = true } = options;
   syncingPresetInputs = true;
-  if (providerSelect) providerSelect.value = preset.creationSettings.provider || "helius";
+  if (providerSelect) providerSelect.value = preset.creationSettings.provider || "helius-sender";
+  if (endpointProfileSelect) endpointProfileSelect.value = preset.creationSettings.endpointProfile || "global";
   if (creationTipInput) creationTipInput.value = preset.creationSettings.tipSol || "";
   if (creationPriorityInput) creationPriorityInput.value = preset.creationSettings.priorityFeeSol || "";
-  if (buyProviderSelect) buyProviderSelect.value = preset.buySettings.provider || "helius";
+  if (buyProviderSelect) buyProviderSelect.value = preset.buySettings.provider || "helius-sender";
+  if (buyEndpointProfileSelect) buyEndpointProfileSelect.value = preset.buySettings.endpointProfile || "global";
   if (buyPriorityFeeInput) buyPriorityFeeInput.value = preset.buySettings.priorityFeeSol || "";
   if (buyTipInput) buyTipInput.value = preset.buySettings.tipSol || "";
   if (buySlippageInput) buySlippageInput.value = preset.buySettings.slippagePercent || "";
-  if (sellProviderSelect) sellProviderSelect.value = preset.sellSettings.provider || "helius";
+  if (sellProviderSelect) sellProviderSelect.value = preset.sellSettings.provider || "helius-sender";
+  if (sellEndpointProfileSelect) sellEndpointProfileSelect.value = preset.sellSettings.endpointProfile || "global";
   if (sellPriorityFeeInput) sellPriorityFeeInput.value = preset.sellSettings.priorityFeeSol || "";
   if (sellTipInput) sellTipInput.value = preset.sellSettings.tipSol || "";
   if (sellSlippageInput) sellSlippageInput.value = preset.sellSettings.slippagePercent || "";
@@ -921,6 +973,7 @@ function syncActivePresetFromInputs() {
   activePreset.creationSettings = {
     ...activePreset.creationSettings,
     provider: getProvider(),
+    endpointProfile: providerSupportsEndpointProfile(getProvider()) ? getEndpointProfile() : "",
     policy: getPolicy(),
     tipSol: creationTipInput ? creationTipInput.value.trim() : "",
     priorityFeeSol: creationPriorityInput ? creationPriorityInput.value.trim() : "",
@@ -931,6 +984,7 @@ function syncActivePresetFromInputs() {
   activePreset.buySettings = {
     ...activePreset.buySettings,
     provider: getBuyProvider(),
+    endpointProfile: providerSupportsEndpointProfile(getBuyProvider()) ? getBuyEndpointProfile() : "",
     policy: getBuyPolicy(),
     priorityFeeSol: buyPriorityFeeInput ? buyPriorityFeeInput.value.trim() : "",
     tipSol: buyTipInput ? buyTipInput.value.trim() : "",
@@ -939,6 +993,7 @@ function syncActivePresetFromInputs() {
   activePreset.sellSettings = {
     ...activePreset.sellSettings,
     provider: getSellProvider(),
+    endpointProfile: providerSupportsEndpointProfile(getSellProvider()) ? getSellEndpointProfile() : "",
     policy: getSellPolicy(),
     priorityFeeSol: sellPriorityFeeInput ? sellPriorityFeeInput.value.trim() : "",
     tipSol: sellTipInput ? sellTipInput.value.trim() : "",
@@ -968,13 +1023,16 @@ function setPresetEditing(editing) {
   setConfig(config);
   const inputs = [
     providerSelect,
+    endpointProfileSelect,
     creationTipInput,
     creationPriorityInput,
     buyProviderSelect,
+    buyEndpointProfileSelect,
     buyPriorityFeeInput,
     buyTipInput,
     buySlippageInput,
     sellProviderSelect,
+    sellEndpointProfileSelect,
     sellPriorityFeeInput,
     sellTipInput,
     sellSlippageInput,
@@ -1778,6 +1836,7 @@ function updateFeeSplitVisibility() {
   if (active) ensureFeeSplitDefaultRow();
   if (!active && feeSplitModal) feeSplitModal.hidden = true;
   syncFeeSplitTotals();
+  syncSettingsCapabilities();
 }
 
 function showFeeSplitModal() {
@@ -2035,7 +2094,7 @@ function updateModeVisibility() {
 }
 
 function usesBundledJito() {
-  return getProvider() === "jito" && Number(creationTipInput ? creationTipInput.value || 0 : 0) > 0;
+  return getProvider() === "jito-bundle" && Number(creationTipInput ? creationTipInput.value || 0 : 0) > 0;
 }
 
 function updateJitoVisibility() {
@@ -2113,6 +2172,9 @@ function applyPersistentDefaults(config) {
     setNamedValue("automaticDevSellPercent", String(defaults.automaticDevSell.percent || 0));
     setNamedValue("automaticDevSellDelaySeconds", String(defaults.automaticDevSell.delaySeconds || 0));
   }
+  if (trackSendBlockHeightToggle) {
+    trackSendBlockHeightToggle.checked = Boolean(defaults.misc && defaults.misc.trackSendBlockHeight);
+  }
   setPresetEditing(Boolean(defaults.presetEditing));
   renderQuickDevBuyButtons(config);
   populateDevBuyPresetEditor(config);
@@ -2141,6 +2203,12 @@ function readForm() {
   const data = new FormData(form);
   const values = Object.fromEntries(data.entries());
   const mode = values.mode || "regular";
+  const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
+  const buyCapabilities = getRouteCapabilities(getBuyProvider(), "buy");
+  const sellCapabilities = getRouteCapabilities(getSellProvider(), "sell");
+  const creationSupportsEndpointProfile = providerSupportsEndpointProfile(getProvider());
+  const buySupportsEndpointProfile = providerSupportsEndpointProfile(getBuyProvider());
+  const sellSupportsEndpointProfile = providerSupportsEndpointProfile(getSellProvider());
   const devBuyAmount = String(values.devBuyAmount || "").trim();
   const agentSplitRecipients = mode === "agent-custom" ? collectAgentSplitRecipients() : [];
   const agentBuyback = agentSplitRecipients.find((entry) => entry.type === "agent");
@@ -2158,10 +2226,13 @@ function readForm() {
     selectedWalletKey: selectedWalletKey(),
     launchpad: getLaunchpad(),
     provider: getProvider(),
+    endpointProfile: creationSupportsEndpointProfile ? getEndpointProfile() : "",
     policy: getPolicy(),
     buyProvider: getBuyProvider(),
+    buyEndpointProfile: buySupportsEndpointProfile ? getBuyEndpointProfile() : "",
     buyPolicy: getBuyPolicy(),
     sellProvider: getSellProvider(),
+    sellEndpointProfile: sellSupportsEndpointProfile ? getSellEndpointProfile() : "",
     sellPolicy: getSellPolicy(),
     activePresetId: getActivePresetId(),
     mode,
@@ -2182,21 +2253,22 @@ function readForm() {
     devBuyAmount,
     autoGas: true,
     buyAutoGas: true,
-    priorityFeeSol: getNamedValue("creationPriorityFeeSol") || "",
-    creationTipSol: getNamedValue("creationTipSol") || "",
-    maxPriorityFeeSol: getNamedValue("creationPriorityFeeSol") || "",
-    maxTipSol: getNamedValue("creationTipSol") || "",
-    buyPriorityFeeSol: getNamedValue("buyPriorityFeeSol") || "",
-    buyTipSol: getNamedValue("buyTipSol") || "",
+    priorityFeeSol: creationCapabilities.priority ? (getNamedValue("creationPriorityFeeSol") || "") : "",
+    creationTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
+    maxPriorityFeeSol: creationCapabilities.priority ? (getNamedValue("creationPriorityFeeSol") || "") : "",
+    maxTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
+    buyPriorityFeeSol: buyCapabilities.priority ? (getNamedValue("buyPriorityFeeSol") || "") : "",
+    buyTipSol: buyCapabilities.tip ? (getNamedValue("buyTipSol") || "") : "",
     buySlippagePercent: getNamedValue("buySlippagePercent") || "",
-    buyMaxPriorityFeeSol: getNamedValue("buyPriorityFeeSol") || "",
-    buyMaxTipSol: getNamedValue("buyTipSol") || "",
-    sellPriorityFeeSol: getNamedValue("sellPriorityFeeSol") || "",
-    sellTipSol: getNamedValue("sellTipSol") || "",
+    buyMaxPriorityFeeSol: buyCapabilities.priority ? (getNamedValue("buyPriorityFeeSol") || "") : "",
+    buyMaxTipSol: buyCapabilities.tip ? (getNamedValue("buyTipSol") || "") : "",
+    sellPriorityFeeSol: sellCapabilities.priority ? (getNamedValue("sellPriorityFeeSol") || "") : "",
+    sellTipSol: sellCapabilities.tip ? (getNamedValue("sellTipSol") || "") : "",
     sellSlippagePercent: getNamedValue("sellSlippagePercent") || "",
-    enableJito: getProvider() === "jito" || Number(getNamedValue("creationTipSol") || 0) > 0,
-    jitoTipSol: getNamedValue("creationTipSol") || "",
+    enableJito: getProvider() === "jito-bundle" || Number(getNamedValue("creationTipSol") || 0) > 0,
+    jitoTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
     skipPreflight: getNamedValue("skipPreflight") === "true",
+    trackSendBlockHeight: Boolean(trackSendBlockHeightToggle && trackSendBlockHeightToggle.checked),
     feeSplitEnabled: mode === "regular" && feeSplitEnabled.checked,
     feeSplitRecipients: mode === "regular" && feeSplitEnabled.checked ? collectFeeSplitRecipients() : [],
     postLaunchStrategy: getNamedValue("postLaunchStrategy") || "none",
@@ -2250,31 +2322,43 @@ async function refreshWalletStatus(preserveSelection = true) {
     if (!response.ok || !payload.ok) {
       throw new Error(payload.error || "Failed to load wallet status.");
     }
-
-    latestWalletStatus = payload;
-    renderWalletOptions(payload.wallets || [], payload.selectedWalletKey || "", payload.balanceSol);
-    applyPersistentDefaults(payload.config);
-    applyProviderAvailability(payload.providers || {});
-    applyLaunchpadAvailability(payload.launchpads || {});
-    renderQuickDevBuyButtons(payload.config);
-    populateDevBuyPresetEditor(payload.config);
-    renderSniperUI();
-
-    if (!payload.connected) {
-      if (walletBalance) walletBalance.textContent = "-";
-      metaNode.textContent = "No wallet configured. Add SOLANA_PRIVATE_KEY to .env.";
-      updateLockedModeFields();
-      return;
-    }
-
-    if (walletBalance) walletBalance.textContent = `${Number(payload.balanceSol).toFixed(4)} SOL`;
-    const selectedWallet = (payload.wallets || []).find((walletEntry) => walletEntry.envKey === payload.selectedWalletKey);
-    metaNode.textContent = selectedWallet ? `Using ${walletLabel(selectedWallet)}` : "Wallet ready";
-    updateLockedModeFields();
+    applyWalletStatusPayload(payload);
   } catch (error) {
     if (walletBalance) walletBalance.textContent = "-";
     metaNode.textContent = error.message;
   }
+}
+
+function applyWalletStatusPayload(payload) {
+  latestWalletStatus = payload;
+  renderWalletOptions(payload.wallets || [], payload.selectedWalletKey || "", payload.balanceSol);
+  applyPersistentDefaults(payload.config);
+  applyProviderAvailability(payload.providers || {});
+  applyLaunchpadAvailability(payload.launchpads || {});
+  renderQuickDevBuyButtons(payload.config);
+  populateDevBuyPresetEditor(payload.config);
+  renderSniperUI();
+
+  if (!payload.connected) {
+    if (walletBalance) walletBalance.textContent = "-";
+    metaNode.textContent = "No wallet configured. Add SOLANA_PRIVATE_KEY to .env.";
+    updateLockedModeFields();
+    return;
+  }
+
+  if (walletBalance) walletBalance.textContent = `${Number(payload.balanceSol).toFixed(4)} SOL`;
+  const selectedWallet = (payload.wallets || []).find((walletEntry) => walletEntry.envKey === payload.selectedWalletKey);
+  metaNode.textContent = selectedWallet ? `Using ${walletLabel(selectedWallet)}` : "Wallet ready";
+  updateLockedModeFields();
+}
+
+async function bootstrapApp() {
+  const response = await fetch("/api/bootstrap");
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to load app bootstrap.");
+  }
+  applyWalletStatusPayload(payload);
 }
 
 async function updateQuote() {
@@ -2369,15 +2453,6 @@ async function applyTestPreset() {
   if (devBuySolInput) devBuySolInput.value = TEST_PRESET.devBuyMode === "sol" ? TEST_PRESET.devBuyAmount : "";
   if (devBuyPercentInput) devBuyPercentInput.value = "";
   syncingDevBuyInputs = false;
-  setNamedValue("creationTipSol", TEST_PRESET.creationTipSol);
-  setNamedValue("creationPriorityFeeSol", TEST_PRESET.creationPriorityFeeSol);
-  setNamedValue("buyPriorityFeeSol", TEST_PRESET.buyPriorityFeeSol);
-  setNamedValue("buyTipSol", TEST_PRESET.buyTipSol);
-  setNamedValue("buySlippagePercent", TEST_PRESET.buySlippagePercent);
-  setNamedValue("sellPriorityFeeSol", TEST_PRESET.sellPriorityFeeSol);
-  setNamedValue("sellTipSol", TEST_PRESET.sellTipSol);
-  setNamedValue("sellSlippagePercent", TEST_PRESET.sellSlippagePercent);
-  setNamedValue("skipPreflight", TEST_PRESET.skipPreflight);
 
   clearValidationErrors();
   Object.keys(fieldValidators).forEach((name) => setFieldError(name, ""));
@@ -2385,29 +2460,30 @@ async function applyTestPreset() {
   updateJitoVisibility();
   queueQuoteUpdate();
 
-  try {
-    imageStatus.textContent = "Uploading image...";
-    imagePath.textContent = "";
-    metadataUri.value = "";
-    const response = await fetch("/solana-logo.png");
-    if (!response.ok) {
-      throw new Error("Failed to load test image.");
-    }
-    const blob = await response.blob();
-    const file = new File([blob], "image (17).png", { type: blob.type || "image/png" });
+  if (!uploadedImage) {
     try {
-      const dataTransfer = new DataTransfer();
-      dataTransfer.items.add(file);
-      imageInput.files = dataTransfer.files;
-    } catch (_error) {
-      // Some browsers restrict programmatic file input assignment.
+      imageStatus.textContent = "Uploading image...";
+      imagePath.textContent = "";
+      metadataUri.value = "";
+      const response = await fetch("/solana-mark.png");
+      if (!response.ok) {
+        throw new Error("Failed to load test image.");
+      }
+      const blob = await response.blob();
+      const file = new File([blob], "solana-mark.png", { type: blob.type || "image/png" });
+      try {
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(file);
+        imageInput.files = dataTransfer.files;
+      } catch (_error) {
+        // Some browsers restrict programmatic file input assignment.
+      }
+      setImagePreview(URL.createObjectURL(file));
+      await uploadSelectedImage(file);
+    } catch (error) {
+      imageStatus.textContent = error.message;
+      imagePath.textContent = "";
     }
-    setImagePreview(URL.createObjectURL(file));
-    await uploadSelectedImage(file);
-  } catch (error) {
-    uploadedImage = null;
-    imageStatus.textContent = error.message;
-    imagePath.textContent = "";
   }
 }
 
@@ -2663,9 +2739,21 @@ function buildDeployPreviewHTML() {
     { label: "Balance", value: bal, cls: "green" },
     { label: "Preset", value: f.activePresetId || DEFAULT_PRESET_ID, cls: "secondary" },
     { label: "Platform", value: f.launchpad || "pump", cls: "" },
-    { label: "Creation", value: `${f.provider || "helius"} / ${f.policy || "safe"}`, cls: "" },
-    { label: "Buy Route", value: `${f.buyProvider || "helius"} / ${f.buyPolicy || "safe"} | slip ${f.buySlippagePercent || "90"}%`, cls: "secondary" },
-    { label: "Sell Route", value: `${f.sellProvider || "helius"} / ${f.sellPolicy || "safe"} | slip ${f.sellSlippagePercent || "90"}%`, cls: "secondary" },
+    {
+      label: "Creation",
+      value: `${PROVIDER_LABELS[f.provider || "helius-sender"] || (f.provider || "helius-sender")}${f.endpointProfile ? ` / ${ENDPOINT_PROFILE_LABELS[f.endpointProfile] || f.endpointProfile}` : ""} / ${f.policy || "safe"}`,
+      cls: "",
+    },
+    {
+      label: "Buy Route",
+      value: `${PROVIDER_LABELS[f.buyProvider || "helius-sender"] || (f.buyProvider || "helius-sender")}${f.buyEndpointProfile ? ` / ${ENDPOINT_PROFILE_LABELS[f.buyEndpointProfile] || f.buyEndpointProfile}` : ""} / ${f.buyPolicy || "safe"} | slip ${f.buySlippagePercent || "90"}%`,
+      cls: "secondary",
+    },
+    {
+      label: "Sell Route",
+      value: `${PROVIDER_LABELS[f.sellProvider || "helius-sender"] || (f.sellProvider || "helius-sender")}${f.sellEndpointProfile ? ` / ${ENDPOINT_PROFILE_LABELS[f.sellEndpointProfile] || f.sellEndpointProfile}` : ""} / ${f.sellPolicy || "safe"} | slip ${f.sellSlippagePercent || "90"}%`,
+      cls: "secondary",
+    },
     { label: "Mode", value: `${modeLabels[f.mode] || f.mode}${f.mayhemMode ? " + Mayhem" : ""}`, cls: "" },
     ...(f.mode.startsWith("agent") ? [{ label: "Buyback", value: buybackText, cls: "" }] : []),
     { label: "Fees", value: feesText, cls: "secondary" },
@@ -2738,17 +2826,25 @@ async function run(action) {
     const wallet = latestWalletStatus && latestWalletStatus.selectedWalletKey
       ? `Using #${walletIndexFromEnvKey(latestWalletStatus.selectedWalletKey)}`
       : "Wallet ready";
-    metaNode.textContent = `${wallet} | ${payload.report.launchpad || "pump"} | ${payload.report.execution.resolvedProvider || payload.report.execution.provider || "auto"} | Mint: ${shortAddress(payload.report.mint)}`;
+    metaNode.textContent = `${wallet} | ${payload.report.launchpad || "pump"} | ${payload.report.execution.resolvedProvider || payload.report.execution.provider || "helius-sender"} | Mint: ${shortAddress(payload.report.mint)}`;
     metadataUri.value = payload.metadataUri || "";
     output.textContent = payload.text;
+    if (payload.sendLogPath) {
+      await refreshReportsTerminal({
+        preserveSelection: false,
+        preferId: extractReportIdFromPath(payload.sendLogPath),
+      }).catch((error) => {
+        if (reportsTerminalOutput && reportsTerminalSection && !reportsTerminalSection.hidden) {
+          reportsTerminalOutput.textContent = error.message || "Failed to refresh reports.";
+        }
+      });
+    }
     await refreshWalletStatus(true);
   } catch (error) {
     statusNode.textContent = "Error";
     output.textContent = error.message;
   } finally {
-    buttons.forEach((button) => {
-      button.disabled = false;
-    });
+    setBusy(false, statusNode.textContent || "Idle");
   }
 }
 
@@ -2763,6 +2859,9 @@ function buildSavedConfigFromForm() {
     mode: f.mode || "regular",
     activePresetId: f.activePresetId || DEFAULT_PRESET_ID,
     presetEditing: isPresetEditing(base),
+    misc: {
+      trackSendBlockHeight: Boolean(f.trackSendBlockHeight),
+    },
     automaticDevSell: {
       enabled: Boolean(f.automaticDevSellEnabled),
       percent: Number(f.automaticDevSellPercent || 0),
@@ -2776,7 +2875,8 @@ function buildSavedConfigFromForm() {
         ...preset,
         creationSettings: {
           ...preset.creationSettings,
-          provider: f.provider || "helius",
+          provider: f.provider || "helius-sender",
+          endpointProfile: f.endpointProfile || "global",
           policy: f.policy || "safe",
           tipSol: f.creationTipSol || "",
           priorityFeeSol: f.priorityFeeSol || "",
@@ -2784,7 +2884,8 @@ function buildSavedConfigFromForm() {
         },
         buySettings: {
           ...preset.buySettings,
-          provider: f.buyProvider || "helius",
+          provider: f.buyProvider || "helius-sender",
+          endpointProfile: f.buyEndpointProfile || "global",
           policy: f.buyPolicy || "safe",
           priorityFeeSol: f.buyPriorityFeeSol || "",
           tipSol: f.buyTipSol || "",
@@ -2792,7 +2893,8 @@ function buildSavedConfigFromForm() {
         },
         sellSettings: {
           ...preset.sellSettings,
-          provider: f.sellProvider || "helius",
+          provider: f.sellProvider || "helius-sender",
+          endpointProfile: f.sellEndpointProfile || "global",
           policy: f.sellPolicy || "safe",
           priorityFeeSol: f.sellPriorityFeeSol || "",
           tipSol: f.sellTipSol || "",
@@ -2828,10 +2930,7 @@ async function saveSettings() {
     statusNode.textContent = "Error";
     output.textContent = error.message;
   } finally {
-    buttons.forEach((button) => {
-      button.disabled = false;
-    });
-    if (saveSettingsButton) saveSettingsButton.disabled = false;
+    setBusy(false, statusNode.textContent || "Ready");
   }
 }
 
@@ -2870,6 +2969,139 @@ function setOutputSectionVisible(isVisible) {
   } catch (_error) {
     // Ignore storage access failures and keep the UI functional.
   }
+}
+
+function getStoredReportsTerminalVisible() {
+  try {
+    const stored = window.localStorage.getItem(REPORTS_TERMINAL_VISIBILITY_KEY);
+    if (stored === "true") return true;
+    if (stored === "false") return false;
+  } catch (_error) {
+    // Ignore storage access failures and fall back to hidden state.
+  }
+  return false;
+}
+
+function getStoredReportsTerminalSort() {
+  try {
+    return window.localStorage.getItem(REPORTS_TERMINAL_SORT_KEY) === "oldest" ? "oldest" : "newest";
+  } catch (_error) {
+    return "newest";
+  }
+}
+
+function setReportsTerminalVisible(isVisible, { persist = true } = {}) {
+  document.documentElement.classList.toggle("reports-hidden", !isVisible);
+  document.body.classList.toggle("reports-hidden", !isVisible);
+  if (reportsTerminalSection) reportsTerminalSection.hidden = !isVisible;
+  if (toggleReportsButton) {
+    toggleReportsButton.classList.toggle("active", isVisible);
+    toggleReportsButton.setAttribute("aria-pressed", String(isVisible));
+  }
+  if (isVisible) {
+    refreshReportsTerminal().catch((error) => {
+      if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to load reports.";
+    });
+  }
+  if (!persist) return;
+  try {
+    window.localStorage.setItem(REPORTS_TERMINAL_VISIBILITY_KEY, String(isVisible));
+  } catch (_error) {
+    // Ignore storage failures and keep the UI functional.
+  }
+}
+
+function setReportsTerminalSort(sort, { persist = true } = {}) {
+  reportsTerminalState.sort = sort === "oldest" ? "oldest" : "newest";
+  if (reportsSortButton) {
+    reportsSortButton.textContent = reportsTerminalState.sort === "oldest" ? "Oldest" : "Newest";
+  }
+  if (!persist) return;
+  try {
+    window.localStorage.setItem(REPORTS_TERMINAL_SORT_KEY, reportsTerminalState.sort);
+  } catch (_error) {
+    // Ignore storage failures and keep the UI functional.
+  }
+}
+
+function describeReportEntry(entry) {
+  const parts = [];
+  if (entry.displayTime) parts.push(entry.displayTime);
+  if (entry.provider) parts.push(entry.provider);
+  if (entry.signatureCount) parts.push(`${entry.signatureCount} sig${entry.signatureCount === 1 ? "" : "s"}`);
+  return parts.join(" | ");
+}
+
+function renderReportsTerminalList() {
+  if (!reportsTerminalList) return;
+  if (!reportsTerminalState.entries.length) {
+    reportsTerminalList.innerHTML = '<div class="reports-terminal-empty">No persisted reports found yet.</div>';
+    return;
+  }
+  reportsTerminalList.innerHTML = reportsTerminalState.entries.map((entry) => `
+    <button
+      type="button"
+      class="reports-terminal-item${entry.id === reportsTerminalState.activeId ? " active" : ""}"
+      data-report-id="${escapeHTML(entry.id)}"
+    >
+      <span class="reports-terminal-item-title">${escapeHTML(String(entry.action || "unknown"))}</span>
+      <span class="reports-terminal-item-meta">${escapeHTML(String(entry.mint || entry.fileName || "Unknown mint"))}</span>
+      <span class="reports-terminal-item-meta">${escapeHTML(describeReportEntry(entry) || "No metadata")}</span>
+    </button>
+  `).join("");
+}
+
+async function loadReportsTerminalEntry(id) {
+  if (!id || !reportsTerminalOutput) return;
+  reportsTerminalOutput.textContent = "Loading report...";
+  const response = await fetch(`/api/reports/view?id=${encodeURIComponent(id)}`);
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to load report.");
+  }
+  reportsTerminalState.activeId = payload.entry && payload.entry.id ? payload.entry.id : id;
+  if (reportsTerminalMeta) {
+    reportsTerminalMeta.textContent = payload.entry
+      ? `${payload.entry.displayTime || "Unknown time"} | ${payload.entry.action || "unknown"} | ${payload.entry.provider || "unknown route"}`
+      : "Report loaded.";
+  }
+  reportsTerminalOutput.textContent = payload.text || "Report is empty.";
+  renderReportsTerminalList();
+}
+
+async function refreshReportsTerminal({ preserveSelection = true, preferId = "" } = {}) {
+  if (!reportsTerminalList || !reportsTerminalOutput) return;
+  reportsTerminalList.innerHTML = '<div class="reports-terminal-empty">Loading reports...</div>';
+  const response = await fetch(`/api/reports?sort=${encodeURIComponent(reportsTerminalState.sort)}`);
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to list reports.");
+  }
+  reportsTerminalState.entries = Array.isArray(payload.reports) ? payload.reports : [];
+  setReportsTerminalSort(payload.sort || reportsTerminalState.sort, { persist: false });
+  const availableIds = new Set(reportsTerminalState.entries.map((entry) => entry.id));
+  const nextId = preferId && availableIds.has(preferId)
+    ? preferId
+    : preserveSelection && reportsTerminalState.activeId && availableIds.has(reportsTerminalState.activeId)
+      ? reportsTerminalState.activeId
+      : reportsTerminalState.entries[0] && reportsTerminalState.entries[0].id
+        ? reportsTerminalState.entries[0].id
+        : "";
+  reportsTerminalState.activeId = nextId;
+  renderReportsTerminalList();
+  if (!nextId) {
+    if (reportsTerminalMeta) reportsTerminalMeta.textContent = "No persisted reports available yet.";
+    reportsTerminalOutput.textContent = "Run Build, Simulate, or Deploy to create persisted reports.";
+    return;
+  }
+  await loadReportsTerminalEntry(nextId);
+}
+
+function extractReportIdFromPath(filePath) {
+  const normalized = String(filePath || "").trim();
+  if (!normalized) return "";
+  const parts = normalized.split(/[\\/]+/);
+  return parts[parts.length - 1] || "";
 }
 
 function getStoredThemeMode() {
@@ -3081,8 +3313,11 @@ if (providerSelect) providerSelect.addEventListener("change", () => {
   syncActivePresetFromInputs();
   updateJitoVisibility();
 });
+if (endpointProfileSelect) endpointProfileSelect.addEventListener("change", syncActivePresetFromInputs);
 if (buyProviderSelect) buyProviderSelect.addEventListener("change", syncActivePresetFromInputs);
+if (buyEndpointProfileSelect) buyEndpointProfileSelect.addEventListener("change", syncActivePresetFromInputs);
 if (sellProviderSelect) sellProviderSelect.addEventListener("change", syncActivePresetFromInputs);
+if (sellEndpointProfileSelect) sellEndpointProfileSelect.addEventListener("change", syncActivePresetFromInputs);
 feeSplitPill.addEventListener("click", () => {
   if (getMode() !== "regular") return;
   if (!feeSplitEnabled.checked) {
@@ -3493,6 +3728,41 @@ if (toggleOutputButton) {
     setOutputSectionVisible(outputSection ? outputSection.hidden : true);
   });
 }
+if (toggleReportsButton) {
+  toggleReportsButton.addEventListener("click", () => {
+    setReportsTerminalVisible(reportsTerminalSection ? reportsTerminalSection.hidden : true);
+  });
+}
+if (reportsRefreshButton) {
+  reportsRefreshButton.addEventListener("click", async () => {
+    try {
+      await refreshReportsTerminal();
+    } catch (error) {
+      if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to refresh reports.";
+    }
+  });
+}
+if (reportsSortButton) {
+  reportsSortButton.addEventListener("click", async () => {
+    setReportsTerminalSort(reportsTerminalState.sort === "newest" ? "oldest" : "newest");
+    try {
+      await refreshReportsTerminal({ preserveSelection: false });
+    } catch (error) {
+      if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to sort reports.";
+    }
+  });
+}
+if (reportsTerminalList) {
+  reportsTerminalList.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-report-id]");
+    if (!button) return;
+    try {
+      await loadReportsTerminalEntry(button.getAttribute("data-report-id") || "");
+    } catch (error) {
+      if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to load report.";
+    }
+  });
+}
 if (openSettingsButton) {
   openSettingsButton.addEventListener("click", showSettingsModal);
 }
@@ -3580,7 +3850,11 @@ if (devBuyCustomDeployButton) {
     const mode = getDevBuyMode();
     const amount = getNamedValue("devBuyAmount").trim();
     if (!amount) {
-      showValidationErrors(["Custom dev buy amount is required."]);
+      clearDevBuyState();
+      const errors = validateForm();
+      if (showValidationErrors(errors)) return;
+      clearValidationErrors();
+      showDeployModal();
       return;
     }
     await triggerDeployWithDevBuy(mode, amount, lastDevBuyEditSource);
@@ -3803,18 +4077,15 @@ updateModeVisibility();
 updateJitoVisibility();
 syncDevAutoSellUI();
 hydrateModeActionState();
-if (bootstrapState && bootstrapState.config) {
-  applyPersistentDefaults(bootstrapState.config);
-}
-if (bootstrapState && bootstrapState.launchpads) {
-  applyLaunchpadAvailability(bootstrapState.launchpads);
-}
 renderPresetChips();
 renderQuickDevBuyButtons();
 populateDevBuyPresetEditor();
 updateTokenFieldCounts();
 updateDescriptionDisclosure();
 updateQuote();
-Promise.resolve(refreshWalletStatus(false)).finally(() => {
+Promise.resolve(bootstrapApp()).catch((error) => {
+  if (walletBalance) walletBalance.textContent = "-";
+  metaNode.textContent = error.message;
+}).finally(() => {
   completeInitialBoot();
 });

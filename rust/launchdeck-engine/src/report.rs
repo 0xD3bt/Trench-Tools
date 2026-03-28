@@ -1,15 +1,15 @@
 #![allow(non_snake_case, dead_code)]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{NormalizedConfig, NormalizedRecipient},
-    transport::{execution_class, resolved_provider},
+    transport::TransportPlan,
 };
 
 const DEFAULT_LOOKUP_TABLES: [&str; 1] = ["AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ"];
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstructionSummary {
     pub index: usize,
     pub programId: String,
@@ -18,7 +18,7 @@ pub struct InstructionSummary {
     pub signerKeys: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeSettings {
     pub computeUnitLimit: Option<i64>,
     pub computeUnitPriceMicroLamports: Option<i64>,
@@ -26,7 +26,7 @@ pub struct FeeSettings {
     pub jitoTipAccount: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionSummary {
     pub label: String,
     pub instructionSummary: Vec<InstructionSummary>,
@@ -44,7 +44,7 @@ pub struct TransactionSummary {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionItem {
     pub label: String,
     pub format: String,
@@ -53,24 +53,77 @@ pub struct ExecutionItem {
     pub logs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentItem {
     pub label: String,
-    pub signature: String,
+    pub format: String,
+    pub signature: Option<String>,
+    pub explorerUrl: Option<String>,
+    pub transportType: String,
+    pub endpoint: Option<String>,
+    pub attemptedEndpoints: Vec<String>,
+    pub skipPreflight: bool,
+    pub maxRetries: u32,
+    pub confirmationStatus: Option<String>,
+    pub sendObservedBlockHeight: Option<u64>,
+    pub confirmedObservedBlockHeight: Option<u64>,
+    pub confirmedSlot: Option<u64>,
+    pub computeUnitLimit: Option<u64>,
+    pub computeUnitPriceMicroLamports: Option<u64>,
+    pub inlineTipLamports: Option<u64>,
+    pub inlineTipAccount: Option<String>,
+    pub bundleId: Option<String>,
+    pub attemptedBundleIds: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecutionTimings {
+    pub totalElapsedMs: Option<u128>,
+    pub formToRawConfigMs: Option<u128>,
+    pub normalizeConfigMs: Option<u128>,
+    pub walletLoadMs: Option<u128>,
+    pub reportBuildMs: Option<u128>,
+    pub compileTransactionsMs: Option<u128>,
+    pub simulateMs: Option<u128>,
+    pub sendMs: Option<u128>,
+    pub persistReportMs: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BenchmarkSentItem {
+    pub label: String,
+    pub signature: Option<String>,
+    pub confirmationStatus: Option<String>,
+    pub sendBlockHeight: Option<u64>,
+    pub confirmedBlockHeight: Option<u64>,
+    pub blocksToConfirm: Option<u64>,
+    pub confirmedSlot: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BenchmarkSummary {
+    pub timings: ExecutionTimings,
+    pub sent: Vec<BenchmarkSentItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSummary {
     pub provider: String,
     pub resolvedProvider: String,
+    pub endpointProfile: String,
+    pub resolvedEndpointProfile: String,
     pub policy: String,
     pub executionClass: String,
+    pub transportType: String,
+    pub ordering: String,
     pub autoGas: bool,
     pub launchAutoMode: String,
     pub activePresetId: String,
     pub buyProvider: String,
+    pub buyEndpointProfile: String,
     pub buyPolicy: String,
     pub sellProvider: String,
+    pub sellEndpointProfile: String,
     pub sellPolicy: String,
     pub buyAutoGas: bool,
     pub buyAutoMode: String,
@@ -78,12 +131,20 @@ pub struct ExecutionSummary {
     pub txFormat: String,
     pub commitment: String,
     pub skipPreflight: bool,
+    pub trackSendBlockHeight: bool,
+    pub maxRetries: u32,
+    pub requiresInlineTip: bool,
+    pub requiresPriorityFee: bool,
+    pub separateTipTransaction: bool,
+    pub heliusSenderEndpoint: Option<String>,
+    #[serde(default)]
+    pub timings: ExecutionTimings,
     pub simulation: Vec<ExecutionItem>,
     pub sent: Vec<SentItem>,
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchReport {
     pub builtAt: String,
     pub configPath: Option<String>,
@@ -104,6 +165,8 @@ pub struct LaunchReport {
     pub bundleJitoTip: bool,
     pub transactions: Vec<TransactionSummary>,
     pub execution: ExecutionSummary,
+    #[serde(default)]
+    pub benchmark: Option<BenchmarkSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outPath: Option<String>,
 }
@@ -175,7 +238,7 @@ fn parse_lookup_table_addresses(config: &NormalizedConfig) -> Vec<String> {
 
 fn planned_transactions(
     config: &NormalizedConfig,
-    bundle_jito_tip: bool,
+    transport_plan: &TransportPlan,
     lookup_tables: &[String],
 ) -> Vec<TransactionSummary> {
     let mut transactions = vec![TransactionSummary {
@@ -193,12 +256,14 @@ fn planned_transactions(
         feeSettings: FeeSettings {
             computeUnitLimit: config.tx.computeUnitLimit,
             computeUnitPriceMicroLamports: config.tx.computeUnitPriceMicroLamports,
-            jitoTipLamports: if bundle_jito_tip {
+            jitoTipLamports: if transport_plan.separateTipTransaction {
                 0
             } else {
                 config.tx.jitoTipLamports
             },
-            jitoTipAccount: if bundle_jito_tip || config.tx.jitoTipAccount.is_empty() {
+            jitoTipAccount: if transport_plan.separateTipTransaction
+                || config.tx.jitoTipAccount.is_empty()
+            {
                 None
             } else {
                 Some(config.tx.jitoTipAccount.clone())
@@ -229,14 +294,22 @@ fn planned_transactions(
             feeSettings: FeeSettings {
                 computeUnitLimit: config.tx.computeUnitLimit,
                 computeUnitPriceMicroLamports: config.tx.computeUnitPriceMicroLamports,
-                jitoTipLamports: 0,
-                jitoTipAccount: None,
+                jitoTipLamports: if transport_plan.requiresInlineTip {
+                    config.tx.jitoTipLamports
+                } else {
+                    0
+                },
+                jitoTipAccount: if transport_plan.requiresInlineTip && !config.tx.jitoTipAccount.is_empty() {
+                    Some(config.tx.jitoTipAccount.clone())
+                } else {
+                    None
+                },
             },
             base64: None,
             warnings: vec![],
         });
     }
-    if bundle_jito_tip {
+    if transport_plan.separateTipTransaction {
         transactions.push(TransactionSummary {
             label: "jito-tip".to_string(),
             instructionSummary: vec![],
@@ -268,25 +341,33 @@ fn planned_transactions(
 
 fn requested_summary(
     config: &NormalizedConfig,
-    resolved_provider: &str,
-    execution_class: &str,
+    transport_plan: &TransportPlan,
 ) -> String {
     if config.execution.send {
         if config.execution.simulate {
             return format!(
-                "simulate + send ({}, provider={}, class={})",
-                config.execution.txFormat, resolved_provider, execution_class
+                "simulate + send ({}, provider={}, class={}, transport={})",
+                config.execution.txFormat,
+                transport_plan.resolvedProvider,
+                transport_plan.executionClass,
+                transport_plan.transportType
             );
         }
         return format!(
-            "send ({}, provider={}, class={})",
-            config.execution.txFormat, resolved_provider, execution_class
+            "send ({}, provider={}, class={}, transport={})",
+            config.execution.txFormat,
+            transport_plan.resolvedProvider,
+            transport_plan.executionClass,
+            transport_plan.transportType
         );
     }
     if config.execution.simulate {
         return format!(
-            "simulate ({}, provider={}, class={})",
-            config.execution.txFormat, resolved_provider, execution_class
+            "simulate ({}, provider={}, class={}, transport={})",
+            config.execution.txFormat,
+            transport_plan.resolvedProvider,
+            transport_plan.executionClass,
+            transport_plan.transportType
         );
     }
     "build only".to_string()
@@ -294,18 +375,17 @@ fn requested_summary(
 
 pub fn build_report(
     config: &NormalizedConfig,
+    transport_plan: &TransportPlan,
     built_at: String,
     rpc_url: String,
     creator: String,
     mint: String,
     agent_authority: Option<String>,
     config_path: Option<String>,
+    loaded_lookup_tables: Vec<String>,
 ) -> LaunchReport {
-    let bundle_jito_tip = config.tx.jitoTipLamports > 0 && config.mode != "agent-unlocked";
     let requested_lookup_tables = parse_lookup_table_addresses(config);
-    let transactions = planned_transactions(config, bundle_jito_tip, &requested_lookup_tables);
-    let resolved_provider = resolved_provider(&config.execution, transactions.len());
-    let execution_class = execution_class(&config.execution, transactions.len());
+    let transactions = planned_transactions(config, transport_plan, &requested_lookup_tables);
     let creator_fee_receiver = match config.mode.as_str() {
         "cashback" => "cashback to traders".to_string(),
         "agent-locked" => "agent buyback escrow (locked after launch)".to_string(),
@@ -336,11 +416,12 @@ pub fn build_report(
         "Rust engine owns validation, runtime state, and API contracts. Native Pump assembly covers LaunchDeck's Pump launch modes end-to-end."
             .to_string(),
     ];
-    let has_unverified_provider = !crate::providers::get_provider_meta(&resolved_provider).verified;
+    let has_unverified_provider =
+        !crate::providers::get_provider_meta(&transport_plan.resolvedProvider).verified;
     if has_unverified_provider {
         warnings.push(format!(
             "Provider {} is currently marked unverified in this environment.",
-            resolved_provider
+            transport_plan.resolvedProvider
         ));
     }
 
@@ -368,31 +449,45 @@ pub fn build_report(
             .map(|entry| format!("{}:{}", entry.mode, entry.amount))
             .unwrap_or_else(|| "none".to_string()),
         requestedLookupTables: requested_lookup_tables.clone(),
-        loadedLookupTables: requested_lookup_tables,
-        bundleJitoTip: bundle_jito_tip,
+        loadedLookupTables: loaded_lookup_tables,
+        bundleJitoTip: transport_plan.separateTipTransaction,
         transactions,
         execution: ExecutionSummary {
             provider: config.execution.provider.clone(),
-            resolvedProvider: resolved_provider.clone(),
+            resolvedProvider: transport_plan.resolvedProvider.clone(),
+            endpointProfile: config.execution.endpointProfile.clone(),
+            resolvedEndpointProfile: transport_plan.resolvedEndpointProfile.clone(),
             policy: config.execution.policy.clone(),
-            executionClass: execution_class.clone(),
+            executionClass: transport_plan.executionClass.clone(),
+            transportType: transport_plan.transportType.clone(),
+            ordering: transport_plan.ordering.clone(),
             autoGas: config.execution.autoGas,
             launchAutoMode: config.execution.autoMode.clone(),
             activePresetId: config.presets.activePresetId.clone(),
             buyProvider: config.execution.buyProvider.clone(),
+            buyEndpointProfile: config.execution.buyEndpointProfile.clone(),
             buyPolicy: config.execution.buyPolicy.clone(),
             sellProvider: config.execution.sellProvider.clone(),
+            sellEndpointProfile: config.execution.sellEndpointProfile.clone(),
             sellPolicy: config.execution.sellPolicy.clone(),
             buyAutoGas: config.execution.buyAutoGas,
             buyAutoMode: config.execution.buyAutoMode.clone(),
-            requestedSummary: requested_summary(config, &resolved_provider, &execution_class),
+            requestedSummary: requested_summary(config, transport_plan),
             txFormat: config.execution.txFormat.clone(),
             commitment: config.execution.commitment.clone(),
-            skipPreflight: config.execution.skipPreflight,
+            skipPreflight: transport_plan.skipPreflight,
+            trackSendBlockHeight: config.execution.trackSendBlockHeight,
+            maxRetries: transport_plan.maxRetries,
+            requiresInlineTip: transport_plan.requiresInlineTip,
+            requiresPriorityFee: transport_plan.requiresPriorityFee,
+            separateTipTransaction: transport_plan.separateTipTransaction,
+            heliusSenderEndpoint: transport_plan.heliusSenderEndpoint.clone(),
+            timings: ExecutionTimings::default(),
             simulation: vec![],
             sent: vec![],
             warnings,
         },
+        benchmark: None,
         outPath: None,
     }
 }
@@ -431,14 +526,86 @@ pub fn render_report(report: &LaunchReport) -> String {
         "Provider: {} ({})",
         report.execution.resolvedProvider, report.execution.policy
     ));
+    if !report.execution.resolvedEndpointProfile.is_empty() {
+        lines.push(format!(
+            "Endpoint profile: {}",
+            report.execution.resolvedEndpointProfile
+        ));
+    }
     lines.push(format!(
         "Execution class: {}",
         report.execution.executionClass
     ));
+    lines.push(format!("Transport: {}", report.execution.transportType));
+    lines.push(format!("Ordering: {}", report.execution.ordering));
+    lines.push(format!(
+        "Skip preflight: {} | max retries: {}",
+        report.execution.skipPreflight, report.execution.maxRetries
+    ));
+    lines.push(format!(
+        "Track send block height: {}",
+        report.execution.trackSendBlockHeight
+    ));
+    if let Some(endpoint) = &report.execution.heliusSenderEndpoint {
+        lines.push(format!("Helius Sender endpoint: {}", endpoint));
+    }
     if report.bundleJitoTip {
         lines.push("Jito tip handling: separate bundled tip transaction".to_string());
     }
     lines.push(format!("Execution: {}", report.execution.requestedSummary));
+    if let Some(benchmark) = &report.benchmark {
+        lines.push("Benchmark:".to_string());
+        let timings = &benchmark.timings;
+        let mut timing_parts = Vec::new();
+        if let Some(value) = timings.totalElapsedMs {
+            timing_parts.push(format!("total={value}ms"));
+        }
+        if let Some(value) = timings.formToRawConfigMs {
+            timing_parts.push(format!("form={value}ms"));
+        }
+        if let Some(value) = timings.normalizeConfigMs {
+            timing_parts.push(format!("normalize={value}ms"));
+        }
+        if let Some(value) = timings.walletLoadMs {
+            timing_parts.push(format!("wallet={value}ms"));
+        }
+        if let Some(value) = timings.reportBuildMs {
+            timing_parts.push(format!("report={value}ms"));
+        }
+        if let Some(value) = timings.compileTransactionsMs {
+            timing_parts.push(format!("compile={value}ms"));
+        }
+        if let Some(value) = timings.simulateMs {
+            timing_parts.push(format!("simulate={value}ms"));
+        }
+        if let Some(value) = timings.sendMs {
+            timing_parts.push(format!("send={value}ms"));
+        }
+        if let Some(value) = timings.persistReportMs {
+            timing_parts.push(format!("persist={value}ms"));
+        }
+        if !timing_parts.is_empty() {
+            lines.push(format!("  Timings: {}", timing_parts.join(" | ")));
+        }
+        for sent in &benchmark.sent {
+            let mut sent_parts = Vec::new();
+            if let Some(value) = sent.sendBlockHeight {
+                sent_parts.push(format!("send block height={value}"));
+            }
+            if let Some(value) = sent.confirmedBlockHeight {
+                sent_parts.push(format!("confirmed block height={value}"));
+            }
+            if let Some(value) = sent.blocksToConfirm {
+                sent_parts.push(format!("blocks to confirm={value}"));
+            }
+            if let Some(value) = sent.confirmedSlot {
+                sent_parts.push(format!("confirmed slot={value}"));
+            }
+            if !sent_parts.is_empty() {
+                lines.push(format!("  {}: {}", sent.label, sent_parts.join(" | ")));
+            }
+        }
+    }
     lines.push(String::new());
     lines.push("Transactions:".to_string());
     for tx in &report.transactions {
@@ -461,6 +628,37 @@ pub fn render_report(report: &LaunchReport) -> String {
                 "  lookup tables: {}",
                 tx.lookupTablesUsed.join(", ")
             ));
+        }
+    }
+    if !report.execution.sent.is_empty() {
+        lines.push(String::new());
+        lines.push("Sent:".to_string());
+        for sent in &report.execution.sent {
+            let mut summary = format!(
+                "- {}: signature={} | status={}",
+                sent.label,
+                sent.signature.as_deref().unwrap_or("(missing)"),
+                sent.confirmationStatus.as_deref().unwrap_or("(pending)")
+            );
+            if let Some(block_height) = sent.sendObservedBlockHeight {
+                summary.push_str(&format!(" | send block height={block_height}"));
+            }
+            if let Some(block_height) = sent.confirmedObservedBlockHeight {
+                summary.push_str(&format!(" | confirmed block height={block_height}"));
+            }
+            if let (Some(send_height), Some(confirmed_height)) = (
+                sent.sendObservedBlockHeight,
+                sent.confirmedObservedBlockHeight,
+            ) {
+                summary.push_str(&format!(
+                    " | blocks to confirm={}",
+                    confirmed_height.saturating_sub(send_height)
+                ));
+            }
+            if let Some(slot) = sent.confirmedSlot {
+                summary.push_str(&format!(" | confirmed slot={slot}"));
+            }
+            lines.push(summary);
         }
     }
     if !report.execution.warnings.is_empty() {
@@ -487,6 +685,13 @@ mod tests {
         raw.token.name = "LaunchDeck".to_string();
         raw.token.symbol = "LDECK".to_string();
         raw.token.uri = "ipfs://fixture".to_string();
+        raw.tx.computeUnitPriceMicroLamports = Some(serde_json::Value::from(1));
+        raw.tx.jitoTipLamports = Some(serde_json::Value::from(200_000));
+        raw.tx.jitoTipAccount = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE".to_string();
+        raw.execution.skipPreflight = Some(serde_json::Value::Bool(true));
+        raw.execution.provider = "helius-sender".to_string();
+        raw.execution.buyProvider = "helius-sender".to_string();
+        raw.execution.sellProvider = "helius-sender".to_string();
         normalize_raw_config(raw).expect("normalized config")
     }
 
@@ -498,15 +703,48 @@ mod tests {
 
         let report = build_report(
             &config,
+            &crate::transport::build_transport_plan(&config.execution, 1),
             "2026-03-27T00:00:00Z".to_string(),
             "https://rpc.example".to_string(),
             "creator".to_string(),
             "mint".to_string(),
             Some("creator".to_string()),
             None,
+            vec![],
         );
 
         assert_eq!(report.transactions.len(), 1);
         assert_eq!(report.transactions[0].label, "launch");
+    }
+
+    #[test]
+    fn report_uses_actual_loaded_lookup_tables() {
+        let mut config = regular_config();
+        config.tx.useDefaultLookupTables = true;
+        config.tx.lookupTables = vec!["CustomLookup1111111111111111111111111111111".to_string()];
+
+        let report = build_report(
+            &config,
+            &crate::transport::build_transport_plan(&config.execution, 2),
+            "2026-03-27T00:00:00Z".to_string(),
+            "https://rpc.example".to_string(),
+            "creator".to_string(),
+            "mint".to_string(),
+            Some("creator".to_string()),
+            None,
+            vec!["LoadedLookup2222222222222222222222222222222".to_string()],
+        );
+
+        assert_eq!(
+            report.requestedLookupTables,
+            vec![
+                "AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ".to_string(),
+                "CustomLookup1111111111111111111111111111111".to_string()
+            ]
+        );
+        assert_eq!(
+            report.loadedLookupTables,
+            vec!["LoadedLookup2222222222222222222222222222222".to_string()]
+        );
     }
 }
