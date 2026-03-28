@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LaunchDeck</title>
+    <script>
+      try {
+        document.documentElement.classList.add("boot-pending");
+        if (window.localStorage.getItem("launchdeck.themeMode") === "light") {
+          document.documentElement.classList.add("theme-light");
+        }
+        if (window.localStorage.getItem("launchdeck.outputSectionVisible") === "false") {
+          document.documentElement.classList.add("output-hidden");
+        }
+        window.__launchdeckBootFallback = window.setTimeout(() => {
+          document.documentElement.classList.remove("boot-pending");
+        }, 4000);
+      } catch (_error) {
+        // Ignore storage access failures before app boot.
+      }
+    </script>
+    <link rel="preload" as="image" href="/solana-mark.png">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <form id="launch-form" class="flow">
+        <section class="card launch-surface">
+          <div class="launch-surface-section launch-surface-wallet">
+            <div class="wallet-box">
+              <div class="wallet-inline-row">
+                <button
+                  id="wallet-trigger-button"
+                  type="button"
+                  class="wallet-trigger-button"
+                  aria-expanded="false"
+                  aria-controls="wallet-dropdown"
+                >
+                  <span class="wallet-trigger-summary">
+                    <img src="/solana-mark.png" alt="SOL" class="wallet-balance-icon">
+                    <strong id="wallet-summary-sol" class="wallet-summary-value">0.00</strong>
+                    <span class="wallet-summary-divider">|</span>
+                    <img src="/usd1-mark.png" alt="USD1" class="wallet-balance-icon wallet-balance-icon-usd1">
+                    <strong id="wallet-summary-usd" class="wallet-summary-value">0.00</strong>
+                  </span>
+                  <span class="wallet-trigger-chevron" aria-hidden="true"></span>
+                </button>
+                <div class="wallet-inline-controls">
+                  <div class="wallet-preset-panel">
+                    <div id="top-preset-chip-bar" class="preset-chip-bar top-preset-chip-bar"></div>
+                  </div>
+                  <button id="open-vamp-button" type="button" class="preset-chip compact wallet-chip-button">Vamp</button>
+                  <button id="open-popout-button" type="button" class="preset-chip compact wallet-chip-button">Popout</button>
+                  <button id="toggle-output-button" type="button" class="preset-chip compact wallet-chip-button">Output</button>
+                  <button id="toggle-theme-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Switch to white mode" aria-label="Switch to white mode">&#9728;</button>
+                  <button id="open-settings-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Settings" aria-label="Settings">&#9881;</button>
+                </div>
+              </div>
+              <div id="wallet-dropdown" class="wallet-dropdown" hidden>
+                <div class="wallet-dropdown-header">
+                  <span class="wallet-dropdown-title">Select wallet</span>
+                  <button id="wallet-refresh-button" type="button" class="wallet-refresh-button" title="Refresh balances" aria-label="Refresh balances">&#8635;</button>
+                </div>
+                <div id="wallet-dropdown-list" class="wallet-dropdown-list"></div>
+              </div>
+              <select id="wallet-select" hidden aria-hidden="true" tabindex="-1"></select>
+            </div>
+          </div>
+
+          <div class="launch-surface-section launch-surface-platform">
+          <h2>Platform <span class="section-tag required">required</span></h2>
+          <div class="launchpad-grid">
+            <label class="launchpad-option">
+              <input type="radio" name="launchpad" value="pump" checked>
+              <span class="launchpad-option-content">
+                <span class="launchpad-mark-wrap">
+                  <img src="/pump-mark.png" alt="" class="launchpad-mark">
+                </span>
+                <span class="launchpad-title">__PUMP_LABEL__</span>
+              </span>
+            </label>
+            <label class="launchpad-option">
+              <input type="radio" name="launchpad" value="bonk">
+              <span class="launchpad-option-content">
+                <span class="launchpad-mark-wrap">
+                  <img src="/bonk-mark.png" alt="" class="launchpad-mark">
+                </span>
+                <span class="launchpad-title">__BONK_LABEL__</span>
+              </span>
+            </label>
+            <label class="launchpad-option">
+              <input type="radio" name="launchpad" value="bagsapp">
+              <span class="launchpad-option-content">
+                <span class="launchpad-mark-wrap">
+                  <img src="/bagsapp-mark.png" alt="" class="launchpad-mark">
+                </span>
+                <span class="launchpad-title">__BAGSAPP_LABEL__</span>
+              </span>
+            </label>
+          </div>
+          </div>
+
+        <div class="launch-surface-section launch-surface-token">
+          <div class="stack">
+            <div class="image-panel-wrap">
+              <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+              <button id="open-image-library-button" type="button" class="image-panel">
+                <div class="image-preview-wrap">
+                  <img id="image-preview" alt="Token preview" hidden>
+                  <div id="image-empty" class="image-empty">
+                    <span class="image-empty-title">Select Image</span>
+                    <span class="tag required image-empty-tag">required</span>
+                  </div>
+                </div>
+              </button>
+              <div class="image-meta">
+                <div id="image-status" class="muted small"></div>
+                <div id="image-path" class="mono small"></div>
+              </div>
+            </div>
+            <div class="row two token-primary-row">
+              <label>
+                <span class="field-head">
+                  <span class="field-head-main">Name <span class="tag required">required</span></span>
+                  <span id="name-char-count" class="field-count">0/32</span>
+                </span>
+                <input name="name" type="text" placeholder="Coin Name" required maxlength="32">
+              </label>
+              <label>
+                <span class="field-head">
+                  <span class="field-head-main">Ticker <span class="tag required">required</span></span>
+                  <span class="field-head-actions">
+                    <button id="ticker-caps-toggle" type="button" class="field-mini-toggle">All Caps</button>
+                    <span id="symbol-char-count" class="field-count">0/10</span>
+                  </span>
+                </span>
+                <input name="symbol" type="text" placeholder="Coin Ticker" required maxlength="10">
+              </label>
+            </div>
+            <div class="description-disclosure" id="description-disclosure">
+              <button
+                id="description-toggle"
+                type="button"
+                class="description-toggle"
+                aria-expanded="false"
+                aria-controls="description-panel-body"
+              >
+                <span class="description-toggle-main">
+                  <span class="description-toggle-icon">&#9716;</span>
+                  <span>Description</span>
+                </span>
+                <span class="description-toggle-meta">
+                  <span class="tag optional">optional</span>
+                  <span id="description-char-count" class="field-count">0/500</span>
+                  <span class="description-toggle-chevron">&#8964;</span>
+                </span>
+              </button>
+              <div id="description-panel-body" class="description-panel-body" hidden>
+                <label class="description-panel-field">
+                  <span>Description</span>
+                  <textarea name="description" rows="4" maxlength="500" placeholder="Tell people what this token is about"></textarea>
+                </label>
+              </div>
+            </div>
+            <div class="row three">
+              <label>
+                <span>Website <span class="tag optional">optional</span></span>
+                <input name="website" type="text" placeholder="https://...">
+                <div class="field-error" data-error-for="website"></div>
+              </label>
+              <label>
+                <span>Twitter / X <span class="tag optional">optional</span></span>
+                <input name="twitter" type="text" placeholder="https://x.com/...">
+                <div class="field-error" data-error-for="twitter"></div>
+              </label>
+              <label>
+                <span>Telegram <span class="tag optional">optional</span></span>
+                <input name="telegram" type="text" placeholder="https://t.me/...">
+                <div class="field-error" data-error-for="telegram"></div>
+              </label>
+            </div>
+            <input id="metadata-uri" type="hidden" value="">
+            <input id="metadata-status" type="hidden" value="">
+          </div>
+        </div>
+
+        <div class="launch-surface-section launch-surface-mode">
+          <h2>Mode <span class="section-tag required">required</span></h2>
+          <div class="mode-grid mode-grid-three">
+            <label class="mode-option">
+              <input type="radio" name="mode" value="regular" checked>
+              <span class="mode-title">regular</span>
+              <span class="tooltip-dot" title="Standard Pump launch. Creator rewards go to the deployer unless you apply a separate fee split.">?</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="cashback">
+              <span class="mode-title">cashback</span>
+              <span class="tooltip-dot" title="Creator rewards are redirected to traders as cashback. Trading behavior is unchanged.">?</span>
+            </label>
+            <label class="mode-option">
+              <input name="mayhemMode" type="checkbox">
+              <span class="mode-title">mayhem</span>
+              <span class="tooltip-dot" title="Enables Pump mayhem-mode behavior.">?</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="agent-custom">
+              <span class="mode-title">agent-custom</span>
+              <span class="tooltip-dot" title="Creates the token first, then bundles agent setup and your custom reward split right after launch. Pump only allows creator reward distribution to be configured once, so this becomes final immediately.">?</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="agent-unlocked">
+              <span class="mode-title">agent-unlocked</span>
+              <span class="tooltip-dot" title="Initializes the agent only and leaves creator reward distribution untouched. Use this if you want to preserve Pump's one allowed reward-distribution setup for later.">?</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="agent-locked">
+              <span class="mode-title">agent-locked</span>
+              <span class="tooltip-dot" title="Creates the token first, then bundles agent setup that routes 100% of creator rewards to the agent. Because reward distribution is configured immediately, it is final from the start.">?</span>
+            </label>
+          </div>
+
+          <div class="stack mode-panel" data-mode-panel="regular" hidden></div>
+
+          <div class="stack mode-panel" data-mode-panel="cashback" hidden></div>
+
+          <div class="stack mode-panel" data-mode-panel="agent-custom" hidden></div>
+
+          <div class="stack mode-panel" data-mode-panel="agent-unlocked" hidden>
+            <div class="row two">
+              <label class="locked-field">
+                <span>Agent authority</span>
+                <input id="agent-unlocked-authority" type="text" disabled>
+              </label>
+              <label>
+                <span>Buyback %</span>
+                <input id="agent-unlocked-buyback" name="agentUnlockedBuybackPercent" type="number" min="0" max="100" step="0.01" value="0">
+                <div class="field-error" data-error-for="agentUnlockedBuybackPercent"></div>
+              </label>
+            </div>
+          </div>
+
+          <div class="stack mode-panel" data-mode-panel="agent-locked" hidden></div>
+
+          <div class="mode-divider" aria-hidden="true"></div>
+
+          <div class="mode-action-row">
+            <button type="button" id="fee-split-pill" class="button subtle mode-action-button fee-split-action-button" title="Enable fee-sharing split after launch.">
+              <span class="mode-title">Fee Split</span>
+            </button>
+            <button id="mode-vanity-button" type="button" class="button subtle mode-action-button">
+              <span class="mode-title">Vanity</span>
+            </button>
+            <button id="mode-sniper-button" type="button" class="button subtle mode-action-button">
+              <span class="mode-title">Snipe</span>
+            </button>
+            <div class="auto-sell-popover">
+              <button id="dev-auto-sell-button" type="button" class="button subtle auto-sell-trigger mode-action-button">
+                <span class="mode-title">Auto-Sell</span>
+              </button>
+              <div id="dev-auto-sell-panel" class="auto-sell-popover-panel" hidden>
+                <div class="auto-sell-popover-header">
+                  <div class="auto-sell-popover-title">
+                    Auto-Sell
+                    <span class="tooltip-dot inline" title="Automatic selling behavior for your launch positions.">?</span>
+                  </div>
+                </div>
+                <div class="auto-sell-card">
+                  <div class="auto-sell-panel-head">
+                    <div class="auto-sell-panel-title">
+                      <span class="auto-sell-dot"></span>
+                      <span>Dev Auto-Sell</span>
+                    </div>
+                    <label class="auto-sell-toggle">
+                      <input id="auto-sell-enabled-input" name="automaticDevSellEnabled" type="checkbox" hidden>
+                      <span id="auto-sell-toggle-state">OFF</span>
+                    </label>
+                  </div>
+                  <div id="auto-sell-settings" class="auto-sell-settings" hidden>
+                    <div class="auto-sell-slider-block">
+                      <div class="auto-sell-slider-head">
+                        <span>Delay</span>
+                        <strong id="auto-sell-delay-value">0.0s</strong>
+                      </div>
+                      <input id="auto-sell-delay-slider" class="auto-sell-slider" type="range" min="0" max="10" step="0.1" value="0">
+                      <input name="automaticDevSellDelaySeconds" type="hidden" value="0">
+                      <div class="field-error" data-error-for="automaticDevSellDelaySeconds"></div>
+                    </div>
+                    <div class="auto-sell-slider-block">
+                      <div class="auto-sell-slider-head">
+                        <span>Sell Amount</span>
+                        <strong id="auto-sell-percent-value">0%</strong>
+                      </div>
+                      <input id="auto-sell-percent-slider" class="auto-sell-slider" type="range" min="0" max="100" step="1" value="0">
+                      <input name="automaticDevSellPercent" type="hidden" value="0">
+                      <div class="field-error" data-error-for="automaticDevSellPercent"></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <input name="feeSplitEnabled" type="checkbox" hidden>
+          <input name="postLaunchStrategy" type="hidden" value="none">
+          <input name="snipeBuyAmountSol" type="hidden" value="">
+          <input name="sniperEnabled" type="hidden" value="false">
+          <input name="sniperConfigJson" type="hidden" value="[]">
+          <input name="vanityPrivateKey" type="hidden" value="">
+        </div>
+
+        <div class="launch-surface-section launch-surface-dev-buy">
+          <div class="section-head">
+            <h2>Dev Buy <span class="section-tag optional">optional</span></h2>
+          </div>
+          <div class="stack">
+            <div class="dev-buy-quick-head">
+              <span class="dev-buy-quick-title">Quick Deploy</span>
+              <div class="dev-buy-quick-actions">
+                <button
+                  id="change-dev-buy-presets-button"
+                  type="button"
+                  class="dev-buy-change-presets"
+                  aria-expanded="false"
+                  aria-controls="dev-buy-quick-buttons"
+                >
+                  Change Presets
+                </button>
+                <button id="cancel-dev-buy-presets-button" type="button" class="dev-buy-change-presets dev-buy-quick-action-button" hidden>Cancel</button>
+                <button id="save-dev-buy-presets-button" type="button" class="dev-buy-change-presets dev-buy-quick-action-button" hidden>Save</button>
+              </div>
+            </div>
+            <div id="dev-buy-quick-buttons" class="dev-buy-quick-grid"></div>
+            <label class="dev-buy-hidden-inputs" hidden>
+              <input name="devBuyMode" type="hidden" value="sol">
+              <input name="devBuyAmount" type="hidden" value="">
+            </label>
+            <div class="field-error" data-error-for="devBuyAmount"></div>
+            <div class="dev-buy-custom-wrap">
+              <div class="dev-buy-custom-label">Custom Amount</div>
+              <div class="dev-buy-custom-grid">
+                <label class="dev-buy-custom-field">
+                  <span class="dev-buy-custom-prefix dev-buy-custom-prefix-icon">
+                    <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo">
+                  </span>
+                  <input id="dev-buy-sol-input" type="text" inputmode="decimal" placeholder="0.0">
+                </label>
+                <label class="dev-buy-custom-field">
+                  <span class="dev-buy-custom-prefix">%</span>
+                  <input id="dev-buy-percent-input" type="text" inputmode="decimal" placeholder="0">
+                </label>
+                <button id="dev-buy-custom-deploy" type="button" class="button deploy dev-buy-custom-deploy">Deploy</button>
+              </div>
+            </div>
+            <div id="quote-output" class="quote muted" hidden>No dev buy selected.</div>
+          </div>
+        </div>
+
+        <div id="output-section" class="launch-surface-section launch-surface-output output">
+          <div class="output-head">
+            <h2>Output</h2>
+            <div class="output-head-actions">
+              <button type="button" data-action="build" class="button subtle output-head-button">Build</button>
+              <button type="button" data-action="simulate" class="button subtle output-head-button">Simulate</button>
+              <button id="test-fill-button" type="button" class="button subtle output-head-button output-dev-button">Test</button>
+              <span id="status" class="status">Idle</span>
+            </div>
+          </div>
+          <div id="meta" class="meta muted"></div>
+          <pre id="output" class="console">Ready.</pre>
+        </div>
+        </section>
+
+      </form>
+    </main>
+
+    <div id="settings-modal" class="modal-overlay" hidden>
+      <div class="modal settings-modal">
+        <div class="modal-header">
+          <h3>Settings</h3>
+          <button type="button" id="settings-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body settings-modal-body">
+          <section class="settings-preset-toolbar">
+            <div class="settings-preset-copy">
+              <span class="settings-preset-label">Active Preset</span>
+              <div id="settings-preset-chip-bar" class="preset-chip-bar settings-preset-chip-bar"></div>
+            </div>
+            <button type="button" id="preset-edit-toggle" class="preset-edit-toggle button subtle" aria-pressed="false" title="Unlock preset editing">&#9998;</button>
+          </section>
+
+          <section class="stack settings-section settings-section-modern">
+            <div class="settings-section-title-row">
+              <div>
+                <h4>Creation Settings</h4>
+                <p class="settings-section-copy">Launch route, creation fees, and preset quick deploy amount.</p>
+              </div>
+              <span class="settings-section-pill">Creation</span>
+            </div>
+            <div class="settings-grid settings-grid-three">
+              <label>
+                <span>Route</span>
+                <select name="creationProvider" id="provider-select">
+                  <option value="helius" selected>Helius</option>
+                  <option value="jito">Jito</option>
+                  <option value="astralane">Astralane</option>
+                  <option value="bloxroute">bloXroute</option>
+                  <option value="hellomoon">Hello Moon</option>
+                </select>
+              </label>
+              <label>
+                <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                <input name="creationTipSol" id="creation-tip-input" type="text" placeholder="0.01">
+                <div class="field-error" data-error-for="creationTipSol"></div>
+              </label>
+              <label>
+                <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                <input name="creationPriorityFeeSol" id="creation-priority-input" type="text" placeholder="0.001">
+                <div class="field-error" data-error-for="creationPriorityFeeSol"></div>
+              </label>
+            </div>
+          </section>
+
+          <section class="stack settings-section settings-section-modern">
+            <div class="settings-section-title-row">
+              <div>
+                <h4>Buy Settings</h4>
+                <p class="settings-section-copy">Sniper buy route, fees, slippage, and post-launch buy defaults.</p>
+              </div>
+              <span class="settings-section-pill">Buy</span>
+            </div>
+            <div class="settings-grid settings-grid-three">
+              <label>
+                <span>Route</span>
+                <select name="buyProvider" id="buy-provider-select">
+                  <option value="helius" selected>Helius</option>
+                  <option value="jito">Jito</option>
+                  <option value="astralane">Astralane</option>
+                  <option value="bloxroute">bloXroute</option>
+                  <option value="hellomoon">Hello Moon</option>
+                </select>
+              </label>
+              <label>
+                <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                <input name="buyPriorityFeeSol" id="buy-priority-fee-input" type="text" placeholder="0.009">
+                <div class="field-error" data-error-for="buyPriorityFeeSol"></div>
+              </label>
+              <label>
+                <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                <input name="buyTipSol" id="buy-tip-input" type="text" placeholder="0.01">
+                <div class="field-error" data-error-for="buyTipSol"></div>
+              </label>
+            </div>
+            <div class="settings-grid settings-grid-three">
+              <label>
+                <span>Slippage (%)</span>
+                <input name="buySlippagePercent" id="buy-slippage-input" type="text" placeholder="90">
+                <div class="field-error" data-error-for="buySlippagePercent"></div>
+              </label>
+            </div>
+          </section>
+
+          <section class="stack settings-section settings-section-modern">
+            <div class="settings-section-title-row">
+              <div>
+                <h4>Sell Settings</h4>
+                <p class="settings-section-copy">Sell-side routing for sniper sell and dev auto-sell defaults.</p>
+              </div>
+              <span class="settings-section-pill">Sell</span>
+            </div>
+            <div class="settings-grid settings-grid-three">
+              <label>
+                <span>Route</span>
+                <select name="sellProvider" id="sell-provider-select">
+                  <option value="helius" selected>Helius</option>
+                  <option value="jito">Jito</option>
+                  <option value="astralane">Astralane</option>
+                  <option value="bloxroute">bloXroute</option>
+                  <option value="hellomoon">Hello Moon</option>
+                </select>
+              </label>
+              <label>
+                <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                <input name="sellPriorityFeeSol" id="sell-priority-fee-input" type="text" placeholder="0.009">
+                <div class="field-error" data-error-for="sellPriorityFeeSol"></div>
+              </label>
+              <label>
+                <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                <input name="sellTipSol" id="sell-tip-input" type="text" placeholder="0.01">
+                <div class="field-error" data-error-for="sellTipSol"></div>
+              </label>
+            </div>
+            <div class="settings-grid settings-grid-three">
+              <label>
+                <span>Slippage (%)</span>
+                <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="90">
+                <div class="field-error" data-error-for="sellSlippagePercent"></div>
+              </label>
+            </div>
+          </section>
+
+          <input name="skipPreflight" type="hidden" value="false">
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="settings-cancel" class="button">Close</button>
+          <button type="button" id="save-settings-button" class="button deploy">Save Settings</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="image-library-modal" class="modal-overlay" hidden>
+      <div class="modal image-library-modal">
+        <div class="modal-header">
+          <h3>Image Library</h3>
+          <button type="button" id="image-library-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body image-library-body">
+          <div class="image-library-topbar">
+            <label class="image-library-search">
+              <span class="image-library-search-icon">&#128269;</span>
+              <input id="image-library-search-input" type="text" placeholder="Search images by name, tags...">
+            </label>
+            <button id="image-library-upload-button" type="button" class="button subtle image-library-upload-button">Upload</button>
+          </div>
+          <div class="image-library-section-label">Categories</div>
+          <div class="image-library-categories">
+            <button type="button" class="image-category-chip active" data-image-category="favorites">Favorites</button>
+            <button type="button" class="image-category-chip" data-image-category="all">All</button>
+            <button type="button" id="new-image-category-button" class="image-category-chip image-category-chip-new">+ New</button>
+            <div id="image-category-chips" class="image-category-dynamic"></div>
+          </div>
+          <div class="image-library-grid-shell">
+            <div id="image-library-grid" class="image-library-grid"></div>
+            <div id="image-library-empty" class="image-library-empty" hidden>No images found.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="sniper-modal" class="modal-overlay" hidden>
+      <div class="modal sniper-modal">
+        <div class="modal-header sniper-modal-header">
+          <div>
+            <h3>Sniper Configuration</h3>
+            <div class="muted small">Select wallets and configure amounts.</div>
+          </div>
+          <div class="sniper-modal-actions">
+            <button type="button" id="sniper-refresh-button" class="button subtle sniper-header-button">Refresh</button>
+            <button type="button" id="sniper-reset-button" class="button subtle sniper-header-button">Reset</button>
+            <button type="button" id="sniper-close" class="modal-close">&times;</button>
+          </div>
+        </div>
+        <div class="modal-body sniper-modal-body">
+          <div class="sniper-card">
+            <div class="sniper-card-head">
+              <div class="sniper-card-title">
+                <span class="sniper-card-icon"><img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                <div>
+                  <strong>Sniper</strong>
+                  <div class="muted small">Buy in next blocks with selected wallets after creation.</div>
+                </div>
+              </div>
+              <label class="auto-sell-toggle sniper-enable-toggle">
+                <input id="sniper-enabled-toggle" type="checkbox" hidden>
+                <span id="sniper-enabled-state">OFF</span>
+              </label>
+            </div>
+            <div id="sniper-wallets-section" class="sniper-wallets-section" hidden>
+              <div class="sniper-wallets-header">
+                <div class="muted small">Selected deployer wallet is disabled because it already creates the token.</div>
+                <div id="sniper-selection-summary" class="muted small">0 wallets selected</div>
+              </div>
+              <div id="sniper-wallet-list" class="sniper-wallet-list"></div>
+              <div id="sniper-modal-error" class="field-error sniper-modal-error"></div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="sniper-cancel" class="button">Close</button>
+          <button type="button" id="sniper-save" class="button deploy">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fee-split-modal" class="modal-overlay" hidden>
+      <div class="modal fee-split-modal">
+        <div class="modal-header">
+          <div>
+            <h3>Fee Split</h3>
+            <div class="muted small">Wallet addresses or GitHub usernames. Total must equal 100%.</div>
+          </div>
+          <button type="button" id="fee-split-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="fee-split-header">
+            <div>
+              <strong>Recipients</strong>
+              <div class="muted small">Creator rewards will be routed using this split after launch.</div>
+            </div>
+            <div id="fee-split-total" class="fee-split-total">0%</div>
+          </div>
+          <div id="fee-split-list" class="fee-split-list"></div>
+          <div class="fee-split-actions">
+            <button id="fee-split-add" type="button" class="button subtle">+ Add</button>
+            <button id="fee-split-reset" type="button" class="button subtle">Reset</button>
+            <button id="fee-split-even" type="button" class="button subtle">Split evenly</button>
+          </div>
+          <div class="fee-split-legend">
+            <div id="fee-split-bar" class="fee-split-bar"></div>
+            <div id="fee-split-legend-list" class="fee-split-legend-list"></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="fee-split-disable" class="button">Disable</button>
+          <button type="button" id="fee-split-save" class="button deploy">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="agent-split-modal" class="modal-overlay" hidden>
+      <div class="modal fee-split-modal">
+        <div class="modal-header">
+          <div>
+            <h3>Agent Split</h3>
+            <div class="muted small">Bundled right after launch and final once created. Total must equal 100%.</div>
+          </div>
+          <button type="button" id="agent-split-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="fee-split-header">
+            <div>
+              <strong>Fee Split</strong>
+              <div class="muted small">Define the bundled agent buyback row plus any wallet or GitHub recipients.</div>
+            </div>
+            <div id="agent-split-total" class="fee-split-total">0%</div>
+          </div>
+          <div id="agent-split-list" class="fee-split-list"></div>
+          <div class="fee-split-actions">
+            <button id="agent-split-add" type="button" class="button subtle">+ Add recipient</button>
+            <button id="agent-split-reset" type="button" class="button subtle">Reset</button>
+            <button id="agent-split-even" type="button" class="button subtle">Split evenly</button>
+          </div>
+          <div class="fee-split-legend">
+            <div id="agent-split-bar" class="fee-split-bar"></div>
+            <div id="agent-split-legend-list" class="fee-split-legend-list"></div>
+          </div>
+          <div id="agent-split-modal-error" class="field-error"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="agent-split-cancel" class="button">Cancel</button>
+          <button type="button" id="agent-split-save" class="button deploy">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="vanity-modal" class="modal-overlay" hidden>
+      <div class="modal vanity-modal">
+        <div class="modal-header">
+          <h3>Vanity</h3>
+          <button type="button" id="vanity-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="stack">
+            <div class="muted small">Insert a private key to use for vanity CA generation. This is not saved to settings presets.</div>
+            <label>
+              <span>Private Key</span>
+              <textarea id="vanity-private-key-input" rows="4" placeholder="Paste vanity private key"></textarea>
+            </label>
+            <div id="vanity-modal-error" class="field-error"></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="vanity-clear" class="button">Clear</button>
+          <button type="button" id="vanity-save" class="button deploy">Apply Vanity Key</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="vamp-modal" class="modal-overlay" hidden>
+      <div class="modal vamp-modal">
+        <div class="modal-header">
+          <div>
+            <h3>Vamp</h3>
+            <div class="muted small">Paste a contract address to copy the token image, metadata, ticker, and links into the form.</div>
+          </div>
+          <button type="button" id="vamp-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="stack">
+            <label>
+              <span>Contract Address</span>
+              <input id="vamp-contract-input" type="text" inputmode="text" spellcheck="false" placeholder="Paste Solana mint / contract address">
+            </label>
+            <div id="vamp-status" class="quote muted" hidden></div>
+            <div id="vamp-error" class="field-error"></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="vamp-cancel" class="button">Cancel</button>
+          <button type="button" id="vamp-import" class="button deploy">Import</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="image-item-menu" class="image-item-menu" hidden>
+      <button type="button" id="image-menu-favorite" class="image-item-menu-button">Add to Favorites</button>
+      <button type="button" id="image-menu-edit" class="image-item-menu-button">Edit Details</button>
+      <button type="button" id="image-menu-delete" class="image-item-menu-button danger">Delete Image</button>
+    </div>
+
+    <div id="image-details-modal" class="modal-overlay" hidden>
+      <div class="modal image-details-modal">
+        <div class="modal-header">
+          <h3 id="image-details-title">Edit Image Details</h3>
+          <button type="button" id="image-details-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="stack">
+            <label>
+              <span>Name</span>
+              <input id="image-details-name" type="text" maxlength="64" placeholder="Image name">
+            </label>
+            <label>
+              <span>Tags</span>
+              <div class="image-tag-editor">
+                <input id="image-details-tags" type="text" placeholder="Add a tag...">
+                <button type="button" id="image-details-add-tag" class="image-tag-add-button">+</button>
+              </div>
+              <div id="image-details-tag-list" class="image-tag-list"></div>
+            </label>
+            <label id="image-details-category-row">
+              <span>Category</span>
+              <div class="image-category-editor">
+                <select id="image-details-category">
+                  <option value="">Uncategorized</option>
+                </select>
+                <button type="button" id="image-details-new-category" class="button subtle image-details-new-category">+ New</button>
+              </div>
+            </label>
+          </div>
+          <div id="image-details-error" class="field-error image-details-error"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="image-details-cancel" class="button">Cancel</button>
+          <button type="button" id="image-details-save" class="button deploy">Save Changes</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="image-category-modal" class="modal-overlay" hidden>
+      <div class="modal image-category-modal">
+        <div class="modal-header">
+          <h3>New Category</h3>
+          <button type="button" id="image-category-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="stack">
+            <label>
+              <span>Category Name</span>
+              <input id="image-category-name" type="text" maxlength="32" placeholder="Memes, Logos, Animals">
+            </label>
+          </div>
+          <div id="image-category-error" class="field-error image-details-error"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="image-category-cancel" class="button">Cancel</button>
+          <button type="button" id="image-category-save" class="button deploy">Create Category</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="deploy-modal" class="modal-overlay" hidden>
+      <div class="modal">
+        <div class="modal-header">
+          <h3>Confirm Deploy</h3>
+          <button type="button" id="modal-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-footer">
+          <button type="button" id="modal-cancel" class="button">Cancel</button>
+          <button type="button" id="modal-confirm" class="button deploy">Deploy to Mainnet</button>
+        </div>
+      </div>
+    </div>
+
+    <script>window.__LAUNCHDECK_BOOTSTRAP__ = __LAUNCHDECK_BOOTSTRAP__;</script>
+    <script src="/app.js"></script>
+  </body>
+</html>

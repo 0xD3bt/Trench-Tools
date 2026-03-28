@@ -1,0 +1,77 @@
+launchpad: pump
+mode: agent-custom
+
+token:
+  name: "My Agent Coin"
+  symbol: "AGENT"
+  uri: "https://example.com/metadata.json"
+  mayhemMode: false
+
+signer:
+  keypairFile: ""
+  secretKey: ""
+
+agent:
+  authority: ""
+  buybackBps: 5000
+  splitAgentInit: false
+
+tx:
+  computeUnitLimit: 300000
+  computeUnitPriceMicroLamports: 100000
+  jitoTipLamports: 0
+  jitoTipAccount: ""
+  useDefaultLookupTables: true
+  lookupTables: []
+  dumpBase64: false
+  writeReport: true
+
+execution:
+  provider: auto
+  policy: fast
+  autoGas: true
+  autoMode: launchAuto
+  priorityFeeSol: ""
+  tipSol: ""
+  maxPriorityFeeSol: ""
+  maxTipSol: ""
+  buyProvider: auto
+  buyPolicy: fast
+  buyAutoGas: true
+  buyAutoMode: buyAuto
+  buyPriorityFeeSol: ""
+  buyTipSol: ""
+  buyMaxPriorityFeeSol: ""
+  buyMaxTipSol: ""
+  simulate: false
+  send: false
+  txFormat: auto
+  commitment: confirmed
+  skipPreflight: false
+
+# Leave both shorthand fields blank for no dev buy.
+initialBuySol: ""
+initialBuyTokens: ""
+
+# Optional object form. Use this instead of the shorthand fields above if you prefer.
+devBuy:
+  mode: ""
+  amount: ""
+
+postLaunch:
+  strategy: none
+  snipeOwnLaunch:
+    buyAmountSol: ""
+  automaticDevSell:
+    enabled: false
+    percent: 0
+    delaySeconds: 0
+
+presets:
+  selectedLaunchPresetId: ""
+  selectedSniperPresetId: ""
+
+# Only used in regular mode when you want to build a later one-time fee-sharing setup artifact.
+feeSharing:
+  generateLaterSetup: false
+  recipients: []
