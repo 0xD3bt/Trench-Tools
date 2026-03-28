@@ -30,6 +30,7 @@ use crate::{
         fetch_latest_blockhash_cached,
     },
     transport::TransportPlan,
+    wallet::read_keypair_bytes,
 };
 
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -136,7 +137,7 @@ pub async fn try_compile_native_pump(
     let creator_keypair = keypair_from_secret_bytes(wallet_secret)?;
     let creator = creator_keypair.pubkey();
     let agent_authority = resolve_agent_authority(config, &creator)?;
-    let mint_keypair = Keypair::new();
+    let mint_keypair = resolve_mint_keypair(config)?;
     let mint = mint_keypair.pubkey();
     let separate_tip_transaction =
         transport_plan.separateTipTransaction && config.tx.jitoTipLamports > 0;
@@ -520,6 +521,16 @@ fn cache_global_state(state: &PumpGlobalState) {
 
 fn keypair_from_secret_bytes(bytes: &[u8]) -> Result<Keypair, String> {
     Keypair::try_from(bytes).map_err(|error| error.to_string())
+}
+
+fn resolve_mint_keypair(config: &NormalizedConfig) -> Result<Keypair, String> {
+    let vanity_private_key = config.vanityPrivateKey.trim();
+    if vanity_private_key.is_empty() {
+        return Ok(Keypair::new());
+    }
+    let bytes = read_keypair_bytes(vanity_private_key)
+        .map_err(|error| format!("Invalid vanity private key: {error}"))?;
+    keypair_from_secret_bytes(&bytes).map_err(|error| format!("Invalid vanity private key: {error}"))
 }
 
 fn parse_pubkey(value: &str, label: &str) -> Result<Pubkey, String> {
@@ -2337,6 +2348,27 @@ mod tests {
     fn supports_plain_regular_pump_launches() {
         let config = regular_config();
         assert!(supports_native_pump_compile(&config));
+    }
+
+    #[test]
+    fn resolve_mint_keypair_uses_vanity_private_key_when_present() {
+        let vanity_keypair = Keypair::new();
+        let mut config = regular_config();
+        config.vanityPrivateKey = bs58::encode(vanity_keypair.to_bytes()).into_string();
+
+        let resolved = resolve_mint_keypair(&config).expect("vanity mint keypair");
+
+        assert_eq!(resolved.pubkey(), vanity_keypair.pubkey());
+    }
+
+    #[test]
+    fn resolve_mint_keypair_rejects_invalid_vanity_private_key() {
+        let mut config = regular_config();
+        config.vanityPrivateKey = "not-a-keypair".to_string();
+
+        let error = resolve_mint_keypair(&config).expect_err("invalid vanity key should fail");
+
+        assert!(error.contains("Invalid vanity private key"));
     }
 
     #[test]

@@ -188,6 +188,7 @@ const REPORTS_TERMINAL_VISIBILITY_KEY = "launchdeck.reportsTerminalVisible";
 const REPORTS_TERMINAL_SORT_KEY = "launchdeck.reportsTerminalSort";
 const REPORTS_TERMINAL_LIST_WIDTH_KEY = "launchdeck.reportsTerminalListWidth";
 const THEME_MODE_STORAGE_KEY = "launchdeck.themeMode";
+const SELECTED_WALLET_STORAGE_KEY = "launchdeck.selectedWalletKey";
 const pageSearchParams = new URLSearchParams(window.location.search);
 const isPopoutMode = pageSearchParams.get("popout") === "1";
 const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
@@ -261,6 +262,7 @@ const SPLIT_COLORS = ["#5b7cff", "#ff5d5d", "#14c38e", "#ffb020", "#7c5cff", "#0
 const DEFAULT_QUICK_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
 const DEFAULT_PRESET_ID = "preset1";
 const METADATA_PREUPLOAD_DEBOUNCE_MS = 500;
+const MAX_FEE_SPLIT_RECIPIENTS = 10;
 const SNIPER_BALANCE_PRESETS = [
   { label: "MAX", ratio: 1 },
   { label: "75%", ratio: 0.75 },
@@ -851,6 +853,16 @@ function getMode() {
   return checked ? checked.value : "regular";
 }
 
+function setMode(mode) {
+  const normalized = String(mode || "").trim();
+  const target = normalized || "regular";
+  const next = form.querySelector(`input[name="mode"][value="${CSS.escape(target)}"]`)
+    || form.querySelector('input[name="mode"][value="regular"]');
+  if (!next) return;
+  next.checked = true;
+  updateModeVisibility();
+}
+
 function getDevBuyMode() {
   const explicit = getNamedValue("devBuyMode");
   return explicit || "sol";
@@ -1310,6 +1322,7 @@ async function importVampToken() {
     if (websiteInput) websiteInput.value = payload.token && payload.token.website ? payload.token.website : "";
     if (twitterInput) twitterInput.value = payload.token && payload.token.twitter ? payload.token.twitter : "";
     if (telegramInput) telegramInput.value = payload.token && payload.token.telegram ? payload.token.telegram : "";
+    setMode(payload.token && payload.token.mode ? payload.token.mode : "regular");
     clearMetadataUploadCache({ clearInput: true });
     updateTokenFieldCounts();
 
@@ -1592,6 +1605,27 @@ function selectedWalletKey() {
   return walletSelect.value || "";
 }
 
+function getStoredSelectedWalletKey() {
+  try {
+    return window.localStorage.getItem(SELECTED_WALLET_STORAGE_KEY) || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function setStoredSelectedWalletKey(walletKey) {
+  try {
+    const normalized = String(walletKey || "").trim();
+    if (!normalized) {
+      window.localStorage.removeItem(SELECTED_WALLET_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(SELECTED_WALLET_STORAGE_KEY, normalized);
+  } catch (_error) {
+    // Ignore storage access failures and keep the UI functional.
+  }
+}
+
 function shortAddress(value) {
   if (!value) return "-";
   if (value.length <= 10) return value;
@@ -1808,6 +1842,7 @@ function syncFeeSplitTotals() {
   feeSplitTotal.classList.toggle("invalid", Math.abs(total - 100) > 0.001 && total !== 0);
   feeSplitReset.disabled = rows.length === 0;
   feeSplitEven.disabled = rows.length === 0;
+  if (feeSplitAdd) feeSplitAdd.disabled = rows.length >= MAX_FEE_SPLIT_RECIPIENTS;
 
   if (rows.length === 0 || total === 0) {
     feeSplitBar.style.background = "#1e2630";
@@ -1850,20 +1885,27 @@ function syncFeeSplitTotals() {
 }
 
 function updateFeeSplitVisibility() {
-  const active = getMode() === "regular" && feeSplitEnabled.checked;
+  const mode = getMode();
+  const active = mode === "agent-custom" || (mode === "regular" && feeSplitEnabled.checked);
   feeSplitPill.classList.toggle("active", active);
-  feeSplitPill.disabled = getMode() !== "regular";
-  if (active) ensureFeeSplitDefaultRow();
-  if (!active && feeSplitModal) feeSplitModal.hidden = true;
+  feeSplitPill.disabled = mode !== "regular" && mode !== "agent-custom";
+  if (mode === "regular" && active) ensureFeeSplitDefaultRow();
+  if (mode !== "regular" && feeSplitModal) feeSplitModal.hidden = true;
   syncFeeSplitTotals();
   syncSettingsCapabilities();
 }
 
 function showFeeSplitModal() {
-  if (getMode() !== "regular") return;
-  feeSplitEnabled.checked = true;
-  updateFeeSplitVisibility();
-  if (feeSplitModal) feeSplitModal.hidden = false;
+  const mode = getMode();
+  if (mode === "regular") {
+    feeSplitEnabled.checked = true;
+    updateFeeSplitVisibility();
+    if (feeSplitModal) feeSplitModal.hidden = false;
+    return;
+  }
+  if (mode === "agent-custom") {
+    showAgentSplitModal();
+  }
 }
 
 function hideFeeSplitModal() {
@@ -1938,6 +1980,7 @@ function syncAgentSplitTotals() {
   agentSplitTotal.classList.toggle("invalid", Math.abs(total - 100) > 0.001 && total !== 0);
   agentSplitReset.disabled = rows.length === 0;
   agentSplitEven.disabled = rows.length === 0;
+  if (agentSplitAdd) agentSplitAdd.disabled = rows.length >= MAX_FEE_SPLIT_RECIPIENTS;
 
   if (rows.length === 0 || total === 0) {
     agentSplitBar.style.background = "#1e2630";
@@ -1981,7 +2024,9 @@ function syncAgentSplitTotals() {
 
 function initAgentSplitIfEmpty() {
   if (agentSplitList.children.length === 0) {
-    resetAgentSplitToDefault();
+    if (!seedAgentSplitFromFeeSplit()) {
+      resetAgentSplitToDefault();
+    }
   }
 }
 
@@ -1999,6 +2044,34 @@ function hideAgentSplitModal() {
 
 function setAgentSplitModalError(message = "") {
   if (agentSplitModalError) agentSplitModalError.textContent = message;
+}
+
+function seedAgentSplitFromFeeSplit() {
+  if (!agentSplitList) return false;
+  const regularRows = getFeeSplitRows();
+  if (!regularRows.length) return false;
+  const defaultReceiverRow = regularRows.find((row) => row.dataset.defaultReceiver === "true");
+  if (!defaultReceiverRow) return false;
+
+  const agentSharePercent = defaultReceiverRow.querySelector(".recipient-share").value.trim() || "0";
+  const carriedRows = regularRows
+    .filter((row) => row !== defaultReceiverRow)
+    .map((row) => ({
+      type: row.dataset.type || "wallet",
+      value: row.querySelector(".recipient-target").value.trim(),
+      sharePercent: row.querySelector(".recipient-share").value.trim(),
+      targetLocked: row.dataset.targetLocked === "true",
+    }))
+    .filter((entry) => entry.value || entry.sharePercent);
+
+  agentSplitList.innerHTML = "";
+  agentSplitList.appendChild(createAgentSplitRow({ locked: true, sharePercent: agentSharePercent }));
+  carriedRows.forEach((entry) => {
+    agentSplitList.appendChild(createAgentSplitRow(entry));
+  });
+  syncAgentSplitTotals();
+  setAgentSplitModalError("");
+  return true;
 }
 
 function resetAgentSplitToDefault() {
@@ -2578,6 +2651,17 @@ async function bootstrapApp() {
     throw new Error(payload.error || "Failed to load app bootstrap.");
   }
   applyWalletStatusPayload(payload);
+  const storedWalletKey = getStoredSelectedWalletKey();
+  const availableWallets = Array.isArray(payload.wallets) ? payload.wallets : [];
+  if (
+    storedWalletKey
+    && storedWalletKey !== (payload.selectedWalletKey || "")
+    && availableWallets.some((wallet) => wallet && wallet.envKey === storedWalletKey)
+    && walletSelect
+  ) {
+    walletSelect.value = storedWalletKey;
+    await refreshWalletStatus(true);
+  }
   fetch("/api/lookup-tables/warm", { method: "POST" }).catch(() => {});
   fetch("/api/pump-global/warm", { method: "POST" }).catch(() => {});
 }
@@ -2833,6 +2917,9 @@ function validateAgentSplit() {
     errors.push("Agent fee split is required.");
     return errors;
   }
+  if (recipients.length > MAX_FEE_SPLIT_RECIPIENTS) {
+    errors.push(`Agent custom fee split supports at most ${MAX_FEE_SPLIT_RECIPIENTS} recipients.`);
+  }
 
   const total = recipients.reduce((sum, entry) => sum + (Number(entry.shareBps) || 0), 0);
   const agentRows = recipients.filter((entry) => entry.type === "agent");
@@ -2860,6 +2947,16 @@ function validateAgentSplit() {
   return errors;
 }
 
+function validateFeeSplit() {
+  const errors = [];
+  if (getMode() !== "regular" || !feeSplitEnabled.checked) return errors;
+  const recipients = collectFeeSplitRecipients();
+  if (recipients.length > MAX_FEE_SPLIT_RECIPIENTS) {
+    errors.push(`Fee split supports at most ${MAX_FEE_SPLIT_RECIPIENTS} recipients.`);
+  }
+  return errors;
+}
+
 function validateForm() {
   const errors = [];
   const f = readForm();
@@ -2871,6 +2968,7 @@ function validateForm() {
   validateSniperState().forEach((msg) => errors.push(msg));
   const inlineErrors = validateAllInlineFields();
   inlineErrors.forEach((msg) => errors.push(msg));
+  validateFeeSplit().forEach((msg) => errors.push(msg));
   validateAgentSplit().forEach((msg) => errors.push(msg));
   return errors;
 }
@@ -3533,20 +3631,7 @@ async function deleteImageRecord(id) {
 form.querySelectorAll('input[name="mode"]').forEach((node) => {
   node.addEventListener("change", () => {
     updateModeVisibility();
-    if (node.value === "agent-custom" && node.checked) {
-      showAgentSplitModal();
-    }
   });
-  if (node.value === "agent-custom") {
-    const option = node.closest(".mode-option");
-    if (option) {
-      option.addEventListener("click", () => {
-        queueMicrotask(() => {
-          if (node.checked) showAgentSplitModal();
-        });
-      });
-    }
-  }
 });
 launchpadInputs.forEach((input) => {
   input.addEventListener("change", () => {
@@ -3691,11 +3776,13 @@ if (walletDropdownList) {
     const nextKey = String(button.dataset.walletKey || "").trim();
     if (!nextKey) return;
     walletSelect.value = nextKey;
+    setStoredSelectedWalletKey(nextKey);
     setWalletDropdownOpen(false);
     refreshWalletStatus(true);
   });
 }
 walletSelect.addEventListener("change", () => {
+  setStoredSelectedWalletKey(selectedWalletKey());
   refreshWalletStatus(true);
 });
 document.addEventListener("click", (event) => {
@@ -3706,6 +3793,7 @@ document.addEventListener("click", (event) => {
 });
 
 feeSplitAdd.addEventListener("click", () => {
+  if (getFeeSplitRows().length >= MAX_FEE_SPLIT_RECIPIENTS) return;
   feeSplitList.appendChild(createFeeSplitRow({ type: "wallet", sharePercent: "" }));
   syncFeeSplitTotals();
 });
@@ -3770,6 +3858,10 @@ feeSplitList.addEventListener("input", (event) => {
 });
 
 agentSplitAdd.addEventListener("click", () => {
+  if (getAgentSplitRows().length >= MAX_FEE_SPLIT_RECIPIENTS) {
+    setAgentSplitModalError(`Agent custom fee split supports at most ${MAX_FEE_SPLIT_RECIPIENTS} recipients.`);
+    return;
+  }
   agentSplitList.appendChild(createAgentSplitRow({ type: "wallet", sharePercent: "" }));
   normalizeAgentSplitStructure({ afterAdd: true });
   syncAgentSplitTotals();

@@ -6,6 +6,7 @@ use thiserror::Error;
 
 const TOKEN_NAME_MAX_LENGTH: usize = 32;
 const TOKEN_SYMBOL_MAX_LENGTH: usize = 10;
+const MAX_FEE_SPLIT_RECIPIENTS: usize = 10;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -47,6 +48,8 @@ pub struct RawConfig {
     pub imageLocalPath: String,
     #[serde(default)]
     pub selectedWalletKey: String,
+    #[serde(default)]
+    pub vanityPrivateKey: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -273,6 +276,7 @@ pub struct NormalizedConfig {
     pub presets: NormalizedPresets,
     pub imageLocalPath: String,
     pub selectedWalletKey: String,
+    pub vanityPrivateKey: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -514,6 +518,12 @@ fn normalize_recipients(
     label_prefix: &str,
     allow_agent: bool,
 ) -> Result<Vec<NormalizedRecipient>, ConfigError> {
+    if entries.len() > MAX_FEE_SPLIT_RECIPIENTS {
+        return Err(ConfigError::Message(format!(
+            "{}s support at most {} recipients.",
+            label_prefix, MAX_FEE_SPLIT_RECIPIENTS
+        )));
+    }
     let mut normalized = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if entry.shareBps.is_none() {
@@ -969,6 +979,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         },
         imageLocalPath: raw.imageLocalPath.trim().to_string(),
         selectedWalletKey: raw.selectedWalletKey.trim().to_string(),
+        vanityPrivateKey: raw.vanityPrivateKey.trim().to_string(),
     };
 
     if normalized.token.uri.is_empty() {

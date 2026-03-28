@@ -23,6 +23,7 @@ use std::{
 };
 
 const FIXED_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
+const MAX_FEE_SPLIT_RECIPIENTS: usize = 10;
 const HELIUS_SENDER_TIP_ACCOUNTS: [&str; 3] = [
     "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
     "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
@@ -94,6 +95,8 @@ pub struct QuoteForm {
 pub struct UiForm {
     #[serde(default)]
     pub selectedWalletKey: String,
+    #[serde(default)]
+    pub vanityPrivateKey: String,
     #[serde(default)]
     pub activePresetId: String,
     #[serde(default)]
@@ -288,6 +291,11 @@ fn parse_recipients(
     entries: &[UiRecipientInput],
     allow_agent: bool,
 ) -> Result<Vec<RawRecipient>, String> {
+    if entries.len() > MAX_FEE_SPLIT_RECIPIENTS {
+        return Err(format!(
+            "Fee split supports at most {MAX_FEE_SPLIT_RECIPIENTS} recipients."
+        ));
+    }
     entries
         .iter()
         .enumerate()
@@ -985,6 +993,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             uploads_dir().join(&image_file_name).display().to_string()
         },
         selectedWalletKey: selected_wallet_key,
+        vanityPrivateKey: form.vanityPrivateKey.trim().to_string(),
     })
 }
 
@@ -1103,5 +1112,20 @@ mod tests {
         .expect("zero buyback should be accepted");
 
         assert_eq!(raw.agent.buybackBps, Some(json!(0)));
+    }
+
+    #[tokio::test]
+    async fn preserves_vanity_private_key_from_ui_form() {
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                vanityPrivateKey: " vanity-secret ".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("vanity key should be preserved");
+
+        assert_eq!(raw.vanityPrivateKey, "vanity-secret");
     }
 }

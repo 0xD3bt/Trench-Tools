@@ -1684,6 +1684,7 @@ async fn api_vamp_import(
             "website": imported.website,
             "twitter": imported.twitter,
             "telegram": imported.telegram,
+            "mode": imported.mode,
         },
         "image": image,
         "warning": warning,

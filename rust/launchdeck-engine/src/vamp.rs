@@ -16,6 +16,7 @@ pub struct ImportedTokenData {
     pub telegram: String,
     pub imageUrl: String,
     pub metadataUri: String,
+    pub mode: String,
     pub source: String,
 }
 
@@ -97,12 +98,37 @@ fn merge_imported(base: ImportedTokenData, overlay: ImportedTokenData) -> Import
         } else {
             overlay.metadataUri
         },
+        mode: if !base.mode.is_empty() {
+            base.mode
+        } else {
+            overlay.mode
+        },
         source: if !base.source.is_empty() {
             base.source
         } else {
             overlay.source
         },
     }
+}
+
+fn infer_imported_mode(payload: &Value) -> String {
+    if payload
+        .get("is_cashback_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "cashback".to_string();
+    }
+    if payload
+        .get("tokenized_agent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        // Pump's public coin payload exposes agent presence but not enough detail
+        // to distinguish custom vs locked vs unlocked reward routing.
+        return "agent-locked".to_string();
+    }
+    "regular".to_string()
 }
 
 fn normalize_imported_metadata_payload(payload: &Value, source: &str) -> ImportedTokenData {
@@ -202,6 +228,7 @@ fn normalize_imported_metadata_payload(payload: &Value, source: &str) -> Importe
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         ),
+        mode: infer_imported_mode(payload),
         source: source.to_string(),
     }
 }
@@ -371,4 +398,37 @@ pub async fn import_remote_image_to_library(
         },
     )
     .map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::infer_imported_mode;
+    use serde_json::json;
+
+    #[test]
+    fn infers_cashback_mode_from_pump_payload() {
+        assert_eq!(
+            infer_imported_mode(&json!({
+                "is_cashback_enabled": true,
+                "tokenized_agent": false
+            })),
+            "cashback"
+        );
+    }
+
+    #[test]
+    fn infers_agent_mode_from_pump_payload() {
+        assert_eq!(
+            infer_imported_mode(&json!({
+                "is_cashback_enabled": false,
+                "tokenized_agent": true
+            })),
+            "agent-locked"
+        );
+    }
+
+    #[test]
+    fn defaults_to_regular_mode_when_flags_are_missing() {
+        assert_eq!(infer_imported_mode(&json!({})), "regular");
+    }
 }
