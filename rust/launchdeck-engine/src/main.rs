@@ -18,26 +18,36 @@ mod wallet;
 
 use crate::{
     config::{RawConfig, normalize_raw_config},
-    image_library::{build_image_library_payload, create_category, delete_image, save_data_url_image, update_image},
+    image_library::{
+        build_image_library_payload, create_category, delete_image, save_data_url_image,
+        update_image,
+    },
     launchpads::launchpad_registry,
-    observability::{log_event, new_trace_context, persist_launch_report},
+    observability::{
+        log_event, new_trace_context, persist_launch_report, update_persisted_launch_report,
+    },
     providers::{provider_availability_registry, provider_registry},
-    pump_native::try_compile_native_pump,
+    pump_native::{try_compile_native_pump, warm_default_lookup_tables, warm_pump_global_state},
     report::{LaunchReport, build_report, render_report},
     reports_browser::{list_persisted_reports, read_persisted_report},
-    rpc::{send_transactions_for_transport, simulate_transactions},
+    rpc::{send_transactions_for_transport, simulate_transactions, spawn_blockhash_refresh_task},
     runtime::{
         RuntimeRegistry, RuntimeRequest, RuntimeResponse, fail_worker, heartbeat_worker,
         list_workers, restore_workers, start_worker, stop_worker,
     },
     strategies::strategy_registry,
-    transport::{build_transport_plan, configured_helius_sender_endpoint, configured_jito_bundle_endpoints, estimate_transaction_count},
-    ui_bridge::{build_raw_config_from_form, quote_from_form},
-    ui_config::{create_default_persistent_config, read_persistent_config, write_persistent_config},
+    transport::{
+        build_transport_plan, configured_helius_sender_endpoint, configured_jito_bundle_endpoints,
+        estimate_transaction_count,
+    },
+    ui_bridge::{build_raw_config_from_form, quote_from_form, upload_metadata_from_form},
+    ui_config::{
+        create_default_persistent_config, read_persistent_config, write_persistent_config,
+    },
     vamp::{fetch_imported_token_metadata, import_remote_image_to_library},
     wallet::{
-        enrich_wallet_statuses, list_solana_env_wallets, load_solana_wallet_by_env_key, public_key_from_secret,
-        selected_wallet_key_or_default,
+        enrich_wallet_statuses, list_solana_env_wallets, load_solana_wallet_by_env_key,
+        public_key_from_secret, selected_wallet_key_or_default,
     },
 };
 use axum::{
@@ -90,6 +100,14 @@ struct StatusQuery {
 #[derive(Deserialize, Default)]
 struct RunRequest {
     action: Option<String>,
+    form: Option<Value>,
+    #[serde(default)]
+    #[serde(rename = "clientPreRequestMs")]
+    client_pre_request_ms: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct MetadataUploadRequest {
     form: Option<Value>,
 }
 
@@ -346,6 +364,12 @@ fn set_report_timing(report: &mut Value, key: &str, value_ms: u128) {
     }
 }
 
+fn set_optional_report_timing(report: &mut Value, key: &str, value_ms: Option<u128>) {
+    if let Some(value_ms) = value_ms {
+        set_report_timing(report, key, value_ms);
+    }
+}
+
 fn refresh_report_benchmark(report: &mut Value) {
     let timings = report
         .get("execution")
@@ -385,14 +409,20 @@ fn refresh_report_benchmark(report: &mut Value) {
     });
 }
 
-async fn build_status_payload(state: &Arc<AppState>, requested_wallet: &str) -> Result<Value, String> {
+async fn build_status_payload(
+    state: &Arc<AppState>,
+    requested_wallet: &str,
+) -> Result<Value, String> {
     let raw_wallets = list_solana_env_wallets();
     if !requested_wallet.trim().is_empty()
         && !raw_wallets
             .iter()
             .any(|wallet| wallet.envKey == requested_wallet.trim())
     {
-        return Err(format!("Unknown wallet env key: {}", requested_wallet.trim()));
+        return Err(format!(
+            "Unknown wallet env key: {}",
+            requested_wallet.trim()
+        ));
     }
     let selected_wallet_key = selected_wallet_key_or_default(requested_wallet);
     let rpc_url = configured_rpc_url();
@@ -495,46 +525,47 @@ async fn execute_engine_action_payload(
         }));
     }
     let form_prepare_started_ms = current_time_ms();
-    let (raw_config_value, prepared_metadata_uri, form_to_raw_config_ms) = if let Some(raw_config_value) = payload.raw_config {
-        (raw_config_value, None, None)
-    } else if let Some(form_value) = payload.form.clone() {
-        let (raw_config, metadata_uri) = build_raw_config_from_form(&action, form_value)
-            .await
-            .map_err(|error| {
+    let (raw_config_value, prepared_metadata_uri, form_to_raw_config_ms) =
+        if let Some(raw_config_value) = payload.raw_config {
+            (raw_config_value, None, None)
+        } else if let Some(form_value) = payload.form.clone() {
+            let (raw_config, metadata_uri) = build_raw_config_from_form(&action, form_value)
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": error,
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?;
+            let raw_config_value = serde_json::to_value(raw_config).map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
                     Json(json!({
                         "ok": false,
-                        "error": error,
+                        "error": error.to_string(),
                         "traceId": trace.traceId,
                     })),
                 )
             })?;
-        let raw_config_value = serde_json::to_value(raw_config).map_err(|error| {
             (
+                raw_config_value,
+                metadata_uri,
+                Some(current_time_ms().saturating_sub(form_prepare_started_ms)),
+            )
+        } else {
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "ok": false,
-                    "error": error.to_string(),
+                    "error": "rawConfig or form is required.",
                     "traceId": trace.traceId,
                 })),
-            )
-        })?;
-        (
-            raw_config_value,
-            metadata_uri,
-            Some(current_time_ms().saturating_sub(form_prepare_started_ms)),
-        )
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": "rawConfig or form is required.",
-                "traceId": trace.traceId,
-            })),
-        ));
-    };
+            ));
+        };
     let parsed: RawConfig = serde_json::from_value(raw_config_value.clone()).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -611,7 +642,10 @@ async fn execute_engine_action_payload(
     } else {
         Some(creator_public_key.clone())
     };
-    let transport_plan = build_transport_plan(&normalized.execution, estimate_transaction_count(&normalized));
+    let transport_plan = build_transport_plan(
+        &normalized.execution,
+        estimate_transaction_count(&normalized),
+    );
     let should_persist_report = normalized.tx.writeReport || action == "send";
     if action == "build" {
         let report_build_started_ms = current_time_ms();
@@ -645,17 +679,18 @@ async fn execute_engine_action_payload(
         set_report_timing(&mut report_value, "reportBuildMs", report_build_ms);
         let send_log_path = if should_persist_report {
             let persist_started_ms = current_time_ms();
-            let path = persist_launch_report(&trace.traceId, &action, &transport_plan, &report_value)
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": error,
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?;
+            let path =
+                persist_launch_report(&trace.traceId, &action, &transport_plan, &report_value)
+                    .map_err(|error| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": error,
+                                "traceId": trace.traceId,
+                            })),
+                        )
+                    })?;
             set_report_timing(
                 &mut report_value,
                 "persistReportMs",
@@ -672,6 +707,25 @@ async fn execute_engine_action_payload(
             current_time_ms().saturating_sub(action_started_ms),
         );
         refresh_report_benchmark(&mut report_value);
+        if let Some(path) = send_log_path.as_ref() {
+            update_persisted_launch_report(
+                path,
+                &trace.traceId,
+                &action,
+                &transport_plan,
+                &report_value,
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Action completed but failed to finalize persisted report: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
+        }
         log_event(
             "engine_action_completed",
             &trace.traceId,
@@ -736,11 +790,42 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
-    let (compiled_transactions, report_value, text_value, assembly_executor) = (
+    let (compiled_transactions, mut report_value, text_value, assembly_executor, compile_breakdown) = (
         native.compiled_transactions,
         native.report,
         Value::String(native.text),
         "rust-native".to_string(),
+        native.compile_timings,
+    );
+    set_report_timing(
+        &mut report_value,
+        "compileTransactionsMs",
+        compile_transactions_ms,
+    );
+    set_report_timing(
+        &mut report_value,
+        "compileAltLoadMs",
+        compile_breakdown.alt_load_ms,
+    );
+    set_report_timing(
+        &mut report_value,
+        "compileBlockhashFetchMs",
+        compile_breakdown.blockhash_fetch_ms,
+    );
+    set_optional_report_timing(
+        &mut report_value,
+        "compileGlobalFetchMs",
+        compile_breakdown.global_fetch_ms,
+    );
+    set_optional_report_timing(
+        &mut report_value,
+        "compileFollowUpPrepMs",
+        compile_breakdown.follow_up_prep_ms,
+    );
+    set_report_timing(
+        &mut report_value,
+        "compileTxSerializeMs",
+        compile_breakdown.tx_serialize_ms,
     );
 
     if action == "simulate" {
@@ -767,7 +852,36 @@ async fn execute_engine_action_payload(
         }
         set_report_timing(&mut report, "normalizeConfigMs", normalize_config_ms);
         set_report_timing(&mut report, "walletLoadMs", wallet_load_ms);
-        set_report_timing(&mut report, "compileTransactionsMs", compile_transactions_ms);
+        set_report_timing(
+            &mut report,
+            "compileTransactionsMs",
+            compile_transactions_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "compileAltLoadMs",
+            compile_breakdown.alt_load_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "compileBlockhashFetchMs",
+            compile_breakdown.blockhash_fetch_ms,
+        );
+        set_optional_report_timing(
+            &mut report,
+            "compileGlobalFetchMs",
+            compile_breakdown.global_fetch_ms,
+        );
+        set_optional_report_timing(
+            &mut report,
+            "compileFollowUpPrepMs",
+            compile_breakdown.follow_up_prep_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "compileTxSerializeMs",
+            compile_breakdown.tx_serialize_ms,
+        );
         set_report_timing(
             &mut report,
             "simulateMs",
@@ -813,6 +927,25 @@ async fn execute_engine_action_payload(
             current_time_ms().saturating_sub(action_started_ms),
         );
         refresh_report_benchmark(&mut report);
+        if let Some(path) = send_log_path.as_ref() {
+            update_persisted_launch_report(
+                path,
+                &trace.traceId,
+                &action,
+                &transport_plan,
+                &report,
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Action completed but failed to finalize persisted report: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
+        }
         log_event(
             "engine_action_completed",
             &trace.traceId,
@@ -846,8 +979,7 @@ async fn execute_engine_action_payload(
 
     if action == "send" {
         let execution_class = transport_plan.executionClass.clone();
-        let send_started_ms = current_time_ms();
-        let (sent, warnings) = send_transactions_for_transport(
+        let (sent, warnings, send_timing) = send_transactions_for_transport(
             &configured_rpc_url(),
             &transport_plan,
             &compiled_transactions,
@@ -872,12 +1004,43 @@ async fn execute_engine_action_payload(
         }
         set_report_timing(&mut report, "normalizeConfigMs", normalize_config_ms);
         set_report_timing(&mut report, "walletLoadMs", wallet_load_ms);
-        set_report_timing(&mut report, "compileTransactionsMs", compile_transactions_ms);
+        set_report_timing(
+            &mut report,
+            "compileTransactionsMs",
+            compile_transactions_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "compileAltLoadMs",
+            compile_breakdown.alt_load_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "compileBlockhashFetchMs",
+            compile_breakdown.blockhash_fetch_ms,
+        );
+        set_optional_report_timing(
+            &mut report,
+            "compileGlobalFetchMs",
+            compile_breakdown.global_fetch_ms,
+        );
+        set_optional_report_timing(
+            &mut report,
+            "compileFollowUpPrepMs",
+            compile_breakdown.follow_up_prep_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "compileTxSerializeMs",
+            compile_breakdown.tx_serialize_ms,
+        );
         set_report_timing(
             &mut report,
             "sendMs",
-            current_time_ms().saturating_sub(send_started_ms),
+            send_timing.submit_ms.saturating_add(send_timing.confirm_ms),
         );
+        set_report_timing(&mut report, "sendSubmitMs", send_timing.submit_ms);
+        set_report_timing(&mut report, "sendConfirmMs", send_timing.confirm_ms);
         if let Some(execution) = report.get_mut("execution") {
             execution["sent"] = serde_json::to_value(sent).unwrap_or(Value::Array(vec![]));
             let mut existing_warnings = execution
@@ -917,6 +1080,25 @@ async fn execute_engine_action_payload(
             current_time_ms().saturating_sub(action_started_ms),
         );
         refresh_report_benchmark(&mut report);
+        if let Some(path) = send_log_path.as_ref() {
+            update_persisted_launch_report(
+                path,
+                &trace.traceId,
+                &action,
+                &transport_plan,
+                &report,
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Action completed but failed to finalize persisted report: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
+        }
         log_event(
             "engine_action_completed",
             &trace.traceId,
@@ -984,7 +1166,9 @@ async fn engine_action(
     Json(payload): Json<EngineRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     authorize(&headers, &state)?;
-    execute_engine_action_payload(&state, payload).await.map(Json)
+    execute_engine_action_payload(&state, payload)
+        .await
+        .map(Json)
 }
 
 fn build_settings_payload() -> Value {
@@ -1000,7 +1184,9 @@ fn build_settings_payload() -> Value {
     })
 }
 
-async fn api_bootstrap(State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn api_bootstrap(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mut payload = build_status_payload(&state, "").await.map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -1021,12 +1207,28 @@ async fn api_bootstrap(State(state): State<Arc<AppState>>) -> Result<Json<Value>
     Ok(Json(payload))
 }
 
-async fn api_status(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<StatusQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let wallet = query.wallet.unwrap_or_default();
-    let mut payload = build_status_payload(&state, &wallet).await.map_err(|error| {
+async fn api_lookup_tables_warm() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rpc_url = configured_rpc_url();
+    let loaded = warm_default_lookup_tables(&rpc_url)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })?;
+    Ok(Json(json!({
+        "ok": true,
+        "loaded": loaded,
+    })))
+}
+
+async fn api_pump_global_warm() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rpc_url = configured_rpc_url();
+    warm_pump_global_state(&rpc_url).await.map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -1035,6 +1237,27 @@ async fn api_status(
             })),
         )
     })?;
+    Ok(Json(json!({
+        "ok": true,
+    })))
+}
+
+async fn api_status(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<StatusQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let wallet = query.wallet.unwrap_or_default();
+    let mut payload = build_status_payload(&state, &wallet)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })?;
     payload["backend"] = Value::String("rust".to_string());
     payload["signerSource"] = Value::String(resolve_signer_source(
         payload
@@ -1050,6 +1273,7 @@ async fn api_run(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RunRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let client_pre_request_ms = payload.client_pre_request_ms.map(u128::from);
     let action = payload.action.unwrap_or_else(|| "build".to_string());
     if !["build", "simulate", "send"].contains(&action.trim().to_lowercase().as_str()) {
         return Err((
@@ -1070,12 +1294,62 @@ async fn api_run(
     let mut response = execute_engine_action_payload(
         &state,
         EngineRequest {
-            action: Some(action),
+            action: Some(action.clone()),
             form: payload.form,
             raw_config: None,
         },
     )
     .await?;
+    let persisted_path = response
+        .get("sendLogPath")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let response_trace_id = response
+        .get("traceId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let response_transport_plan = response.get("transportPlan").cloned();
+    let mut rendered_text: Option<Value> = None;
+    let mut persisted_report_snapshot: Option<Value> = None;
+    if let Some(report) = response.get_mut("report") {
+        if let Some(pre_request_ms) = client_pre_request_ms {
+            let backend_total_ms = report
+                .get("execution")
+                .and_then(|execution| execution.get("timings"))
+                .and_then(|timings| timings.get("totalElapsedMs"))
+                .and_then(Value::as_u64)
+                .map(u128::from);
+            set_optional_report_timing(report, "backendTotalElapsedMs", backend_total_ms);
+            set_report_timing(
+                report,
+                "totalElapsedMs",
+                backend_total_ms.unwrap_or_default().saturating_add(pre_request_ms),
+            );
+            set_report_timing(report, "clientPreRequestMs", pre_request_ms);
+        }
+        refresh_report_benchmark(report);
+        rendered_text = Some(render_report_value(report));
+        persisted_report_snapshot = Some(report.clone());
+    }
+    if let Some(text) = rendered_text {
+        response["text"] = text;
+    }
+    if let (Some(path), Some(trace_id), Some(transport_plan_value), Some(report_snapshot)) = (
+        persisted_path.as_deref(),
+        response_trace_id.as_deref(),
+        response_transport_plan,
+        persisted_report_snapshot,
+    ) && let Ok(transport_plan) =
+        serde_json::from_value::<crate::transport::TransportPlan>(transport_plan_value)
+    {
+        let _ = update_persisted_launch_report(
+            path,
+            trace_id,
+            &action,
+            &transport_plan,
+            &report_snapshot,
+        );
+    }
     response["backend"] = Value::String("rust".to_string());
     response["metadataUri"] = response
         .get("metadataUri")
@@ -1095,7 +1369,9 @@ async fn api_engine_health() -> Json<Value> {
     }))
 }
 
-async fn api_quote(Query(query): Query<QuoteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn api_quote(
+    Query(query): Query<QuoteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mode = query.mode.unwrap_or_default();
     let amount = query.amount.unwrap_or_default();
     if mode.trim().is_empty() || amount.trim().is_empty() {
@@ -1104,17 +1380,20 @@ async fn api_quote(Query(query): Query<QuoteQuery>) -> Result<Json<Value>, (Stat
             "quote": Value::Null,
         })));
     }
-    let quote = quote_from_form(&configured_rpc_url(), json!({ "mode": mode, "amount": amount }))
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "ok": false,
-                    "error": error,
-                })),
-            )
-        })?;
+    let quote = quote_from_form(
+        &configured_rpc_url(),
+        json!({ "mode": mode, "amount": amount }),
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+    })?;
     Ok(Json(json!({
         "ok": true,
         "quote": quote,
@@ -1146,7 +1425,12 @@ async fn api_settings_save(
 }
 
 async fn api_reports_list(Query(query): Query<ReportsQuery>) -> Json<Value> {
-    let sort = if query.sort.unwrap_or_else(|| "newest".to_string()).trim().eq_ignore_ascii_case("oldest") {
+    let sort = if query
+        .sort
+        .unwrap_or_else(|| "newest".to_string())
+        .trim()
+        .eq_ignore_ascii_case("oldest")
+    {
         "oldest"
     } else {
         "newest"
@@ -1208,7 +1492,28 @@ async fn api_upload_image(
     })))
 }
 
-async fn api_images_list(Query(query): Query<ImagesQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn api_metadata_upload(
+    Json(payload): Json<MetadataUploadRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let form = payload.form.unwrap_or(Value::Null);
+    let metadata_uri = upload_metadata_from_form(form).await.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+    })?;
+    Ok(Json(json!({
+        "ok": true,
+        "metadataUri": metadata_uri,
+    })))
+}
+
+async fn api_images_list(
+    Query(query): Query<ImagesQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let payload = build_image_library_payload(
         query.search.as_deref().unwrap_or_default(),
         query.category.as_deref().unwrap_or_default(),
@@ -1227,7 +1532,9 @@ async fn api_images_list(Query(query): Query<ImagesQuery>) -> Result<Json<Value>
             })),
         )
     })?;
-    Ok(Json(serde_json::to_value(payload).unwrap_or(json!({"ok": false}))))
+    Ok(Json(
+        serde_json::to_value(payload).unwrap_or(json!({"ok": false})),
+    ))
 }
 
 async fn api_image_update(
@@ -1287,16 +1594,19 @@ async fn api_image_category_create(
 async fn api_image_delete(
     Json(payload): Json<ImageDeleteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let library_payload = delete_image(payload.id.as_deref().unwrap_or_default()).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": error,
-            })),
-        )
-    })?;
-    Ok(Json(serde_json::to_value(library_payload).unwrap_or(json!({"ok": true}))))
+    let library_payload =
+        delete_image(payload.id.as_deref().unwrap_or_default()).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })?;
+    Ok(Json(
+        serde_json::to_value(library_payload).unwrap_or(json!({"ok": true})),
+    ))
 }
 
 async fn api_vamp_import(
@@ -1321,15 +1631,17 @@ async fn api_vamp_import(
             })),
         )
     })?;
-    let imported = fetch_imported_token_metadata(&mint.to_string()).await.map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": error,
-            })),
-        )
-    })?;
+    let imported = fetch_imported_token_metadata(&mint.to_string())
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })?;
     let mut image = Value::Null;
     let mut warning = String::new();
     if !imported.imageUrl.is_empty() {
@@ -1518,25 +1830,39 @@ mod tests {
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
+    let rpc_url = configured_rpc_url();
     let state = Arc::new(AppState {
         auth_token: configured_auth_token(),
         runtime: Arc::new(RuntimeRegistry::new(configured_runtime_state_path())),
     });
+    spawn_blockhash_refresh_task(rpc_url, "confirmed");
     let restored_workers = restore_workers(&state.runtime).await;
     let app = Router::new()
         .route("/health", get(health))
-        .route("/", get(|| async { file_response(paths::ui_dir().join("index.html")) }))
-        .route("/index.html", get(|| async { file_response(paths::ui_dir().join("index.html")) }))
+        .route(
+            "/",
+            get(|| async { file_response(paths::ui_dir().join("index.html")) }),
+        )
+        .route(
+            "/index.html",
+            get(|| async { file_response(paths::ui_dir().join("index.html")) }),
+        )
         .route("/api/bootstrap", get(api_bootstrap))
+        .route("/api/lookup-tables/warm", post(api_lookup_tables_warm))
+        .route("/api/pump-global/warm", post(api_pump_global_warm))
         .route("/api/status", get(api_status))
         .route("/api/run", post(api_run))
         .route("/api/engine/health", get(api_engine_health))
         .route("/api/quote", get(api_quote))
-        .route("/api/settings", get(api_settings_get).post(api_settings_save))
+        .route(
+            "/api/settings",
+            get(api_settings_get).post(api_settings_save),
+        )
         .route("/api/settings/save", post(api_settings_save))
         .route("/api/reports", get(api_reports_list))
         .route("/api/reports/view", get(api_reports_view))
         .route("/api/upload-image", post(api_upload_image))
+        .route("/api/metadata/upload", post(api_metadata_upload))
         .route("/api/images", get(api_images_list))
         .route("/api/images/update", post(api_image_update))
         .route("/api/images/categories", post(api_image_category_create))

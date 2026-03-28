@@ -29,7 +29,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use transport::{build_transport_plan, estimate_transaction_count};
-use wallet::{load_solana_wallet_by_env_key, public_key_from_secret, selected_wallet_key_or_default};
+use wallet::{
+    load_solana_wallet_by_env_key, public_key_from_secret, selected_wallet_key_or_default,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "launchdeck-cli")]
@@ -84,6 +86,23 @@ fn now_timestamp_string() -> String {
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
     millis.to_string()
+}
+
+fn set_report_timing(report: &mut Value, key: &str, value_ms: u128) {
+    if let Some(execution) = report.get_mut("execution") {
+        if execution.get("timings").is_none()
+            || execution.get("timings").is_some_and(Value::is_null)
+        {
+            execution["timings"] = json!({});
+        }
+        execution["timings"][key] = Value::from(value_ms as u64);
+    }
+}
+
+fn set_optional_report_timing(report: &mut Value, key: &str, value_ms: Option<u128>) {
+    if let Some(value_ms) = value_ms {
+        set_report_timing(report, key, value_ms);
+    }
 }
 
 fn read_raw_config(path: &Path) -> Result<RawConfig, String> {
@@ -156,7 +175,10 @@ async fn run_cli() -> Result<(), String> {
     let wallet_secret = load_solana_wallet_by_env_key(&selected_wallet_key)?;
     let creator_public_key = public_key_from_secret(&wallet_secret)?;
     let rpc_url = configured_rpc_url();
-    let transport_plan = build_transport_plan(&normalized.execution, estimate_transaction_count(&normalized));
+    let transport_plan = build_transport_plan(
+        &normalized.execution,
+        estimate_transaction_count(&normalized),
+    );
 
     let native = try_compile_native_pump(
         &rpc_url,
@@ -178,6 +200,28 @@ async fn run_cli() -> Result<(), String> {
     let compiled_transactions = native.compiled_transactions;
     let mut report = native.report;
     let text = native.text;
+    let compile_timings = native.compile_timings;
+    set_report_timing(&mut report, "compileAltLoadMs", compile_timings.alt_load_ms);
+    set_report_timing(
+        &mut report,
+        "compileBlockhashFetchMs",
+        compile_timings.blockhash_fetch_ms,
+    );
+    set_optional_report_timing(
+        &mut report,
+        "compileGlobalFetchMs",
+        compile_timings.global_fetch_ms,
+    );
+    set_optional_report_timing(
+        &mut report,
+        "compileFollowUpPrepMs",
+        compile_timings.follow_up_prep_ms,
+    );
+    set_report_timing(
+        &mut report,
+        "compileTxSerializeMs",
+        compile_timings.tx_serialize_ms,
+    );
     let mut extra = None;
     let should_persist_report = normalized.tx.writeReport || action == "send";
 
@@ -201,7 +245,7 @@ async fn run_cli() -> Result<(), String> {
         }
         extra = Some(json!(simulation));
     } else if action == "send" {
-        let (sent, warnings) = send_transactions_for_transport(
+        let (sent, warnings, send_timing) = send_transactions_for_transport(
             &rpc_url,
             &transport_plan,
             &compiled_transactions,
@@ -210,9 +254,15 @@ async fn run_cli() -> Result<(), String> {
             normalized.execution.trackSendBlockHeight,
         )
         .await?;
+        set_report_timing(
+            &mut report,
+            "sendMs",
+            send_timing.submit_ms.saturating_add(send_timing.confirm_ms),
+        );
+        set_report_timing(&mut report, "sendSubmitMs", send_timing.submit_ms);
+        set_report_timing(&mut report, "sendConfirmMs", send_timing.confirm_ms);
         if let Some(execution) = report.get_mut("execution") {
-            execution["sent"] =
-                serde_json::to_value(&sent).map_err(|error| error.to_string())?;
+            execution["sent"] = serde_json::to_value(&sent).map_err(|error| error.to_string())?;
             let mut existing_warnings = execution
                 .get("warnings")
                 .and_then(Value::as_array)
@@ -255,5 +305,9 @@ async fn run_cli() -> Result<(), String> {
         return Ok(());
     }
 
-    print_human_output(action, payload["text"].as_str().unwrap_or_default(), extra.as_ref())
+    print_human_output(
+        action,
+        payload["text"].as_str().unwrap_or_default(),
+        extra.as_ref(),
+    )
 }

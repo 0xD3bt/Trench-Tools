@@ -23,6 +23,8 @@ The code is split into:
 
 The browser UI now talks directly to the Rust host on the local UI port.
 
+The browser also pre-uploads launch metadata when possible so deploy-time latency is not dominated by metadata upload on every click.
+
 ## Provider Intent
 
 - `helius-sender`: recommended low-latency send path with strict Sender requirements
@@ -47,6 +49,10 @@ Examples:
 
 - current verified native execution path
 - LaunchDeck launch modes are built by the Rust engine rather than the legacy JS planner
+- verified native coverage currently includes `regular`, `cashback`, `agent-custom`, `agent-unlocked`, and `agent-locked`
+- default lookup tables are warmed on app load, cached locally, and reused in the compile path
+- blockhash and Pump global state are cached in the Rust runtime to reduce compile latency
+- benchmark reports expose `total`, `backendTotal`, `preRequest`, compile sub-timings, and send sub-timings
 
 ### Bonk
 
@@ -79,13 +85,17 @@ The backend reports:
 - `Helius Sender`, `Standard RPC`, and `Jito Bundle` are the current explicit provider choices.
 - `Standard RPC` and `Helius Sender` keep dependent launch/follow-up flows sequential.
 - `Jito Bundle` owns the current bundle transport path.
+- metadata upload provider is configurable:
+  - default: `pump-fun`
+  - optional custom provider: `pinata`
+  - Pinata reuses uploaded image CIDs across metadata-only edits within the current app session
 - Bonk and Bags are represented in the launchpad model, but still require live validation before they should be treated as production-verified launch builders.
 
 ## Documentation Pointers
 
-- [`README.md`](README.md)
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- [`docs/CONFIG.md`](docs/CONFIG.md)
-- [`docs/PROVIDERS.md`](docs/PROVIDERS.md)
-- [`docs/LAUNCHPADS.md`](docs/LAUNCHPADS.md)
-- [`docs/STRATEGIES.md`](docs/STRATEGIES.md)
+- [`README.md`](../README.md)
+- [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- [`CONFIG.md`](CONFIG.md)
+- [`PROVIDERS.md`](PROVIDERS.md)
+- [`LAUNCHPADS.md`](LAUNCHPADS.md)
+- [`STRATEGIES.md`](STRATEGIES.md)

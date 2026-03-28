@@ -1,9 +1,12 @@
 #![allow(non_snake_case, dead_code)]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 
-use crate::{config::{NormalizedConfig, NormalizedExecution}, providers::get_provider_meta};
+use crate::{
+    config::{NormalizedConfig, NormalizedExecution},
+    providers::get_provider_meta,
+};
 
 const DEFAULT_HELIUS_SENDER_ENDPOINT: &str = "https://sender.helius-rpc.com/fast";
 const DEFAULT_HELIUS_SENDER_REGIONAL_ENDPOINTS: [(&str, &str); 7] = [
@@ -27,14 +30,14 @@ const DEFAULT_JITO_BUNDLE_BASE_URLS: [&str; 9] = [
     "https://dublin.mainnet.block-engine.jito.wtf",
 ];
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JitoBundleEndpoint {
     pub name: String,
     pub send: String,
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportPlan {
     pub requestedProvider: String,
     pub resolvedProvider: String,
@@ -84,13 +87,13 @@ fn append_api_key(endpoint: &str, api_key: &str) -> String {
     format!("{endpoint}{separator}api-key={api_key}")
 }
 
-pub fn configured_helius_sender_endpoints_for_profile(endpoint_profile: &str) -> Vec<String> {
+fn configured_helius_sender_override() -> Option<String> {
     let explicit = env::var("HELIUS_SENDER_ENDPOINT")
         .or_else(|_| env::var("HELIUS_SENDER_URL"))
         .unwrap_or_default();
-    let trimmed = explicit.trim();
-    if !trimmed.is_empty() {
-        return vec![trimmed.to_string()];
+    let trimmed_explicit = explicit.trim();
+    if !trimmed_explicit.is_empty() {
+        return Some(trimmed_explicit.to_string());
     }
 
     let base = env::var("HELIUS_SENDER_BASE_URL")
@@ -98,7 +101,15 @@ pub fn configured_helius_sender_endpoints_for_profile(endpoint_profile: &str) ->
         .trim()
         .to_string();
     if !base.is_empty() {
-        return vec![format!("{}/fast", base.trim_end_matches('/'))];
+        return Some(format!("{}/fast", base.trim_end_matches('/')));
+    }
+
+    None
+}
+
+pub fn configured_helius_sender_endpoints_for_profile(endpoint_profile: &str) -> Vec<String> {
+    if let Some(override_endpoint) = configured_helius_sender_override() {
+        return vec![override_endpoint];
     }
 
     let api_key = env::var("HELIUS_SENDER_API_KEY")
@@ -166,11 +177,12 @@ pub fn transport_ordering(execution: &NormalizedExecution, transaction_count: us
 fn jito_endpoint_matches_profile(endpoint: &JitoBundleEndpoint, endpoint_profile: &str) -> bool {
     let name = endpoint.name.to_lowercase();
     match endpoint_profile {
-        "us" => {
-            name.contains("ny.") || name.contains("slc.")
-        }
+        "us" => name.contains("ny.") || name.contains("slc."),
         "eu" => {
-            name.contains("frankfurt.") || name.contains("amsterdam.") || name.contains("london.") || name.contains("dublin.")
+            name.contains("frankfurt.")
+                || name.contains("amsterdam.")
+                || name.contains("london.")
+                || name.contains("dublin.")
         }
         "asia" => name.contains("singapore.") || name.contains("tokyo."),
         "west" => {
@@ -185,7 +197,9 @@ fn jito_endpoint_matches_profile(endpoint: &JitoBundleEndpoint, endpoint_profile
     }
 }
 
-pub fn configured_jito_bundle_endpoints_for_profile(endpoint_profile: &str) -> Vec<JitoBundleEndpoint> {
+pub fn configured_jito_bundle_endpoints_for_profile(
+    endpoint_profile: &str,
+) -> Vec<JitoBundleEndpoint> {
     let explicit_send = env::var("JITO_SEND_BUNDLE_ENDPOINT")
         .unwrap_or_default()
         .trim()
@@ -284,6 +298,13 @@ pub fn build_transport_plan(
                 .to_string(),
         );
     }
+    if resolved == "helius-sender" {
+        if let Some(override_endpoint) = configured_helius_sender_override() {
+            warnings.push(format!(
+                "HELIUS_SENDER endpoint override is active ({override_endpoint}); endpoint profile fanout is bypassed."
+            ));
+        }
+    }
 
     TransportPlan {
         requestedProvider: requested,
@@ -319,7 +340,9 @@ pub fn estimate_transaction_count(config: &NormalizedConfig) -> usize {
     {
         transaction_count += 1;
     }
-    if normalize_provider(&config.execution.provider) == "jito-bundle" && config.tx.jitoTipLamports > 0 {
+    if normalize_provider(&config.execution.provider) == "jito-bundle"
+        && config.tx.jitoTipLamports > 0
+    {
         transaction_count += 1;
     }
     transaction_count
@@ -391,18 +414,19 @@ mod tests {
         let plan = build_transport_plan(&config.execution, 2);
         assert_eq!(plan.resolvedEndpointProfile, "eu");
         assert!(!plan.heliusSenderEndpoints.is_empty());
-        assert!(plan
-            .heliusSenderEndpoints
-            .iter()
-            .all(|entry| {
-                entry.contains("lon-")
-                    || entry.contains("fra-")
-                    || entry.contains("ams-")
-            }));
-        assert!(plan
-            .heliusSenderEndpoints
-            .iter()
-            .all(|entry| !entry.contains("https://sender.helius-rpc.com/fast")));
+        assert!(plan.heliusSenderEndpoints.iter().all(|entry| {
+            entry.contains("lon-") || entry.contains("fra-") || entry.contains("ams-")
+        }));
+        assert!(
+            plan.heliusSenderEndpoints
+                .iter()
+                .all(|entry| !entry.contains("https://sender.helius-rpc.com/fast"))
+        );
+        assert!(
+            plan.heliusSenderEndpoints
+                .iter()
+                .all(|entry| entry.starts_with("http://"))
+        );
     }
 
     #[test]

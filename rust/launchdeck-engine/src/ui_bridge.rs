@@ -12,7 +12,15 @@ use crate::{
 use reqwest::{Client, multipart};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{fs, path::Path, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    env,
+    fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const FIXED_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const HELIUS_SENDER_TIP_ACCOUNTS: [&str; 3] = [
@@ -30,6 +38,49 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataUploadProvider {
+    PumpFun,
+    Pinata,
+}
+
+fn parse_metadata_upload_provider(value: &str) -> Result<MetadataUploadProvider, String> {
+    match value.trim().to_lowercase().as_str() {
+        "" | "pump-fun" | "pumpfun" => Ok(MetadataUploadProvider::PumpFun),
+        "pinata" | "custom" => Ok(MetadataUploadProvider::Pinata),
+        other => Err(format!(
+            "Unsupported metadata upload provider: {other}. Expected pump-fun or pinata."
+        )),
+    }
+}
+
+fn configured_metadata_upload_provider() -> Result<MetadataUploadProvider, String> {
+    let configured = env::var("LAUNCHDECK_METADATA_UPLOAD_PROVIDER")
+        .or_else(|_| env::var("LAUNCHDECK_METADATA_PROVIDER"))
+        .unwrap_or_default();
+    parse_metadata_upload_provider(&configured)
+}
+
+fn configured_pinata_jwt() -> Result<String, String> {
+    let jwt = env::var("PINATA_JWT")
+        .or_else(|_| env::var("LAUNCHDECK_PINATA_JWT"))
+        .unwrap_or_default();
+    let trimmed = jwt.trim();
+    if trimmed.is_empty() {
+        Err(
+            "PINATA_JWT (or LAUNCHDECK_PINATA_JWT) is required when metadata upload provider is pinata."
+                .to_string(),
+        )
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn pinata_image_cache() -> &'static Mutex<HashMap<u64, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub struct QuoteForm {
@@ -247,7 +298,10 @@ fn parse_recipients(
                 entry.r#type.trim().to_lowercase()
             };
             let share_bps = entry.shareBps.ok_or_else(|| {
-                format!("Fee split recipient {} must have a positive share.", index + 1)
+                format!(
+                    "Fee split recipient {} must have a positive share.",
+                    index + 1
+                )
             })?;
             if share_bps <= 0 {
                 return Err(format!(
@@ -292,7 +346,9 @@ fn parse_recipients(
                     ..RawRecipient::default()
                 });
             }
-            Err(format!("Unsupported fee split recipient type: {entry_type}"))
+            Err(format!(
+                "Unsupported fee split recipient type: {entry_type}"
+            ))
         })
         .collect()
 }
@@ -361,7 +417,38 @@ fn image_mime(path: &Path) -> &'static str {
     }
 }
 
-async fn upload_metadata_to_pump_fun(config: &RawConfig) -> Result<String, String> {
+fn normalize_metadata_uri(uri: &str) -> String {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("ipfs://") {
+        return trimmed.to_string();
+    }
+    let Some(without_scheme) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+    else {
+        return trimmed.to_string();
+    };
+    let Some((_, path)) = without_scheme.split_once('/') else {
+        return trimmed.to_string();
+    };
+    let Some(ipfs_path) = path.strip_prefix("ipfs/") else {
+        return trimmed.to_string();
+    };
+    let normalized_path = ipfs_path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches('/');
+    if normalized_path.is_empty() {
+        return trimmed.to_string();
+    }
+    format!("ipfs://{normalized_path}")
+}
+
+fn uploaded_image_details(config: &RawConfig) -> Result<(String, PathBuf), String> {
     let image_file_name = Path::new(&config.imageLocalPath)
         .file_name()
         .and_then(|value| value.to_str())
@@ -372,21 +459,154 @@ async fn upload_metadata_to_pump_fun(config: &RawConfig) -> Result<String, Strin
         return Err("Image is required before launching.".to_string());
     }
     let image_path = uploads_dir().join(&image_file_name);
-    let image_bytes = fs::read(&image_path)
-        .map_err(|error| format!("Failed to read uploaded image {}: {error}", image_path.display()))?;
+    Ok((image_file_name, image_path))
+}
+
+fn build_launch_metadata_json(config: &RawConfig, image_uri: &str) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("name".to_string(), Value::String(config.token.name.clone()));
+    payload.insert("symbol".to_string(), Value::String(config.token.symbol.clone()));
+    payload.insert(
+        "description".to_string(),
+        Value::String(config.token.description.clone()),
+    );
+    payload.insert("image".to_string(), Value::String(image_uri.to_string()));
+    payload.insert("showName".to_string(), Value::Bool(true));
+    payload.insert(
+        "createdOn".to_string(),
+        Value::String("https://pump.fun".to_string()),
+    );
+    if !config.token.website.trim().is_empty() {
+        payload.insert(
+            "website".to_string(),
+            Value::String(config.token.website.clone()),
+        );
+    }
+    if !config.token.twitter.trim().is_empty() {
+        payload.insert(
+            "twitter".to_string(),
+            Value::String(config.token.twitter.clone()),
+        );
+    }
+    if !config.token.telegram.trim().is_empty() {
+        payload.insert(
+            "telegram".to_string(),
+            Value::String(config.token.telegram.clone()),
+        );
+    }
+    Value::Object(payload)
+}
+
+fn pinata_cid(payload: &Value, label: &str) -> Result<String, String> {
+    payload
+        .get("cid")
+        .or_else(|| payload.get("IpfsHash"))
+        .or_else(|| payload.get("data").and_then(|value| value.get("cid")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{label} did not return an IPFS CID."))
+}
+
+fn stable_image_cache_key(image_file_name: &str, image_bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    image_file_name.hash(&mut hasher);
+    image_bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cached_pinata_image_uri(cache_key: u64) -> Option<String> {
+    pinata_image_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+}
+
+fn store_pinata_image_uri(cache_key: u64, image_uri: &str) {
+    if let Ok(mut cache) = pinata_image_cache().lock() {
+        cache.insert(cache_key, image_uri.to_string());
+    }
+}
+
+async fn upload_image_to_pinata(
+    client: &Client,
+    jwt: &str,
+    image_file_name: &str,
+    image_path: &Path,
+    image_bytes: Vec<u8>,
+) -> Result<String, String> {
+    let image_cache_key = stable_image_cache_key(image_file_name, &image_bytes);
+    if let Some(image_uri) = cached_pinata_image_uri(image_cache_key) {
+        return Ok(image_uri);
+    }
+    let image_part = multipart::Part::bytes(image_bytes)
+        .file_name(image_file_name.to_string())
+        .mime_str(image_mime(image_path))
+        .map_err(|error| format!("Failed to prepare uploaded image: {error}"))?;
+    let image_upload_response = client
+        .post("https://uploads.pinata.cloud/v3/files")
+        .bearer_auth(jwt)
+        .multipart(
+            multipart::Form::new()
+                .text("network", "public")
+                .text("name", image_file_name.to_string())
+                .part("file", image_part),
+        )
+        .send()
+        .await
+        .map_err(|error| format!("Pinata image upload failed: {error}"))?;
+    if !image_upload_response.status().is_success() {
+        let status = image_upload_response.status();
+        let body = image_upload_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Pinata image upload failed with status {status}: {}",
+            if body.trim().is_empty() {
+                "empty response".to_string()
+            } else {
+                body
+            }
+        ));
+    }
+    let image_payload: Value = image_upload_response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to parse Pinata image upload response: {error}"))?;
+    let image_uri = format!("ipfs://{}", pinata_cid(&image_payload, "Pinata image upload")?);
+    store_pinata_image_uri(image_cache_key, &image_uri);
+    Ok(image_uri)
+}
+
+async fn upload_metadata_to_pump_fun(config: &RawConfig) -> Result<String, String> {
+    let (image_file_name, image_path) = uploaded_image_details(config)?;
+    let image_bytes = fs::read(&image_path).map_err(|error| {
+        format!(
+            "Failed to read uploaded image {}: {error}",
+            image_path.display()
+        )
+    })?;
     let image_part = multipart::Part::bytes(image_bytes)
         .file_name(image_file_name)
         .mime_str(image_mime(&image_path))
         .map_err(|error| format!("Failed to prepare uploaded image: {error}"))?;
     let mut metadata = serde_json::Map::new();
     if !config.token.website.trim().is_empty() {
-        metadata.insert("website".to_string(), Value::String(config.token.website.clone()));
+        metadata.insert(
+            "website".to_string(),
+            Value::String(config.token.website.clone()),
+        );
     }
     if !config.token.twitter.trim().is_empty() {
-        metadata.insert("twitter".to_string(), Value::String(config.token.twitter.clone()));
+        metadata.insert(
+            "twitter".to_string(),
+            Value::String(config.token.twitter.clone()),
+        );
     }
     if !config.token.telegram.trim().is_empty() {
-        metadata.insert("telegram".to_string(), Value::String(config.token.telegram.clone()));
+        metadata.insert(
+            "telegram".to_string(),
+            Value::String(config.token.telegram.clone()),
+        );
     }
     let form = multipart::Form::new()
         .text("name", config.token.name.clone())
@@ -420,23 +640,100 @@ async fn upload_metadata_to_pump_fun(config: &RawConfig) -> Result<String, Strin
     payload
         .get("metadataUri")
         .and_then(Value::as_str)
-        .map(|value| value.trim().to_string())
+        .map(normalize_metadata_uri)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Metadata upload did not return metadataUri.".to_string())
 }
 
-pub async fn quote_from_form(rpc_url: &str, form_value: Value) -> Result<Option<LaunchQuote>, String> {
+async fn upload_metadata_to_pinata(config: &RawConfig) -> Result<String, String> {
+    let jwt = configured_pinata_jwt()?;
+    let client = Client::new();
+    let (image_file_name, image_path) = uploaded_image_details(config)?;
+    let image_bytes = fs::read(&image_path).map_err(|error| {
+        format!(
+            "Failed to read uploaded image {}: {error}",
+            image_path.display()
+        )
+    })?;
+    let image_uri =
+        upload_image_to_pinata(&client, &jwt, &image_file_name, &image_path, image_bytes).await?;
+
+    let metadata_name = Path::new(&image_file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| format!("{value}-metadata.json"))
+        .unwrap_or_else(|| "metadata.json".to_string());
+    let metadata_payload = json!({
+        "pinataContent": build_launch_metadata_json(config, &image_uri),
+        "pinataMetadata": {
+            "name": metadata_name,
+        },
+        "pinataOptions": {
+            "cidVersion": 1,
+        }
+    });
+    let metadata_response = client
+        .post("https://api.pinata.cloud/pinning/pinJSONToIPFS")
+        .bearer_auth(&jwt)
+        .json(&metadata_payload)
+        .send()
+        .await
+        .map_err(|error| format!("Pinata metadata upload failed: {error}"))?;
+    if !metadata_response.status().is_success() {
+        let status = metadata_response.status();
+        let body = metadata_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Pinata metadata upload failed with status {status}: {}",
+            if body.trim().is_empty() {
+                "empty response".to_string()
+            } else {
+                body
+            }
+        ));
+    }
+    let metadata_payload: Value = metadata_response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to parse Pinata metadata upload response: {error}"))?;
+    Ok(format!(
+        "ipfs://{}",
+        pinata_cid(&metadata_payload, "Pinata metadata upload")?
+    ))
+}
+
+async fn upload_metadata(config: &RawConfig) -> Result<String, String> {
+    match configured_metadata_upload_provider()? {
+        MetadataUploadProvider::PumpFun => upload_metadata_to_pump_fun(config).await,
+        MetadataUploadProvider::Pinata => match upload_metadata_to_pinata(config).await {
+            Ok(uri) => Ok(uri),
+            Err(pinata_error) => upload_metadata_to_pump_fun(config).await.map_err(|pump_error| {
+                format!(
+                    "Pinata metadata upload failed and pump-fun fallback also failed. Pinata: {pinata_error} | pump-fun: {pump_error}"
+                )
+            }),
+        },
+    }
+}
+
+fn provided_metadata_uri(form: &UiForm) -> Option<String> {
+    let normalized = normalize_metadata_uri(&form.metadataUri);
+    if normalized.trim().is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub async fn quote_from_form(
+    rpc_url: &str,
+    form_value: Value,
+) -> Result<Option<LaunchQuote>, String> {
     let form: QuoteForm = serde_json::from_value(form_value)
         .map_err(|error| format!("Invalid quote form payload: {error}"))?;
     quote_launch(rpc_url, &form.mode, &form.amount).await
 }
 
-pub async fn build_raw_config_from_form(
-    action: &str,
-    form_value: Value,
-) -> Result<(RawConfig, Option<String>), String> {
-    let form: UiForm = serde_json::from_value(form_value)
-        .map_err(|error| format!("Invalid launch form payload: {error}"))?;
+async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<RawConfig, String> {
     let mode = if form.mode.trim().is_empty() {
         "regular".to_string()
     } else {
@@ -484,7 +781,7 @@ pub async fn build_raw_config_from_form(
     } else {
         0
     };
-    let is_agent_complete = matches!(mode.as_str(), "agent-unlocked" | "agent-locked");
+    let is_agent_locked = mode == "agent-locked";
     let is_agent_custom = mode == "agent-custom";
     let is_agent_unlocked = mode == "agent-unlocked";
     let fee_split_enabled = mode == "regular" && form.feeSplitEnabled;
@@ -498,7 +795,7 @@ pub async fn build_raw_config_from_form(
         .find(|entry| entry.r#type == "agent")
         .and_then(|entry| entry.shareBps.as_ref())
         .and_then(Value::as_i64);
-    let buyback_bps = if is_agent_complete {
+    let buyback_bps = if is_agent_locked {
         Some(10_000)
     } else if is_agent_custom {
         agent_recipient_share
@@ -520,9 +817,9 @@ pub async fn build_raw_config_from_form(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_string();
-    let selected_wallet_key = selected_wallet_key_or_default(&form.selectedWalletKey)
-        .unwrap_or_default();
-    let mut raw = RawConfig {
+    let selected_wallet_key =
+        selected_wallet_key_or_default(&form.selectedWalletKey).unwrap_or_default();
+    Ok(RawConfig {
         mode: mode.clone(),
         launchpad,
         token: RawToken {
@@ -542,7 +839,7 @@ pub async fn build_raw_config_from_form(
         },
         signer: Default::default(),
         agent: RawAgent {
-            authority: if is_agent_complete {
+            authority: if is_agent_locked {
                 String::new()
             } else {
                 form.agentAuthority.trim().to_string()
@@ -550,7 +847,7 @@ pub async fn build_raw_config_from_form(
             buybackBps: buyback_bps.map(|value| json!(value)),
             splitAgentInit: Some(json!(is_agent_custom || mode == "agent-locked")),
             feeReceiver: String::new(),
-            feeRecipients: if is_agent_complete || is_agent_unlocked {
+            feeRecipients: if is_agent_locked || is_agent_unlocked {
                 vec![]
             } else {
                 agent_fee_recipients
@@ -558,9 +855,9 @@ pub async fn build_raw_config_from_form(
         },
         tx: RawTx {
             computeUnitLimit: Some(json!(FIXED_COMPUTE_UNIT_LIMIT)),
-            computeUnitPriceMicroLamports: Some(json!(
-                lamports_to_priority_fee_micro_lamports(priority_fee_lamports)
-            )),
+            computeUnitPriceMicroLamports: Some(json!(lamports_to_priority_fee_micro_lamports(
+                priority_fee_lamports
+            ))),
             jitoTipLamports: Some(json!(tip_lamports)),
             jitoTipAccount: if tip_lamports > 0 {
                 pick_tip_account(&provider)
@@ -579,7 +876,7 @@ pub async fn build_raw_config_from_form(
         creatorFee: RawCreatorFee {
             mode: if mode == "cashback" {
                 "cashback".to_string()
-            } else if is_agent_complete {
+            } else if is_agent_locked {
                 "agent-escrow".to_string()
             } else {
                 "deployer".to_string()
@@ -688,8 +985,123 @@ pub async fn build_raw_config_from_form(
             uploads_dir().join(&image_file_name).display().to_string()
         },
         selectedWalletKey: selected_wallet_key,
+    })
+}
+
+pub async fn upload_metadata_from_form(form_value: Value) -> Result<String, String> {
+    let form: UiForm = serde_json::from_value(form_value)
+        .map_err(|error| format!("Invalid launch form payload: {error}"))?;
+    let raw = build_raw_config_from_ui_form("send", form).await?;
+    upload_metadata(&raw).await
+}
+
+pub async fn build_raw_config_from_form(
+    action: &str,
+    form_value: Value,
+) -> Result<(RawConfig, Option<String>), String> {
+    let form: UiForm = serde_json::from_value(form_value)
+        .map_err(|error| format!("Invalid launch form payload: {error}"))?;
+    let existing_metadata_uri = provided_metadata_uri(&form);
+    let mut raw = build_raw_config_from_ui_form(action, form).await?;
+    let metadata_uri = if let Some(metadata_uri) = existing_metadata_uri {
+        metadata_uri
+    } else if action == "send" {
+        upload_metadata(&raw).await?
+    } else {
+        return Err(format!(
+            "Metadata is still uploading. Wait for the metadata pre-upload to finish before {action}."
+        ));
     };
-    let metadata_uri = upload_metadata_to_pump_fun(&raw).await?;
     raw.token.uri = metadata_uri.clone();
     Ok((raw, Some(metadata_uri)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MetadataUploadProvider, UiForm, build_raw_config_from_ui_form, normalize_metadata_uri,
+        parse_metadata_upload_provider,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn keeps_ipfs_uri_unchanged() {
+        assert_eq!(
+            normalize_metadata_uri("ipfs://QmExampleCid"),
+            "ipfs://QmExampleCid"
+        );
+    }
+
+    #[test]
+    fn normalizes_ipfs_gateway_uri() {
+        assert_eq!(
+            normalize_metadata_uri("https://ipfs.io/ipfs/QmExampleCid"),
+            "ipfs://QmExampleCid"
+        );
+    }
+
+    #[test]
+    fn normalizes_gateway_uri_with_nested_path() {
+        assert_eq!(
+            normalize_metadata_uri("https://example.com/ipfs/QmExampleCid/metadata.json"),
+            "ipfs://QmExampleCid/metadata.json"
+        );
+    }
+
+    #[test]
+    fn leaves_non_ipfs_url_unchanged() {
+        assert_eq!(
+            normalize_metadata_uri("https://example.com/metadata.json"),
+            "https://example.com/metadata.json"
+        );
+    }
+
+    #[test]
+    fn metadata_upload_provider_defaults_to_pump_fun() {
+        assert_eq!(
+            parse_metadata_upload_provider("").expect("provider"),
+            MetadataUploadProvider::PumpFun
+        );
+    }
+
+    #[test]
+    fn metadata_upload_provider_accepts_pinata() {
+        assert_eq!(
+            parse_metadata_upload_provider("pinata").expect("provider"),
+            MetadataUploadProvider::Pinata
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_unlocked_preserves_configured_buyback_percent() {
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                mode: "agent-unlocked".to_string(),
+                buybackPercent: "1".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("agent-unlocked config should build");
+
+        assert_eq!(raw.agent.buybackBps, Some(json!(100)));
+        assert_eq!(raw.creatorFee.mode, "deployer");
+    }
+
+    #[tokio::test]
+    async fn agent_unlocked_allows_zero_buyback_percent() {
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                mode: "agent-unlocked".to_string(),
+                buybackPercent: "0".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("zero buyback should be accepted");
+
+        assert_eq!(raw.agent.buybackBps, Some(json!(0)));
+    }
 }

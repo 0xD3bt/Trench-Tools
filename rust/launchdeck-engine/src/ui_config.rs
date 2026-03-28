@@ -153,7 +153,10 @@ fn trade_settings(
 fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
     let mut buy = trade_settings("", "", "", "", "", "");
     if let Some(object) = buy.as_object_mut() {
-        object.insert("snipeBuyAmountSol".to_string(), Value::String(String::new()));
+        object.insert(
+            "snipeBuyAmountSol".to_string(),
+            Value::String(String::new()),
+        );
     }
     json!({
         "id": id,
@@ -200,9 +203,18 @@ fn first_non_empty(values: &[String]) -> String {
 fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index: usize) -> Value {
     let preset_obj = preset.and_then(Value::as_object);
     let fallback_obj = fallback_preset.as_object().expect("fallback preset object");
-    let fallback_creation = fallback_obj.get("creationSettings").and_then(Value::as_object).expect("creation settings");
-    let fallback_buy = fallback_obj.get("buySettings").and_then(Value::as_object).expect("buy settings");
-    let fallback_sell = fallback_obj.get("sellSettings").and_then(Value::as_object).expect("sell settings");
+    let fallback_creation = fallback_obj
+        .get("creationSettings")
+        .and_then(Value::as_object)
+        .expect("creation settings");
+    let fallback_buy = fallback_obj
+        .get("buySettings")
+        .and_then(Value::as_object)
+        .expect("buy settings");
+    let fallback_sell = fallback_obj
+        .get("sellSettings")
+        .and_then(Value::as_object)
+        .expect("sell settings");
     let creation = preset_obj
         .and_then(|value| value.get("creationSettings"))
         .and_then(Value::as_object);
@@ -227,20 +239,110 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
         .to_string()
         .if_empty_then(format!("P{}", index + 1));
     let creation_settings = creation_settings(
-        creation.and_then(|value| value.get("provider")).and_then(Value::as_str).unwrap_or(fallback_creation.get("provider").and_then(Value::as_str).unwrap_or(DEFAULT_PROVIDER)),
-        creation.and_then(|value| value.get("endpointProfile")).and_then(Value::as_str).unwrap_or(fallback_creation.get("endpointProfile").and_then(Value::as_str).unwrap_or(DEFAULT_ENDPOINT_PROFILE)),
-        creation.and_then(|value| value.get("policy")).and_then(Value::as_str).unwrap_or(fallback_creation.get("policy").and_then(Value::as_str).unwrap_or(DEFAULT_POLICY)),
-        creation.and_then(|value| value.get("tipSol")).and_then(Value::as_str).unwrap_or(fallback_creation.get("tipSol").and_then(Value::as_str).unwrap_or(DEFAULT_CREATION_TIP_SOL)),
-        creation.and_then(|value| value.get("priorityFeeSol")).and_then(Value::as_str).unwrap_or(fallback_creation.get("priorityFeeSol").and_then(Value::as_str).unwrap_or("0.001")),
-        creation.and_then(|value| value.get("devBuySol")).and_then(Value::as_str).unwrap_or(fallback_creation.get("devBuySol").and_then(Value::as_str).unwrap_or("")),
+        creation
+            .and_then(|value| value.get("provider"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_creation
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_PROVIDER),
+            ),
+        creation
+            .and_then(|value| value.get("endpointProfile"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_creation
+                    .get("endpointProfile")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_ENDPOINT_PROFILE),
+            ),
+        creation
+            .and_then(|value| value.get("policy"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_creation
+                    .get("policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_POLICY),
+            ),
+        creation
+            .and_then(|value| value.get("tipSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_creation
+                    .get("tipSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_CREATION_TIP_SOL),
+            ),
+        creation
+            .and_then(|value| value.get("priorityFeeSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_creation
+                    .get("priorityFeeSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0.001"),
+            ),
+        creation
+            .and_then(|value| value.get("devBuySol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_creation
+                    .get("devBuySol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
     );
     let mut buy_settings = trade_settings(
-        buy.and_then(|value| value.get("provider")).and_then(Value::as_str).unwrap_or(fallback_buy.get("provider").and_then(Value::as_str).unwrap_or(DEFAULT_PROVIDER)),
-        buy.and_then(|value| value.get("endpointProfile")).and_then(Value::as_str).unwrap_or(fallback_buy.get("endpointProfile").and_then(Value::as_str).unwrap_or(DEFAULT_ENDPOINT_PROFILE)),
-        buy.and_then(|value| value.get("policy")).and_then(Value::as_str).unwrap_or(fallback_buy.get("policy").and_then(Value::as_str).unwrap_or(DEFAULT_POLICY)),
-        buy.and_then(|value| value.get("priorityFeeSol")).and_then(Value::as_str).unwrap_or(fallback_buy.get("priorityFeeSol").and_then(Value::as_str).unwrap_or(DEFAULT_TRADE_PRIORITY_FEE_SOL)),
-        buy.and_then(|value| value.get("tipSol")).and_then(Value::as_str).unwrap_or(fallback_buy.get("tipSol").and_then(Value::as_str).unwrap_or(DEFAULT_TRADE_TIP_SOL)),
-        buy.and_then(|value| value.get("slippagePercent")).and_then(Value::as_str).unwrap_or(fallback_buy.get("slippagePercent").and_then(Value::as_str).unwrap_or(DEFAULT_TRADE_SLIPPAGE_PERCENT)),
+        buy.and_then(|value| value.get("provider"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_buy
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_PROVIDER),
+            ),
+        buy.and_then(|value| value.get("endpointProfile"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_buy
+                    .get("endpointProfile")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_ENDPOINT_PROFILE),
+            ),
+        buy.and_then(|value| value.get("policy"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_buy
+                    .get("policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_POLICY),
+            ),
+        buy.and_then(|value| value.get("priorityFeeSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_buy
+                    .get("priorityFeeSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_TRADE_PRIORITY_FEE_SOL),
+            ),
+        buy.and_then(|value| value.get("tipSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_buy
+                    .get("tipSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_TRADE_TIP_SOL),
+            ),
+        buy.and_then(|value| value.get("slippagePercent"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_buy
+                    .get("slippagePercent")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_TRADE_SLIPPAGE_PERCENT),
+            ),
     );
     buy_settings
         .as_object_mut()
@@ -248,17 +350,66 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
         .insert(
             "snipeBuyAmountSol".to_string(),
             Value::String(normalize_decimal_string(
-                buy.and_then(|value| value.get("snipeBuyAmountSol")).and_then(Value::as_str).unwrap_or(fallback_buy.get("snipeBuyAmountSol").and_then(Value::as_str).unwrap_or("")),
+                buy.and_then(|value| value.get("snipeBuyAmountSol"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(
+                        fallback_buy
+                            .get("snipeBuyAmountSol")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    ),
                 "",
             )),
         );
     let sell_settings = trade_settings(
-        sell.and_then(|value| value.get("provider")).and_then(Value::as_str).unwrap_or(fallback_sell.get("provider").and_then(Value::as_str).unwrap_or(DEFAULT_PROVIDER)),
-        sell.and_then(|value| value.get("endpointProfile")).and_then(Value::as_str).unwrap_or(fallback_sell.get("endpointProfile").and_then(Value::as_str).unwrap_or(DEFAULT_ENDPOINT_PROFILE)),
-        sell.and_then(|value| value.get("policy")).and_then(Value::as_str).unwrap_or(fallback_sell.get("policy").and_then(Value::as_str).unwrap_or(DEFAULT_POLICY)),
-        sell.and_then(|value| value.get("priorityFeeSol")).and_then(Value::as_str).unwrap_or(fallback_sell.get("priorityFeeSol").and_then(Value::as_str).unwrap_or(DEFAULT_TRADE_PRIORITY_FEE_SOL)),
-        sell.and_then(|value| value.get("tipSol")).and_then(Value::as_str).unwrap_or(fallback_sell.get("tipSol").and_then(Value::as_str).unwrap_or(DEFAULT_TRADE_TIP_SOL)),
-        sell.and_then(|value| value.get("slippagePercent")).and_then(Value::as_str).unwrap_or(fallback_sell.get("slippagePercent").and_then(Value::as_str).unwrap_or(DEFAULT_TRADE_SLIPPAGE_PERCENT)),
+        sell.and_then(|value| value.get("provider"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_sell
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_PROVIDER),
+            ),
+        sell.and_then(|value| value.get("endpointProfile"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_sell
+                    .get("endpointProfile")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_ENDPOINT_PROFILE),
+            ),
+        sell.and_then(|value| value.get("policy"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_sell
+                    .get("policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_POLICY),
+            ),
+        sell.and_then(|value| value.get("priorityFeeSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_sell
+                    .get("priorityFeeSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_TRADE_PRIORITY_FEE_SOL),
+            ),
+        sell.and_then(|value| value.get("tipSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_sell
+                    .get("tipSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_TRADE_TIP_SOL),
+            ),
+        sell.and_then(|value| value.get("slippagePercent"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_sell
+                    .get("slippagePercent")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_TRADE_SLIPPAGE_PERCENT),
+            ),
     );
     let post_launch_strategy = preset_obj
         .and_then(|value| value.get("postLaunchStrategy"))
@@ -440,7 +591,13 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
         .iter()
         .enumerate()
         .map(|(index, id)| {
-            let fallback = base_items.get(index).cloned().unwrap_or_else(|| default_preset(id, &format!("P{}", index + 1), DEFAULT_DEV_BUY_AMOUNTS[index]));
+            let fallback = base_items.get(index).cloned().unwrap_or_else(|| {
+                default_preset(
+                    id,
+                    &format!("P{}", index + 1),
+                    DEFAULT_DEV_BUY_AMOUNTS[index],
+                )
+            });
             let existing = merged_items
                 .iter()
                 .find(|entry| string_value(entry.get("id")) == *id)
@@ -448,7 +605,8 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
             normalize_preset_shape(existing, &fallback, index)
         })
         .collect::<Vec<_>>();
-    let launchpad = string_value(merged_defaults.get("launchpad")).if_empty_then("pump".to_string());
+    let launchpad =
+        string_value(merged_defaults.get("launchpad")).if_empty_then("pump".to_string());
     let mode = string_value(merged_defaults.get("mode")).if_empty_then("regular".to_string());
     let active_preset_id = {
         let value = string_value(merged_defaults.get("activePresetId"));

@@ -3,6 +3,11 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::Instant,
+};
 use tokio::time::{Duration, sleep};
 
 use crate::transport::{JitoBundleEndpoint, TransportPlan};
@@ -58,10 +63,62 @@ pub struct SentResult {
     pub attemptedBundleIds: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct SendTimingBreakdown {
+    pub submit_ms: u128,
+    pub confirm_ms: u128,
+}
+
 struct ConfirmationDetails {
     status: Value,
     confirmed_observed_block_height: Option<u64>,
     confirmed_slot: Option<u64>,
+}
+
+const BLOCKHASH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const BLOCKHASH_MAX_AGE: Duration = Duration::from_secs(45);
+
+#[derive(Clone)]
+struct CachedBlockhash {
+    blockhash: String,
+    last_valid_block_height: u64,
+    fetched_at: Instant,
+}
+
+fn blockhash_cache() -> &'static Mutex<HashMap<String, CachedBlockhash>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedBlockhash>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn blockhash_cache_key(rpc_url: &str, commitment: &str) -> String {
+    format!("{rpc_url}|{commitment}")
+}
+
+fn get_cached_blockhash(rpc_url: &str, commitment: &str) -> Option<(String, u64)> {
+    let cache = blockhash_cache().lock().ok()?;
+    let entry = cache.get(&blockhash_cache_key(rpc_url, commitment))?;
+    if entry.fetched_at.elapsed() > BLOCKHASH_MAX_AGE {
+        return None;
+    }
+    Some((entry.blockhash.clone(), entry.last_valid_block_height))
+}
+
+fn cache_blockhash(
+    rpc_url: &str,
+    commitment: &str,
+    blockhash: String,
+    last_valid_block_height: u64,
+) {
+    if let Ok(mut cache) = blockhash_cache().lock() {
+        cache.insert(
+            blockhash_cache_key(rpc_url, commitment),
+            CachedBlockhash {
+                blockhash,
+                last_valid_block_height,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
 }
 
 async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value, String> {
@@ -132,6 +189,37 @@ pub async fn fetch_latest_blockhash(
     Ok((blockhash, last_valid_block_height))
 }
 
+pub async fn fetch_latest_blockhash_cached(
+    rpc_url: &str,
+    commitment: &str,
+) -> Result<(String, u64), String> {
+    if let Some(cached) = get_cached_blockhash(rpc_url, commitment) {
+        return Ok(cached);
+    }
+    let (blockhash, last_valid_block_height) = fetch_latest_blockhash(rpc_url, commitment).await?;
+    cache_blockhash(
+        rpc_url,
+        commitment,
+        blockhash.clone(),
+        last_valid_block_height,
+    );
+    Ok((blockhash, last_valid_block_height))
+}
+
+#[allow(dead_code)]
+pub fn spawn_blockhash_refresh_task(rpc_url: String, commitment: &'static str) {
+    tokio::spawn(async move {
+        loop {
+            if let Ok((blockhash, last_valid_block_height)) =
+                fetch_latest_blockhash(&rpc_url, commitment).await
+            {
+                cache_blockhash(&rpc_url, commitment, blockhash, last_valid_block_height);
+            }
+            sleep(BLOCKHASH_REFRESH_INTERVAL).await;
+        }
+    });
+}
+
 pub async fn fetch_account_data(
     rpc_url: &str,
     account: &str,
@@ -185,10 +273,7 @@ pub async fn fetch_account_exists(
     Ok(result.get("value").is_some_and(|value| !value.is_null()))
 }
 
-pub async fn fetch_current_block_height(
-    rpc_url: &str,
-    commitment: &str,
-) -> Result<u64, String> {
+pub async fn fetch_current_block_height(rpc_url: &str, commitment: &str) -> Result<u64, String> {
     let result = rpc_request(
         rpc_url,
         "getBlockHeight",
@@ -340,11 +425,13 @@ pub async fn send_transactions_sequential(
     commitment: &str,
     skip_preflight: bool,
     track_send_block_height: bool,
-) -> Result<(Vec<SentResult>, Vec<String>), String> {
+) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
     let mut results = Vec::new();
     let warnings = Vec::new();
+    let mut timing = SendTimingBreakdown::default();
     for transaction in transactions {
         let max_retries = 3;
+        let submit_started = std::time::Instant::now();
         let signature = rpc_request(
             rpc_url,
             "sendTransaction",
@@ -362,14 +449,17 @@ pub async fn send_transactions_sequential(
         .as_str()
         .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?
         .to_string();
+        timing.submit_ms += submit_started.elapsed().as_millis();
         let send_observed_block_height = if track_send_block_height {
             fetch_current_block_height(rpc_url, commitment).await.ok()
         } else {
             None
         };
+        let confirm_started = std::time::Instant::now();
         let confirmation =
             wait_for_confirmation(rpc_url, &signature, commitment, 20, track_send_block_height)
                 .await?;
+        timing.confirm_ms += confirm_started.elapsed().as_millis();
         results.push(SentResult {
             label: transaction.label.clone(),
             format: transaction.format.clone(),
@@ -396,7 +486,7 @@ pub async fn send_transactions_sequential(
             attemptedBundleIds: vec![],
         });
     }
-    Ok((results, warnings))
+    Ok((results, warnings, timing))
 }
 
 fn validate_helius_sender_transaction(transaction: &CompiledTransaction) -> Result<(), String> {
@@ -421,9 +511,10 @@ pub async fn send_transactions_helius_sender(
     transactions: &[CompiledTransaction],
     commitment: &str,
     track_send_block_height: bool,
-) -> Result<(Vec<SentResult>, Vec<String>), String> {
+) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
     let mut results = Vec::new();
     let mut warnings = Vec::new();
+    let mut timing = SendTimingBreakdown::default();
     if endpoints.is_empty() {
         return Err("Helius Sender endpoint is not configured.".to_string());
     }
@@ -432,6 +523,7 @@ pub async fn send_transactions_helius_sender(
         let mut successful_endpoints = Vec::new();
         let mut signatures = Vec::new();
         let mut errors = Vec::new();
+        let submit_started = std::time::Instant::now();
         for endpoint in endpoints {
             match rpc_request(
                 endpoint,
@@ -458,9 +550,11 @@ pub async fn send_transactions_helius_sender(
                 Err(error) => errors.push(format!("{endpoint}: {error}")),
             }
         }
+        timing.submit_ms += submit_started.elapsed().as_millis();
         if signatures.is_empty() {
             return Err(format!(
-                "Helius Sender failed for all endpoints in the selected profile: {}",
+                "Helius Sender failed for transaction {} on all attempted endpoints: {}",
+                transaction.label,
                 errors.join(" | ")
             ));
         }
@@ -480,9 +574,11 @@ pub async fn send_transactions_helius_sender(
         } else {
             None
         };
+        let confirm_started = std::time::Instant::now();
         let confirmation =
             wait_for_confirmation(rpc_url, &signature, commitment, 20, track_send_block_height)
                 .await?;
+        timing.confirm_ms += confirm_started.elapsed().as_millis();
         results.push(SentResult {
             label: transaction.label.clone(),
             format: transaction.format.clone(),
@@ -509,7 +605,7 @@ pub async fn send_transactions_helius_sender(
             attemptedBundleIds: vec![],
         });
     }
-    Ok((results, warnings))
+    Ok((results, warnings, timing))
 }
 
 async fn jito_request(endpoint: &str, method: &str, params: Value) -> Result<Value, String> {
@@ -554,9 +650,9 @@ pub async fn send_transactions_bundle(
     transactions: &[CompiledTransaction],
     commitment: &str,
     track_send_block_height: bool,
-) -> Result<(Vec<SentResult>, Vec<String>), String> {
+) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
     if transactions.is_empty() {
-        return Ok((vec![], vec![]));
+        return Ok((vec![], vec![], SendTimingBreakdown::default()));
     }
     if transactions.len() > 5 {
         return Err(format!(
@@ -573,6 +669,8 @@ pub async fn send_transactions_bundle(
         .collect();
     let mut attempts = Vec::new();
     let mut send_errors = Vec::new();
+    let mut timing = SendTimingBreakdown::default();
+    let submit_started = std::time::Instant::now();
     for endpoint in endpoints {
         match jito_request(
             &endpoint.send,
@@ -591,6 +689,7 @@ pub async fn send_transactions_bundle(
             Err(error) => send_errors.push(format!("{}: {}", endpoint.name, error)),
         }
     }
+    timing.submit_ms += submit_started.elapsed().as_millis();
     if attempts.is_empty() {
         return Err(format!(
             "Jito bundle submission failed for all endpoints in the selected profile: {}",
@@ -610,6 +709,7 @@ pub async fn send_transactions_bundle(
         None
     };
 
+    let confirm_started = std::time::Instant::now();
     for _ in 0..20 {
         let mut observed_errors = Vec::new();
         for (endpoint, bundle_id) in &attempts {
@@ -686,7 +786,8 @@ pub async fn send_transactions_bundle(
                             confirmedObservedBlockHeight: confirmed_observed_block_height,
                             confirmedSlot: confirmed_slot,
                             computeUnitLimit: transaction.computeUnitLimit,
-                            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+                            computeUnitPriceMicroLamports: transaction
+                                .computeUnitPriceMicroLamports,
                             inlineTipLamports: transaction.inlineTipLamports,
                             inlineTipAccount: transaction.inlineTipAccount.clone(),
                             bundleId: Some(bundle_id.clone()),
@@ -706,7 +807,8 @@ pub async fn send_transactions_bundle(
                         observed_errors.join(" | ")
                     ));
                 }
-                return Ok((results, warnings));
+                timing.confirm_ms += confirm_started.elapsed().as_millis();
+                return Ok((results, warnings, timing));
             }
         }
         sleep(Duration::from_millis(1500)).await;
@@ -729,7 +831,7 @@ pub async fn send_transactions_for_transport(
     commitment: &str,
     skip_preflight: bool,
     track_send_block_height: bool,
-) -> Result<(Vec<SentResult>, Vec<String>), String> {
+) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
     match transport_plan.transportType.as_str() {
         "jito-bundle" => {
             send_transactions_bundle(
@@ -927,17 +1029,13 @@ mod tests {
             }))
         }
 
-        let app = Router::new()
-            .route("/", post(handler))
-            .with_state(calls);
+        let app = Router::new().route("/", post(handler)).with_state(calls);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind sender listener");
         let addr = listener.local_addr().expect("read sender addr");
         tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve sender app");
+            axum::serve(listener, app).await.expect("serve sender app");
         });
         addr
     }
@@ -961,16 +1059,15 @@ mod tests {
     async fn sends_transactions_sequentially_via_rpc() {
         let addr = start_jsonrpc_server().await;
         let rpc_url = format!("http://{addr}/");
-        let (results, warnings) =
-            send_transactions_sequential(
-                &rpc_url,
-                &[compiled_tx("launch")],
-                "confirmed",
-                false,
-                true,
-            )
-                .await
-                .expect("send should succeed");
+        let (results, warnings, timing) = send_transactions_sequential(
+            &rpc_url,
+            &[compiled_tx("launch")],
+            "confirmed",
+            false,
+            true,
+        )
+        .await
+        .expect("send should succeed");
         assert!(warnings.is_empty());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].signature.as_deref(), Some("sig-test-123"));
@@ -981,6 +1078,10 @@ mod tests {
             results[0].explorerUrl.as_deref(),
             Some("https://solscan.io/tx/sig-test-123")
         );
+        assert_eq!(
+            timing.submit_ms.saturating_add(timing.confirm_ms) >= timing.confirm_ms,
+            true
+        );
     }
 
     #[tokio::test]
@@ -989,10 +1090,18 @@ mod tests {
         let status_calls_one = Arc::new(Mutex::new(Vec::new()));
         let send_calls_two = Arc::new(Mutex::new(Vec::new()));
         let status_calls_two = Arc::new(Mutex::new(Vec::new()));
-        let (send_addr_one, status_addr_one) =
-            start_jito_server(send_calls_one.clone(), status_calls_one.clone(), "bundle-123").await;
-        let (send_addr_two, status_addr_two) =
-            start_jito_server(send_calls_two.clone(), status_calls_two.clone(), "bundle-456").await;
+        let (send_addr_one, status_addr_one) = start_jito_server(
+            send_calls_one.clone(),
+            status_calls_one.clone(),
+            "bundle-123",
+        )
+        .await;
+        let (send_addr_two, status_addr_two) = start_jito_server(
+            send_calls_two.clone(),
+            status_calls_two.clone(),
+            "bundle-456",
+        )
+        .await;
         let endpoints = vec![
             JitoBundleEndpoint {
                 name: "local-one".to_string(),
@@ -1008,7 +1117,7 @@ mod tests {
         let transactions = vec![compiled_tx("launch"), compiled_tx("jito-tip")];
         let rpc_addr = start_jsonrpc_server().await;
         let rpc_url = format!("http://{rpc_addr}/");
-        let (results, warnings) =
+        let (results, warnings, timing) =
             send_transactions_bundle(&rpc_url, &endpoints, &transactions, "confirmed", true)
                 .await
                 .expect("bundle send should succeed");
@@ -1018,13 +1127,27 @@ mod tests {
         assert_eq!(results[0].sendObservedBlockHeight, Some(345678));
         assert_eq!(results[0].confirmedObservedBlockHeight, Some(345678));
         assert_eq!(results[0].confirmedSlot, Some(567890));
-        assert!(warnings.iter().any(|warning| warning.contains("fanout to 2 endpoints")));
-        assert!(warnings.iter().any(|warning| warning.contains("Sent via Jito bundle")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("fanout to 2 endpoints"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("Sent via Jito bundle"))
+        );
         assert_eq!(results[0].attemptedEndpoints.len(), 2);
         assert_eq!(results[0].attemptedBundleIds.len(), 2);
         assert_eq!(send_calls_one.lock().await.len(), 1);
         assert_eq!(send_calls_two.lock().await.len(), 1);
-        assert!(!status_calls_one.lock().await.is_empty() || !status_calls_two.lock().await.is_empty());
+        assert!(
+            !status_calls_one.lock().await.is_empty() || !status_calls_two.lock().await.is_empty()
+        );
+        assert_eq!(
+            timing.submit_ms.saturating_add(timing.confirm_ms) >= timing.confirm_ms,
+            true
+        );
     }
 
     #[tokio::test]
@@ -1037,7 +1160,7 @@ mod tests {
         let rpc_url = format!("http://{rpc_addr}/");
         let endpoint_one = format!("http://{sender_addr_one}/");
         let endpoint_two = format!("http://{sender_addr_two}/");
-        let (results, warnings) = send_transactions_helius_sender(
+        let (results, warnings, timing) = send_transactions_helius_sender(
             &rpc_url,
             &[endpoint_one.clone(), endpoint_two.clone()],
             &[compiled_tx("launch")],
@@ -1052,6 +1175,10 @@ mod tests {
         assert_eq!(results[0].confirmedObservedBlockHeight, Some(345678));
         assert_eq!(results[0].confirmedSlot, Some(456789));
         assert_eq!(results[0].attemptedEndpoints.len(), 2);
+        assert_eq!(
+            timing.submit_ms.saturating_add(timing.confirm_ms) >= timing.confirm_ms,
+            true
+        );
 
         let recorded = calls_one.lock().await;
         assert_eq!(recorded.len(), 1);

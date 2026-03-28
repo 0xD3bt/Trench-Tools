@@ -57,15 +57,51 @@ fn normalize_social_url(raw_value: &str, kind: &str) -> String {
 
 fn merge_imported(base: ImportedTokenData, overlay: ImportedTokenData) -> ImportedTokenData {
     ImportedTokenData {
-        name: if !base.name.is_empty() { base.name } else { overlay.name },
-        symbol: if !base.symbol.is_empty() { base.symbol } else { overlay.symbol },
-        description: if !base.description.is_empty() { base.description } else { overlay.description },
-        website: if !base.website.is_empty() { base.website } else { overlay.website },
-        twitter: if !base.twitter.is_empty() { base.twitter } else { overlay.twitter },
-        telegram: if !base.telegram.is_empty() { base.telegram } else { overlay.telegram },
-        imageUrl: if !base.imageUrl.is_empty() { base.imageUrl } else { overlay.imageUrl },
-        metadataUri: if !base.metadataUri.is_empty() { base.metadataUri } else { overlay.metadataUri },
-        source: if !base.source.is_empty() { base.source } else { overlay.source },
+        name: if !base.name.is_empty() {
+            base.name
+        } else {
+            overlay.name
+        },
+        symbol: if !base.symbol.is_empty() {
+            base.symbol
+        } else {
+            overlay.symbol
+        },
+        description: if !base.description.is_empty() {
+            base.description
+        } else {
+            overlay.description
+        },
+        website: if !base.website.is_empty() {
+            base.website
+        } else {
+            overlay.website
+        },
+        twitter: if !base.twitter.is_empty() {
+            base.twitter
+        } else {
+            overlay.twitter
+        },
+        telegram: if !base.telegram.is_empty() {
+            base.telegram
+        } else {
+            overlay.telegram
+        },
+        imageUrl: if !base.imageUrl.is_empty() {
+            base.imageUrl
+        } else {
+            overlay.imageUrl
+        },
+        metadataUri: if !base.metadataUri.is_empty() {
+            base.metadataUri
+        } else {
+            overlay.metadataUri
+        },
+        source: if !base.source.is_empty() {
+            base.source
+        } else {
+            overlay.source
+        },
     }
 }
 
@@ -87,7 +123,8 @@ fn normalize_imported_metadata_payload(payload: &Value, source: &str) -> Importe
     let twitter_social = socials
         .iter()
         .find(|entry| {
-            entry.get("type")
+            entry
+                .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .eq_ignore_ascii_case("twitter")
@@ -98,7 +135,8 @@ fn normalize_imported_metadata_payload(payload: &Value, source: &str) -> Importe
     let telegram_social = socials
         .iter()
         .find(|entry| {
-            entry.get("type")
+            entry
+                .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .eq_ignore_ascii_case("telegram")
@@ -169,14 +207,21 @@ fn normalize_imported_metadata_payload(payload: &Value, source: &str) -> Importe
 }
 
 async fn fetch_json_or_null(client: &Client, url: &str) -> Option<Value> {
-    let response = client.get(url).header("accept", "application/json").send().await.ok()?;
+    let response = client
+        .get(url)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .ok()?;
     if !response.status().is_success() {
         return None;
     }
     response.json::<Value>().await.ok()
 }
 
-pub async fn fetch_imported_token_metadata(contract_address: &str) -> Result<ImportedTokenData, String> {
+pub async fn fetch_imported_token_metadata(
+    contract_address: &str,
+) -> Result<ImportedTokenData, String> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
@@ -193,7 +238,8 @@ pub async fn fetch_imported_token_metadata(contract_address: &str) -> Result<Imp
             normalize_imported_metadata_payload(&pump_payload, "pump.fun"),
         );
         if !imported.metadataUri.is_empty() {
-            if let Some(metadata_payload) = fetch_json_or_null(&client, &imported.metadataUri).await {
+            if let Some(metadata_payload) = fetch_json_or_null(&client, &imported.metadataUri).await
+            {
                 imported = merge_imported(
                     imported,
                     normalize_imported_metadata_payload(&metadata_payload, "metadata"),
@@ -279,17 +325,27 @@ pub async fn import_remote_image_to_library(
         _ => None,
     };
     if extension.is_none() {
-        extension = Path::new(reqwest::Url::parse(&safe_url).ok().and_then(|url| url.path_segments().and_then(|mut segments| segments.next_back()).map(|v| v.to_string())).unwrap_or_default().as_str())
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|ext| match ext.to_ascii_lowercase().as_str() {
-                "png" => ".png",
-                "jpg" | "jpeg" => ".jpg",
-                "webp" => ".webp",
-                "gif" => ".gif",
-                _ => "",
-            })
-            .filter(|value| !value.is_empty());
+        extension = Path::new(
+            reqwest::Url::parse(&safe_url)
+                .ok()
+                .and_then(|url| {
+                    url.path_segments()
+                        .and_then(|mut segments| segments.next_back())
+                        .map(|v| v.to_string())
+                })
+                .unwrap_or_default()
+                .as_str(),
+        )
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| match ext.to_ascii_lowercase().as_str() {
+            "png" => ".png",
+            "jpg" | "jpeg" => ".jpg",
+            "webp" => ".webp",
+            "gif" => ".gif",
+            _ => "",
+        })
+        .filter(|value| !value.is_empty());
     }
     let Some(extension) = extension else {
         return Err("Imported token image format is not supported.".to_string());
@@ -308,7 +364,11 @@ pub async fn import_remote_image_to_library(
         &bytes,
         extension,
         original_name,
-        if record_name.trim().is_empty() { None } else { Some(record_name) },
+        if record_name.trim().is_empty() {
+            None
+        } else {
+            Some(record_name)
+        },
     )
     .map(Some)
 }

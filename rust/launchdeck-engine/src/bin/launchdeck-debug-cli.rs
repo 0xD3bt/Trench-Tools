@@ -140,7 +140,8 @@ async fn rpc_json_with_retry(url: &str, method: &str, params: Value) -> Result<V
                 if !rate_limited || attempt == 4 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis((500 * (1u64 << attempt)).min(5_000))).await;
+                tokio::time::sleep(Duration::from_millis((500 * (1u64 << attempt)).min(5_000)))
+                    .await;
             }
         }
     }
@@ -247,7 +248,10 @@ fn account_strings(ix: &Value) -> Vec<String> {
 }
 
 fn instruction_label(ix: &Value) -> String {
-    let program_id = ix.get("programId").and_then(Value::as_str).unwrap_or("(unknown)");
+    let program_id = ix
+        .get("programId")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown)");
     let parsed_type = ix
         .get("parsed")
         .and_then(|parsed| parsed.get("type"))
@@ -267,7 +271,8 @@ fn collect_interesting_logs(logs: &[Value]) -> Vec<String> {
         .filter_map(Value::as_str)
         .filter(|entry| entry.contains("Instruction:"))
         .map(|entry| {
-            entry.strip_prefix("Program log: Instruction: ")
+            entry
+                .strip_prefix("Program log: Instruction: ")
                 .unwrap_or(entry)
                 .trim()
                 .to_string()
@@ -326,7 +331,10 @@ fn find_instruction_indexes(tx: &Value) -> InstructionIndexes {
     };
 
     for (index, ix) in instructions.iter().enumerate() {
-        let program_id = ix.get("programId").and_then(Value::as_str).unwrap_or_default();
+        let program_id = ix
+            .get("programId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let logs = logs_by_instruction.get(index).cloned().unwrap_or_default();
         if program_id == PROGRAM_PUMP && logs.iter().any(|entry| entry.contains("CreateV2")) {
             indexes.create = index as isize;
@@ -449,11 +457,17 @@ fn render_analyze_result(result: &Value) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
         "Signature: {}",
-        result.get("signature").and_then(Value::as_str).unwrap_or("(unknown)")
+        result
+            .get("signature")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown)")
     ));
     lines.push(format!(
         "Flavor: {}",
-        result.get("flavor").and_then(Value::as_str).unwrap_or("(unknown)")
+        result
+            .get("flavor")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown)")
     ));
     lines.push(format!(
         "Mint: {}",
@@ -487,7 +501,9 @@ fn render_analyze_result(result: &Value) -> String {
     {
         lines.push(format!(
             "Agent fee receiver owner: {} | space={} | lamports={}",
-            info.get("owner").and_then(Value::as_str).unwrap_or("(unknown)"),
+            info.get("owner")
+                .and_then(Value::as_str)
+                .unwrap_or("(unknown)"),
             info.get("space").cloned().unwrap_or(Value::Null),
             info.get("lamports").cloned().unwrap_or(Value::Null)
         ));
@@ -500,14 +516,21 @@ fn render_analyze_result(result: &Value) -> String {
             lines.push(format!(
                 "- [{}] {} | accounts={} | data={}",
                 item.get("index").cloned().unwrap_or(Value::Null),
-                item.get("label").and_then(Value::as_str).unwrap_or("(unknown)"),
+                item.get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unknown)"),
                 item.get("accountCount").cloned().unwrap_or(Value::Null),
-                item.get("data").and_then(Value::as_str).unwrap_or("(parsed only)")
+                item.get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(parsed only)")
             ));
         }
     }
 
-    if let Some(agent_initialize) = result.get("agentInitialize").filter(|value| !value.is_null()) {
+    if let Some(agent_initialize) = result
+        .get("agentInitialize")
+        .filter(|value| !value.is_null())
+    {
         lines.push(String::new());
         lines.push("AgentInitialize accounts:".to_string());
         if let Some(accounts) = agent_initialize.get("accounts").and_then(Value::as_array) {
@@ -537,16 +560,18 @@ fn render_analyze_result(result: &Value) -> String {
 
     lines.push(String::new());
     lines.push("Interpretation:".to_string());
-    match result.get("flavor").and_then(Value::as_str).unwrap_or_default() {
+    match result
+        .get("flavor")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
         "pump-normal" => {
             lines.push("- Normal Pump launch: create + buy, no agent initialization.".to_string())
         }
-        "pump-agent" => {
-            lines.push(
-                "- Native Pump agent launch: create + buy + AgentInitialize in the same transaction."
-                    .to_string(),
-            )
-        }
+        "pump-agent" => lines.push(
+            "- Native Pump agent launch: create + buy + AgentInitialize in the same transaction."
+                .to_string(),
+        ),
         _ => lines.push("- Launch flavor could not be classified confidently.".to_string()),
     }
     if result
@@ -577,7 +602,8 @@ fn summarize_tx(signature: &str, tx: &Value, address: &str) -> Value {
         .filter_map(Value::as_str)
         .filter(|entry| entry.contains("Instruction:"))
         .map(|entry| {
-            entry.strip_prefix("Program log: Instruction: ")
+            entry
+                .strip_prefix("Program log: Instruction: ")
                 .unwrap_or(entry)
                 .trim()
                 .to_string()
@@ -604,7 +630,10 @@ fn render_trace_report(report: &Value) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
         "Address: {}",
-        report.get("address").and_then(Value::as_str).unwrap_or("(unknown)")
+        report
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown)")
     ));
     let account_info = report.get("accountInfo").filter(|value| !value.is_null());
     lines.push(format!(
@@ -636,7 +665,10 @@ fn render_trace_report(report: &Value) -> String {
         .is_some_and(|owner| owner == PROGRAM_AGENT)
     {
         lines.push("Interpretation:".to_string());
-        lines.push("- This is an agent-program-owned escrow/state account, not a normal wallet.".to_string());
+        lines.push(
+            "- This is an agent-program-owned escrow/state account, not a normal wallet."
+                .to_string(),
+        );
         lines.push("- It can receive creator-fee revenue and later be referenced by the agent program during buybacks.".to_string());
         lines.push(String::new());
     }
@@ -669,11 +701,16 @@ fn render_trace_report(report: &Value) -> String {
             if tx.get("hasBurn").and_then(Value::as_bool).unwrap_or(false) {
                 tags.push("burn");
             }
-            let signature = tx.get("signature").and_then(Value::as_str).unwrap_or_default();
+            let signature = tx
+                .get("signature")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             lines.push(format!(
                 "- {} | writable={} | logs={}",
                 short_address(signature, 6, 6),
-                tx.get("targetWritable").and_then(Value::as_bool).unwrap_or(false),
+                tx.get("targetWritable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 if tags.is_empty() {
                     "none".to_string()
                 } else {

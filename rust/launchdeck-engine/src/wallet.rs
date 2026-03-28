@@ -147,12 +147,10 @@ async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value
         .map_err(|error| format!("RPC {method} request failed: {error}"))?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    let payload: Value =
-        serde_json::from_str(&body).map_err(|error| format!("RPC {method} returned invalid JSON: {error}"))?;
+    let payload: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("RPC {method} returned invalid JSON: {error}"))?;
     if !status.is_success() {
-        return Err(format!(
-            "RPC {method} failed with status {status}: {body}"
-        ));
+        return Err(format!("RPC {method} failed with status {status}: {body}"));
     }
     if let Some(message) = payload
         .get("error")

@@ -9,6 +9,9 @@ Key variables:
 - `SOLANA_PRIVATE_KEY`
 - `HELIUS_RPC_URL`
 - `HELIUS_API_KEY`
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER`
+- `PINATA_JWT`
+- `LAUNCHDECK_PINATA_JWT`
 - `BAGS_API_KEY`
 - `HELIUS_SENDER_ENDPOINT`
 - `HELIUS_SENDER_URL`
@@ -18,6 +21,13 @@ Key variables:
 - `JITO_SEND_BUNDLE_ENDPOINT`
 - `JITO_BUNDLE_STATUS_ENDPOINT`
 - `LAUNCHDECK_SEND_LOG_DIR`
+
+Metadata upload behavior:
+
+- default provider: `pump-fun`
+- optional provider: `pinata`
+- supported values for `LAUNCHDECK_METADATA_UPLOAD_PROVIDER`: `pump-fun`, `pinata`
+- `PINATA_JWT` or `LAUNCHDECK_PINATA_JWT` is required when `pinata` is selected
 
 ## Host Runtime
 
@@ -131,3 +141,47 @@ Durable send reports are written under the local runtime area by default:
 `LaunchDeck/.local/launchdeck/send-reports`
 
 Each report captures the planned transport strategy and the actual send outcome per transaction.
+
+The local runtime area also stores:
+
+- `LaunchDeck/.local/launchdeck/uploads`
+- `LaunchDeck/.local/launchdeck/image-library.json`
+- `LaunchDeck/.local/launchdeck/lookup-tables.json`
+
+## Metadata Upload Providers
+
+LaunchDeck supports configurable off-chain metadata upload behavior before deploy.
+
+### `pump-fun`
+
+- default when no metadata provider env var is set
+- uploads image and metadata together through Pump's upload API
+- full metadata URI reuse is supported when the whole metadata fingerprint is unchanged
+
+### `pinata`
+
+- enabled with `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
+- uploads the image to Pinata and pins metadata JSON separately
+- reuses the uploaded image CID across metadata-only edits during the current app session
+- this reduces deploy-time wait when name, symbol, description, or socials change but the image does not
+- if Pinata upload fails, LaunchDeck automatically falls back to the `pump-fun` upload path
+
+Pinata can also be used on its free tier for local LaunchDeck testing:
+
+- storage: `1 GB`
+- pinned files: `500`
+- API rate limit: `60 requests/minute`
+- dedicated gateway: `1`
+- gateway bandwidth: `10 GB/month`
+- gateway requests: `10,000/month`
+
+## Runtime Reports
+
+Benchmark timing output now separates user-visible wait from backend execution:
+
+- `total`: end-to-end click-to-finish duration
+- `backendTotal`: Rust backend duration after request receipt
+- `preRequest`: browser-side wait before `/api/run`
+- `form`, `normalize`, `wallet`, `compile`, `send`, `persist`
+- compile sub-timings: `altLoad`, `blockhash`, `global`, `followUpPrep`, `serialize`
+- send sub-timings: `submit`, `confirm`

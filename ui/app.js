@@ -7,6 +7,7 @@ const reportsTerminalSection = document.getElementById("reports-terminal-section
 const reportsTerminalList = document.getElementById("reports-terminal-list");
 const reportsTerminalOutput = document.getElementById("reports-terminal-output");
 const reportsTerminalMeta = document.getElementById("reports-terminal-meta");
+const reportsTerminalResizeHandle = document.getElementById("reports-terminal-resize-handle");
 const buttons = Array.from(document.querySelectorAll("[data-action]"));
 const walletBox = document.querySelector(".wallet-box");
 const walletSelect = document.getElementById("wallet-select");
@@ -62,6 +63,9 @@ const metadataUri = document.getElementById("metadata-uri");
 const nameInput = form.querySelector('[name="name"]');
 const symbolInput = form.querySelector('[name="symbol"]');
 const descriptionInput = form.querySelector('[name="description"]');
+const websiteInput = form.querySelector('[name="website"]');
+const twitterInput = form.querySelector('[name="twitter"]');
+const telegramInput = form.querySelector('[name="telegram"]');
 const descriptionDisclosure = document.getElementById("description-disclosure");
 const descriptionToggle = document.getElementById("description-toggle");
 const descriptionPanelBody = document.getElementById("description-panel-body");
@@ -182,6 +186,7 @@ const vampError = document.getElementById("vamp-error");
 const OUTPUT_SECTION_VISIBILITY_KEY = "launchdeck.outputSectionVisible";
 const REPORTS_TERMINAL_VISIBILITY_KEY = "launchdeck.reportsTerminalVisible";
 const REPORTS_TERMINAL_SORT_KEY = "launchdeck.reportsTerminalSort";
+const REPORTS_TERMINAL_LIST_WIDTH_KEY = "launchdeck.reportsTerminalListWidth";
 const THEME_MODE_STORAGE_KEY = "launchdeck.themeMode";
 const pageSearchParams = new URLSearchParams(window.location.search);
 const isPopoutMode = pageSearchParams.get("popout") === "1";
@@ -203,6 +208,17 @@ let latestWalletStatus = null;
 let latestLaunchpadRegistry = {};
 let quoteTimer = null;
 let defaultsApplied = false;
+let metadataUploadState = {
+  debounceTimer: null,
+  inFlightPromise: null,
+  inFlightFingerprint: "",
+  completedFingerprint: "",
+  latestScheduledFingerprint: "",
+  lastCanPreupload: false,
+  staleWhileUploading: false,
+  autoRetryFailures: 0,
+  autoRetryDisabled: false,
+};
 let imageLibraryState = {
   images: [],
   categories: [],
@@ -234,11 +250,17 @@ let reportsTerminalState = {
   activeId: "",
   sort: getStoredReportsTerminalSort(),
 };
+let reportsTerminalResizeState = null;
+const REPORTS_TERMINAL_DEFAULT_LIST_WIDTH = 152;
+const REPORTS_TERMINAL_MIN_LIST_WIDTH = 120;
+const REPORTS_TERMINAL_MAX_LIST_WIDTH = 240;
 setReportsTerminalSort(reportsTerminalState.sort, { persist: false });
 setReportsTerminalVisible(getStoredReportsTerminalVisible(), { persist: false });
+setReportsTerminalListWidth(getStoredReportsTerminalListWidth(), { persist: false });
 const SPLIT_COLORS = ["#5b7cff", "#ff5d5d", "#14c38e", "#ffb020", "#7c5cff", "#00b8d9", "#ef5da8", "#8b5cf6"];
 const DEFAULT_QUICK_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
 const DEFAULT_PRESET_ID = "preset1";
+const METADATA_PREUPLOAD_DEBOUNCE_MS = 500;
 const SNIPER_BALANCE_PRESETS = [
   { label: "MAX", ratio: 1 },
   { label: "75%", ratio: 0.75 },
@@ -1285,13 +1307,10 @@ async function importVampToken() {
       toggleDescriptionDisclosure(Boolean(descriptionInput.value.trim()));
       updateDescriptionDisclosure();
     }
-    const websiteInput = form.querySelector('[name="website"]');
-    const twitterInput = form.querySelector('[name="twitter"]');
-    const telegramInput = form.querySelector('[name="telegram"]');
     if (websiteInput) websiteInput.value = payload.token && payload.token.website ? payload.token.website : "";
     if (twitterInput) twitterInput.value = payload.token && payload.token.twitter ? payload.token.twitter : "";
     if (telegramInput) telegramInput.value = payload.token && payload.token.telegram ? payload.token.telegram : "";
-    metadataUri.value = "";
+    clearMetadataUploadCache({ clearInput: true });
     updateTokenFieldCounts();
 
     if (payload.image) {
@@ -1405,7 +1424,7 @@ function addImageDetailTag(rawValue) {
 
 function setSelectedImage(image) {
   uploadedImage = image || null;
-  metadataUri.value = "";
+  clearMetadataUploadCache({ clearInput: true });
   if (!image) {
     imageStatus.textContent = "";
     imagePath.textContent = "";
@@ -1415,6 +1434,7 @@ function setSelectedImage(image) {
   imageStatus.textContent = "";
   imagePath.textContent = "";
   setImagePreview(image.previewUrl);
+  scheduleMetadataPreupload({ immediate: true });
 }
 
 function renderImageCategoryChips() {
@@ -2285,6 +2305,205 @@ function readForm() {
   };
 }
 
+function metadataFingerprintFromForm(formValues = readForm()) {
+  return JSON.stringify({
+    imageId: uploadedImage ? (uploadedImage.id || uploadedImage.fileName || "") : "",
+    imageFileName: formValues.imageFileName || "",
+    name: String(formValues.name || "").trim(),
+    symbol: String(formValues.symbol || "").trim(),
+    description: String(formValues.description || "").trim(),
+    website: String(formValues.website || "").trim(),
+    twitter: String(formValues.twitter || "").trim(),
+    telegram: String(formValues.telegram || "").trim(),
+  });
+}
+
+function canPreuploadMetadata(formValues = readForm()) {
+  return Boolean(
+    formValues.imageFileName
+    && String(formValues.name || "").trim()
+    && String(formValues.symbol || "").trim()
+  );
+}
+
+function hasFreshPreuploadedMetadata(formValues = readForm()) {
+  if (!canPreuploadMetadata(formValues) || !metadataUri.value) return false;
+  return metadataUploadState.completedFingerprint === metadataFingerprintFromForm(formValues);
+}
+
+function clearMetadataUploadDebounce() {
+  if (!metadataUploadState.debounceTimer) return;
+  clearTimeout(metadataUploadState.debounceTimer);
+  metadataUploadState.debounceTimer = null;
+}
+
+function clearMetadataUploadCache({ clearInput = false } = {}) {
+  clearMetadataUploadDebounce();
+  metadataUploadState.completedFingerprint = "";
+  metadataUploadState.latestScheduledFingerprint = "";
+  metadataUploadState.lastCanPreupload = false;
+  metadataUploadState.autoRetryFailures = 0;
+  metadataUploadState.autoRetryDisabled = false;
+  if (clearInput && metadataUri) {
+    metadataUri.value = "";
+  }
+}
+
+function markMetadataUploadDirty() {
+  const formValues = readForm();
+  if (hasFreshPreuploadedMetadata(formValues)) return;
+  metadataUploadState.completedFingerprint = "";
+  metadataUploadState.autoRetryFailures = 0;
+  metadataUploadState.autoRetryDisabled = false;
+  if (metadataUri) {
+    metadataUri.value = "";
+  }
+}
+
+function currentMetadataRetryDelayMs() {
+  return metadataUploadState.autoRetryFailures >= 2
+    ? METADATA_PREUPLOAD_DEBOUNCE_MS * 2
+    : METADATA_PREUPLOAD_DEBOUNCE_MS;
+}
+
+async function uploadMetadataForCurrentForm(source = "background") {
+  const formValues = readForm();
+  if (!canPreuploadMetadata(formValues)) {
+    if (source === "send") {
+      throw new Error("Select an image and fill in both name and ticker before deploying.");
+    }
+    return "";
+  }
+  const fingerprint = metadataFingerprintFromForm(formValues);
+  if (hasFreshPreuploadedMetadata(formValues)) {
+    return metadataUri.value;
+  }
+  if (metadataUploadState.inFlightPromise) {
+    if (metadataUploadState.inFlightFingerprint === fingerprint) {
+      return metadataUploadState.inFlightPromise;
+    }
+    metadataUploadState.staleWhileUploading = true;
+    metadataUploadState.latestScheduledFingerprint = fingerprint;
+    if (source !== "send") {
+      await metadataUploadState.inFlightPromise.catch(() => "");
+      if (hasFreshPreuploadedMetadata(readForm())) {
+        return metadataUri.value;
+      }
+    }
+  }
+
+  metadataUploadState.inFlightFingerprint = fingerprint;
+  metadataUploadState.latestScheduledFingerprint = fingerprint;
+  imageStatus.textContent = source === "send" ? "Preparing metadata..." : "Uploading metadata...";
+  imagePath.textContent = "";
+
+  const request = fetch("/api/metadata/upload", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      form: formValues,
+    }),
+  })
+    .then(async (response) => {
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.error || "Metadata upload failed.");
+      }
+      const liveForm = readForm();
+      const liveFingerprint = canPreuploadMetadata(liveForm) ? metadataFingerprintFromForm(liveForm) : "";
+      if (liveFingerprint === fingerprint) {
+        metadataUri.value = payload.metadataUri || "";
+        metadataUploadState.completedFingerprint = fingerprint;
+        metadataUploadState.autoRetryFailures = 0;
+        metadataUploadState.autoRetryDisabled = false;
+        imageStatus.textContent = "Metadata ready.";
+      } else {
+        metadataUploadState.staleWhileUploading = true;
+      }
+      return payload.metadataUri || "";
+    })
+    .catch((error) => {
+      if (source === "background") {
+        metadataUploadState.autoRetryFailures += 1;
+        metadataUploadState.autoRetryDisabled = metadataUploadState.autoRetryFailures >= 4;
+        if (metadataUploadState.autoRetryDisabled) {
+          imageStatus.textContent = `${error.message} Auto retry paused until deploy.`;
+        } else {
+          const nextDelayMs = currentMetadataRetryDelayMs();
+          imageStatus.textContent = `${error.message} Retrying in ${nextDelayMs}ms.`;
+        }
+      }
+      throw error;
+    })
+    .finally(() => {
+      if (metadataUploadState.inFlightPromise === request) {
+        metadataUploadState.inFlightPromise = null;
+        metadataUploadState.inFlightFingerprint = "";
+      }
+      if (
+        metadataUploadState.staleWhileUploading
+        && metadataUploadState.latestScheduledFingerprint
+        && metadataUploadState.latestScheduledFingerprint !== metadataUploadState.completedFingerprint
+      ) {
+        metadataUploadState.staleWhileUploading = false;
+        scheduleMetadataPreupload({ immediate: true });
+      } else {
+        metadataUploadState.staleWhileUploading = false;
+      }
+    });
+
+  metadataUploadState.inFlightPromise = request;
+  return request;
+}
+
+function scheduleMetadataPreupload({ immediate = false } = {}) {
+  clearMetadataUploadDebounce();
+  if (!uploadedImage) return;
+  const formValues = readForm();
+  if (!canPreuploadMetadata(formValues)) {
+    metadataUploadState.lastCanPreupload = false;
+    markMetadataUploadDirty();
+    imageStatus.textContent = "Waiting for name and ticker to pre-upload metadata.";
+    imagePath.textContent = "";
+    return;
+  }
+  const becameReady = !metadataUploadState.lastCanPreupload;
+  metadataUploadState.lastCanPreupload = true;
+  const fingerprint = metadataFingerprintFromForm(formValues);
+  metadataUploadState.latestScheduledFingerprint = fingerprint;
+  if (hasFreshPreuploadedMetadata(formValues)) return;
+  if (metadataUploadState.inFlightPromise && metadataUploadState.inFlightFingerprint === fingerprint) {
+    return;
+  }
+  if (metadataUploadState.autoRetryDisabled) {
+    imageStatus.textContent = "Metadata auto retry paused until deploy.";
+    imagePath.textContent = "";
+    return;
+  }
+  const delayMs = immediate || becameReady ? 0 : currentMetadataRetryDelayMs();
+  metadataUploadState.debounceTimer = setTimeout(() => {
+    metadataUploadState.debounceTimer = null;
+    uploadMetadataForCurrentForm("background").catch(() => {});
+  }, delayMs);
+}
+
+async function ensureMetadataReadyForAction(action) {
+  const formValues = readForm();
+  if (!formValues.imageFileName) return;
+  if (hasFreshPreuploadedMetadata(formValues)) return;
+  if (action === "send") {
+    await uploadMetadataForCurrentForm("send");
+    return;
+  }
+  if (metadataUploadState.inFlightPromise) {
+    await metadataUploadState.inFlightPromise.catch(() => "");
+    if (hasFreshPreuploadedMetadata(readForm())) {
+      return;
+    }
+  }
+  throw new Error(`Metadata is still uploading. Wait for the pre-upload to finish before ${action}.`);
+}
+
 function renderWalletOptions(wallets, selectedKey, balanceSol) {
   walletSelect.innerHTML = "";
   if (!wallets || wallets.length === 0) {
@@ -2359,6 +2578,8 @@ async function bootstrapApp() {
     throw new Error(payload.error || "Failed to load app bootstrap.");
   }
   applyWalletStatusPayload(payload);
+  fetch("/api/lookup-tables/warm", { method: "POST" }).catch(() => {});
+  fetch("/api/pump-global/warm", { method: "POST" }).catch(() => {});
 }
 
 async function updateQuote() {
@@ -2464,7 +2685,7 @@ async function applyTestPreset() {
     try {
       imageStatus.textContent = "Uploading image...";
       imagePath.textContent = "";
-      metadataUri.value = "";
+      clearMetadataUploadCache({ clearInput: true });
       const response = await fetch("/solana-mark.png");
       if (!response.ok) {
         throw new Error("Failed to load test image.");
@@ -2805,16 +3026,22 @@ function hideDeployModal() {
 async function run(action) {
   const actualAction = action === "deploy" ? "send" : action;
   const label = action === "deploy" ? "Deploying..." : action === "simulate" ? "Simulating..." : "Building...";
+  const clientActionStartedAt = performance.now();
   setBusy(true, label);
   output.textContent = "Working...";
 
   try {
+    await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    await ensureMetadataReadyForAction(actualAction);
+    const formPayload = readForm();
+    const clientPreRequestMs = Math.max(0, Math.round(performance.now() - clientActionStartedAt));
     const response = await fetch("/api/run", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         action: actualAction,
-        form: readForm(),
+        form: formPayload,
+        clientPreRequestMs,
       }),
     });
     const payload = await response.json();
@@ -2828,6 +3055,9 @@ async function run(action) {
       : "Wallet ready";
     metaNode.textContent = `${wallet} | ${payload.report.launchpad || "pump"} | ${payload.report.execution.resolvedProvider || payload.report.execution.provider || "helius-sender"} | Mint: ${shortAddress(payload.report.mint)}`;
     metadataUri.value = payload.metadataUri || "";
+    if (payload.metadataUri) {
+      metadataUploadState.completedFingerprint = metadataFingerprintFromForm(readForm());
+    }
     output.textContent = payload.text;
     if (payload.sendLogPath) {
       await refreshReportsTerminal({
@@ -2990,6 +3220,47 @@ function getStoredReportsTerminalSort() {
   }
 }
 
+function clampReportsTerminalListWidth(width) {
+  const numeric = Number(width);
+  if (!Number.isFinite(numeric)) return REPORTS_TERMINAL_DEFAULT_LIST_WIDTH;
+  return Math.min(REPORTS_TERMINAL_MAX_LIST_WIDTH, Math.max(REPORTS_TERMINAL_MIN_LIST_WIDTH, Math.round(numeric)));
+}
+
+function getCurrentReportsTerminalListWidth() {
+  if (!reportsTerminalSection) return REPORTS_TERMINAL_DEFAULT_LIST_WIDTH;
+  const inlineWidth = reportsTerminalSection.style.getPropertyValue("--reports-terminal-list-width");
+  if (inlineWidth) {
+    const parsedInlineWidth = Number.parseInt(inlineWidth, 10);
+    if (Number.isFinite(parsedInlineWidth)) return clampReportsTerminalListWidth(parsedInlineWidth);
+  }
+  return REPORTS_TERMINAL_DEFAULT_LIST_WIDTH;
+}
+
+function getStoredReportsTerminalListWidth() {
+  try {
+    return clampReportsTerminalListWidth(window.localStorage.getItem(REPORTS_TERMINAL_LIST_WIDTH_KEY));
+  } catch (_error) {
+    return REPORTS_TERMINAL_DEFAULT_LIST_WIDTH;
+  }
+}
+
+function setReportsTerminalListWidth(width, { persist = true } = {}) {
+  if (!reportsTerminalSection) return;
+  const normalized = clampReportsTerminalListWidth(width);
+  reportsTerminalSection.style.setProperty("--reports-terminal-list-width", `${normalized}px`);
+  if (reportsTerminalResizeHandle) {
+    reportsTerminalResizeHandle.setAttribute("aria-valuemin", String(REPORTS_TERMINAL_MIN_LIST_WIDTH));
+    reportsTerminalResizeHandle.setAttribute("aria-valuemax", String(REPORTS_TERMINAL_MAX_LIST_WIDTH));
+    reportsTerminalResizeHandle.setAttribute("aria-valuenow", String(normalized));
+  }
+  if (!persist) return;
+  try {
+    window.localStorage.setItem(REPORTS_TERMINAL_LIST_WIDTH_KEY, String(normalized));
+  } catch (_error) {
+    // Ignore storage failures and keep the UI functional.
+  }
+}
+
 function setReportsTerminalVisible(isVisible, { persist = true } = {}) {
   document.documentElement.classList.toggle("reports-hidden", !isVisible);
   document.body.classList.toggle("reports-hidden", !isVisible);
@@ -3095,6 +3366,66 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
     return;
   }
   await loadReportsTerminalEntry(nextId);
+}
+
+function startReportsTerminalResize(event) {
+  if (!reportsTerminalSection || !reportsTerminalResizeHandle || window.innerWidth <= 680) return;
+  reportsTerminalResizeState = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startWidth: getCurrentReportsTerminalListWidth(),
+  };
+  reportsTerminalSection.classList.add("is-resizing");
+  reportsTerminalResizeHandle.classList.add("is-active");
+  reportsTerminalResizeHandle.setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function updateReportsTerminalResize(event) {
+  if (!reportsTerminalResizeState) return;
+  const delta = event.clientX - reportsTerminalResizeState.startX;
+  setReportsTerminalListWidth(reportsTerminalResizeState.startWidth + delta, { persist: false });
+}
+
+function finishReportsTerminalResize(event) {
+  if (!reportsTerminalResizeState || !reportsTerminalSection || !reportsTerminalResizeHandle) return;
+  const activePointerId = reportsTerminalResizeState.pointerId;
+  reportsTerminalResizeState = null;
+  reportsTerminalSection.classList.remove("is-resizing");
+  reportsTerminalResizeHandle.classList.remove("is-active");
+  if (typeof activePointerId === "number" && reportsTerminalResizeHandle.hasPointerCapture(activePointerId)) {
+    reportsTerminalResizeHandle.releasePointerCapture(activePointerId);
+  }
+  setReportsTerminalListWidth(getCurrentReportsTerminalListWidth());
+}
+
+function handleReportsTerminalResizeKeydown(event) {
+  if (!reportsTerminalSection || window.innerWidth <= 680) return;
+  const step = event.shiftKey ? 40 : 20;
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    setReportsTerminalListWidth(getCurrentReportsTerminalListWidth() - step);
+    return;
+  }
+  if (event.key === "ArrowRight") {
+    event.preventDefault();
+    setReportsTerminalListWidth(getCurrentReportsTerminalListWidth() + step);
+    return;
+  }
+  if (event.key === "Home") {
+    event.preventDefault();
+    setReportsTerminalListWidth(REPORTS_TERMINAL_MIN_LIST_WIDTH);
+    return;
+  }
+  if (event.key === "End") {
+    event.preventDefault();
+    setReportsTerminalListWidth(REPORTS_TERMINAL_MAX_LIST_WIDTH);
+    return;
+  }
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    setReportsTerminalListWidth(REPORTS_TERMINAL_DEFAULT_LIST_WIDTH);
+  }
 }
 
 function extractReportIdFromPath(filePath) {
@@ -3226,6 +3557,8 @@ launchpadInputs.forEach((input) => {
 if (nameInput) {
   nameInput.addEventListener("input", () => {
     syncTickerFromName();
+    markMetadataUploadDirty();
+    scheduleMetadataPreupload({ immediate: true });
   });
 }
 if (descriptionToggle) {
@@ -3236,6 +3569,8 @@ if (descriptionToggle) {
 if (descriptionInput) {
   descriptionInput.addEventListener("input", () => {
     updateDescriptionDisclosure();
+    markMetadataUploadDirty();
+    scheduleMetadataPreupload({ immediate: true });
   });
 }
 if (symbolInput) {
@@ -3261,6 +3596,8 @@ if (symbolInput) {
     tickerManuallyEdited = true;
     tickerClearedForManualEntry = symbolInput.value.trim().length === 0;
     updateTokenFieldCounts();
+    markMetadataUploadDirty();
+    scheduleMetadataPreupload({ immediate: true });
   });
   symbolInput.addEventListener("blur", () => {
     if (!symbolInput.value.trim()) {
@@ -3272,6 +3609,16 @@ if (symbolInput) {
     tickerClearedForManualEntry = false;
   });
 }
+[
+  websiteInput,
+  twitterInput,
+  telegramInput,
+].filter(Boolean).forEach((input) => {
+  input.addEventListener("input", () => {
+    markMetadataUploadDirty();
+    scheduleMetadataPreupload({ immediate: true });
+  });
+});
 if (tickerCapsToggle) {
   tickerCapsToggle.addEventListener("click", () => {
     tickerCapsToggle.classList.toggle("active");
@@ -3762,6 +4109,16 @@ if (reportsTerminalList) {
       if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to load report.";
     }
   });
+}
+if (reportsTerminalResizeHandle) {
+  reportsTerminalResizeHandle.addEventListener("pointerdown", startReportsTerminalResize);
+  reportsTerminalResizeHandle.addEventListener("pointermove", updateReportsTerminalResize);
+  reportsTerminalResizeHandle.addEventListener("pointerup", finishReportsTerminalResize);
+  reportsTerminalResizeHandle.addEventListener("pointercancel", finishReportsTerminalResize);
+  reportsTerminalResizeHandle.addEventListener("dblclick", () => {
+    setReportsTerminalListWidth(REPORTS_TERMINAL_DEFAULT_LIST_WIDTH);
+  });
+  reportsTerminalResizeHandle.addEventListener("keydown", handleReportsTerminalResizeKeydown);
 }
 if (openSettingsButton) {
   openSettingsButton.addEventListener("click", showSettingsModal);

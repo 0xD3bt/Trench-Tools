@@ -48,6 +48,40 @@ pub fn persist_launch_report(
 ) -> Result<String, String> {
     let dir = launch_log_dir();
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let file_name = format!(
+        "{}-{}-{}.json",
+        current_time_ms(),
+        action,
+        trace_id.replace('-', "")
+    );
+    let path = dir.join(file_name);
+    write_launch_report_file(&path, trace_id, action, transport_plan, report)?;
+    Ok(path.display().to_string())
+}
+
+pub fn update_persisted_launch_report(
+    path: &str,
+    trace_id: &str,
+    action: &str,
+    transport_plan: &TransportPlan,
+    report: &Value,
+) -> Result<(), String> {
+    write_launch_report_file(
+        std::path::Path::new(path),
+        trace_id,
+        action,
+        transport_plan,
+        report,
+    )
+}
+
+fn write_launch_report_file(
+    path: &std::path::Path,
+    trace_id: &str,
+    action: &str,
+    transport_plan: &TransportPlan,
+    report: &Value,
+) -> Result<(), String> {
     let mint = report
         .get("mint")
         .and_then(Value::as_str)
@@ -64,13 +98,6 @@ pub fn persist_launch_report(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let file_name = format!(
-        "{}-{}-{}.json",
-        current_time_ms(),
-        action,
-        trace_id.replace('-', "")
-    );
-    let path = dir.join(file_name);
     let payload = json!({
         "traceId": trace_id,
         "action": action,
@@ -81,11 +108,10 @@ pub fn persist_launch_report(
         "report": report,
     });
     fs::write(
-        &path,
+        path,
         serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?,
     )
-    .map_err(|error| error.to_string())?;
-    Ok(path.display().to_string())
+    .map_err(|error| error.to_string())
 }
 
 fn current_time_ms() -> u128 {
@@ -141,11 +167,65 @@ mod tests {
                 ]
             }
         });
-        let path = persist_launch_report("trace-123", "send", &plan, &report)
-            .expect("persist send log");
+        let path =
+            persist_launch_report("trace-123", "send", &plan, &report).expect("persist send log");
         let raw = fs::read_to_string(&path).expect("read persisted log");
         assert!(raw.contains("\"traceId\": \"trace-123\""));
         assert!(raw.contains("\"signature\""));
+        unsafe {
+            std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
+        }
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn updates_existing_launch_report_contents() {
+        let _guard = env_lock().lock().expect("lock env");
+        let temp_dir =
+            std::env::temp_dir().join(format!("launchdeck-send-log-update-{}", Uuid::new_v4()));
+        unsafe {
+            std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
+        }
+        let plan = TransportPlan {
+            requestedProvider: "helius-sender".to_string(),
+            resolvedProvider: "helius-sender".to_string(),
+            requestedEndpointProfile: "global".to_string(),
+            resolvedEndpointProfile: "global".to_string(),
+            executionClass: "single".to_string(),
+            transportType: "helius-sender".to_string(),
+            ordering: "single".to_string(),
+            verified: true,
+            supportsBundle: false,
+            requiresInlineTip: true,
+            requiresPriorityFee: true,
+            separateTipTransaction: false,
+            skipPreflight: true,
+            maxRetries: 0,
+            heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
+            heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
+            jitoBundleEndpoints: vec![],
+            warnings: vec![],
+        };
+        let initial_report = json!({
+            "mint": "mint-test",
+            "execution": {}
+        });
+        let path = persist_launch_report("trace-456", "simulate", &plan, &initial_report)
+            .expect("persist initial log");
+        let updated_report = json!({
+            "mint": "mint-test",
+            "benchmark": {
+                "timings": {
+                    "totalElapsedMs": 42
+                }
+            },
+            "execution": {}
+        });
+        update_persisted_launch_report(&path, "trace-456", "simulate", &plan, &updated_report)
+            .expect("update persisted log");
+        let raw = fs::read_to_string(&path).expect("read updated log");
+        assert!(raw.contains("\"benchmark\""));
+        assert!(raw.contains("\"totalElapsedMs\": 42"));
         unsafe {
             std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
         }

@@ -50,6 +50,10 @@ pub fn app_config_path() -> PathBuf {
     local_root_dir().join("app-config.json")
 }
 
+pub fn lookup_table_cache_path() -> PathBuf {
+    local_root_dir().join("lookup-tables.json")
+}
+
 pub fn runtime_state_path() -> PathBuf {
     if let Ok(explicit) = env::var("LAUNCHDECK_ENGINE_RUNTIME_PATH") {
         let trimmed = explicit.trim();

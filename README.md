@@ -33,6 +33,18 @@ The current verified native launch runtime is still centered on `pump`, but the 
 
 The default local entrypoint is `http://127.0.0.1:8789`.
 
+## Current Pump Coverage
+
+The Rust-native Pump path currently covers:
+
+- `regular`
+- `cashback`
+- `agent-custom`
+- `agent-unlocked`
+- `agent-locked`
+
+Pump launch assembly, transaction shaping, reporting, simulation, and send execution now run through the Rust engine rather than the legacy JS compile bridge for these verified launch shapes.
+
 ## Run Locally
 
 Primary local entrypoints:
@@ -100,12 +112,48 @@ LaunchDeck now writes richer execution reports that capture:
 
 Durable send reports are persisted under the local runtime area so launches can be audited after the fact.
 
+The benchmark output now includes both end-to-end and backend-only timings:
+
+- `total`: full click-to-finish time seen by the user
+- `backendTotal`: Rust-side execution time after `/api/run` is received
+- `preRequest`: browser-side wait before the request is dispatched
+- compile breakdowns such as `altLoad`, `blockhash`, `global`, `followUpPrep`, and `serialize`
+- send breakdowns such as `submit` and `confirm`
+
+This makes metadata wait, compile latency, and chain confirmation time visible separately in both the main output and persisted reports.
+
+## Launch Optimizations
+
+Recent Pump-focused optimizations in the Rust runtime include:
+
+- measured versioned transaction selection with lookup-table-aware sizing diagnostics
+- curated default lookup table coverage for launch and follow-up flows
+- local lookup-table persistence and warm-up on page load
+- background blockhash refresh with cache age limits
+- cached Pump global state for dev-buy quoting and compile-time launch assembly
+- immediate metadata pre-upload from the UI once image, name, and ticker are present
+- configurable metadata upload provider:
+  - `pump-fun` remains the default
+  - `pinata` is optional through env config
+  - Pinata uploads reuse the uploaded image CID across metadata-only edits so name/symbol/description changes only need metadata JSON repinning
+  - when `pinata` is selected and its upload fails, LaunchDeck automatically falls back to `pump-fun`
+
+Pinata can also be tested on its free tier, which is enough for basic LaunchDeck experimentation:
+
+- storage: `1 GB`
+- pinned files: `500`
+- API rate limit: `60 requests/minute`
+- dedicated gateway: `1`
+- gateway bandwidth: `10 GB/month`
+- gateway requests: `10,000/month`
+
 ## Local Data
 
 The Rust host preserves the existing local storage layout under `.local/launchdeck`:
 
 - `app-config.json`
 - `image-library.json`
+- `lookup-tables.json`
 - `uploads/`
 - `send-reports/`
 
@@ -118,4 +166,4 @@ This keeps existing UI settings, uploaded images, and persisted reports compatib
 - `docs/CONFIG.md`
 - `docs/LAUNCHPADS.md`
 - `docs/STRATEGIES.md`
-- `EXECUTION_PROVIDER_PLAN.md`
+- `docs/EXECUTION_PROVIDER_PLAN.md`

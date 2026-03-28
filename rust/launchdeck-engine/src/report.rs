@@ -7,7 +7,10 @@ use crate::{
     transport::TransportPlan,
 };
 
-const DEFAULT_LOOKUP_TABLES: [&str; 1] = ["AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ"];
+const DEFAULT_LOOKUP_TABLES: [&str; 2] = [
+    "AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ",
+    "BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstructionSummary {
@@ -79,13 +82,22 @@ pub struct SentItem {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExecutionTimings {
     pub totalElapsedMs: Option<u128>,
+    pub backendTotalElapsedMs: Option<u128>,
+    pub clientPreRequestMs: Option<u128>,
     pub formToRawConfigMs: Option<u128>,
     pub normalizeConfigMs: Option<u128>,
     pub walletLoadMs: Option<u128>,
     pub reportBuildMs: Option<u128>,
     pub compileTransactionsMs: Option<u128>,
+    pub compileAltLoadMs: Option<u128>,
+    pub compileBlockhashFetchMs: Option<u128>,
+    pub compileGlobalFetchMs: Option<u128>,
+    pub compileFollowUpPrepMs: Option<u128>,
+    pub compileTxSerializeMs: Option<u128>,
     pub simulateMs: Option<u128>,
     pub sendMs: Option<u128>,
+    pub sendSubmitMs: Option<u128>,
+    pub sendConfirmMs: Option<u128>,
     pub persistReportMs: Option<u128>,
 }
 
@@ -160,6 +172,7 @@ pub struct LaunchReport {
     pub creatorFeeReceiver: String,
     pub buybackBps: Option<i64>,
     pub devBuyDescription: String,
+    pub metadataUri: Option<String>,
     pub requestedLookupTables: Vec<String>,
     pub loadedLookupTables: Vec<String>,
     pub bundleJitoTip: bool,
@@ -299,7 +312,9 @@ fn planned_transactions(
                 } else {
                     0
                 },
-                jitoTipAccount: if transport_plan.requiresInlineTip && !config.tx.jitoTipAccount.is_empty() {
+                jitoTipAccount: if transport_plan.requiresInlineTip
+                    && !config.tx.jitoTipAccount.is_empty()
+                {
                     Some(config.tx.jitoTipAccount.clone())
                 } else {
                     None
@@ -339,10 +354,7 @@ fn planned_transactions(
     transactions
 }
 
-fn requested_summary(
-    config: &NormalizedConfig,
-    transport_plan: &TransportPlan,
-) -> String {
+fn requested_summary(config: &NormalizedConfig, transport_plan: &TransportPlan) -> String {
     if config.execution.send {
         if config.execution.simulate {
             return format!(
@@ -448,6 +460,11 @@ pub fn build_report(
             .as_ref()
             .map(|entry| format!("{}:{}", entry.mode, entry.amount))
             .unwrap_or_else(|| "none".to_string()),
+        metadataUri: if config.token.uri.trim().is_empty() {
+            None
+        } else {
+            Some(config.token.uri.clone())
+        },
         requestedLookupTables: requested_lookup_tables.clone(),
         loadedLookupTables: loaded_lookup_tables,
         bundleJitoTip: transport_plan.separateTipTransaction,
@@ -521,6 +538,9 @@ pub fn render_report(report: &LaunchReport) -> String {
             .unwrap_or_else(|| "(not used)".to_string())
     ));
     lines.push(format!("Dev buy: {}", report.devBuyDescription));
+    if let Some(metadata_uri) = &report.metadataUri {
+        lines.push(format!("Metadata URI: {}", metadata_uri));
+    }
     lines.push(format!("Launchpad: {}", report.launchpad));
     lines.push(format!(
         "Provider: {} ({})",
@@ -560,6 +580,12 @@ pub fn render_report(report: &LaunchReport) -> String {
         if let Some(value) = timings.totalElapsedMs {
             timing_parts.push(format!("total={value}ms"));
         }
+        if let Some(value) = timings.backendTotalElapsedMs {
+            timing_parts.push(format!("backendTotal={value}ms"));
+        }
+        if let Some(value) = timings.clientPreRequestMs {
+            timing_parts.push(format!("preRequest={value}ms"));
+        }
         if let Some(value) = timings.formToRawConfigMs {
             timing_parts.push(format!("form={value}ms"));
         }
@@ -575,11 +601,32 @@ pub fn render_report(report: &LaunchReport) -> String {
         if let Some(value) = timings.compileTransactionsMs {
             timing_parts.push(format!("compile={value}ms"));
         }
+        if let Some(value) = timings.compileAltLoadMs {
+            timing_parts.push(format!("altLoad={value}ms"));
+        }
+        if let Some(value) = timings.compileBlockhashFetchMs {
+            timing_parts.push(format!("blockhash={value}ms"));
+        }
+        if let Some(value) = timings.compileGlobalFetchMs {
+            timing_parts.push(format!("global={value}ms"));
+        }
+        if let Some(value) = timings.compileFollowUpPrepMs {
+            timing_parts.push(format!("followUpPrep={value}ms"));
+        }
+        if let Some(value) = timings.compileTxSerializeMs {
+            timing_parts.push(format!("serialize={value}ms"));
+        }
         if let Some(value) = timings.simulateMs {
             timing_parts.push(format!("simulate={value}ms"));
         }
         if let Some(value) = timings.sendMs {
             timing_parts.push(format!("send={value}ms"));
+        }
+        if let Some(value) = timings.sendSubmitMs {
+            timing_parts.push(format!("submit={value}ms"));
+        }
+        if let Some(value) = timings.sendConfirmMs {
+            timing_parts.push(format!("confirm={value}ms"));
         }
         if let Some(value) = timings.persistReportMs {
             timing_parts.push(format!("persist={value}ms"));
@@ -628,6 +675,9 @@ pub fn render_report(report: &LaunchReport) -> String {
                 "  lookup tables: {}",
                 tx.lookupTablesUsed.join(", ")
             ));
+        }
+        for warning in &tx.warnings {
+            lines.push(format!("  note: {warning}"));
         }
     }
     if !report.execution.sent.is_empty() {
@@ -739,6 +789,7 @@ mod tests {
             report.requestedLookupTables,
             vec![
                 "AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ".to_string(),
+                "BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj".to_string(),
                 "CustomLookup1111111111111111111111111111111".to_string()
             ]
         );

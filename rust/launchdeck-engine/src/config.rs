@@ -1156,8 +1156,8 @@ mod tests {
         let mut raw = sample_raw_config();
         raw.execution.provider = "auto".to_string();
         let error = normalize_raw_config(raw).expect_err("auto should be rejected");
-        assert!(error
-            .to_string()
-            .contains("execution.provider must be one of standard-rpc, helius-sender, jito-bundle"));
+        assert!(error.to_string().contains(
+            "execution.provider must be one of standard-rpc, helius-sender, jito-bundle"
+        ));
     }
 }

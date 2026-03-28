@@ -140,9 +140,17 @@ pub fn read_image_library() -> Result<ImageLibrary, String> {
                 .collect(),
             category,
             isFavorite: entry.isFavorite,
-            createdAt: if entry.createdAt == 0 { now_ms() } else { entry.createdAt },
+            createdAt: if entry.createdAt == 0 {
+                now_ms()
+            } else {
+                entry.createdAt
+            },
             updatedAt: if entry.updatedAt == 0 {
-                if entry.createdAt == 0 { now_ms() } else { entry.createdAt }
+                if entry.createdAt == 0 {
+                    now_ms()
+                } else {
+                    entry.createdAt
+                }
             } else {
                 entry.updatedAt
             },
@@ -244,10 +252,14 @@ pub fn build_image_library_payload(
     })
 }
 
-pub fn save_data_url_image(data_url: &str, original_name: &str) -> Result<SerializedImageRecord, String> {
+pub fn save_data_url_image(
+    data_url: &str,
+    original_name: &str,
+) -> Result<SerializedImageRecord, String> {
     let Some((content_type, encoded)) = data_url
         .strip_prefix("data:")
-        .and_then(|value| value.split_once(";base64,")) else {
+        .and_then(|value| value.split_once(";base64,"))
+    else {
         return Err("Invalid image payload.".to_string());
     };
     let Some(extension) = supported_extension(content_type) else {
@@ -256,12 +268,7 @@ pub fn save_data_url_image(data_url: &str, original_name: &str) -> Result<Serial
     let bytes = BASE64
         .decode(encoded.as_bytes())
         .map_err(|_| "Invalid image payload.".to_string())?;
-    save_image_bytes(
-        &bytes,
-        extension,
-        original_name,
-        None,
-    )
+    save_image_bytes(&bytes, extension, original_name, None)
 }
 
 pub fn save_image_bytes(

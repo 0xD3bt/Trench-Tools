@@ -2579,11 +2579,14 @@ button {
 }
 
 .reports-terminal {
-  flex: 0 0 372px;
-  width: 372px;
+  flex: 0 1 560px;
+  width: min(560px, calc(100vw - 24px));
+  min-width: min(420px, calc(100vw - 24px));
+  max-width: min(720px, calc(100vw - 24px));
   padding: 10px 12px;
   position: sticky;
   top: 12px;
+  overflow: visible;
 }
 
 .reports-terminal-head {
@@ -2594,17 +2597,34 @@ button {
   margin-bottom: 8px;
 }
 
+.reports-terminal-head > :first-child {
+  min-width: 0;
+}
+
+.reports-terminal-head .meta {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .reports-terminal-actions {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .reports-terminal-body {
+  --reports-terminal-list-width: 152px;
   display: grid;
-  grid-template-columns: minmax(120px, 144px) minmax(0, 1fr);
+  grid-template-columns: minmax(120px, var(--reports-terminal-list-width)) 12px minmax(0, 1fr);
   gap: 8px;
   min-height: 420px;
+  min-width: 0;
+}
+
+.reports-terminal-body > * {
+  min-width: 0;
 }
 
 .reports-terminal-list {
@@ -2614,6 +2634,44 @@ button {
   max-height: 520px;
   overflow: auto;
   padding-right: 2px;
+}
+
+.reports-terminal-resize-handle {
+  position: relative;
+  align-self: stretch;
+  width: 12px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.reports-terminal-resize-handle::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 3px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.reports-terminal-resize-handle:hover::before,
+.reports-terminal-resize-handle:focus-visible::before,
+.reports-terminal-resize-handle.is-active::before,
+.reports-terminal.is-resizing .reports-terminal-resize-handle::before {
+  background: rgba(0, 209, 178, 0.6);
+  box-shadow: 0 0 0 3px rgba(0, 209, 178, 0.12);
+}
+
+.reports-terminal.is-resizing,
+.reports-terminal.is-resizing * {
+  cursor: ew-resize !important;
+  user-select: none;
 }
 
 .reports-terminal-item {
@@ -2652,6 +2710,7 @@ button {
   font-size: 10px;
   line-height: 1.35;
   color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 .reports-terminal-empty {
@@ -2665,6 +2724,8 @@ button {
 .reports-console {
   min-height: 420px;
   max-height: 520px;
+  width: 100%;
+  overflow-wrap: anywhere;
 }
 
 /* ── Modal ── */
@@ -3111,6 +3172,18 @@ label.is-disabled textarea {
   border-color: #c5d0dc;
 }
 
+.theme-light .reports-terminal-resize-handle::before {
+  background: rgba(15, 23, 42, 0.18);
+}
+
+.theme-light .reports-terminal-resize-handle:hover::before,
+.theme-light .reports-terminal-resize-handle:focus-visible::before,
+.theme-light .reports-terminal-resize-handle.is-active::before,
+.theme-light .reports-terminal.is-resizing .reports-terminal-resize-handle::before {
+  background: rgba(0, 143, 122, 0.48);
+  box-shadow: 0 0 0 3px rgba(0, 209, 178, 0.12);
+}
+
 .theme-light .wallet-inline-controls .wallet-chip-button:not(.icon-chip-button),
 .theme-light .wallet-inline-controls .preset-chip.compact,
 .theme-light .dev-buy-change-presets,
@@ -3285,8 +3358,14 @@ label.is-disabled textarea {
 
   .reports-terminal {
     width: 100%;
+    max-width: none;
+    min-width: 0;
     position: static;
     margin-top: 12px;
+  }
+
+  .reports-terminal-resize-handle {
+    display: none;
   }
 
   .reports-terminal-body {

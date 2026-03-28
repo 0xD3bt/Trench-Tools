@@ -129,12 +129,20 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_uppercase(),
-            format_report_time(payload.get("writtenAtMs").and_then(Value::as_u64).unwrap_or(0) as u128)
+            format_report_time(
+                payload
+                    .get("writtenAtMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u128
+            )
         ),
         format!("File: {file_name}"),
         format!(
             "Trace: {}",
-            payload.get("traceId").and_then(Value::as_str).unwrap_or("(missing)")
+            payload
+                .get("traceId")
+                .and_then(Value::as_str)
+                .unwrap_or("(missing)")
         ),
         format!(
             "Mint: {}",
@@ -159,7 +167,10 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
             lines.push(format!("Transport: {transport}"));
         }
     }
-    if let Some(profile) = execution.get("resolvedEndpointProfile").and_then(Value::as_str) {
+    if let Some(profile) = execution
+        .get("resolvedEndpointProfile")
+        .and_then(Value::as_str)
+    {
         if !profile.is_empty() {
             lines.push(format!("Endpoint profile: {profile}"));
         }
@@ -183,9 +194,15 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
             for sent in sent_items {
                 let mut summary = format!(
                     "- {}: signature={} | status={}",
-                    sent.get("label").and_then(Value::as_str).unwrap_or("(unknown)"),
-                    sent.get("signature").and_then(Value::as_str).unwrap_or("(missing)"),
-                    sent.get("confirmationStatus").and_then(Value::as_str).unwrap_or("(pending)")
+                    sent.get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(unknown)"),
+                    sent.get("signature")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(missing)"),
+                    sent.get("confirmationStatus")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(pending)")
                 );
                 if let Some(block_height) =
                     sent.get("sendObservedBlockHeight").and_then(Value::as_u64)
@@ -200,7 +217,8 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
                 }
                 if let (Some(send_height), Some(confirmed_height)) = (
                     sent.get("sendObservedBlockHeight").and_then(Value::as_u64),
-                    sent.get("confirmedObservedBlockHeight").and_then(Value::as_u64),
+                    sent.get("confirmedObservedBlockHeight")
+                        .and_then(Value::as_u64),
                 ) {
                     summary.push_str(&format!(
                         " | blocks to confirm={}",
@@ -224,13 +242,22 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
                 }
             };
             push_timing(&mut timing_parts, "totalElapsedMs", "total");
+            push_timing(&mut timing_parts, "backendTotalElapsedMs", "backendTotal");
+            push_timing(&mut timing_parts, "clientPreRequestMs", "preRequest");
             push_timing(&mut timing_parts, "formToRawConfigMs", "form");
             push_timing(&mut timing_parts, "normalizeConfigMs", "normalize");
             push_timing(&mut timing_parts, "walletLoadMs", "wallet");
             push_timing(&mut timing_parts, "reportBuildMs", "report");
             push_timing(&mut timing_parts, "compileTransactionsMs", "compile");
+            push_timing(&mut timing_parts, "compileAltLoadMs", "altLoad");
+            push_timing(&mut timing_parts, "compileBlockhashFetchMs", "blockhash");
+            push_timing(&mut timing_parts, "compileGlobalFetchMs", "global");
+            push_timing(&mut timing_parts, "compileFollowUpPrepMs", "followUpPrep");
+            push_timing(&mut timing_parts, "compileTxSerializeMs", "serialize");
             push_timing(&mut timing_parts, "simulateMs", "simulate");
             push_timing(&mut timing_parts, "sendMs", "send");
+            push_timing(&mut timing_parts, "sendSubmitMs", "submit");
+            push_timing(&mut timing_parts, "sendConfirmMs", "confirm");
             push_timing(&mut timing_parts, "persistReportMs", "persist");
             if !timing_parts.is_empty() {
                 lines.push(format!("  Timings: {}", timing_parts.join(" | ")));
@@ -238,7 +265,10 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
         }
         if let Some(sent_items) = benchmark.get("sent").and_then(Value::as_array) {
             for sent in sent_items {
-                let label = sent.get("label").and_then(Value::as_str).unwrap_or("(unknown)");
+                let label = sent
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unknown)");
                 let mut sent_parts = Vec::new();
                 if let Some(value) = sent.get("sendBlockHeight").and_then(Value::as_u64) {
                     sent_parts.push(format!("send block height={value}"));
