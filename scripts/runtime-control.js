@@ -19,7 +19,7 @@ const scriptPath = (() => {
   return path.join(projectRoot, `${action}.sh`);
 })();
 
-const command = isWindows ? "powershell" : "sh";
+const command = isWindows ? "powershell" : "bash";
 const args = isWindows
   ? ["-ExecutionPolicy", "Bypass", "-File", scriptPath]
   : [scriptPath];
