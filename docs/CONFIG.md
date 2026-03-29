@@ -31,7 +31,10 @@ Metadata upload behavior:
 
 ## Host Runtime
 
-LaunchDeck now runs as a single Rust host process on the local UI port.
+LaunchDeck now runs as two local Rust processes:
+
+- Rust host on the UI/API port
+- follow daemon on the follow-daemon port
 
 Primary runtime variables:
 
@@ -49,9 +52,15 @@ Primary runtime variables:
 Current behavior:
 
 - `LAUNCHDECK_PORT` is the primary host port for both `/api/*` and `/engine/*`
-- `npm start` starts the Rust host and follow daemon through `start.ps1`
-- `npm stop` stops both local processes through `stop.ps1`
-- `npm restart` performs the same clean recycle explicitly
+- `npm start` dispatches to the platform runtime helper:
+  - Windows: `start.ps1`
+  - Linux: `start.sh`
+- `npm stop` dispatches to the platform runtime helper:
+  - Windows: `stop.ps1`
+  - Linux: `stop.sh`
+- `npm restart` dispatches to the platform runtime helper:
+  - Windows: `start.ps1`
+  - Linux: `restart.sh`
 - `npm run ui` starts the Rust host directly
 - the follow daemon defaults to `http://127.0.0.1:8790`
 

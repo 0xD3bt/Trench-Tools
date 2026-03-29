@@ -64,11 +64,21 @@ Primary local entrypoints:
 - `npm restart`
 - `npm run ui`
 
-`npm start` uses `start.ps1` to stop any existing LaunchDeck engine or follow-daemon processes, start both, wait for health, and open the local UI.
+`npm start` dispatches to the platform runtime helper:
 
-`npm stop` uses `stop.ps1` to stop any running LaunchDeck engine or follow-daemon processes, including stale listeners on the configured local ports.
+- Windows: `start.ps1`
+- Linux: `start.sh`
 
-`npm restart` performs the same clean recycle explicitly.
+Both variants stop any existing LaunchDeck engine or follow-daemon processes, start both, wait for health, and then open the local UI when the platform supports it.
+
+`npm stop` dispatches to the matching platform helper:
+
+- Windows: `stop.ps1`
+- Linux: `stop.sh`
+
+Both variants stop any running LaunchDeck engine or follow-daemon processes, including stale listeners on the configured local ports.
+
+`npm restart` dispatches to the matching platform helper and performs the same clean recycle explicitly.
 
 `npm run ui` starts the Rust host directly without the helper script.
 
