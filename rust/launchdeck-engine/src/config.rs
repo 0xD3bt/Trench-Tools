@@ -21,6 +21,8 @@ pub struct RawConfig {
     #[serde(default)]
     pub launchpad: String,
     #[serde(default)]
+    pub quoteAsset: String,
+    #[serde(default)]
     pub token: RawToken,
     #[serde(default)]
     pub signer: RawSigner,
@@ -350,6 +352,7 @@ pub struct RawRecipient {
 pub struct NormalizedConfig {
     pub mode: String,
     pub launchpad: String,
+    pub quoteAsset: String,
     pub token: NormalizedToken,
     pub signer: NormalizedSigner,
     pub agent: NormalizedAgent,
@@ -364,6 +367,36 @@ pub struct NormalizedConfig {
     pub imageLocalPath: String,
     pub selectedWalletKey: String,
     pub vanityPrivateKey: String,
+}
+
+pub fn validate_launchpad_support(config: &NormalizedConfig) -> Result<(), ConfigError> {
+    match config.launchpad.as_str() {
+        "bonk" => {
+            if config.mode != "regular" && config.mode != "bonkers" {
+                return Err(ConfigError::Message(format!(
+                    "Bonk currently supports only regular and bonkers modes. Got mode={}.",
+                    config.mode
+                )));
+            }
+            if config.feeSharing.generateLaterSetup || !config.feeSharing.recipients.is_empty() {
+                return Err(ConfigError::Message(
+                    "Bonk does not support fee-sharing setup yet.".to_string(),
+                ));
+            }
+            if config.token.mayhemMode {
+                return Err(ConfigError::Message(
+                    "Bonk does not support mayhem mode.".to_string(),
+                ));
+            }
+            if config.token.cashback {
+                return Err(ConfigError::Message(
+                    "Bonk does not support cashback mode.".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -787,6 +820,26 @@ fn normalize_creator_fee(
     Ok(normalized)
 }
 
+fn normalize_quote_asset(raw: &RawConfig, launchpad: &str) -> Result<String, ConfigError> {
+    let requested = if raw.quoteAsset.trim().is_empty() {
+        "sol".to_string()
+    } else {
+        raw.quoteAsset.trim().to_lowercase()
+    };
+    match launchpad {
+        "bonk" => parse_choice(&requested, "quoteAsset", &["sol", "usd1"], "sol"),
+        _ => {
+            if requested != "sol" {
+                return Err(ConfigError::Message(format!(
+                    "quoteAsset={} is only supported for bonk right now.",
+                    requested
+                )));
+            }
+            Ok("sol".to_string())
+        }
+    }
+}
+
 fn normalize_dev_buy(raw: &RawConfig) -> Result<Option<NormalizedDevBuy>, ConfigError> {
     let object_mode = raw
         .devBuy
@@ -940,6 +993,7 @@ fn legacy_follow_launch(
     raw: &RawConfig,
     post_launch_strategy: &str,
 ) -> Result<NormalizedFollowLaunch, ConfigError> {
+    let launchpad_is_pump = raw.launchpad.trim().is_empty() || raw.launchpad.trim() == "pump";
     let mut snipes = Vec::new();
     if post_launch_strategy == "snipe-own-launch"
         && !raw.postLaunch.snipeOwnLaunch.buyAmountSol.trim().is_empty()
@@ -1003,7 +1057,7 @@ fn legacy_follow_launch(
         snipes,
         devAutoSell: dev_auto_sell,
         constraints: NormalizedFollowLaunchConstraints {
-            pumpOnly: true,
+            pumpOnly: launchpad_is_pump,
             retryBudget: 1,
             requireDaemonReadiness: true,
             blockOnRequiredPrechecks: true,
@@ -1117,7 +1171,10 @@ fn normalize_follow_launch(
         snipes,
         devAutoSell: dev_auto_sell,
         constraints: NormalizedFollowLaunchConstraints {
-            pumpOnly: parse_bool(&follow.constraints.pumpOnly, true),
+            pumpOnly: parse_bool(
+                &follow.constraints.pumpOnly,
+                raw.launchpad.trim().is_empty() || raw.launchpad.trim() == "pump",
+            ),
             retryBudget: parse_int(
                 &follow.constraints.retryBudget,
                 "followLaunch.constraints.retryBudget",
@@ -1147,6 +1204,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
     };
     if ![
         "regular",
+        "bonkers",
         "cashback",
         "agent-custom",
         "agent-unlocked",
@@ -1155,7 +1213,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
     .contains(&mode.as_str())
     {
         return Err(ConfigError::Message(format!(
-            "mode must be one of regular, cashback, agent-custom, agent-unlocked, agent-locked. Got: {mode}"
+            "mode must be one of regular, bonkers, cashback, agent-custom, agent-unlocked, agent-locked. Got: {mode}"
         )));
     }
 
@@ -1165,6 +1223,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         &["pump", "bonk", "bagsapp"],
         "pump",
     )?;
+    let quote_asset = normalize_quote_asset(&raw, &launchpad)?;
     let post_launch_strategy = parse_choice(
         &raw.postLaunch.strategy,
         "postLaunch.strategy",
@@ -1180,6 +1239,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
     let mut normalized = NormalizedConfig {
         mode: mode.clone(),
         launchpad,
+        quoteAsset: quote_asset,
         token: NormalizedToken {
             name: parse_limited_string(&raw.token.name, "token.name", TOKEN_NAME_MAX_LENGTH, true)?,
             symbol: parse_limited_string(
@@ -1461,6 +1521,8 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
     // Keep variable live for future parity extensions.
     agent_fee_recipients.clear();
 
+    validate_launchpad_support(&normalized)?;
+
     Ok(normalized)
 }
 
@@ -1473,6 +1535,7 @@ mod tests {
         serde_json::from_value(json!({
             "mode": "regular",
             "launchpad": "pump",
+            "quoteAsset": "sol",
             "token": {
                 "name": "LaunchDeck",
                 "symbol": "LDECK",
@@ -1535,6 +1598,7 @@ mod tests {
             normalize_raw_config(sample_raw_config()).expect("config should normalize");
         assert_eq!(normalized.mode, "regular");
         assert_eq!(normalized.launchpad, "pump");
+        assert_eq!(normalized.quoteAsset, "sol");
         assert_eq!(normalized.token.name, "LaunchDeck");
         assert_eq!(normalized.execution.provider, "helius-sender");
         assert_eq!(normalized.execution.endpointProfile, "global");
@@ -1593,6 +1657,65 @@ mod tests {
         assert!(error.to_string().contains(
             "execution.provider must be one of standard-rpc, helius-sender, jito-bundle"
         ));
+    }
+
+    #[test]
+    fn bonk_rejects_pump_only_modes() {
+        let mut raw = sample_raw_config();
+        raw.launchpad = "bonk".to_string();
+        raw.mode = "cashback".to_string();
+
+        let error = normalize_raw_config(raw).expect_err("bonk should reject cashback mode");
+        assert_eq!(
+            error.to_string(),
+            "Bonk currently supports only regular and bonkers modes. Got mode=cashback."
+        );
+    }
+
+    #[test]
+    fn bonk_rejects_fee_sharing_setup() {
+        let mut raw = sample_raw_config();
+        raw.launchpad = "bonk".to_string();
+        raw.feeSharing.generateLaterSetup = Some(json!(true));
+        raw.feeSharing.recipients = vec![RawRecipient {
+            r#type: "wallet".to_string(),
+            address: "11111111111111111111111111111111".to_string(),
+            githubUsername: String::new(),
+            githubUserId: String::new(),
+            shareBps: Some(json!(10_000)),
+        }];
+
+        let error =
+            normalize_raw_config(raw).expect_err("bonk should reject fee-sharing setup");
+        assert_eq!(
+            error.to_string(),
+            "Bonk does not support fee-sharing setup yet."
+        );
+    }
+
+    #[test]
+    fn bonk_allows_bonkers_mode() {
+        let mut raw = sample_raw_config();
+        raw.launchpad = "bonk".to_string();
+        raw.mode = "bonkers".to_string();
+        raw.quoteAsset = "usd1".to_string();
+
+        let normalized = normalize_raw_config(raw).expect("bonk bonkers mode should normalize");
+        assert_eq!(normalized.launchpad, "bonk");
+        assert_eq!(normalized.mode, "bonkers");
+        assert_eq!(normalized.quoteAsset, "usd1");
+    }
+
+    #[test]
+    fn pump_rejects_non_sol_quote_asset() {
+        let mut raw = sample_raw_config();
+        raw.launchpad = "pump".to_string();
+        raw.quoteAsset = "usd1".to_string();
+        let error = normalize_raw_config(raw).expect_err("pump should reject usd1 quote asset");
+        assert_eq!(
+            error.to_string(),
+            "quoteAsset=usd1 is only supported for bonk right now."
+        );
     }
 
     #[test]

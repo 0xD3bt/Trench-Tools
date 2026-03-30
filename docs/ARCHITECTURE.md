@@ -60,9 +60,9 @@ The same engine-owned shaping applies to:
 
 ## Current Boundary
 
-Pump is the only active native build/send path in the current initial version.
+The current active launch paths are Pump and Bonk.
 
-Verified native Pump coverage currently includes:
+Verified Pump coverage currently includes:
 
 - `regular`
 - `cashback`
@@ -70,7 +70,21 @@ Verified native Pump coverage currently includes:
 - `agent-unlocked`
 - `agent-locked`
 
-Bonk and Bags are not active launch flows in the current initial version and should not be treated as supported runtime launch targets yet.
+Verified Bonk coverage currently includes:
+
+- `regular`
+- `bonkers`
+- `sol` and `usd1` quote assets
+- immediate dev buy
+- same-time sniper buys
+- follow buy and follow sell execution
+- automatic dev sell
+
+Boundary notes:
+
+- Pump launch assembly is native Rust
+- Bonk validation/send/reporting are Rust-owned, but Bonk launch assembly currently goes through the Raydium LaunchLab SDK-backed helper bridge
+- Bagsapp is still not an active launch flow yet
 
 ## Runtime Shape
 

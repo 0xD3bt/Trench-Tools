@@ -1,5 +1,9 @@
 #[path = "../config.rs"]
 mod config;
+#[path = "../bonk_native.rs"]
+mod bonk_native;
+#[path = "../launchpad_dispatch.rs"]
+mod launchpad_dispatch;
 #[path = "../observability.rs"]
 mod observability;
 #[path = "../paths.rs"]
@@ -19,8 +23,8 @@ mod wallet;
 
 use clap::{Parser, Subcommand};
 use config::{RawConfig, normalize_raw_config};
+use launchpad_dispatch::try_compile_native_launchpad;
 use observability::{new_trace_context, persist_launch_report};
-use pump_native::try_compile_native_pump;
 use rpc::{send_transactions_for_transport, simulate_transactions};
 use serde_json::{Value, json};
 use std::{
@@ -168,7 +172,7 @@ async fn run_cli() -> Result<(), String> {
         estimate_transaction_count(&normalized),
     );
 
-    let native = try_compile_native_pump(
+    let native = try_compile_native_launchpad(
         &rpc_url,
         &normalized,
         &transport_plan,

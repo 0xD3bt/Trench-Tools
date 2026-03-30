@@ -131,6 +131,7 @@ pub struct FollowJobRecord {
     pub createdAtMs: u128,
     pub updatedAtMs: u128,
     pub launchpad: String,
+    pub quoteAsset: String,
     pub selectedWalletKey: String,
     pub execution: NormalizedExecution,
     pub tokenMayhemMode: bool,
@@ -245,6 +246,7 @@ pub struct FollowDaemonStateFile {
 pub struct FollowReserveRequest {
     pub traceId: String,
     pub launchpad: String,
+    pub quoteAsset: String,
     pub selectedWalletKey: String,
     pub followLaunch: NormalizedFollowLaunch,
     pub execution: NormalizedExecution,
@@ -281,6 +283,7 @@ pub struct FollowStopAllRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowReadyRequest {
     pub followLaunch: NormalizedFollowLaunch,
+    pub quoteAsset: String,
     pub execution: NormalizedExecution,
     pub watchEndpoint: Option<String>,
 }
@@ -638,6 +641,7 @@ impl FollowDaemonStore {
             createdAtMs: now,
             updatedAtMs: now,
             launchpad: request.launchpad,
+            quoteAsset: request.quoteAsset,
             selectedWalletKey: request.selectedWalletKey,
             execution: request.execution,
             tokenMayhemMode: request.tokenMayhemMode,

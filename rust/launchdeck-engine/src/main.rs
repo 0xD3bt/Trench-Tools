@@ -1,6 +1,8 @@
 mod config;
 mod follow;
 mod image_library;
+mod bonk_native;
+mod launchpad_dispatch;
 mod launchpads;
 mod observability;
 mod paths;
@@ -18,6 +20,7 @@ mod vamp;
 mod wallet;
 
 use crate::{
+    bonk_native::compile_sol_to_usd1_topup_transaction,
     config::{NormalizedConfig, NormalizedFollowLaunch, RawConfig, normalize_raw_config},
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
@@ -27,14 +30,17 @@ use crate::{
         build_image_library_payload, create_category, delete_image, save_image_bytes,
         update_image,
     },
+    launchpad_dispatch::{
+        compile_atomic_follow_buy_for_launchpad, quote_launch_for_launchpad,
+        try_compile_native_launchpad,
+    },
     launchpads::launchpad_registry,
     observability::{
         log_event, new_trace_context, persist_launch_report, update_persisted_launch_report,
     },
     providers::{provider_availability_registry, provider_registry},
     pump_native::{
-        compile_atomic_follow_buy_transaction, try_compile_native_pump, warm_default_lookup_tables,
-        warm_pump_global_state,
+        warm_default_lookup_tables, warm_pump_global_state,
     },
     report::{LaunchReport, build_report, render_report},
     reports_browser::{list_persisted_reports, read_persisted_report_bundle},
@@ -144,6 +150,8 @@ struct ReportViewQuery {
 
 #[derive(Deserialize, Default)]
 struct QuoteQuery {
+    launchpad: Option<String>,
+    quoteAsset: Option<String>,
     mode: Option<String>,
     amount: Option<String>,
 }
@@ -564,6 +572,16 @@ fn has_same_time_snipes(follow_launch: &NormalizedFollowLaunch) -> bool {
         .any(|snipe| snipe.enabled && snipe.submitWithLaunch)
 }
 
+fn same_time_wallet_label(wallet_env_key: &str) -> String {
+    let trimmed = wallet_env_key.trim();
+    let suffix = trimmed.trim_start_matches("SOLANA_PRIVATE_KEY").trim();
+    if suffix.is_empty() {
+        "primary".to_string()
+    } else {
+        suffix.to_string()
+    }
+}
+
 fn parse_sol_decimal_to_lamports(value: &str) -> Option<u64> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -653,7 +671,30 @@ async fn compile_same_time_snipes(
 ) -> Result<Vec<CompiledTransaction>, String> {
     let tasks = snipes.iter().enumerate().map(|(index, snipe)| async move {
         let wallet_secret = load_solana_wallet_by_env_key(&snipe.walletEnvKey)?;
-        let mut tx = compile_atomic_follow_buy_transaction(
+        let mut compiled = Vec::new();
+        if normalized.launchpad == "bonk" && normalized.quoteAsset == "usd1" {
+            if let Some(mut topup_tx) = compile_sol_to_usd1_topup_transaction(
+                rpc_url,
+                &normalized.execution,
+                &normalized.tx.jitoTipAccount,
+                &wallet_secret,
+                &snipe.buyAmountSol,
+                &format!("sniper-topup-{}", index + 1),
+            )
+            .await?
+            {
+                topup_tx.label = format!(
+                    "sniper-topup-{}-wallet-{}",
+                    index + 1,
+                    same_time_wallet_label(&snipe.walletEnvKey)
+                );
+                compiled.push(topup_tx);
+            }
+        }
+        let mut tx = compile_atomic_follow_buy_for_launchpad(
+            &normalized.launchpad,
+            &normalized.mode,
+            &normalized.quoteAsset,
             rpc_url,
             &normalized.execution,
             normalized.token.mayhemMode,
@@ -667,14 +708,16 @@ async fn compile_same_time_snipes(
         tx.label = format!(
             "sniper-buy-{}-wallet-{}",
             index + 1,
-            snipe.walletEnvKey.replace("SOLANA_PRIVATE_KEY", "")
+            same_time_wallet_label(&snipe.walletEnvKey)
         );
-        Ok::<CompiledTransaction, String>(tx)
+        compiled.push(tx);
+        Ok::<Vec<CompiledTransaction>, String>(compiled)
     });
     join_all(tasks)
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
+        .map(|groups| groups.into_iter().flatten().collect())
 }
 
 async fn build_status_payload(
@@ -1157,7 +1200,7 @@ async fn execute_engine_action_payload(
         }));
     }
     let compile_started_ms = current_time_ms();
-    let native_artifacts = try_compile_native_pump(
+    let native_artifacts = try_compile_native_launchpad(
         &configured_rpc_url(),
         &normalized,
         &transport_plan,
@@ -1421,6 +1464,7 @@ async fn execute_engine_action_payload(
             let ready = client
                 .ready(&FollowReadyRequest {
                     followLaunch: deferred_follow_launch.clone(),
+                    quoteAsset: normalized.quoteAsset.clone(),
                     execution: normalized.execution.clone(),
                     watchEndpoint: transport_plan.watchEndpoint.clone(),
                 })
@@ -1451,6 +1495,7 @@ async fn execute_engine_action_payload(
                     .reserve(&FollowReserveRequest {
                         traceId: trace.traceId.clone(),
                         launchpad: normalized.launchpad.clone(),
+                        quoteAsset: normalized.quoteAsset.clone(),
                         selectedWalletKey: normalized.selectedWalletKey.clone(),
                         followLaunch: deferred_follow_launch.clone(),
                         execution: normalized.execution.clone(),
@@ -1523,6 +1568,66 @@ async fn execute_engine_action_payload(
                     })),
                 )
             })?
+        } else if normalized.launchpad == "bonk" {
+            let (launch_sent, mut launch_warnings, _launch_submit_ms) =
+                submit_transactions_for_transport(
+                    &rpc_url,
+                    &transport_plan,
+                    &compiled_transactions,
+                    &normalized.execution.commitment,
+                    normalized.execution.skipPreflight,
+                    normalized.execution.trackSendBlockHeight,
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": error,
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?;
+            launch_warnings.push(
+                "Bonk same-time sniper buys are submitted immediately after the launch transaction on non-bundle transports so the mint exists before buy execution."
+                    .to_string(),
+            );
+            match submit_independent_transactions_for_transport(
+                &rpc_url,
+                &transport_plan,
+                &same_time_independent_compiled,
+                &normalized.execution.commitment,
+                normalized.execution.skipPreflight,
+                normalized.execution.trackSendBlockHeight,
+            )
+            .await
+            {
+                Ok((sent, same_time_warnings, _same_time_submit_ms)) => {
+                    same_time_sent = sent;
+                    launch_warnings.extend(same_time_warnings);
+                }
+                Err(error) if same_time_retry_enabled => {
+                    launch_warnings.push(format!(
+                        "Same-time sniper submit failed after Bonk launch submit; daemon retry is armed for one retry attempt: {error}"
+                    ));
+                }
+                Err(error) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": error,
+                            "traceId": trace.traceId,
+                        })),
+                    ));
+                }
+            }
+            (
+                launch_sent,
+                launch_warnings,
+                current_time_ms().saturating_sub(submit_started_ms),
+            )
         } else {
             let launch_submit = submit_transactions_for_transport(
                 &rpc_url,
@@ -2163,6 +2268,8 @@ async fn api_quote(
     Query(query): Query<QuoteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let started_at_ms = current_time_ms();
+    let launchpad = query.launchpad.unwrap_or_else(|| "pump".to_string());
+    let quote_asset = query.quoteAsset.unwrap_or_else(|| "sol".to_string());
     let mode = query.mode.unwrap_or_default();
     let amount = query.amount.unwrap_or_default();
     if mode.trim().is_empty() || amount.trim().is_empty() {
@@ -2171,9 +2278,12 @@ async fn api_quote(
             "quote": Value::Null,
         }), started_at_ms)));
     }
-    let quote = quote_from_form(
+    let quote = quote_launch_for_launchpad(
         &configured_rpc_url(),
-        json!({ "mode": mode, "amount": amount }),
+        &launchpad,
+        &quote_asset,
+        &mode,
+        &amount,
     )
     .await
     .map_err(|error| {

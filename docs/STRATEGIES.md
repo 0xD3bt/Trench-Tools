@@ -66,3 +66,7 @@ Current supported follow-sell trigger types include:
 - market-cap based sell timing
 
 These actions are daemon-executed and reported independently from the original sniper buy.
+
+Current limitation:
+
+- `followLaunch.snipes[].postBuySell` is not shipped yet, even though the daemon has sell-side follow-action support

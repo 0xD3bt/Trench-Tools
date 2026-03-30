@@ -34,14 +34,16 @@ The Rust host serves:
 
 The follow daemon manages launch-follow actions, realtime watchers, follow telemetry, and persisted timing profiles.
 
-The current initial active launch runtime is `pump` only, but the UI host, settings persistence, image library, reports browser, vamp import flow, and follow-daemon control plane now also live in Rust.
+The current active launch runtimes are `pump` and `bonk`, while the UI host, settings persistence, image library, reports browser, vamp import flow, and follow-daemon control plane now also live in Rust.
 
 Default local entrypoints:
 
 - UI host: `http://127.0.0.1:8789`
 - follow daemon: `http://127.0.0.1:8790`
 
-## Current Pump Coverage
+## Current Launchpad Coverage
+
+### Pump
 
 The Rust-native Pump path currently covers:
 
@@ -53,7 +55,27 @@ The Rust-native Pump path currently covers:
 
 Pump launch assembly, transaction shaping, reporting, simulation, and send execution now run through the Rust engine rather than the legacy JS compile bridge for these verified launch shapes.
 
-Bonk and Bagsapp should not currently be treated as active launch flows in the initial version.
+### Bonk
+
+The verified Bonk path currently covers:
+
+- `regular`
+- `bonkers`
+- `sol` and `usd1` quote assets
+- immediate dev buy
+- same-time sniper buys
+- follow buy and follow sell execution
+- automatic dev sell
+
+Bonk launch validation, reporting, transport planning, and send execution run through the Rust engine. Bonk launch assembly itself uses the Raydium LaunchLab SDK-backed compile bridge for LetsBonk and Bonkers flows.
+
+Current Bonk limitation:
+
+- per-sniper `postBuySell` chaining is still not shipped
+
+### Bagsapp
+
+Bagsapp should not currently be treated as an active launch flow yet.
 
 ## Run Locally
 
@@ -137,6 +159,10 @@ Current follow behavior includes:
 - sniper sell follow actions
 - inline same-time fee safeguard warnings
 - optional one-time same-time retry through the daemon
+
+Current limitation:
+
+- `followLaunch.snipes[].postBuySell` is still not shipped
 
 Current timing modes:
 

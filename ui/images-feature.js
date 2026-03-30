@@ -202,6 +202,17 @@
       }
       state.images = Array.isArray(payload.images) ? payload.images : [];
       state.categories = Array.isArray(payload.categories) ? payload.categories : [];
+      const preferredImageId = (getUploadedImage() && getUploadedImage().id) || "";
+      if (preferredImageId) {
+        const selected = state.images.find((entry) => entry.id === preferredImageId);
+        if (selected) {
+          state.activeImageId = selected.id;
+          if (!getUploadedImage() || getUploadedImage().id !== selected.id) {
+            setUploadedImage(selected);
+            setImagePreview(selected.previewUrl);
+          }
+        }
+      }
       renderCategoryChips();
       renderLibraryGrid();
     }

@@ -3,6 +3,8 @@
 pub mod config;
 pub mod follow;
 pub mod image_library;
+pub mod bonk_native;
+pub mod launchpad_dispatch;
 pub mod launchpads;
 pub mod observability;
 pub mod paths;

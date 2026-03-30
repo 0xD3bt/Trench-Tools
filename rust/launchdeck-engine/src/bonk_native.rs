@@ -1,0 +1,558 @@
+#![allow(non_snake_case, dead_code)]
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    io::Write,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
+use tokio::time::{Duration, sleep};
+
+use crate::{
+    config::{NormalizedConfig, NormalizedExecution, validate_launchpad_support},
+    report::{
+        FeeSettings, InstructionSummary, TransactionSummary, build_report, render_report,
+    },
+    rpc::CompiledTransaction,
+    transport::TransportPlan,
+};
+
+use crate::pump_native::{LaunchQuote, NativeCompileTimings};
+
+const PACKET_LIMIT_BYTES: usize = 1232;
+const FIXED_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
+
+#[derive(Debug, Clone)]
+pub struct NativeBonkArtifacts {
+    pub compiled_transactions: Vec<CompiledTransaction>,
+    pub report: Value,
+    pub text: String,
+    pub compile_timings: NativeCompileTimings,
+    pub mint: String,
+    pub launch_creator: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BonkMarketSnapshot {
+    pub mint: String,
+    pub creator: String,
+    pub virtualTokenReserves: String,
+    pub virtualSolReserves: String,
+    pub realTokenReserves: String,
+    pub realSolReserves: String,
+    pub tokenTotalSupply: String,
+    pub complete: bool,
+    pub marketCapLamports: String,
+    pub marketCapSol: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperTxConfig<'a> {
+    computeUnitLimit: u64,
+    computeUnitPriceMicroLamports: u64,
+    tipLamports: u64,
+    tipAccount: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperCompiledTransaction {
+    label: String,
+    format: String,
+    blockhash: String,
+    lastValidBlockHeight: u64,
+    serializedBase64: String,
+    #[serde(default)]
+    lookupTablesUsed: Vec<String>,
+    #[serde(default)]
+    computeUnitLimit: Option<u64>,
+    #[serde(default)]
+    computeUnitPriceMicroLamports: Option<u64>,
+    #[serde(default)]
+    inlineTipLamports: Option<u64>,
+    #[serde(default)]
+    inlineTipAccount: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperLaunchResponse {
+    mint: String,
+    launchCreator: String,
+    compiledTransactions: Vec<HelperCompiledTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperFollowBuyResponse {
+    compiledTransaction: HelperCompiledTransaction,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperFollowSellResponse {
+    compiledTransaction: Option<HelperCompiledTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperUsd1TopupResponse {
+    compiledTransaction: Option<HelperCompiledTransaction>,
+}
+
+fn project_root() -> Result<PathBuf, String> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(|path| path.parent())
+        .map(PathBuf::from)
+        .ok_or_else(|| "Failed to resolve LaunchDeck project root.".to_string())
+}
+
+fn helper_script_path() -> Result<PathBuf, String> {
+    Ok(project_root()?.join("scripts/bonk-launchpad.js"))
+}
+
+async fn run_helper<T: Serialize, R: for<'de> Deserialize<'de>>(
+    request: &T,
+) -> Result<R, String> {
+    let script_path = helper_script_path()?;
+    let request_bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let mut child = Command::new("node")
+        .arg(script_path)
+        .current_dir(project_root()?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to start Bonk helper: {error}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&request_bytes)
+            .map_err(|error| format!("Failed to send Bonk helper request: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Bonk helper failed to complete: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "Bonk helper exited with a non-zero status.".to_string()
+        } else {
+            format!("Bonk helper error: {stderr}")
+        });
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Failed to parse Bonk helper output: {error}"))
+}
+
+fn helper_tx_config(
+    compute_unit_limit: Option<u64>,
+    compute_unit_price_micro_lamports: u64,
+    tip_lamports: u64,
+    tip_account: &str,
+) -> HelperTxConfig<'_> {
+    HelperTxConfig {
+        computeUnitLimit: compute_unit_limit.unwrap_or(FIXED_COMPUTE_UNIT_LIMIT),
+        computeUnitPriceMicroLamports: compute_unit_price_micro_lamports,
+        tipLamports: tip_lamports,
+        tipAccount: tip_account,
+    }
+}
+
+fn parse_decimal_u64(value: &str, decimals: u32, label: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    let parsed = trimmed
+        .parse::<f64>()
+        .map_err(|error| format!("Invalid {label}: {error}"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("Invalid {label}: expected a non-negative decimal."));
+    }
+    let scale = 10u64.saturating_pow(decimals);
+    let scaled = parsed * scale as f64;
+    if scaled > u64::MAX as f64 {
+        return Err(format!("{label} is too large."));
+    }
+    Ok(scaled.round() as u64)
+}
+
+fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, String> {
+    let lamports = parse_decimal_u64(priority_fee_sol, 9, "priority fee")?;
+    if lamports == 0 {
+        Ok(0)
+    } else {
+        Ok((lamports.saturating_mul(1_000_000)) / FIXED_COMPUTE_UNIT_LIMIT)
+    }
+}
+
+fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
+    let percent = parse_decimal_u64(slippage_percent, 2, "slippage percent")?;
+    Ok(percent / 100)
+}
+
+fn decode_secret_base64(secret: &[u8]) -> String {
+    BASE64.encode(secret)
+}
+
+fn convert_compiled_transaction(source: HelperCompiledTransaction) -> CompiledTransaction {
+    CompiledTransaction {
+        label: source.label,
+        format: source.format,
+        blockhash: source.blockhash,
+        lastValidBlockHeight: source.lastValidBlockHeight,
+        serializedBase64: source.serializedBase64,
+        lookupTablesUsed: source.lookupTablesUsed,
+        computeUnitLimit: source.computeUnitLimit,
+        computeUnitPriceMicroLamports: source.computeUnitPriceMicroLamports,
+        inlineTipLamports: source.inlineTipLamports,
+        inlineTipAccount: source.inlineTipAccount,
+    }
+}
+
+fn build_transaction_summaries(
+    compiled_transactions: &[CompiledTransaction],
+    dump_base64: bool,
+) -> Vec<TransactionSummary> {
+    compiled_transactions
+        .iter()
+        .map(|transaction| {
+            let serialized_len = BASE64
+                .decode(transaction.serializedBase64.as_bytes())
+                .ok()
+                .map(|bytes| bytes.len());
+            let mut summary = TransactionSummary {
+                label: transaction.label.clone(),
+                instructionSummary: Vec::<InstructionSummary>::new(),
+                legacyLength: None,
+                v0Length: None,
+                v0AltLength: None,
+                legacyError: None,
+                v0Error: None,
+                v0AltError: None,
+                lookupTablesUsed: transaction.lookupTablesUsed.clone(),
+                fitsWithAlts: serialized_len
+                    .map(|length| length <= PACKET_LIMIT_BYTES)
+                    .unwrap_or(true),
+                exceedsPacketLimit: serialized_len
+                    .map(|length| length > PACKET_LIMIT_BYTES)
+                    .unwrap_or(false),
+                feeSettings: FeeSettings {
+                    computeUnitLimit: transaction.computeUnitLimit.map(|value| value as i64),
+                    computeUnitPriceMicroLamports: transaction
+                        .computeUnitPriceMicroLamports
+                        .map(|value| value as i64),
+                    jitoTipLamports: transaction.inlineTipLamports.unwrap_or_default() as i64,
+                    jitoTipAccount: transaction.inlineTipAccount.clone(),
+                },
+                base64: if dump_base64 {
+                    Some(Value::String(transaction.serializedBase64.clone()))
+                } else {
+                    None
+                },
+                warnings: vec![],
+            };
+            match transaction.format.as_str() {
+                "legacy" => summary.legacyLength = serialized_len,
+                _ => summary.v0Length = serialized_len,
+            }
+            summary
+        })
+        .collect()
+}
+
+fn validate_bonk_config(config: &NormalizedConfig) -> Result<(), String> {
+    validate_launchpad_support(config).map_err(|error| error.to_string())
+}
+
+pub fn supports_native_bonk_compile(config: &NormalizedConfig) -> bool {
+    config.launchpad == "bonk" && matches!(config.mode.as_str(), "regular" | "bonkers")
+}
+
+pub async fn quote_launch(
+    rpc_url: &str,
+    quote_asset: &str,
+    mode: &str,
+    amount: &str,
+) -> Result<Option<LaunchQuote>, String> {
+    if amount.trim().is_empty() {
+        return Ok(None);
+    }
+    let trimmed_mode = mode.trim().to_lowercase();
+    let quote: LaunchQuote = run_helper(&json!({
+        "action": "quote",
+        "rpcUrl": rpc_url,
+        "quoteAsset": quote_asset,
+        "mode": if trimmed_mode.is_empty() { "sol" } else { trimmed_mode.as_str() },
+        "amount": amount,
+        "commitment": "confirmed",
+    }))
+    .await?;
+    Ok(Some(quote))
+}
+
+pub async fn compile_sol_to_usd1_topup_transaction(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    required_quote_amount: &str,
+    label_prefix: &str,
+) -> Result<Option<CompiledTransaction>, String> {
+    let tip_lamports = parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?;
+    let response: HelperUsd1TopupResponse = run_helper(&json!({
+        "action": "compile-sol-to-usd1-topup",
+        "rpcUrl": rpc_url,
+        "quoteAsset": "usd1",
+        "commitment": execution.commitment,
+        "ownerSecret": decode_secret_base64(wallet_secret),
+        "requiredQuoteAmount": required_quote_amount,
+        "labelPrefix": label_prefix,
+        "txFormat": execution.txFormat,
+        "slippageBps": slippage_bps_from_percent(&execution.buySlippagePercent)?,
+        "txConfig": helper_tx_config(
+            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
+            tip_lamports,
+            jito_tip_account,
+        ),
+    }))
+    .await?;
+    Ok(response.compiledTransaction.map(convert_compiled_transaction))
+}
+
+pub async fn try_compile_native_bonk(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+    transport_plan: &TransportPlan,
+    wallet_secret: &[u8],
+    built_at: String,
+    creator_public_key: String,
+    config_path: Option<String>,
+) -> Result<Option<NativeBonkArtifacts>, String> {
+    if config.launchpad != "bonk" {
+        return Ok(None);
+    }
+    validate_bonk_config(config)?;
+    let tip_lamports = u64::try_from(config.tx.jitoTipLamports.max(0)).unwrap_or_default();
+    let usd1_topup = if config.quoteAsset == "usd1" {
+        if let Some(dev_buy) = config.devBuy.as_ref() {
+            let required_quote_amount = if dev_buy.mode == "tokens" {
+                quote_launch(rpc_url, &config.quoteAsset, "tokens", &dev_buy.amount)
+                    .await?
+                    .ok_or_else(|| "Unable to compute USD1 top-up amount for Bonk dev buy.".to_string())?
+                    .estimatedQuoteAmount
+            } else {
+                dev_buy.amount.clone()
+            };
+            compile_sol_to_usd1_topup_transaction(
+                rpc_url,
+                &config.execution,
+                &config.tx.jitoTipAccount,
+                wallet_secret,
+                &required_quote_amount,
+                "launch-usd1-topup",
+            )
+            .await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let response: HelperLaunchResponse = run_helper(&json!({
+        "action": "build-launch",
+        "mode": config.mode,
+        "quoteAsset": config.quoteAsset,
+        "rpcUrl": rpc_url,
+        "commitment": config.execution.commitment,
+        "ownerSecret": decode_secret_base64(wallet_secret),
+        "vanitySecret": config.vanityPrivateKey,
+        "txFormat": config.execution.txFormat,
+        "slippageBps": slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
+        "txConfig": helper_tx_config(
+            config.tx.computeUnitLimit.and_then(|value| u64::try_from(value).ok()),
+            u64::try_from(config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0))
+                .unwrap_or_default(),
+            tip_lamports,
+            &config.tx.jitoTipAccount,
+        ),
+        "token": {
+            "name": config.token.name,
+            "symbol": config.token.symbol,
+            "uri": config.token.uri,
+        },
+        "devBuy": config.devBuy.as_ref().map(|dev_buy| json!({
+            "mode": dev_buy.mode,
+            "amount": dev_buy.amount,
+            "quoteAsset": config.quoteAsset,
+        })),
+    }))
+    .await?;
+    let mut compiled_transactions = response
+        .compiledTransactions
+        .into_iter()
+        .map(convert_compiled_transaction)
+        .collect::<Vec<_>>();
+    if let Some(topup_tx) = usd1_topup {
+        compiled_transactions.insert(0, topup_tx);
+    }
+    let mut report = build_report(
+        config,
+        transport_plan,
+        built_at,
+        rpc_url.to_string(),
+        creator_public_key,
+        response.mint.clone(),
+        None,
+        config_path,
+        vec![],
+    );
+    report.execution.warnings.push(
+        "Bonk launch assembly uses the Raydium LaunchLab SDK-backed compile bridge."
+            .to_string(),
+    );
+    report.transactions = build_transaction_summaries(&compiled_transactions, config.tx.dumpBase64);
+    let text = render_report(&report);
+    let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
+    Ok(Some(NativeBonkArtifacts {
+        compiled_transactions,
+        report,
+        text,
+        compile_timings: NativeCompileTimings::default(),
+        mint: response.mint,
+        launch_creator: response.launchCreator,
+    }))
+}
+
+pub async fn compile_follow_buy_transaction(
+    rpc_url: &str,
+    quote_asset: &str,
+    execution: &NormalizedExecution,
+    _token_mayhem_mode: bool,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    _launch_creator: &str,
+    buy_amount_sol: &str,
+) -> Result<CompiledTransaction, String> {
+    let tip_lamports = parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?;
+    let response: HelperFollowBuyResponse = run_helper(&json!({
+        "action": "compile-follow-buy",
+        "rpcUrl": rpc_url,
+        "quoteAsset": quote_asset,
+        "commitment": execution.commitment,
+        "ownerSecret": decode_secret_base64(wallet_secret),
+        "mint": mint,
+        "buyAmountSol": buy_amount_sol,
+        "txFormat": execution.txFormat,
+        "slippageBps": slippage_bps_from_percent(&execution.buySlippagePercent)?,
+        "txConfig": helper_tx_config(
+            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
+            tip_lamports,
+            jito_tip_account,
+        ),
+    }))
+    .await?;
+    Ok(convert_compiled_transaction(response.compiledTransaction))
+}
+
+pub async fn compile_atomic_follow_buy_transaction(
+    rpc_url: &str,
+    launch_mode: &str,
+    quote_asset: &str,
+    execution: &NormalizedExecution,
+    _token_mayhem_mode: bool,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    launch_creator: &str,
+    buy_amount_sol: &str,
+) -> Result<CompiledTransaction, String> {
+    let tip_lamports = parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?;
+    let response: HelperFollowBuyResponse = run_helper(&json!({
+        "action": "compile-follow-buy-atomic",
+        "mode": launch_mode,
+        "rpcUrl": rpc_url,
+        "quoteAsset": quote_asset,
+        "commitment": execution.commitment,
+        "ownerSecret": decode_secret_base64(wallet_secret),
+        "mint": mint,
+        "launchCreator": launch_creator,
+        "buyAmountSol": buy_amount_sol,
+        "txFormat": execution.txFormat,
+        "slippageBps": slippage_bps_from_percent(&execution.buySlippagePercent)?,
+        "txConfig": helper_tx_config(
+            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
+            tip_lamports,
+            jito_tip_account,
+        ),
+    }))
+    .await?;
+    Ok(convert_compiled_transaction(response.compiledTransaction))
+}
+
+pub async fn compile_follow_sell_transaction(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    _token_mayhem_mode: bool,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    _launch_creator: &str,
+    sell_percent: u8,
+    _prefer_post_setup_creator_vault: bool,
+) -> Result<Option<CompiledTransaction>, String> {
+    let tip_lamports = parse_decimal_u64(&execution.sellTipSol, 9, "sell tip")?;
+    let response: HelperFollowSellResponse = run_helper(&json!({
+        "action": "compile-follow-sell",
+        "rpcUrl": rpc_url,
+        "commitment": execution.commitment,
+        "ownerSecret": decode_secret_base64(wallet_secret),
+        "mint": mint,
+        "sellPercent": sell_percent,
+        "txFormat": execution.txFormat,
+        "slippageBps": slippage_bps_from_percent(&execution.sellSlippagePercent)?,
+        "txConfig": helper_tx_config(
+            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
+            tip_lamports,
+            jito_tip_account,
+        ),
+    }))
+    .await?;
+    Ok(response.compiledTransaction.map(convert_compiled_transaction))
+}
+
+pub async fn fetch_bonk_market_snapshot(
+    rpc_url: &str,
+    mint: &str,
+    quote_asset: &str,
+) -> Result<BonkMarketSnapshot, String> {
+    run_helper(&json!({
+        "action": "fetch-market-snapshot",
+        "rpcUrl": rpc_url,
+        "commitment": "processed",
+        "mint": mint,
+        "quoteAsset": quote_asset,
+    }))
+    .await
+}
+
+pub async fn poll_bonk_market_cap_lamports(
+    rpc_url: &str,
+    mint: &str,
+    quote_asset: &str,
+) -> Result<Option<u64>, String> {
+    let snapshot = fetch_bonk_market_snapshot(rpc_url, mint, quote_asset).await?;
+    let value = snapshot
+        .marketCapLamports
+        .parse::<u64>()
+        .map_err(|error| format!("Invalid Bonk market cap response: {error}"))?;
+    Ok(Some(value))
+}
+
+pub async fn warm_bonk_state() {
+    let _ = sleep(Duration::from_millis(1)).await;
+}

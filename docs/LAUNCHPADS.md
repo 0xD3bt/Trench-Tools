@@ -2,7 +2,7 @@
 
 ## Pump
 
-Pump is the only active launch flow in the current initial version of `LaunchDeck`.
+Pump is an active verified launch flow in `LaunchDeck`.
 
 The current implementation supports:
 
@@ -77,9 +77,35 @@ When a Pump launch also includes an immediate dev buy, the launch transaction ca
 
 ## Bonk
 
-Bonk is not active in the current initial version.
+Bonk is an active verified launch target.
 
-Do not treat Bonk as a supported launch target yet.
+Current Bonk coverage:
+
+- `regular`
+- `bonkers`
+- `sol` quote asset
+- `usd1` quote asset with automatic SOL -> USD1 top-up when needed
+- immediate dev buy
+- same-time sniper buys
+- follow buys
+- follow sells
+- automatic dev sell
+
+Current runtime notes for Bonk:
+
+- the Rust engine owns Bonk validation, transport planning, reporting, simulation/send orchestration, and follow-daemon integration
+- Bonk launch assembly uses the Raydium LaunchLab SDK-backed helper bridge
+- `regular` routes through LetsBonk
+- `bonkers` routes through the Bonkers platform config on Raydium LaunchLab
+- same-time Bonk sniper buys use a non-bundle safeguard so the launch tx lands before the buy path is sent
+- `usd1` mode prefers Raydium route-based top-up handling before Bonk buys when the wallet is short on USD1
+
+Current Bonk restrictions:
+
+- Pump-only modes such as `cashback`, `agent-custom`, `agent-unlocked`, and `agent-locked` are rejected
+- fee-sharing setup is rejected
+- `mayhem` is rejected
+- per-sniper `postBuySell` chaining is not shipped yet
 
 ## Bagsapp
 

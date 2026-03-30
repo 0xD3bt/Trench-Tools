@@ -98,6 +98,7 @@ Important runtime fields:
 
 - `launchpad`
 - `mode`
+- `quoteAsset`
 - `execution.provider`
 - `execution.skipPreflight`
 - `execution.buyProvider`
@@ -107,6 +108,11 @@ Important runtime fields:
 - `postLaunch.strategy`
 - `presets.selectedLaunchPresetId`
 - `presets.selectedSniperPresetId`
+
+Current launchpad note:
+
+- `bonk` supports `quoteAsset=sol` or `quoteAsset=usd1`
+- other current launchpads only accept `quoteAsset=sol`
 
 ## Safe Defaults
 

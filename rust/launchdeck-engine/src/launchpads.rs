@@ -63,7 +63,7 @@ pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
                 id: "bonk".to_string(),
                 label: "Bonk".to_string(),
                 available: true,
-                supportState: "unverified".to_string(),
+                supportState: "verified".to_string(),
                 tokenMetadata: TokenMetadataLimits {
                     nameMaxLength: 32,
                     symbolMaxLength: 10,
@@ -73,8 +73,9 @@ pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
                     automatic_dev_sell: true,
                     dev_buy: true,
                 },
-                reason: "Official Raydium-backed integration path still needs live validation."
-                    .to_string(),
+                reason:
+                    "Bonk routes through LetsBonk and Bonkers on Raydium LaunchLab with SOL/USD1 quote-asset support, auto USD1 top-up, compile/send, dev-buy, same-time snipers, dev auto-sell, and follow buy/sell automation."
+                        .to_string(),
                 officialSdk: Some("@raydium-io/raydium-sdk-v2".to_string()),
             },
         ),

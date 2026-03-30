@@ -92,6 +92,12 @@ const devBuySolInput = document.getElementById("dev-buy-sol-input");
 const devBuyPercentInput = document.getElementById("dev-buy-percent-input");
 const devBuyCustomDeployButton = document.getElementById("dev-buy-custom-deploy");
 const quoteOutput = document.getElementById("quote-output");
+const bonkQuoteAssetInput = getNamedInput("quoteAsset");
+const bonkQuoteAssetToggle = document.getElementById("bonk-quote-asset-toggle");
+const bonkQuoteAssetToggleSolIcon = document.getElementById("bonk-quote-asset-toggle-sol-icon");
+const bonkQuoteAssetToggleUsd1Icon = document.getElementById("bonk-quote-asset-toggle-usd1-icon");
+const devBuyQuotePrefixIcon = document.getElementById("dev-buy-quote-prefix-icon");
+const devBuyQuotePrefixText = document.getElementById("dev-buy-quote-prefix-text");
 const creationTipInput = document.getElementById("creation-tip-input");
 const creationPriorityInput = document.getElementById("creation-priority-input");
 const launchpadInputs = Array.from(document.querySelectorAll('input[name="launchpad"]'));
@@ -102,9 +108,11 @@ const settingsBackendRegionSummary = document.getElementById("settings-backend-r
 const buyPriorityFeeInput = document.getElementById("buy-priority-fee-input");
 const buyTipInput = document.getElementById("buy-tip-input");
 const buySlippageInput = document.getElementById("buy-slippage-input");
+const buyStandardRpcWarning = document.getElementById("buy-standard-rpc-warning");
 const sellPriorityFeeInput = document.getElementById("sell-priority-fee-input");
 const sellTipInput = document.getElementById("sell-tip-input");
 const sellSlippageInput = document.getElementById("sell-slippage-input");
+const sellStandardRpcWarning = document.getElementById("sell-standard-rpc-warning");
 const settingsPresetChipBar = document.getElementById("settings-preset-chip-bar");
 const presetEditToggle = document.getElementById("preset-edit-toggle");
 const agentUnlockedAuthority = document.getElementById("agent-unlocked-authority");
@@ -198,9 +206,11 @@ const REPORTS_TERMINAL_SORT_KEY = "launchdeck.reportsTerminalSort";
 const REPORTS_TERMINAL_LIST_WIDTH_KEY = "launchdeck.reportsTerminalListWidth";
 const THEME_MODE_STORAGE_KEY = "launchdeck.themeMode";
 const SELECTED_WALLET_STORAGE_KEY = "launchdeck.selectedWalletKey";
+const SELECTED_LAUNCHPAD_STORAGE_KEY = "launchdeck.selectedLaunchpad";
 const SNIPER_DRAFT_STORAGE_KEY = "launchdeck.sniperDraft.v1";
 const IMAGE_LAYOUT_COMPACT_STORAGE_KEY = "launchdeck.imageLayoutCompact";
 const SELECTED_MODE_STORAGE_KEY = "launchdeck.selectedMode";
+const SELECTED_BONK_QUOTE_ASSET_STORAGE_KEY = "launchdeck.bonkQuoteAsset";
 const FEE_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.feeSplitDraft.v1";
 const AGENT_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.agentSplitDraft.v1";
 const POPOUT_FORM_WIDTH = 532;
@@ -217,6 +227,7 @@ const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
   nameMaxLength: 32,
   symbolMaxLength: 10,
 });
+const STANDARD_RPC_SLIPPAGE_DEFAULT = "20";
 
 if (isPopoutMode) {
   document.body.classList.add("popout-mode");
@@ -404,10 +415,22 @@ function formatSliderValue(value, suffix, digits = 0) {
 
 function normalizeLaunchMode(value) {
   const mode = String(value || "").trim();
-  if (["regular", "cashback", "agent-custom", "agent-unlocked", "agent-locked"].includes(mode)) {
+  if (["regular", "bonkers", "cashback", "agent-custom", "agent-unlocked", "agent-locked"].includes(mode)) {
     return mode;
   }
   return "regular";
+}
+
+function normalizeLaunchpad(value) {
+  const launchpad = String(value || "").trim().toLowerCase();
+  if (["pump", "bonk", "bagsapp"].includes(launchpad)) {
+    return launchpad;
+  }
+  return "pump";
+}
+
+function normalizeStoredBonkQuoteAsset(value) {
+  return normalizeQuoteAsset(value);
 }
 
 function getStoredLaunchMode() {
@@ -424,6 +447,43 @@ function setStoredLaunchMode(mode) {
     window.localStorage.setItem(SELECTED_MODE_STORAGE_KEY, normalizeLaunchMode(mode));
   } catch (_error) {
     // Ignore storage failures and keep mode controls functional.
+  }
+}
+
+function getStoredLaunchpad() {
+  try {
+    const stored = window.localStorage.getItem(SELECTED_LAUNCHPAD_STORAGE_KEY);
+    return stored ? normalizeLaunchpad(stored) : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function setStoredLaunchpad(launchpad) {
+  try {
+    window.localStorage.setItem(SELECTED_LAUNCHPAD_STORAGE_KEY, normalizeLaunchpad(launchpad));
+  } catch (_error) {
+    // Ignore storage failures and keep launchpad controls functional.
+  }
+}
+
+function getStoredBonkQuoteAsset() {
+  try {
+    const stored = window.localStorage.getItem(SELECTED_BONK_QUOTE_ASSET_STORAGE_KEY);
+    return stored ? normalizeStoredBonkQuoteAsset(stored) : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function setStoredBonkQuoteAsset(asset) {
+  try {
+    window.localStorage.setItem(
+      SELECTED_BONK_QUOTE_ASSET_STORAGE_KEY,
+      normalizeStoredBonkQuoteAsset(asset),
+    );
+  } catch (_error) {
+    // Ignore storage failures and keep quote asset controls functional.
   }
 }
 
@@ -729,6 +789,41 @@ function renderImageLibraryGrid() {
 
 function fetchImageLibrary() {
   return imagesFeature.fetchLibrary();
+}
+
+function hasAttachedImage() {
+  return Boolean(
+    uploadedImage
+    || (metadataUri && metadataUri.value)
+    || (imagePreview && !imagePreview.hidden && imagePreview.src),
+  );
+}
+
+async function ensureTestImageSelected() {
+  let availableImages = Array.isArray(imageLibraryState.images) ? [...imageLibraryState.images] : [];
+  if (!availableImages.length) {
+    try {
+      const response = await fetch("/api/images");
+      const payload = await response.json();
+      if (response.ok && payload.ok) {
+        imageLibraryState.images = Array.isArray(payload.images) ? payload.images : [];
+        imageLibraryState.categories = Array.isArray(payload.categories) ? payload.categories : [];
+        availableImages = imageLibraryState.images;
+      }
+    } catch (_error) {
+      // Fall through when the library fetch fails.
+    }
+  }
+
+  const preferred =
+    availableImages.find((entry) => entry && entry.fileName === "solana-mark.png")
+    || availableImages.find((entry) => entry && entry.previewUrl === "/solana-mark.png")
+    || availableImages[0];
+
+  if (!preferred) return false;
+  imageLibraryState.activeImageId = preferred.id || "";
+  setSelectedImage(preferred);
+  return true;
 }
 
 function showImageLibraryModal() {
@@ -1485,6 +1580,131 @@ function getLaunchpad() {
   return checked ? checked.value : "pump";
 }
 
+function normalizeQuoteAsset(value) {
+  return String(value || "").trim().toLowerCase() === "usd1" ? "usd1" : "sol";
+}
+
+function getQuoteAsset() {
+  if (getLaunchpad() !== "bonk") return "sol";
+  return normalizeQuoteAsset(getNamedValue("quoteAsset"));
+}
+
+function getQuoteAssetLabel(asset = getQuoteAsset()) {
+  return normalizeQuoteAsset(asset) === "usd1" ? "USD1" : "SOL";
+}
+
+function getQuoteAssetButtonLabel(asset = getQuoteAsset()) {
+  return normalizeQuoteAsset(asset) === "usd1" ? "usd1" : "solana";
+}
+
+function syncBonkQuoteAssetUI() {
+  const launchpad = getLaunchpad();
+  const mode = getMode();
+  const visible = launchpad === "bonk" && ["regular", "bonkers"].includes(mode);
+  const stored = getStoredBonkQuoteAsset();
+  const current = normalizeQuoteAsset(getNamedValue("quoteAsset"));
+  const asset = visible ? normalizeQuoteAsset(current || stored || "sol") : "sol";
+  if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = asset;
+  if (bonkQuoteAssetToggle) bonkQuoteAssetToggle.hidden = !visible;
+  if (bonkQuoteAssetToggle) bonkQuoteAssetToggle.disabled = !visible;
+  if (bonkQuoteAssetToggle) {
+    const nextAsset = asset === "usd1" ? "solana" : "usd1";
+    bonkQuoteAssetToggle.title = `Active quote asset: ${getQuoteAssetButtonLabel(asset)}. Click to switch to ${nextAsset}.`;
+    bonkQuoteAssetToggle.setAttribute(
+      "aria-label",
+      `Active quote asset: ${getQuoteAssetButtonLabel(asset)}. Click to switch to ${nextAsset}.`,
+    );
+  }
+  if (bonkQuoteAssetToggleSolIcon) bonkQuoteAssetToggleSolIcon.hidden = asset !== "sol";
+  if (bonkQuoteAssetToggleUsd1Icon) bonkQuoteAssetToggleUsd1Icon.hidden = asset !== "usd1";
+  if (visible) setStoredBonkQuoteAsset(asset);
+  if (devBuyQuotePrefixIcon) devBuyQuotePrefixIcon.hidden = asset !== "sol";
+  if (devBuyQuotePrefixText) {
+    devBuyQuotePrefixText.hidden = asset === "sol";
+    devBuyQuotePrefixText.textContent = getQuoteAssetLabel(asset);
+  }
+}
+
+function setLaunchpad(launchpad) {
+  const normalized = normalizeLaunchpad(launchpad);
+  const target = document.querySelector(`input[name="launchpad"][value="${CSS.escape(normalized)}"]`)
+    || document.querySelector('input[name="launchpad"][value="pump"]');
+  if (!target || target.disabled) return;
+  target.checked = true;
+}
+
+function getLaunchpadUiCapabilities(launchpad = getLaunchpad()) {
+  const entry = latestLaunchpadRegistry && latestLaunchpadRegistry[launchpad];
+  const supportsStrategies = entry && entry.supportsStrategies ? entry.supportsStrategies : {};
+  if (launchpad === "pump") {
+    return {
+      allowedModes: ["regular", "cashback", "agent-custom", "agent-unlocked", "agent-locked"],
+      mayhem: true,
+      feeSplit: true,
+      vanity: true,
+      sniper: true,
+      autoSell: true,
+    };
+  }
+  if (launchpad === "bonk") {
+    return {
+      allowedModes: ["regular", "bonkers"],
+      mayhem: false,
+      feeSplit: false,
+      vanity: true,
+      sniper: supportsStrategies["snipe-own-launch"] !== false,
+      autoSell: supportsStrategies["automatic-dev-sell"] !== false,
+    };
+  }
+  return {
+    allowedModes: ["regular"],
+    mayhem: false,
+    feeSplit: false,
+    vanity: true,
+    sniper: supportsStrategies["snipe-own-launch"] === true,
+    autoSell: supportsStrategies["automatic-dev-sell"] === true,
+  };
+}
+
+function syncLaunchpadModeOptions() {
+  const { allowedModes, mayhem, feeSplit, vanity, sniper, autoSell } = getLaunchpadUiCapabilities();
+  form.querySelectorAll('input[name="mode"]').forEach((input) => {
+    const option = input.closest(".mode-option");
+    const visible = allowedModes.includes(input.value);
+    if (option) option.hidden = !visible;
+    input.disabled = !visible;
+  });
+  const mayhemInput = form.querySelector('input[name="mayhemMode"]');
+  if (mayhemInput) {
+    const mayhemOption = mayhemInput.closest(".mode-option");
+    if (mayhemOption) mayhemOption.hidden = !mayhem;
+    mayhemInput.disabled = !mayhem;
+    if (!mayhem) mayhemInput.checked = false;
+  }
+  if (!allowedModes.includes(getMode())) {
+    setMode(allowedModes[0] || "regular");
+    setStoredLaunchMode(getMode());
+  }
+  if (feeSplitPill) {
+    feeSplitPill.hidden = !feeSplit;
+    if (!feeSplit && feeSplitEnabled) feeSplitEnabled.checked = false;
+    if (!feeSplit && feeSplitModal) feeSplitModal.hidden = true;
+  }
+  if (modeVanityButton) {
+    modeVanityButton.hidden = !vanity;
+    if (!vanity) hideVanityModal();
+  }
+  if (modeSniperButton) {
+    modeSniperButton.hidden = !sniper;
+    if (!sniper) hideSniperModal();
+  }
+  if (devAutoSellButton) {
+    devAutoSellButton.hidden = !autoSell;
+    if (!autoSell && devAutoSellPanel) devAutoSellPanel.hidden = true;
+    if (!autoSell && autoSellEnabledInput) autoSellEnabledInput.checked = false;
+  }
+}
+
 function getProvider() {
   return providerSelect ? providerSelect.value || "helius-sender" : "helius-sender";
 }
@@ -1517,6 +1737,53 @@ function setFieldVisibility(input, visible) {
   if (label) label.hidden = !visible;
 }
 
+function isStandardRpcProvider(provider) {
+  return String(provider || "").trim().toLowerCase() === "standard-rpc";
+}
+
+function parseNumericSettingValue(value) {
+  const normalized = String(value || "").trim().replace(",", ".");
+  if (!normalized) return null;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function ensureStandardRpcSlippageDefault(input, provider) {
+  if (!input || !isStandardRpcProvider(provider)) return false;
+  const parsed = parseNumericSettingValue(input.value);
+  if (parsed == null || parsed === 90) {
+    if (input.value.trim() === STANDARD_RPC_SLIPPAGE_DEFAULT) return false;
+    input.value = STANDARD_RPC_SLIPPAGE_DEFAULT;
+    return true;
+  }
+  return false;
+}
+
+function standardRpcSlippageWarningText(sideLabel, input) {
+  const parsed = parseNumericSettingValue(input && input.value);
+  const overrideText = parsed != null && parsed > Number(STANDARD_RPC_SLIPPAGE_DEFAULT)
+    ? " You set it above 20%. Only keep that if intentional."
+    : " Default is 20%. Raise it only if intentional.";
+  return `Warning: Standard RPC ${sideLabel} can slip badly. Watch slippage.${overrideText}`;
+}
+
+function syncStandardRpcWarnings() {
+  const buyIsStandardRpc = isStandardRpcProvider(getBuyProvider());
+  if (buyStandardRpcWarning) {
+    buyStandardRpcWarning.hidden = !buyIsStandardRpc;
+    buyStandardRpcWarning.textContent = buyIsStandardRpc
+      ? standardRpcSlippageWarningText("buys", buySlippageInput)
+      : "";
+  }
+  const sellIsStandardRpc = isStandardRpcProvider(getSellProvider());
+  if (sellStandardRpcWarning) {
+    sellStandardRpcWarning.hidden = !sellIsStandardRpc;
+    sellStandardRpcWarning.textContent = sellIsStandardRpc
+      ? standardRpcSlippageWarningText("sells", sellSlippageInput)
+      : "";
+  }
+}
+
 function syncSettingsCapabilities() {
   const editing = isPresetEditing(getConfig());
   const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
@@ -1542,6 +1809,7 @@ function syncSettingsCapabilities() {
   setFieldEnabled(sellPriorityFeeInput, editing && sellCapabilities.priority);
   setFieldEnabled(sellTipInput, editing && sellCapabilities.tip);
   setFieldEnabled(sellSlippageInput, editing && sellCapabilities.slippage);
+  syncStandardRpcWarnings();
 }
 
 function applyPresetToSettingsInputs(preset, options = {}) {
@@ -1560,6 +1828,9 @@ function applyPresetToSettingsInputs(preset, options = {}) {
   if (sellTipInput) sellTipInput.value = preset.sellSettings.tipSol || "";
   if (sellSlippageInput) sellSlippageInput.value = preset.sellSettings.slippagePercent || "";
   syncingPresetInputs = false;
+  const standardizedDefaultsApplied =
+    ensureStandardRpcSlippageDefault(buySlippageInput, getBuyProvider())
+    || ensureStandardRpcSlippageDefault(sellSlippageInput, getSellProvider());
 
   if (syncToMainForm) {
     clearDevBuyState();
@@ -1567,6 +1838,9 @@ function applyPresetToSettingsInputs(preset, options = {}) {
 
   syncDevAutoSellUI();
   syncSettingsCapabilities();
+  if (standardizedDefaultsApplied) {
+    syncActivePresetFromInputs();
+  }
   renderPresetChips();
   renderQuickDevBuyButtons(getConfig());
 }
@@ -1906,6 +2180,11 @@ function formatWalletUsd(value) {
   return Number(value).toFixed(2);
 }
 
+function formatWalletDropdownAmount(value) {
+  if (value == null || Number.isNaN(Number(value))) return "--";
+  return Number(value).toFixed(4);
+}
+
 function walletUsdValue(wallet) {
   if (!wallet || wallet.usd1Balance == null || Number.isNaN(Number(wallet.usd1Balance))) return null;
   return Number(wallet.usd1Balance);
@@ -1943,8 +2222,8 @@ function renderWalletDropdownList(wallets = [], selectedKey = "") {
           <span class="wallet-option-meta">${escapeHTML(shortenAddress(wallet.publicKey || "Unavailable"))}</span>
         </span>
         <span class="wallet-option-balances">
-          <span class="wallet-option-sol">${escapeHTML(formatWalletSol(solValue))} SOL</span>
-          <span class="wallet-option-usd">${escapeHTML(formatWalletUsd(usdValue))} USD1</span>
+          <span class="wallet-option-sol">${escapeHTML(formatWalletDropdownAmount(solValue))} SOL</span>
+          <span class="wallet-option-usd">${escapeHTML(formatWalletDropdownAmount(usdValue))} USD1</span>
         </span>
       </button>
     `;
@@ -2427,6 +2706,8 @@ function updateLockedModeFields() {
 }
 
 function updateModeVisibility() {
+  syncLaunchpadModeOptions();
+  syncBonkQuoteAssetUI();
   const mode = getMode();
   document.querySelectorAll("[data-mode-panel]").forEach((node) => {
     node.hidden = node.getAttribute("data-mode-panel") !== mode;
@@ -2486,7 +2767,7 @@ function applyLaunchpadAvailability(launchpads = {}) {
       const baseLabel = input.value === "bagsapp"
         ? "Bagsapp"
         : input.value.charAt(0).toUpperCase() + input.value.slice(1);
-      titleNode.textContent = baseLabel;
+      titleNode.textContent = (entry && entry.label) || baseLabel;
     }
   });
 
@@ -2497,6 +2778,7 @@ function applyLaunchpadAvailability(launchpads = {}) {
   }
 
   applyLaunchpadTokenMetadata();
+  updateModeVisibility();
 }
 
 function applyPersistentDefaults(config) {
@@ -2504,12 +2786,12 @@ function applyPersistentDefaults(config) {
   const defaults = config.defaults || {};
   const storedSniperDraft = getStoredSniperDraft();
   const storedMode = getStoredLaunchMode();
+  const storedLaunchpad = getStoredLaunchpad();
+  const storedBonkQuoteAsset = getStoredBonkQuoteAsset();
   const storedFeeSplitDraft = getStoredFeeSplitDraft();
   const storedAgentSplitDraft = getStoredAgentSplitDraft();
-  if (defaults.launchpad) {
-    const launchpadInput = document.querySelector(`input[name="launchpad"][value="${defaults.launchpad}"]`);
-    if (launchpadInput) launchpadInput.checked = true;
-  }
+  setLaunchpad(storedLaunchpad || defaults.launchpad || "pump");
+  if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = normalizeQuoteAsset(storedBonkQuoteAsset || "sol");
   setConfig(config);
   applyPresetToSettingsInputs(getActivePreset(config));
   if (defaults.automaticDevSell) {
@@ -2596,6 +2878,7 @@ function readForm() {
   return {
     selectedWalletKey: selectedWalletKey(),
     launchpad: getLaunchpad(),
+    quoteAsset: getQuoteAsset(),
     provider: getProvider(),
     buyProvider: getBuyProvider(),
     sellProvider: getSellProvider(),
@@ -2913,15 +3196,22 @@ function applySelectedWalletLocally(nextKey) {
   updateLockedModeFields();
 }
 
-async function refreshWalletStatus(preserveSelection = true) {
+async function refreshWalletStatus(preserveSelection = true, force = false) {
   try {
     const wallet = preserveSelection ? selectedWalletKey() : "";
-    const url = wallet ? `/api/wallet-status?wallet=${encodeURIComponent(wallet)}` : "/api/wallet-status";
+    const query = new URLSearchParams();
+    if (wallet) query.set("wallet", wallet);
+    if (force) query.set("refresh", String(Date.now()));
+    const url = query.size ? `/api/wallet-status?${query.toString()}` : "/api/wallet-status";
     const result = RequestUtils.fetchJsonLatest
-      ? await RequestUtils.fetchJsonLatest("wallet-status", url, {}, requestStates.walletStatus)
+      ? await RequestUtils.fetchJsonLatest("wallet-status", url, {
+        cache: force ? "no-store" : "default",
+      }, requestStates.walletStatus)
       : null;
     if (result && result.aborted) return;
-    const response = result ? result.response : await fetch(url);
+    const response = result
+      ? result.response
+      : await fetch(url, { cache: force ? "no-store" : "default" });
     const payload = result ? result.payload : await response.json();
     if (result && !result.isLatest) return;
     walletStatusRequestSerial += 1;
@@ -3062,7 +3352,9 @@ async function updateQuote() {
 
   try {
     const mode = getDevBuyMode();
-    const url = `/api/quote?mode=${encodeURIComponent(mode)}&amount=${encodeURIComponent(buyAmount)}`;
+    const launchpad = getLaunchpad();
+    const quoteAsset = getQuoteAsset();
+    const url = `/api/quote?launchpad=${encodeURIComponent(launchpad)}&quoteAsset=${encodeURIComponent(quoteAsset)}&mode=${encodeURIComponent(mode)}&amount=${encodeURIComponent(buyAmount)}`;
     const result = RequestUtils.fetchJsonLatest
       ? await RequestUtils.fetchJsonLatest("quote", url, {}, requestStates.quote)
       : null;
@@ -3081,14 +3373,15 @@ async function updateQuote() {
     if (mode === "sol") {
       if (devBuyPercentInput) devBuyPercentInput.value = payload.quote.estimatedSupplyPercent;
     } else {
-      if (devBuySolInput) devBuySolInput.value = payload.quote.estimatedSol;
+      if (devBuySolInput) devBuySolInput.value = payload.quote.estimatedQuoteAmount || payload.quote.estimatedSol;
       if (devBuyPercentInput) devBuyPercentInput.value = payload.quote.estimatedSupplyPercent;
     }
     syncingDevBuyInputs = false;
+    const quoteLabel = getQuoteAssetLabel();
     quoteOutput.textContent =
       mode === "sol"
         ? `Estimated tokens out: ${payload.quote.estimatedTokens} (${payload.quote.estimatedSupplyPercent}% supply)`
-        : `Estimated SOL required: ${payload.quote.estimatedSol} for ${payload.quote.estimatedSupplyPercent}% supply`;
+        : `Estimated ${quoteLabel} required: ${(payload.quote.estimatedQuoteAmount || payload.quote.estimatedSol)} for ${payload.quote.estimatedSupplyPercent}% supply`;
   } catch (error) {
     quoteOutput.textContent = error.message;
   }
@@ -3151,8 +3444,12 @@ async function applyTestPreset() {
   updateJitoVisibility();
   queueQuoteUpdate();
 
-  if (!uploadedImage) {
+  if (!hasAttachedImage()) {
     try {
+      const reusedExisting = await ensureTestImageSelected();
+      if (reusedExisting) {
+        return;
+      }
       imageStatus.textContent = "Uploading image...";
       imagePath.textContent = "";
       clearMetadataUploadCache({ clearInput: true });
@@ -3354,7 +3651,7 @@ function validateForm() {
   const f = readForm();
   if (!f.name.trim()) errors.push("Token name is required.");
   if (!f.symbol.trim()) errors.push("Ticker is required.");
-  if (!uploadedImage) errors.push("Token image is required.");
+  if (!hasAttachedImage()) errors.push("Token image is required.");
   if (!latestWalletStatus || !latestWalletStatus.connected) errors.push("No wallet connected.");
   if (f.automaticDevSellEnabled && !f.devBuyAmount) errors.push("Dev auto-sell requires a dev buy amount.");
   validateSniperState().forEach((msg) => errors.push(msg));
@@ -3399,13 +3696,14 @@ function buildDeployPreviewHTML() {
     : `<div class="modal-token-img-empty">No img</div>`;
 
   const devBuyText = f.devBuyAmount
-    ? `${f.devBuyAmount} ${f.devBuyMode === "tokens" ? "tokens" : "SOL"}`
+    ? `${f.devBuyAmount} ${f.devBuyMode === "tokens" ? "tokens" : getQuoteAssetLabel(f.quoteAsset)}`
     : "None";
 
   const quoteText = quoteOutput.textContent || "";
 
   const modeLabels = {
     regular: "Regular",
+    bonkers: "Bonkers",
     cashback: "Cashback",
     "agent-custom": "Agent Custom",
     "agent-unlocked": "Agent Unlocked",
@@ -3440,7 +3738,7 @@ function buildDeployPreviewHTML() {
     : "-";
   const sniperText = f.sniperEnabled
     ? (f.sniperWallets.length
-      ? f.sniperWallets.map((entry) => `#${walletIndexFromEnvKey(entry.envKey)} ${entry.amountSol} SOL @ ${entry.targetBlockOffset != null ? `b${entry.targetBlockOffset}` : (entry.submitWithLaunch ? "same-time" : getSniperTriggerSummary(entry).toLowerCase())}`).join(" | ")
+      ? f.sniperWallets.map((entry) => `#${walletIndexFromEnvKey(entry.envKey)} ${entry.amountSol} ${getQuoteAssetLabel(f.quoteAsset)} @ ${entry.targetBlockOffset != null ? `b${entry.targetBlockOffset}` : (entry.submitWithLaunch ? "same-time" : getSniperTriggerSummary(entry).toLowerCase())}`).join(" | ")
       : "Enabled")
     : "Off";
   const vanityText = f.vanityPrivateKey ? "Custom vanity key attached" : "Off";
@@ -3907,7 +4205,13 @@ function describeFollowActionTrigger(action) {
 
 function describeFollowActionSize(action) {
   if (!action || typeof action !== "object") return "--";
-  if (action.buyAmountSol) return `${action.buyAmountSol} SOL`;
+  const quoteLabel = getQuoteAssetLabel(
+    action.quoteAsset
+      || (action.followJob && action.followJob.quoteAsset)
+      || (action.parentQuoteAsset)
+      || "sol",
+  );
+  if (action.buyAmountSol) return `${action.buyAmountSol} ${quoteLabel}`;
   if (action.sellPercent != null) return `${action.sellPercent}%`;
   return "--";
 }
@@ -3959,7 +4263,13 @@ function buildFollowActionMetricItems(action, followJob) {
   const metrics = [
     { label: "Wallet", value: describeFollowActionWallet(action) },
     { label: "Trigger", value: describeFollowActionTrigger(action) },
-    { label: "Size", value: describeFollowActionSize(action) },
+    {
+      label: "Size",
+      value: describeFollowActionSize({
+        ...action,
+        parentQuoteAsset: followJob && followJob.quoteAsset,
+      }),
+    },
     { label: "Start Block", value: action && action.sendObservedBlockHeight != null ? String(action.sendObservedBlockHeight) : isBuy && followJob && followJob.sendObservedBlockHeight != null ? `launch ${followJob.sendObservedBlockHeight}` : "--" },
     { label: "Confirm Block", value: action && action.confirmedObservedBlockHeight != null ? String(action.confirmedObservedBlockHeight) : "--" },
     { label: "Blocks", value: action && action.blocksToConfirm != null ? String(action.blocksToConfirm) : "--" },
@@ -4111,7 +4421,7 @@ function buildReportsActionsMarkup() {
                   <div class="reports-action-head">
                     <div>
                       <strong>${escapeHTML(action.kind || action.actionId || "action")}</strong>
-                      <div class="reports-action-subtitle">${escapeHTML(`${describeFollowActionWallet(action)} | ${describeFollowActionTrigger(action)} | ${describeFollowActionSize(action)}`)}</div>
+                      <div class="reports-action-subtitle">${escapeHTML(`${describeFollowActionWallet(action)} | ${describeFollowActionTrigger(action)} | ${describeFollowActionSize({ ...action, parentQuoteAsset: followJob && followJob.quoteAsset })}`)}</div>
                     </div>
                     <span class="reports-state-badge ${reportStateClass(action.state)}">${escapeHTML(action.state || "--")}</span>
                   </div>
@@ -4540,9 +4850,20 @@ form.querySelectorAll('input[name="mode"]').forEach((node) => {
 launchpadInputs.forEach((input) => {
   input.addEventListener("change", () => {
     if (!input.checked) return;
+    setStoredLaunchpad(input.value);
     applyLaunchpadTokenMetadata();
+    updateModeVisibility();
   });
 });
+if (bonkQuoteAssetToggle) {
+  bonkQuoteAssetToggle.addEventListener("click", () => {
+    const asset = getQuoteAsset() === "usd1" ? "sol" : "usd1";
+    if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = asset;
+    setStoredBonkQuoteAsset(asset);
+    syncBonkQuoteAssetUI();
+    queueQuoteUpdate();
+  });
+}
 if (nameInput) {
   nameInput.addEventListener("input", () => {
     syncTickerFromName();
@@ -4649,8 +4970,14 @@ if (providerSelect) providerSelect.addEventListener("change", () => {
   syncActivePresetFromInputs();
   updateJitoVisibility();
 });
-if (buyProviderSelect) buyProviderSelect.addEventListener("change", syncActivePresetFromInputs);
-if (sellProviderSelect) sellProviderSelect.addEventListener("change", syncActivePresetFromInputs);
+if (buyProviderSelect) buyProviderSelect.addEventListener("change", () => {
+  ensureStandardRpcSlippageDefault(buySlippageInput, getBuyProvider());
+  syncActivePresetFromInputs();
+});
+if (sellProviderSelect) sellProviderSelect.addEventListener("change", () => {
+  ensureStandardRpcSlippageDefault(sellSlippageInput, getSellProvider());
+  syncActivePresetFromInputs();
+});
 feeSplitPill.addEventListener("click", () => {
   const mode = getMode();
   if (mode !== "regular" && mode !== "agent-custom") return;
@@ -4667,8 +4994,15 @@ if (walletTriggerButton) {
   });
 }
 if (walletRefreshButton) {
-  walletRefreshButton.addEventListener("click", async () => {
-    await refreshWalletStatus(true);
+  walletRefreshButton.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    walletRefreshButton.disabled = true;
+    try {
+      await refreshWalletStatus(true, true);
+    } finally {
+      walletRefreshButton.disabled = false;
+    }
   });
 }
 if (walletDropdownList) {

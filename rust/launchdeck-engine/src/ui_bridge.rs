@@ -7,8 +7,9 @@ use crate::{
         RawFollowLaunchSell, RawFollowLaunchSnipe, RawPostLaunch, RawPresets, RawRecipient,
         RawSnipeOwnLaunch, RawToken, RawTx,
     },
+    launchpad_dispatch::quote_launch_for_launchpad,
     paths,
-    pump_native::{LaunchQuote, quote_launch},
+    pump_native::LaunchQuote,
     wallet::selected_wallet_key_or_default,
 };
 use reqwest::{Client, multipart};
@@ -80,6 +81,10 @@ fn pinata_image_cache() -> &'static Mutex<HashMap<u64, String>> {
 #[derive(Debug, Deserialize, Default)]
 pub struct QuoteForm {
     #[serde(default)]
+    pub launchpad: String,
+    #[serde(default)]
+    pub quoteAsset: String,
+    #[serde(default)]
     pub mode: String,
     #[serde(default)]
     pub amount: String,
@@ -95,6 +100,8 @@ pub struct UiForm {
     pub activePresetId: String,
     #[serde(default)]
     pub launchpad: String,
+    #[serde(default)]
+    pub quoteAsset: String,
     #[serde(default)]
     pub mode: String,
     #[serde(default)]
@@ -792,7 +799,19 @@ pub async fn quote_from_form(
 ) -> Result<Option<LaunchQuote>, String> {
     let form: QuoteForm = serde_json::from_value(form_value)
         .map_err(|error| format!("Invalid quote form payload: {error}"))?;
-    quote_launch(rpc_url, &form.mode, &form.amount).await
+    let launchpad = if form.launchpad.trim().is_empty() {
+        "pump"
+    } else {
+        form.launchpad.trim()
+    };
+    quote_launch_for_launchpad(
+        rpc_url,
+        launchpad,
+        &form.quoteAsset,
+        &form.mode,
+        &form.amount,
+    )
+    .await
 }
 
 async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<RawConfig, String> {
@@ -805,6 +824,11 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         "pump".to_string()
     } else {
         form.launchpad.trim().to_lowercase()
+    };
+    let quote_asset = if form.quoteAsset.trim().is_empty() {
+        "sol".to_string()
+    } else {
+        form.quoteAsset.trim().to_lowercase()
     };
     let provider = sanitize_provider(&form.provider);
     let endpoint_profile = String::new();
@@ -963,7 +987,8 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         || form.followLaunch.devAutoSell.enabled;
     Ok(RawConfig {
         mode: mode.clone(),
-        launchpad,
+        launchpad: launchpad.clone(),
+        quoteAsset: quote_asset,
         token: RawToken {
             name: form.name.trim().to_string(),
             symbol: form.symbol.trim().to_string(),
@@ -1157,7 +1182,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                 None
             },
             constraints: RawFollowLaunchConstraints {
-                pumpOnly: Some(json!(true)),
+                pumpOnly: Some(json!(launchpad == "pump")),
                 retryBudget: Some(json!(1)),
                 requireDaemonReadiness: Some(json!(true)),
                 blockOnRequiredPrechecks: Some(json!(true)),

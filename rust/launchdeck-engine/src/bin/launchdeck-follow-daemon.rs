@@ -8,6 +8,12 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use launchdeck_engine::{
+    bonk_native::{
+        compile_follow_buy_transaction as compile_bonk_follow_buy_transaction,
+        compile_follow_sell_transaction as compile_bonk_follow_sell_transaction,
+        compile_sol_to_usd1_topup_transaction,
+        fetch_bonk_market_snapshot,
+    },
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FOLLOW_TELEMETRY_SCHEMA_VERSION, FollowActionKind,
         FollowActionRecord, FollowActionState, FollowArmRequest, FollowCancelRequest,
@@ -46,6 +52,8 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+
+const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 
 #[derive(Clone)]
 struct AppState {
@@ -412,6 +420,9 @@ async fn prepare_follow_job_buy_caches(state: Arc<AppState>, job: &FollowJobReco
     if buy_actions.is_empty() {
         return;
     }
+    if job.launchpad != "pump" {
+        return;
+    }
     if let Ok(prepared_runtime) =
         prepare_follow_buy_runtime(&state.rpc_url, mint, launch_creator).await
     {
@@ -509,19 +520,43 @@ async fn resolve_hot_follow_buy_runtime_for_job(
 
 async fn required_action_precheck(
     rpc_url: &str,
+    quote_asset: &str,
     action: &FollowActionRecord,
 ) -> Result<(), String> {
     let wallet_key = selected_wallet_key_or_default(&action.walletEnvKey)
         .ok_or_else(|| format!("Wallet env key not found: {}", action.walletEnvKey))?;
     let public_key = wallet_public_key(&wallet_key).await?;
     if let Some(amount_sol) = action.buyAmountSol.as_deref() {
-        let required_lamports = parse_sol_to_lamports(amount_sol, "follow buy amount")?
-            .saturating_add(FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS);
-        let balance_lamports = fetch_balance_lamports(rpc_url, &public_key).await?;
-        if balance_lamports < required_lamports {
-            return Err(format!(
-                "Wallet {wallet_key} has insufficient funds for follow buy. Need at least {required_lamports} lamports, found {balance_lamports}."
-            ));
+        if quote_asset.eq_ignore_ascii_case("usd1") {
+            let required_usd1 = amount_sol
+                .trim()
+                .parse::<f64>()
+                .map_err(|error| format!("Invalid USD1 follow buy amount: {error}"))?;
+            let usd1_balance =
+                fetch_token_balance(rpc_url, &public_key, USD1_MINT, "processed").await?;
+            let balance_lamports = fetch_balance_lamports(rpc_url, &public_key).await?;
+            if balance_lamports < FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS {
+                return Err(format!(
+                    "Wallet {wallet_key} has insufficient SOL headroom for follow buy fees. Need at least {} lamports, found {balance_lamports}.",
+                    FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS
+                ));
+            }
+            if usd1_balance + 0.000_001 < required_usd1 && balance_lamports
+                < FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS.saturating_mul(2)
+            {
+                return Err(format!(
+                    "Wallet {wallet_key} is short on USD1 and does not have enough SOL headroom to fund an automatic top-up."
+                ));
+            }
+        } else {
+            let required_lamports = parse_sol_to_lamports(amount_sol, "follow buy amount")?
+                .saturating_add(FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS);
+            let balance_lamports = fetch_balance_lamports(rpc_url, &public_key).await?;
+            if balance_lamports < required_lamports {
+                return Err(format!(
+                    "Wallet {wallet_key} has insufficient funds for follow buy. Need at least {required_lamports} lamports, found {balance_lamports}."
+                ));
+            }
         }
     }
     Ok(())
@@ -595,7 +630,7 @@ async fn run_launch_gate_prechecks(
             bundleId: None,
             lastError: None,
         };
-        required_action_precheck(&state.rpc_url, &action).await?;
+        required_action_precheck(&state.rpc_url, &payload.quoteAsset, &action).await?;
     }
     Ok(())
 }
@@ -1301,7 +1336,7 @@ async fn execute_action(
         .map_err(|_| format!("Wallet env var is missing: {wallet_key}"))
         .and_then(|value| read_keypair_bytes(&value))?;
     if action.precheckRequired {
-        required_action_precheck(&state.rpc_url, action).await?;
+        required_action_precheck(&state.rpc_url, &job.quoteAsset, action).await?;
     }
     ensure_action_not_cancelled(&state, &trace_id, &action.actionId).await?;
     let wallet_lock = wallet_lock(&state, &wallet_key).await;
@@ -1344,48 +1379,99 @@ async fn execute_action(
         ),
         FollowActionKind::SniperBuy => None,
     };
+    let mut pre_send_transactions = Vec::new();
+    if matches!(action.kind, FollowActionKind::SniperBuy)
+        && job.launchpad == "bonk"
+        && job.quoteAsset == "usd1"
+    {
+        if let Some(mut topup) = compile_sol_to_usd1_topup_transaction(
+            &state.rpc_url,
+            &job.execution,
+            &job.jitoTipAccount,
+            &wallet_secret,
+            action.buyAmountSol.as_deref().unwrap_or_default(),
+            &format!("{}-usd1-topup", action.actionId),
+        )
+        .await?
+        {
+            topup.label = format!("{}-usd1-topup", action.actionId);
+            pre_send_transactions.push(topup);
+        }
+    }
     let compiled = match action.kind {
         FollowActionKind::SniperBuy => {
             let amount = action
                 .buyAmountSol
                 .as_deref()
                 .ok_or_else(|| "Follow buy missing amount.".to_string())?;
-            let prepared = resolve_prepared_follow_buy(
-                &state,
-                job,
-                action,
-                &wallet_secret,
-                launch_creator,
-                amount,
-            )
-            .await?;
-            let runtime =
-                resolve_hot_follow_buy_runtime_for_job(&state, job, launch_creator).await?;
-            Some(
-                finalize_follow_buy_transaction(
+            if job.launchpad == "bonk" {
+                Some(
+                    compile_bonk_follow_buy_transaction(
+                        &state.rpc_url,
+                        &job.quoteAsset,
+                        &job.execution,
+                        job.tokenMayhemMode,
+                        &job.jitoTipAccount,
+                        &wallet_secret,
+                        mint,
+                        launch_creator,
+                        amount,
+                    )
+                    .await?,
+                )
+            } else {
+                let prepared = resolve_prepared_follow_buy(
+                    &state,
+                    job,
+                    action,
+                    &wallet_secret,
+                    launch_creator,
+                    amount,
+                )
+                .await?;
+                let runtime =
+                    resolve_hot_follow_buy_runtime_for_job(&state, job, launch_creator).await?;
+                Some(
+                    finalize_follow_buy_transaction(
+                        &state.rpc_url,
+                        &job.execution,
+                        job.tokenMayhemMode,
+                        &wallet_secret,
+                        &prepared,
+                        &runtime,
+                    )
+                    .await?,
+                )
+            }
+        }
+        FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
+            if job.launchpad == "bonk" {
+                compile_bonk_follow_sell_transaction(
                     &state.rpc_url,
                     &job.execution,
                     job.tokenMayhemMode,
+                    &job.jitoTipAccount,
                     &wallet_secret,
-                    &prepared,
-                    &runtime,
+                    mint,
+                    launch_creator,
+                    sell_percent.unwrap_or_default(),
+                    job.preferPostSetupCreatorVaultForSell,
                 )
-                .await?,
-            )
-        }
-        FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
-            compile_follow_sell_transaction(
-                &state.rpc_url,
-                &job.execution,
-                job.tokenMayhemMode,
-                &job.jitoTipAccount,
-                &wallet_secret,
-                mint,
-                launch_creator,
-                sell_percent.unwrap_or_default(),
-                job.preferPostSetupCreatorVaultForSell,
-            )
-            .await?
+                .await?
+            } else {
+                compile_follow_sell_transaction(
+                    &state.rpc_url,
+                    &job.execution,
+                    job.tokenMayhemMode,
+                    &job.jitoTipAccount,
+                    &wallet_secret,
+                    mint,
+                    launch_creator,
+                    sell_percent.unwrap_or_default(),
+                    job.preferPostSetupCreatorVaultForSell,
+                )
+                .await?
+            }
         }
     };
     let Some(mut compiled) = compiled else {
@@ -1394,6 +1480,41 @@ async fn execute_action(
     ensure_action_not_cancelled(&state, &trace_id, &action.actionId).await?;
     let _send_permit =
         acquire_capacity_slot(state.send_slots.clone(), state.capacity_wait_ms, "send").await?;
+    let mut pre_send_notes = Vec::new();
+    for topup in pre_send_transactions {
+        let topup_input = vec![topup.clone()];
+        let (mut topup_submitted, topup_warnings, _) = submit_transactions_for_transport(
+            &state.rpc_url,
+            transport_plan,
+            &topup_input,
+            &job.execution.commitment,
+            job.execution.skipPreflight,
+            job.execution.trackSendBlockHeight,
+        )
+        .await?;
+        let topup_sent = topup_submitted
+            .pop()
+            .ok_or_else(|| "USD1 top-up submit returned no transactions.".to_string())?;
+        let mut topup_confirm_input = vec![topup_sent.clone()];
+        let _ = confirm_submitted_transactions_for_transport(
+            &state.rpc_url,
+            transport_plan,
+            &mut topup_confirm_input,
+            &job.execution.commitment,
+            job.execution.trackSendBlockHeight,
+        )
+        .await?;
+        let confirmed_topup = topup_confirm_input.pop().unwrap_or(topup_sent);
+        let mut note = format!(
+            "USD1 top-up completed before buy: {}",
+            confirmed_topup.signature.unwrap_or_else(|| "(missing-signature)".to_string())
+        );
+        if !topup_warnings.is_empty() {
+            note.push_str(" | ");
+            note.push_str(&topup_warnings.join(" | "));
+        }
+        pre_send_notes.push(note);
+    }
     let mut retried_creator_vault = false;
     let (mut submitted, mut warnings, submit_ms, submit_latency) = loop {
         let started = Instant::now();
@@ -1412,6 +1533,7 @@ async fn execute_action(
             }
             Err(error)
                 if !retried_creator_vault
+                    && job.launchpad == "pump"
                     && sell_percent.is_some()
                     && is_creator_vault_seed_mismatch(&error) =>
             {
@@ -1442,6 +1564,7 @@ async fn execute_action(
                 .to_string(),
         );
     }
+    warnings.extend(pre_send_notes);
     let sent = submitted
         .pop()
         .ok_or_else(|| "Follow daemon submit returned no transactions.".to_string())?;
@@ -2064,6 +2187,44 @@ async fn run_market_watcher(
     let Ok(endpoint) = resolve_job_watch_endpoint(&job) else {
         return;
     };
+    if job.launchpad == "bonk" {
+        let mut attempt: u32 = 0;
+        loop {
+            let session = async {
+                loop {
+                    ensure_job_not_cancelled(&state, &job.traceId).await?;
+                    let snapshot =
+                        fetch_bonk_market_snapshot(&state.rpc_url, &mint, &job.quoteAsset).await?;
+                    let market_cap = snapshot
+                        .marketCapLamports
+                        .parse::<u64>()
+                        .map_err(|error| format!("Invalid Bonk market cap payload: {error}"))?;
+                    let _ = tx.send(Some(market_cap));
+                    sleep(Duration::from_millis(750)).await;
+                }
+            }
+            .await;
+            match session {
+                Ok(()) => return,
+                Err(error) => {
+                    attempt = attempt.saturating_add(1);
+                    if handle_watcher_retry(
+                        &state,
+                        &job.traceId,
+                        WatcherKind::Market,
+                        &endpoint,
+                        attempt,
+                        error,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
     let Ok(bonding_curve) = pump_bonding_curve_address(&mint) else {
         return;
     };

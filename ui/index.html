@@ -211,6 +211,24 @@
               <span class="tooltip-dot" title="Standard Pump launch. Creator rewards go to the deployer unless you apply a separate fee split.">?</span>
             </label>
             <label class="mode-option">
+              <input type="radio" name="mode" value="bonkers">
+              <span class="mode-title">bonkers</span>
+              <span class="tooltip-dot" title="Bonk-only launch mode that routes through the Bonkers platform on Raydium LaunchLab.">?</span>
+            </label>
+            <button
+              type="button"
+              id="bonk-quote-asset-toggle"
+              class="mode-option"
+              hidden
+              title="Switch Bonk quote asset between solana and USD1."
+              aria-label="Switch Bonk quote asset between solana and USD1."
+            >
+              <span class="bonk-quote-asset-toggle-icon" aria-hidden="true">
+                <img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo" id="bonk-quote-asset-toggle-sol-icon">
+                <img src="/usd1-mark.png" alt="" class="sol-logo inline-sol-logo wallet-balance-icon-usd1" id="bonk-quote-asset-toggle-usd1-icon" hidden>
+              </span>
+            </button>
+            <label class="mode-option">
               <input type="radio" name="mode" value="cashback">
               <span class="mode-title">cashback</span>
               <span class="tooltip-dot" title="Creator rewards are redirected to traders as cashback. Trading behavior is unchanged.">?</span>
@@ -238,6 +256,8 @@
           </div>
 
           <div class="stack mode-panel" data-mode-panel="regular" hidden></div>
+
+          <div class="stack mode-panel" data-mode-panel="bonkers" hidden></div>
 
           <div class="stack mode-panel" data-mode-panel="cashback" hidden></div>
 
@@ -378,6 +398,7 @@
             </div>
             <div id="dev-buy-quick-buttons" class="dev-buy-quick-grid"></div>
             <label class="dev-buy-hidden-inputs" hidden>
+              <input name="quoteAsset" type="hidden" value="sol">
               <input name="devBuyMode" type="hidden" value="sol">
               <input name="devBuyAmount" type="hidden" value="">
             </label>
@@ -387,7 +408,8 @@
               <div class="dev-buy-custom-grid">
                 <label class="dev-buy-custom-field">
                   <span class="dev-buy-custom-prefix dev-buy-custom-prefix-icon">
-                    <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo">
+                    <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo" id="dev-buy-quote-prefix-icon">
+                    <span id="dev-buy-quote-prefix-text" hidden>SOL</span>
                   </span>
                   <input id="dev-buy-sol-input" type="text" inputmode="decimal" placeholder="0.0">
                 </label>
@@ -530,6 +552,7 @@
                     <div class="field-error" data-error-for="buySlippagePercent"></div>
                   </label>
                   </div>
+                  <div id="buy-standard-rpc-warning" class="modal-warning settings-provider-warning" hidden></div>
                 </section>
 
                 <section class="settings-row-group">
@@ -565,6 +588,7 @@
                     <div class="field-error" data-error-for="sellSlippagePercent"></div>
                   </label>
                   </div>
+                  <div id="sell-standard-rpc-warning" class="modal-warning settings-provider-warning" hidden></div>
                 </section>
               </div>
             </section>

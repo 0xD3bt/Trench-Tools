@@ -5,7 +5,7 @@ function getBonkLaunchpad() {
     id: "bonk",
     label: "Bonk",
     available: true,
-    supportState: "unverified",
+    supportState: "verified",
     tokenMetadata: {
       nameMaxLength: 32,
       symbolMaxLength: 10,
@@ -15,7 +15,8 @@ function getBonkLaunchpad() {
       "automatic-dev-sell": true,
       "dev-buy": true,
     },
-    reason: "Official Raydium-backed integration path still needs live validation.",
+    reason:
+      "Bonk routes through LetsBonk and Bonkers on Raydium LaunchLab with SOL/USD1 quote-asset support, auto USD1 top-up, compile/send, dev-buy, same-time snipers, dev auto-sell, and follow buy/sell automation.",
     officialSdk: "@raydium-io/raydium-sdk-v2",
   };
 }

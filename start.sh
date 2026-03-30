@@ -55,7 +55,7 @@ stop_launchdeck_process() {
     if kill -0 "$pid" 2>/dev/null; then
       kill -KILL "$pid" 2>/dev/null || true
     fi
-    echo "Stopped process $pid ($reason)."
+    echo "Stopped process $pid ($reason)." >&2
   fi
 }
 

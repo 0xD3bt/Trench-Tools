@@ -84,7 +84,7 @@ The backend reports:
 
 ## Current Runtime Notes
 
-- Pump is the only active launch flow in the code today.
+- Pump and Bonk are active launch flows in the code today.
 - `Helius Sender`, `Standard RPC`, and `Jito Bundle` are the current explicit provider choices.
 - `Standard RPC` and `Helius Sender` keep dependent launch/follow-up flows sequential.
 - `Jito Bundle` owns the current bundle transport path.
@@ -92,7 +92,7 @@ The backend reports:
   - default: `pump-fun`
   - optional custom provider: `pinata`
   - Pinata reuses uploaded image CIDs across metadata-only edits within the current app session
-- Bonk and Bags may appear in model/planning surfaces, but they are not active launch builders in the current initial version.
+- Bags may appear in model/planning surfaces, but it is not an active launch builder in the current initial version.
 
 ## Documentation Pointers
 

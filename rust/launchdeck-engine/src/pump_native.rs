@@ -80,12 +80,18 @@ pub struct NativeCompileTimings {
 }
 
 #[allow(dead_code, non_snake_case)]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchQuote {
     pub mode: String,
     pub input: String,
     pub estimatedTokens: String,
     pub estimatedSol: String,
+    #[serde(default)]
+    pub estimatedQuoteAmount: String,
+    #[serde(default)]
+    pub quoteAsset: String,
+    #[serde(default)]
+    pub quoteAssetLabel: String,
     pub estimatedSupplyPercent: String,
 }
 
@@ -1104,6 +1110,9 @@ pub async fn quote_launch(
             input: trimmed_amount.to_string(),
             estimatedTokens: format_decimal_u128(u128::from(tokens_out), TOKEN_DECIMALS, 6),
             estimatedSol: format_decimal_u128(u128::from(spendable_sol), 9, 6),
+            estimatedQuoteAmount: format_decimal_u128(u128::from(spendable_sol), 9, 6),
+            quoteAsset: "sol".to_string(),
+            quoteAssetLabel: "SOL".to_string(),
             estimatedSupplyPercent: format_supply_percent(tokens_out),
         }));
     }
@@ -1121,6 +1130,13 @@ pub async fn quote_launch(
             9,
             6,
         ),
+        estimatedQuoteAmount: format_decimal_u128(
+            u128::from(quote_buy_sol_from_tokens(&global, token_amount)),
+            9,
+            6,
+        ),
+        quoteAsset: "sol".to_string(),
+        quoteAssetLabel: "SOL".to_string(),
         estimatedSupplyPercent: format_supply_percent(token_amount),
     }))
 }

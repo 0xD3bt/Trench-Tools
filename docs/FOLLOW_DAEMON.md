@@ -10,6 +10,10 @@ Current follow action types:
 - `DevAutoSell`
 - `SniperSell`
 
+Current limitation:
+
+- `followLaunch.snipes[].postBuySell` chaining is still rejected; today the daemon supports delayed sniper buys, dev auto-sells, and sniper sells as separate follow actions
+
 The daemon is designed to:
 
 - stay running between launches
