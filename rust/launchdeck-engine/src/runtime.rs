@@ -9,6 +9,8 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::fs_utils::atomic_write;
 use tokio::{
     sync::{Mutex, RwLock},
     task::JoinHandle,
@@ -104,10 +106,15 @@ fn config_max_restart_attempts(config: &Option<Value>) -> u64 {
 
 fn persist_workers_sync(storage_path: &PathBuf, workers: &[RuntimeWorkerStatus]) {
     if let Some(parent) = storage_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("Failed to create runtime storage directory: {error}");
+            return;
+        }
     }
     if let Ok(serialized) = serde_json::to_string_pretty(workers) {
-        let _ = fs::write(storage_path, serialized);
+        if let Err(error) = atomic_write(storage_path, serialized.as_bytes()) {
+            eprintln!("Failed to persist runtime workers: {error}");
+        }
     }
 }
 

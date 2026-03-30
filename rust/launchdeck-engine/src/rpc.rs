@@ -1,6 +1,6 @@
 #![allow(non_snake_case, dead_code)]
 
-use futures_util::future::join_all;
+use futures_util::{SinkExt, StreamExt, future::join_all};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -10,7 +10,8 @@ use std::{
     sync::{Mutex, OnceLock},
     time::Instant,
 };
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::transport::{JitoBundleEndpoint, TransportPlan};
 
@@ -378,6 +379,25 @@ async fn wait_for_confirmation(
     max_attempts: u32,
     track_confirmed_block_height: bool,
 ) -> Result<ConfirmationDetails, String> {
+    wait_for_confirmation_polling(
+        rpc_url,
+        signature,
+        commitment,
+        max_attempts,
+        1500,
+        track_confirmed_block_height,
+    )
+    .await
+}
+
+async fn wait_for_confirmation_polling(
+    rpc_url: &str,
+    signature: &str,
+    commitment: &str,
+    max_attempts: u32,
+    poll_interval_ms: u64,
+    track_confirmed_block_height: bool,
+) -> Result<ConfirmationDetails, String> {
     for _ in 0..max_attempts {
         let result = rpc_request(
             rpc_url,
@@ -395,7 +415,7 @@ async fn wait_for_confirmation(
             .cloned()
         {
             if status.is_null() {
-                sleep(Duration::from_millis(1500)).await;
+                sleep(Duration::from_millis(poll_interval_ms)).await;
                 continue;
             }
             let actual_commitment = status
@@ -423,12 +443,215 @@ async fn wait_for_confirmation(
                 });
             }
         }
-        sleep(Duration::from_millis(1500)).await;
+        sleep(Duration::from_millis(poll_interval_ms)).await;
     }
     Err(format!(
         "Timed out waiting for transaction {} to reach {}.",
         signature, commitment
     ))
+}
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_subscription_socket(endpoint: &str) -> Result<WsStream, String> {
+    timeout(Duration::from_secs(5), connect_async(endpoint))
+        .await
+        .map_err(|_| format!("Timed out connecting to websocket endpoint: {endpoint}"))?
+        .map(|(stream, _)| stream)
+        .map_err(|error| error.to_string())
+}
+
+async fn subscribe(ws: &mut WsStream, method: &str, params: Value) -> Result<(), String> {
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .map_err(|error| error.to_string())?;
+    loop {
+        let payload = next_json_message(ws).await?;
+        if payload.get("id").and_then(Value::as_i64) == Some(1) {
+            if payload.get("error").is_some() {
+                return Err(format!("Subscription failed: {payload}"));
+            }
+            return Ok(());
+        }
+    }
+}
+
+async fn next_json_message(ws: &mut WsStream) -> Result<Value, String> {
+    loop {
+        let Some(message) = ws.next().await else {
+            return Err("Websocket stream closed.".to_string());
+        };
+        let message = message.map_err(|error| error.to_string())?;
+        match message {
+            Message::Text(text) => {
+                let parsed =
+                    serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())?;
+                return Ok(parsed);
+            }
+            Message::Binary(bytes) => {
+                let parsed =
+                    serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())?;
+                return Ok(parsed);
+            }
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Message::Pong(_) => {}
+            Message::Frame(_) => {}
+            Message::Close(_) => return Err("Websocket stream closed.".to_string()),
+        }
+    }
+}
+
+async fn wait_for_confirmation_websocket(
+    endpoint: &str,
+    rpc_url: &str,
+    signature: &str,
+    commitment: &str,
+    track_confirmed_block_height: bool,
+) -> Result<ConfirmationDetails, String> {
+    let session = async {
+        let mut ws = open_subscription_socket(endpoint).await?;
+        subscribe(
+            &mut ws,
+            "signatureSubscribe",
+            json!([
+                signature,
+                {
+                    "commitment": commitment
+                }
+            ]),
+        )
+        .await?;
+        loop {
+            let message = next_json_message(&mut ws).await?;
+            if let Some(params) = message.get("params") {
+                let context_slot = params
+                    .get("result")
+                    .and_then(|result| result.get("context"))
+                    .and_then(|context| context.get("slot"))
+                    .and_then(Value::as_u64);
+                let value = params
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let err = value.get("err").cloned().unwrap_or(Value::Null);
+                if !err.is_null() {
+                    return Err(format!(
+                        "Launch signature notification reported error: {err}"
+                    ));
+                }
+                let confirmed_observed_block_height = if track_confirmed_block_height {
+                    fetch_current_block_height(rpc_url, commitment).await.ok()
+                } else {
+                    None
+                };
+                return Ok(ConfirmationDetails {
+                    status: json!({
+                        "confirmationStatus": commitment,
+                        "slot": context_slot,
+                    }),
+                    confirmed_observed_block_height,
+                    confirmed_slot: context_slot,
+                });
+            }
+        }
+    };
+    timeout(Duration::from_secs(35), session)
+        .await
+        .map_err(|_| {
+            format!(
+                "Timed out waiting for websocket confirmation for transaction {}.",
+                signature
+            )
+        })?
+}
+
+fn transport_watch_endpoint(transport_plan: &TransportPlan) -> Option<&str> {
+    transport_plan
+        .watchEndpoint
+        .as_deref()
+        .or_else(|| transport_plan.watchEndpoints.first().map(String::as_str))
+}
+
+pub async fn confirm_transactions_with_websocket_fallback(
+    rpc_url: &str,
+    watch_endpoint: Option<&str>,
+    submitted: &mut [SentResult],
+    commitment: &str,
+    track_send_block_height: bool,
+    poll_max_attempts: u32,
+    poll_interval_ms: u64,
+) -> Result<(Vec<String>, u128), String> {
+    let confirm_started = std::time::Instant::now();
+    let mut warnings = Vec::new();
+    for result in submitted {
+        let signature = result.signature.clone().ok_or_else(|| {
+            format!(
+                "Submitted transaction {} is missing a signature.",
+                result.label
+            )
+        })?;
+        let confirmation = if let Some(endpoint) = watch_endpoint {
+            match wait_for_confirmation_websocket(
+                endpoint,
+                rpc_url,
+                &signature,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+            {
+                Ok(confirmation) => confirmation,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Websocket confirmation failed for {}: {}. Falling back to RPC polling.",
+                        result.label, error
+                    ));
+                    wait_for_confirmation_polling(
+                        rpc_url,
+                        &signature,
+                        commitment,
+                        poll_max_attempts,
+                        poll_interval_ms,
+                        track_send_block_height,
+                    )
+                    .await?
+                }
+            }
+        } else {
+            wait_for_confirmation_polling(
+                rpc_url,
+                &signature,
+                commitment,
+                poll_max_attempts,
+                poll_interval_ms,
+                track_send_block_height,
+            )
+            .await?
+        };
+        result.confirmationStatus = confirmation
+            .status
+            .get("confirmationStatus")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        result.confirmedObservedBlockHeight = confirmation.confirmed_observed_block_height;
+        result.confirmedSlot = confirmation.confirmed_slot;
+    }
+    Ok((warnings, confirm_started.elapsed().as_millis()))
 }
 
 pub async fn submit_transactions_sequential(
@@ -574,6 +797,23 @@ pub async fn confirm_transactions_sequential(
     commitment: &str,
     track_send_block_height: bool,
 ) -> Result<u128, String> {
+    confirm_transactions_sequential_with_attempts(
+        rpc_url,
+        submitted,
+        commitment,
+        track_send_block_height,
+        20,
+    )
+    .await
+}
+
+pub async fn confirm_transactions_sequential_with_attempts(
+    rpc_url: &str,
+    submitted: &mut [SentResult],
+    commitment: &str,
+    track_send_block_height: bool,
+    max_attempts: u32,
+) -> Result<u128, String> {
     let confirm_started = std::time::Instant::now();
     for result in submitted {
         let signature = result.signature.clone().ok_or_else(|| {
@@ -582,9 +822,14 @@ pub async fn confirm_transactions_sequential(
                 result.label
             )
         })?;
-        let confirmation =
-            wait_for_confirmation(rpc_url, &signature, commitment, 20, track_send_block_height)
-                .await?;
+        let confirmation = wait_for_confirmation(
+            rpc_url,
+            &signature,
+            commitment,
+            max_attempts,
+            track_send_block_height,
+        )
+        .await?;
         result.confirmationStatus = confirmation
             .status
             .get("confirmationStatus")
@@ -879,6 +1124,14 @@ pub async fn submit_transactions_bundle(
             send_errors.join(" | ")
         ));
     }
+    warnings.push(format!(
+        "Jito fanout accepted bundle submissions: {}",
+        attempts
+            .iter()
+            .map(|(endpoint, bundle_id)| format!("{}={}", endpoint.name, bundle_id))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    ));
     let attempted_endpoints = attempts
         .iter()
         .map(|(attempt_endpoint, _)| attempt_endpoint.send.clone())
@@ -950,15 +1203,33 @@ pub async fn confirm_transactions_bundle(
         })
         .collect::<Vec<_>>();
     let confirm_started = std::time::Instant::now();
+    let accepted_attempts = attempts
+        .iter()
+        .map(|(endpoint, bundle_id)| format!("{}={}", endpoint.name, bundle_id))
+        .collect::<Vec<_>>();
+    let mut last_observed_bundle_statuses = Vec::new();
     for _ in 0..20 {
         let mut observed_errors = Vec::new();
+        let mut observed_bundle_statuses = Vec::new();
         for (endpoint, bundle_id) in &attempts {
-            let status_payload = jito_request(
+            let status_payload = match jito_request(
                 &endpoint.status,
                 "getBundleStatuses",
                 json!([[bundle_id.clone()]]),
             )
-            .await?;
+            .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    observed_errors.push(format!(
+                        "{}:{} status-request={}",
+                        endpoint.name, bundle_id, error
+                    ));
+                    observed_bundle_statuses
+                        .push(format!("{}:{}=status-request-failed", endpoint.name, bundle_id));
+                    continue;
+                }
+            };
             let maybe_status = status_payload
                 .get("value")
                 .and_then(Value::as_array)
@@ -972,6 +1243,8 @@ pub async fn confirm_transactions_bundle(
                 if let Some(err) = status.get("err") {
                     if !err.is_null() {
                         observed_errors.push(format!("{}:{}={}", endpoint.name, bundle_id, err));
+                        observed_bundle_statuses
+                            .push(format!("{}:{}=err:{}", endpoint.name, bundle_id, err));
                         continue;
                     }
                 }
@@ -979,6 +1252,10 @@ pub async fn confirm_transactions_bundle(
                     .get("confirmation_status")
                     .and_then(Value::as_str)
                     .unwrap_or("processed");
+                observed_bundle_statuses.push(format!(
+                    "{}:{}={}",
+                    endpoint.name, bundle_id, actual
+                ));
                 if !commitment_satisfied(actual, commitment) {
                     continue;
                 }
@@ -1022,14 +1299,26 @@ pub async fn confirm_transactions_bundle(
                     ));
                 }
                 return Ok((warnings, confirm_started.elapsed().as_millis()));
+            } else {
+                observed_bundle_statuses.push(format!("{}:{}=not-found", endpoint.name, bundle_id));
             }
+        }
+        if !observed_bundle_statuses.is_empty() {
+            last_observed_bundle_statuses = observed_bundle_statuses;
         }
         sleep(Duration::from_millis(1500)).await;
     }
     Err(format!(
-        "Timed out waiting for fanout Jito bundle submissions to reach {}. Bundle ids: {}",
+        "Timed out waiting for fanout Jito bundle submissions to reach {}. Accepted endpoints: {}. Bundle ids: {}. Last observed bundle statuses: {}",
         commitment,
+        accepted_attempts.join(" | "),
         attempted_bundle_ids.join(", ")
+        ,
+        if last_observed_bundle_statuses.is_empty() {
+            "none".to_string()
+        } else {
+            last_observed_bundle_statuses.join(" | ")
+        }
     ))
 }
 
@@ -1093,6 +1382,49 @@ pub async fn send_transactions_helius_sender(
     commitment: &str,
     track_send_block_height: bool,
 ) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
+    if transactions.len() > 1 {
+        let started = std::time::Instant::now();
+        let mut results = Vec::with_capacity(transactions.len());
+        let mut warnings = Vec::new();
+        let mut submit_ms = 0u128;
+        let mut confirm_ms = 0u128;
+        for transaction in transactions {
+            let submit_started = std::time::Instant::now();
+            let (sent, entry_warnings) = submit_single_transaction_helius_sender(
+                rpc_url,
+                endpoints,
+                transaction,
+                commitment,
+                track_send_block_height,
+            )
+            .await?;
+            submit_ms += submit_started.elapsed().as_millis();
+            warnings.extend(entry_warnings);
+            let mut submitted = vec![sent];
+            let confirm_started = std::time::Instant::now();
+            confirm_transactions_helius_sender(
+                rpc_url,
+                &mut submitted,
+                commitment,
+                track_send_block_height,
+            )
+            .await?;
+            confirm_ms += confirm_started.elapsed().as_millis();
+            results.extend(submitted);
+        }
+        let elapsed_ms = started.elapsed().as_millis();
+        if submit_ms + confirm_ms < elapsed_ms {
+            confirm_ms += elapsed_ms - (submit_ms + confirm_ms);
+        }
+        return Ok((
+            results,
+            warnings,
+            SendTimingBreakdown {
+                submit_ms,
+                confirm_ms,
+            },
+        ));
+    }
     let (mut results, warnings, submit_ms) = submit_transactions_helius_sender(
         rpc_url,
         endpoints,
@@ -1333,24 +1665,28 @@ pub async fn confirm_submitted_transactions_for_transport(
             .await
         }
         "helius-sender" => {
-            let confirm_ms = confirm_transactions_helius_sender(
+            confirm_transactions_with_websocket_fallback(
                 rpc_url,
+                transport_watch_endpoint(transport_plan),
                 submitted,
                 commitment,
                 track_send_block_height,
+                75,
+                400,
             )
-            .await?;
-            Ok((vec![], confirm_ms))
+            .await
         }
         _ => {
-            let confirm_ms = confirm_transactions_sequential(
+            confirm_transactions_with_websocket_fallback(
                 rpc_url,
+                transport_watch_endpoint(transport_plan),
                 submitted,
                 commitment,
                 track_send_block_height,
+                75,
+                400,
             )
-            .await?;
-            Ok((vec![], confirm_ms))
+            .await
         }
     }
 }

@@ -2,10 +2,10 @@
 
 use crate::{
     config::{
-        RawAgent, RawAutomaticDevSell, RawConfig, RawCreatorFee, RawExecution, RawFeeSharing,
-        RawFollowLaunch, RawFollowLaunchConstraints, RawFollowLaunchMarketCapTrigger,
-        RawFollowLaunchSell, RawFollowLaunchSnipe, RawPostLaunch, RawPresets, RawRecipient,
-        RawSnipeOwnLaunch, RawToken, RawTx,
+        RawAgent, RawAutomaticDevSell, RawBags, RawConfig, RawCreatorFee, RawExecution,
+        RawFeeSharing, RawFollowLaunch, RawFollowLaunchConstraints,
+        RawFollowLaunchMarketCapTrigger, RawFollowLaunchSell, RawFollowLaunchSnipe, RawPostLaunch,
+        RawPresets, RawRecipient, RawSnipeOwnLaunch, RawToken, RawTx,
     },
     launchpad_dispatch::quote_launch_for_launchpad,
     paths,
@@ -15,21 +15,30 @@ use crate::{
 use reqwest::{Client, multipart};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use solana_sdk::pubkey::Pubkey;
 use std::{
     collections::HashMap,
     env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const FIXED_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const MAX_FEE_SPLIT_RECIPIENTS: usize = 10;
-const HELIUS_SENDER_TIP_ACCOUNTS: [&str; 3] = [
+const HELIUS_SENDER_TIP_ACCOUNTS: [&str; 10] = [
     "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
     "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
     "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
+    "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+    "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+    "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
+    "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
+    "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+    "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+    "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
 ];
 const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -85,6 +94,8 @@ pub struct QuoteForm {
     #[serde(default)]
     pub quoteAsset: String,
     #[serde(default)]
+    pub launchMode: String,
+    #[serde(default)]
     pub mode: String,
     #[serde(default)]
     pub amount: String,
@@ -137,6 +148,12 @@ pub struct UiForm {
     #[serde(default)]
     pub creationTipSol: String,
     #[serde(default)]
+    pub autoGas: bool,
+    #[serde(default)]
+    pub maxPriorityFeeSol: String,
+    #[serde(default)]
+    pub maxTipSol: String,
+    #[serde(default)]
     pub buyProvider: String,
     #[serde(default)]
     pub buyPriorityFeeSol: String,
@@ -144,6 +161,12 @@ pub struct UiForm {
     pub buyTipSol: String,
     #[serde(default)]
     pub buySlippagePercent: String,
+    #[serde(default)]
+    pub buyAutoGas: bool,
+    #[serde(default)]
+    pub buyMaxPriorityFeeSol: String,
+    #[serde(default)]
+    pub buyMaxTipSol: String,
     #[serde(default)]
     pub sellProvider: String,
     #[serde(default)]
@@ -153,6 +176,12 @@ pub struct UiForm {
     #[serde(default)]
     pub sellSlippagePercent: String,
     #[serde(default)]
+    pub sellAutoGas: bool,
+    #[serde(default)]
+    pub sellMaxPriorityFeeSol: String,
+    #[serde(default)]
+    pub sellMaxTipSol: String,
+    #[serde(default)]
     pub skipPreflight: bool,
     #[serde(default)]
     pub trackSendBlockHeight: bool,
@@ -160,6 +189,14 @@ pub struct UiForm {
     pub feeSplitEnabled: bool,
     #[serde(default)]
     pub feeSplitRecipients: Vec<UiRecipientInput>,
+    #[serde(default)]
+    pub creatorFeeMode: String,
+    #[serde(default)]
+    pub creatorFeeAddress: String,
+    #[serde(default)]
+    pub creatorFeeGithubUsername: String,
+    #[serde(default)]
+    pub creatorFeeGithubUserId: String,
     #[serde(default)]
     pub postLaunchStrategy: String,
     #[serde(default)]
@@ -182,6 +219,14 @@ pub struct UiForm {
     pub automaticDevSellBlockOffset: String,
     #[serde(default)]
     pub imageFileName: String,
+    #[serde(default)]
+    pub bagsIdentityMode: String,
+    #[serde(default)]
+    pub bagsAgentUsername: String,
+    #[serde(default)]
+    pub bagsAuthToken: String,
+    #[serde(default)]
+    pub bagsIdentityVerifiedWallet: String,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -395,16 +440,25 @@ fn parse_recipients(
             }
             if entry_type == "github" {
                 let username = entry.githubUsername.trim();
-                if username.is_empty() {
+                let user_id = entry.githubUserId.trim();
+                if username.is_empty() && user_id.is_empty() {
                     return Err(format!(
-                        "Fee split recipient {} is missing a GitHub username.",
+                        "Fee split recipient {} is missing a GitHub username or user id.",
+                        index + 1
+                    ));
+                }
+                if (!username.is_empty() && Pubkey::from_str(username).is_ok())
+                    || (!user_id.is_empty() && Pubkey::from_str(user_id).is_ok())
+                {
+                    return Err(format!(
+                        "Fee split recipient {} cannot use a Solana address while GitHub is selected.",
                         index + 1
                     ));
                 }
                 return Ok(RawRecipient {
                     r#type: "github".to_string(),
                     githubUsername: username.to_string(),
-                    githubUserId: entry.githubUserId.trim().to_string(),
+                    githubUserId: user_id.to_string(),
                     shareBps: Some(json!(share_bps)),
                     ..RawRecipient::default()
                 });
@@ -808,6 +862,7 @@ pub async fn quote_from_form(
         rpc_url,
         launchpad,
         &form.quoteAsset,
+        &form.launchMode,
         &form.mode,
         &form.amount,
     )
@@ -853,9 +908,16 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         0
     };
+    parse_decimal_to_u64(&form.maxPriorityFeeSol, 9, "creation max auto fee")?;
+    parse_decimal_to_u64(&form.maxTipSol, 9, "creation max auto tip")?;
+    parse_decimal_to_u64(&form.buyMaxPriorityFeeSol, 9, "buy max auto fee")?;
+    parse_decimal_to_u64(&form.buyMaxTipSol, 9, "buy max auto tip")?;
+    parse_decimal_to_u64(&form.sellMaxPriorityFeeSol, 9, "sell max auto fee")?;
+    parse_decimal_to_u64(&form.sellMaxTipSol, 9, "sell max auto tip")?;
     let is_agent_locked = mode == "agent-locked";
     let is_agent_custom = mode == "agent-custom";
     let is_agent_unlocked = mode == "agent-unlocked";
+    let has_agent_mode = is_agent_locked || is_agent_custom || is_agent_unlocked;
     let fee_split_enabled = mode == "regular" && form.feeSplitEnabled;
     let mut agent_fee_recipients = if is_agent_custom {
         parse_recipients(&form.agentSplitRecipients, true)?
@@ -867,7 +929,9 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         .find(|entry| entry.r#type == "agent")
         .and_then(|entry| entry.shareBps.as_ref())
         .and_then(Value::as_i64);
-    let buyback_bps = if is_agent_locked {
+    let buyback_bps = if !has_agent_mode {
+        None
+    } else if is_agent_locked {
         Some(10_000)
     } else if is_agent_custom {
         agent_recipient_share
@@ -905,14 +969,24 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             enabled: Some(json!(true)),
             walletEnvKey: entry.envKey.trim().to_string(),
             buyAmountSol: entry.amountSol.trim().to_string(),
-            submitWithLaunch: Some(json!(entry.triggerMode.trim().eq_ignore_ascii_case("same-time"))),
+            submitWithLaunch: Some(json!(
+                entry.triggerMode.trim().eq_ignore_ascii_case("same-time")
+            )),
             retryOnFailure: Some(json!(entry.retryOnce)),
-            submitDelayMs: if entry.triggerMode.trim().eq_ignore_ascii_case("submit-delay") {
+            submitDelayMs: if entry
+                .triggerMode
+                .trim()
+                .eq_ignore_ascii_case("submit-delay")
+            {
                 entry.submitDelayMs.map(|value| json!(value.max(0)))
             } else {
                 Some(json!(0))
             },
-            targetBlockOffset: if entry.triggerMode.trim().eq_ignore_ascii_case("block-offset") {
+            targetBlockOffset: if entry
+                .triggerMode
+                .trim()
+                .eq_ignore_ascii_case("block-offset")
+            {
                 entry.targetBlockOffset.map(|value| json!(value.max(0)))
             } else {
                 None
@@ -952,7 +1026,8 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         form.automaticDevSellPercent.trim().to_string()
     };
-    let dev_auto_sell_trigger_mode = if !form.followLaunch.devAutoSell.triggerMode.trim().is_empty() {
+    let dev_auto_sell_trigger_mode = if !form.followLaunch.devAutoSell.triggerMode.trim().is_empty()
+    {
         form.followLaunch.devAutoSell.triggerMode.trim().to_string()
     } else if !form.automaticDevSellTriggerMode.trim().is_empty() {
         form.automaticDevSellTriggerMode.trim().to_string()
@@ -964,8 +1039,18 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         form.automaticDevSellDelayMs.trim().to_string()
     };
-    let dev_auto_sell_block_offset = if !form.followLaunch.devAutoSell.targetBlockOffset.trim().is_empty() {
-        form.followLaunch.devAutoSell.targetBlockOffset.trim().to_string()
+    let dev_auto_sell_block_offset = if !form
+        .followLaunch
+        .devAutoSell
+        .targetBlockOffset
+        .trim()
+        .is_empty()
+    {
+        form.followLaunch
+            .devAutoSell
+            .targetBlockOffset
+            .trim()
+            .to_string()
     } else {
         form.automaticDevSellBlockOffset.trim().to_string()
     };
@@ -985,6 +1070,32 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         || !follow_launch_snipes.is_empty()
         || form.automaticDevSellEnabled
         || form.followLaunch.devAutoSell.enabled;
+    let creator_fee_mode = if mode == "cashback" {
+        "cashback".to_string()
+    } else if is_agent_locked {
+        "agent-escrow".to_string()
+    } else if fee_split_enabled || launchpad == "bagsapp" {
+        "deployer".to_string()
+    } else if form.creatorFeeMode.trim().is_empty() {
+        "deployer".to_string()
+    } else {
+        form.creatorFeeMode.trim().to_string()
+    };
+    let creator_fee_address = if creator_fee_mode == "wallet" {
+        form.creatorFeeAddress.trim().to_string()
+    } else {
+        String::new()
+    };
+    let creator_fee_github_username = if creator_fee_mode == "github" {
+        form.creatorFeeGithubUsername.trim().to_string()
+    } else {
+        String::new()
+    };
+    let creator_fee_github_user_id = if creator_fee_mode == "github" {
+        form.creatorFeeGithubUserId.trim().to_string()
+    } else {
+        String::new()
+    };
     Ok(RawConfig {
         mode: mode.clone(),
         launchpad: launchpad.clone(),
@@ -1006,15 +1117,15 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         },
         signer: Default::default(),
         agent: RawAgent {
-            authority: if is_agent_locked {
-                String::new()
-            } else {
+            authority: if has_agent_mode && !is_agent_locked {
                 form.agentAuthority.trim().to_string()
+            } else {
+                String::new()
             },
             buybackBps: buyback_bps.map(|value| json!(value)),
-            splitAgentInit: Some(json!(is_agent_custom || mode == "agent-locked")),
+            splitAgentInit: Some(json!(is_agent_custom || is_agent_locked)),
             feeReceiver: String::new(),
-            feeRecipients: if is_agent_locked || is_agent_unlocked {
+            feeRecipients: if !has_agent_mode || is_agent_locked || is_agent_unlocked {
                 vec![]
             } else {
                 agent_fee_recipients
@@ -1041,14 +1152,16 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             recipients: fee_sharing_recipients,
         },
         creatorFee: RawCreatorFee {
-            mode: if mode == "cashback" {
-                "cashback".to_string()
-            } else if is_agent_locked {
-                "agent-escrow".to_string()
-            } else {
-                "deployer".to_string()
-            },
-            ..RawCreatorFee::default()
+            mode: creator_fee_mode,
+            address: creator_fee_address,
+            githubUsername: creator_fee_github_username,
+            githubUserId: creator_fee_github_user_id,
+        },
+        bags: RawBags {
+            identityMode: form.bagsIdentityMode.trim().to_string(),
+            agentUsername: form.bagsAgentUsername.trim().to_string(),
+            authToken: form.bagsAuthToken.trim().to_string(),
+            identityVerifiedWallet: form.bagsIdentityVerifiedWallet.trim().to_string(),
         },
         execution: RawExecution {
             simulate: Some(json!(action == "simulate")),
@@ -1064,7 +1177,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             provider: provider.clone(),
             endpointProfile: endpoint_profile.clone(),
             policy: String::new(),
-            autoGas: Some(json!(true)),
+            autoGas: Some(json!(form.autoGas)),
             autoMode: "launchAuto".to_string(),
             priorityFeeSol: form.priorityFeeSol.trim().to_string(),
             tipSol: if tip_lamports > 0 {
@@ -1072,16 +1185,24 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             } else {
                 String::new()
             },
-            maxPriorityFeeSol: form.priorityFeeSol.trim().to_string(),
-            maxTipSol: if tip_lamports > 0 {
-                form.creationTipSol.trim().to_string()
+            maxPriorityFeeSol: if form.autoGas {
+                form.maxPriorityFeeSol.trim().to_string()
+            } else {
+                form.priorityFeeSol.trim().to_string()
+            },
+            maxTipSol: if tip_lamports > 0 || form.autoGas {
+                if form.autoGas {
+                    form.maxTipSol.trim().to_string()
+                } else {
+                    form.creationTipSol.trim().to_string()
+                }
             } else {
                 String::new()
             },
             buyProvider: buy_provider,
             buyEndpointProfile: buy_endpoint_profile,
             buyPolicy: String::new(),
-            buyAutoGas: Some(json!(true)),
+            buyAutoGas: Some(json!(form.buyAutoGas)),
             buyAutoMode: "buyAuto".to_string(),
             buyPriorityFeeSol: form.buyPriorityFeeSol.trim().to_string(),
             buyTipSol: if buy_tip_supported {
@@ -1090,12 +1211,22 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                 String::new()
             },
             buySlippagePercent: form.buySlippagePercent.trim().to_string(),
-            buyMaxPriorityFeeSol: form.buyPriorityFeeSol.trim().to_string(),
-            buyMaxTipSol: if buy_tip_supported {
-                form.buyTipSol.trim().to_string()
+            buyMaxPriorityFeeSol: if form.buyAutoGas {
+                form.buyMaxPriorityFeeSol.trim().to_string()
+            } else {
+                form.buyPriorityFeeSol.trim().to_string()
+            },
+            buyMaxTipSol: if buy_tip_supported || form.buyAutoGas {
+                if form.buyAutoGas {
+                    form.buyMaxTipSol.trim().to_string()
+                } else {
+                    form.buyTipSol.trim().to_string()
+                }
             } else {
                 String::new()
             },
+            sellAutoGas: Some(json!(form.sellAutoGas)),
+            sellAutoMode: "sellAuto".to_string(),
             sellProvider: sell_provider,
             sellEndpointProfile: sell_endpoint_profile,
             sellPolicy: String::new(),
@@ -1106,6 +1237,20 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                 String::new()
             },
             sellSlippagePercent: form.sellSlippagePercent.trim().to_string(),
+            sellMaxPriorityFeeSol: if form.sellAutoGas {
+                form.sellMaxPriorityFeeSol.trim().to_string()
+            } else {
+                form.sellPriorityFeeSol.trim().to_string()
+            },
+            sellMaxTipSol: if sell_tip_supported || form.sellAutoGas {
+                if form.sellAutoGas {
+                    form.sellMaxTipSol.trim().to_string()
+                } else {
+                    form.sellTipSol.trim().to_string()
+                }
+            } else {
+                String::new()
+            },
         },
         initialBuySol: if form.devBuyMode.trim().eq_ignore_ascii_case("sol") {
             form.devBuyAmount.trim().to_string()
@@ -1378,7 +1523,10 @@ mod tests {
             "SOLANA_PRIVATE_KEY2"
         );
         assert_eq!(raw.followLaunch.snipes[0].buyAmountSol, "0.25");
-        assert_eq!(raw.followLaunch.snipes[0].submitWithLaunch, Some(json!(false)));
+        assert_eq!(
+            raw.followLaunch.snipes[0].submitWithLaunch,
+            Some(json!(false))
+        );
         assert_eq!(raw.followLaunch.snipes[0].submitDelayMs, Some(json!(25)));
         let dev_auto_sell = raw
             .followLaunch

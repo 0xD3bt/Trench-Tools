@@ -16,7 +16,7 @@ function getBonkLaunchpad() {
       "dev-buy": true,
     },
     reason:
-      "Bonk routes through LetsBonk and Bonkers on Raydium LaunchLab with SOL/USD1 quote-asset support, auto USD1 top-up, compile/send, dev-buy, same-time snipers, dev auto-sell, and follow buy/sell automation.",
+      "Bonk routes through LetsBonk and Bonkers on Raydium LaunchLab with SOL/USD1 quote-asset support, auto USD1 top-up, compile/send, dev-buy, same-time snipers, dev auto-sell, and snipe buy/sell automation.",
     officialSdk: "@raydium-io/raydium-sdk-v2",
   };
 }

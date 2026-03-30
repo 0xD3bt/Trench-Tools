@@ -1,7 +1,11 @@
-#[path = "../config.rs"]
-mod config;
+#[path = "../bags_native.rs"]
+mod bags_native;
 #[path = "../bonk_native.rs"]
 mod bonk_native;
+#[path = "../config.rs"]
+mod config;
+#[path = "../fs_utils.rs"]
+mod fs_utils;
 #[path = "../launchpad_dispatch.rs"]
 mod launchpad_dispatch;
 #[path = "../observability.rs"]

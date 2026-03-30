@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    config::{NormalizedConfig, NormalizedRecipient},
+    config::{NormalizedConfig, NormalizedCreatorFee, NormalizedFollowLaunch, NormalizedRecipient},
     transport::TransportPlan,
+    wallet::list_solana_env_wallets,
 };
 
 const DEFAULT_LOOKUP_TABLES: [&str; 2] = [
@@ -151,7 +152,17 @@ pub struct ExecutionSummary {
     pub timings: ExecutionTimings,
     pub simulation: Vec<ExecutionItem>,
     pub sent: Vec<SentItem>,
+    #[serde(default)]
+    pub notes: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedBagsReportConfig {
+    pub configType: String,
+    pub identityMode: String,
+    pub agentUsername: String,
+    pub identityVerifiedWallet: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +187,20 @@ pub struct LaunchReport {
     pub bundleJitoTip: bool,
     pub transactions: Vec<TransactionSummary>,
     pub execution: ExecutionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savedSelectedWalletKey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savedQuoteAsset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savedFollowLaunch: Option<NormalizedFollowLaunch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savedBags: Option<SavedBagsReportConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savedFeeSharingRecipients: Option<Vec<NormalizedRecipient>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savedAgentFeeRecipients: Option<Vec<NormalizedRecipient>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub savedCreatorFee: Option<NormalizedCreatorFee>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followDaemon: Option<Value>,
     #[serde(default)]
@@ -222,6 +247,101 @@ fn summarize_recipients(
         ));
     }
     parts.join(" + ")
+}
+
+fn report_wallet_label(wallet_env_key: &str) -> String {
+    let key = wallet_env_key.trim();
+    if key.is_empty() {
+        return "Wallet".to_string();
+    }
+    let suffix = key.strip_prefix("SOLANA_PRIVATE_KEY").unwrap_or(key);
+    let base = if suffix.is_empty() {
+        "Wallet #1".to_string()
+    } else if suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        format!("Wallet #{suffix}")
+    } else {
+        key.to_string()
+    };
+    let custom_name = list_solana_env_wallets()
+        .into_iter()
+        .find(|wallet| wallet.envKey == key)
+        .and_then(|wallet| wallet.customName)
+        .unwrap_or_default();
+    if custom_name.is_empty() {
+        base
+    } else {
+        format!("{base} {custom_name}")
+    }
+}
+
+fn render_follow_action_summary(action: &Value) -> Option<String> {
+    let kind = action
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let state = action
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let wallet = report_wallet_label(
+        action
+            .get("walletEnvKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let title = match kind {
+        "sniper-buy" => "Sniper buy",
+        "sniper-sell" => "Sniper sell",
+        "dev-auto-sell" => "Dev auto-sell",
+        _ => return None,
+    };
+    let mut parts = vec![format!("{title}: {wallet}")];
+    if let Some(amount) = action.get("buyAmountSol").and_then(Value::as_str)
+        && !amount.trim().is_empty()
+    {
+        parts.push(format!("buy {}", amount.trim()));
+    }
+    if let Some(percent) = action.get("sellPercent").and_then(Value::as_u64) {
+        parts.push(format!("sell {}%", percent));
+    }
+    if let Some(delay_ms) = action.get("submitDelayMs").and_then(Value::as_u64) {
+        parts.push(format!("submit delay={}ms", delay_ms));
+    }
+    if let Some(delay_ms) = action.get("delayMs").and_then(Value::as_u64) {
+        parts.push(format!("delay={}ms", delay_ms));
+    }
+    if let Some(block_offset) = action.get("targetBlockOffset").and_then(Value::as_u64) {
+        parts.push(format!("block+{}", block_offset));
+    }
+    if let Some(market_cap) = action.get("marketCap").and_then(Value::as_object) {
+        let direction = market_cap
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or("gte");
+        let threshold = market_cap
+            .get("threshold")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !threshold.trim().is_empty() {
+            parts.push(format!("market {} {}", direction, threshold.trim()));
+        }
+    }
+    parts.push(format!("status={state}"));
+    if let Some(signature) = action.get("signature").and_then(Value::as_str)
+        && !signature.trim().is_empty()
+    {
+        parts.push(format!("sig={}", short_address(signature.trim(), 8, 8)));
+    }
+    if let Some(blocks) = action.get("blocksToConfirm").and_then(Value::as_u64) {
+        parts.push(format!("blocks={blocks}"));
+    }
+    if let Some(error) = action.get("lastError").and_then(Value::as_str)
+        && !error.trim().is_empty()
+    {
+        parts.push(format!("error={}", error.trim()));
+    }
+    Some(parts.join(" | "))
 }
 
 fn short_address(value: &str, left: usize, right: usize) -> String {
@@ -424,10 +544,11 @@ pub fn build_report(
         _ if config.feeSharing.generateLaterSetup => "deferred one-time setup artifact".to_string(),
         _ => "untouched".to_string(),
     };
-    let mut warnings = vec![
+    let notes = vec![
         "Rust engine owns validation, runtime state, and API contracts. Native Pump assembly covers LaunchDeck's Pump launch modes end-to-end."
             .to_string(),
     ];
+    let mut warnings = vec![];
     let has_unverified_provider =
         !crate::providers::get_provider_meta(&transport_plan.resolvedProvider).verified;
     if has_unverified_provider {
@@ -499,8 +620,45 @@ pub fn build_report(
             timings: ExecutionTimings::default(),
             simulation: vec![],
             sent: vec![],
+            notes,
             warnings,
         },
+        savedSelectedWalletKey: if config.selectedWalletKey.trim().is_empty() {
+            None
+        } else {
+            Some(config.selectedWalletKey.clone())
+        },
+        savedQuoteAsset: if config.quoteAsset.trim().is_empty() {
+            None
+        } else {
+            Some(config.quoteAsset.clone())
+        },
+        savedFollowLaunch: if config.followLaunch.enabled {
+            Some(config.followLaunch.clone())
+        } else {
+            None
+        },
+        savedBags: if config.launchpad == "bagsapp" {
+            Some(SavedBagsReportConfig {
+                configType: config.bags.configType.clone(),
+                identityMode: config.bags.identityMode.clone(),
+                agentUsername: config.bags.agentUsername.clone(),
+                identityVerifiedWallet: config.bags.identityVerifiedWallet.clone(),
+            })
+        } else {
+            None
+        },
+        savedFeeSharingRecipients: if config.feeSharing.recipients.is_empty() {
+            None
+        } else {
+            Some(config.feeSharing.recipients.clone())
+        },
+        savedAgentFeeRecipients: if config.agent.feeRecipients.is_empty() {
+            None
+        } else {
+            Some(config.agent.feeRecipients.clone())
+        },
+        savedCreatorFee: Some(config.creatorFee.clone()),
         followDaemon: None,
         benchmark: None,
         outPath: None,
@@ -540,10 +698,7 @@ pub fn render_report(report: &LaunchReport) -> String {
         lines.push(format!("Metadata URI: {}", metadata_uri));
     }
     lines.push(format!("Launchpad: {}", report.launchpad));
-    lines.push(format!(
-        "Provider: {}",
-        report.execution.resolvedProvider
-    ));
+    lines.push(format!("Provider: {}", report.execution.resolvedProvider));
     if !report.execution.resolvedEndpointProfile.is_empty() {
         lines.push(format!(
             "Endpoint profile: {}",
@@ -618,6 +773,16 @@ pub fn render_report(report: &LaunchReport) -> String {
                         confirmed,
                         problems
                     ));
+                    let configured_actions = actions
+                        .iter()
+                        .filter_map(render_follow_action_summary)
+                        .collect::<Vec<_>>();
+                    if !configured_actions.is_empty() {
+                        lines.push("  Configured actions:".to_string());
+                        for summary in configured_actions {
+                            lines.push(format!("  - {}", summary));
+                        }
+                    }
                 }
             }
             if let Some(profiles) = follow.get("timingProfiles").and_then(Value::as_array)
@@ -817,6 +982,13 @@ pub fn render_report(report: &LaunchReport) -> String {
         lines.push("Warnings:".to_string());
         for warning in &report.execution.warnings {
             lines.push(format!("- {}", warning));
+        }
+    }
+    if !report.execution.notes.is_empty() {
+        lines.push(String::new());
+        lines.push("Notes:".to_string());
+        for note in &report.execution.notes {
+            lines.push(format!("- {}", note));
         }
     }
     lines.join("\n")

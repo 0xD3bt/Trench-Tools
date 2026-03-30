@@ -403,12 +403,12 @@ pub async fn try_compile_native_pump(
             .map(|table| table.key.to_string())
             .collect(),
     );
-    if let Some(first_warning) = report.execution.warnings.first_mut() {
-        *first_warning =
+    if let Some(first_note) = report.execution.notes.first_mut() {
+        *first_note =
             "Rust engine owns validation, runtime state, and API contracts. Native Pump assembly now covers LaunchDeck's Pump launch modes end-to-end; non-Pump flows still fall back to the JS compile bridge."
                 .to_string();
     }
-    report.execution.warnings.push(
+    report.execution.notes.push(
         "Native Pump assembly now includes compute-budget and priority-fee instructions for supported launch shapes."
             .to_string(),
     );
@@ -1380,14 +1380,13 @@ pub async fn compile_follow_sell_transaction(
     let user = user_keypair.pubkey();
     let mint = parse_pubkey(mint, "mint")?;
     let launch_creator = parse_pubkey(launch_creator, "launch creator")?;
-    let creator_vault_authority =
-        resolve_follow_creator_vault_authority(
-            rpc_url,
-            &mint,
-            &launch_creator,
-            prefer_post_setup_creator_vault,
-        )
-        .await?;
+    let creator_vault_authority = resolve_follow_creator_vault_authority(
+        rpc_url,
+        &mint,
+        &launch_creator,
+        prefer_post_setup_creator_vault,
+    )
+    .await?;
     let global = fetch_global_state_cached(rpc_url).await?;
     let curve = fetch_bonding_curve_state(rpc_url, &mint).await?;
     let associated_user =
@@ -1814,9 +1813,10 @@ fn build_sell_instruction(
             .accounts
             .push(AccountMeta::new(user_volume_accumulator_pda(user)?, false));
     }
-    instruction
-        .accounts
-        .push(AccountMeta::new_readonly(bonding_curve_v2_pda(mint)?, false));
+    instruction.accounts.push(AccountMeta::new_readonly(
+        bonding_curve_v2_pda(mint)?,
+        false,
+    ));
     Ok(instruction)
 }
 

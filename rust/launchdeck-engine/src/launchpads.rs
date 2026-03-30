@@ -1,7 +1,9 @@
 #![allow(non_snake_case, dead_code)]
 
 use serde::Serialize;
-use std::{collections::BTreeMap, env};
+use std::{collections::BTreeMap, env, fs};
+
+use crate::paths;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenMetadataLimits {
@@ -35,7 +37,15 @@ pub struct LaunchpadAvailability {
 pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
     let bags_configured = env::var("BAGS_API_KEY")
         .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || fs::read_to_string(paths::bags_credentials_path())
+            .ok()
+            .map(|value| value.contains("\"apiKey\""))
+            .unwrap_or(false)
+        || fs::read_to_string(paths::bags_session_path())
+            .ok()
+            .map(|value| value.contains("\"apiKey\""))
+            .unwrap_or(false);
     [
         (
             "pump".to_string(),
@@ -74,7 +84,7 @@ pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
                     dev_buy: true,
                 },
                 reason:
-                    "Bonk routes through LetsBonk and Bonkers on Raydium LaunchLab with SOL/USD1 quote-asset support, auto USD1 top-up, compile/send, dev-buy, same-time snipers, dev auto-sell, and follow buy/sell automation."
+                    "Bonk routes through LetsBonk and Bonkers on Raydium LaunchLab with SOL/USD1 quote-asset support, auto USD1 top-up, compile/send, dev-buy, same-time snipers, dev auto-sell, and snipe buy/sell automation."
                         .to_string(),
                 officialSdk: Some("@raydium-io/raydium-sdk-v2".to_string()),
             },
@@ -95,12 +105,12 @@ pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
                     symbolMaxLength: 10,
                 },
                 supportsStrategies: StrategySupport {
-                    snipe_own_launch: false,
-                    automatic_dev_sell: false,
+                    snipe_own_launch: true,
+                    automatic_dev_sell: true,
                     dev_buy: true,
                 },
                 reason: if bags_configured {
-                    "Bags integration is wired for the documented launch flow but still needs live validation.".to_string()
+                    "Bags hosted launch flow is enabled with fee-share modes, wallet-only or linked identity, dev-buy, same-time snipers, snipe buy/sell automation, and market-triggered auto-sell.".to_string()
                 } else {
                     "Missing BAGS_API_KEY.".to_string()
                 },

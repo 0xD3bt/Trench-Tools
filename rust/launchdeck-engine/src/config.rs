@@ -35,6 +35,8 @@ pub struct RawConfig {
     #[serde(default)]
     pub creatorFee: RawCreatorFee,
     #[serde(default)]
+    pub bags: RawBags,
+    #[serde(default)]
     pub execution: RawExecution,
     #[serde(default)]
     pub initialBuySol: String,
@@ -141,6 +143,18 @@ pub struct RawCreatorFee {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawBags {
+    #[serde(default)]
+    pub identityMode: String,
+    #[serde(default)]
+    pub agentUsername: String,
+    #[serde(default)]
+    pub authToken: String,
+    #[serde(default)]
+    pub identityVerifiedWallet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RawExecution {
     #[serde(default)]
     pub simulate: Option<Value>,
@@ -193,6 +207,10 @@ pub struct RawExecution {
     #[serde(default)]
     pub buyMaxTipSol: String,
     #[serde(default)]
+    pub sellAutoGas: Option<Value>,
+    #[serde(default)]
+    pub sellAutoMode: String,
+    #[serde(default)]
     pub sellProvider: String,
     #[serde(default)]
     pub sellEndpointProfile: String,
@@ -204,6 +222,10 @@ pub struct RawExecution {
     pub sellTipSol: String,
     #[serde(default)]
     pub sellSlippagePercent: String,
+    #[serde(default)]
+    pub sellMaxPriorityFeeSol: String,
+    #[serde(default)]
+    pub sellMaxTipSol: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -359,6 +381,7 @@ pub struct NormalizedConfig {
     pub tx: NormalizedTx,
     pub feeSharing: NormalizedFeeSharing,
     pub creatorFee: NormalizedCreatorFee,
+    pub bags: NormalizedBags,
     pub execution: NormalizedExecution,
     pub devBuy: Option<NormalizedDevBuy>,
     pub postLaunch: NormalizedPostLaunch,
@@ -391,6 +414,47 @@ pub fn validate_launchpad_support(config: &NormalizedConfig) -> Result<(), Confi
             if config.token.cashback {
                 return Err(ConfigError::Message(
                     "Bonk does not support cashback mode.".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        "bagsapp" => {
+            if !matches!(
+                config.mode.as_str(),
+                "bags-2-2" | "bags-025-1" | "bags-1-025"
+            ) {
+                return Err(ConfigError::Message(format!(
+                    "Bagsapp currently supports only bags-2-2, bags-025-1, and bags-1-025 modes. Got mode={}.",
+                    config.mode
+                )));
+            }
+            if config.quoteAsset != "sol" {
+                return Err(ConfigError::Message(
+                    "Bagsapp currently supports only SOL-denominated launch and trade flows."
+                        .to_string(),
+                ));
+            }
+            if config.token.mayhemMode {
+                return Err(ConfigError::Message(
+                    "Bagsapp does not support mayhem mode.".to_string(),
+                ));
+            }
+            if config.token.cashback {
+                return Err(ConfigError::Message(
+                    "Bagsapp does not support cashback mode.".to_string(),
+                ));
+            }
+            if config.agent.splitAgentInit
+                || config.agent.buybackBps.is_some()
+                || !config.agent.feeRecipients.is_empty()
+            {
+                return Err(ConfigError::Message(
+                    "Bagsapp does not support Pump agent modes.".to_string(),
+                ));
+            }
+            if config.creatorFee.mode != "deployer" {
+                return Err(ConfigError::Message(
+                    "Bagsapp creator fee receiver must remain the deployer wallet.".to_string(),
                 ));
             }
             Ok(())
@@ -445,12 +509,21 @@ pub struct NormalizedFeeSharing {
     pub recipients: Vec<NormalizedRecipient>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedCreatorFee {
     pub mode: String,
     pub address: String,
     pub githubUsername: String,
     pub githubUserId: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NormalizedBags {
+    pub configType: String,
+    pub identityMode: String,
+    pub agentUsername: String,
+    pub authToken: String,
+    pub identityVerifiedWallet: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,11 +551,15 @@ pub struct NormalizedExecution {
     pub buySlippagePercent: String,
     pub buyMaxPriorityFeeSol: String,
     pub buyMaxTipSol: String,
+    pub sellAutoGas: bool,
+    pub sellAutoMode: String,
     pub sellProvider: String,
     pub sellEndpointProfile: String,
     pub sellPriorityFeeSol: String,
     pub sellTipSol: String,
     pub sellSlippagePercent: String,
+    pub sellMaxPriorityFeeSol: String,
+    pub sellMaxTipSol: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -574,7 +651,7 @@ pub struct NormalizedPresets {
     pub selectedSniperPresetId: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedRecipient {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
@@ -667,6 +744,23 @@ fn parse_choice(
     }
 }
 
+fn normalize_bags_mode(mode: &str) -> String {
+    match mode {
+        "regular" | "bags-2-2" => "bags-2-2".to_string(),
+        "bags-025-1" => "bags-025-1".to_string(),
+        "bags-1-025" => "bags-1-025".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn bags_config_type_for_mode(mode: &str) -> &'static str {
+    match mode {
+        "bags-025-1" => "d16d3585-6488-4a6c-9a6f-e6c39ca0fda3",
+        "bags-1-025" => "a7c8e1f2-3d4b-5a6c-9e0f-1b2c3d4e5f6a",
+        _ => "fa29606e-5e48-4c37-827f-4b03d58ee23d",
+    }
+}
+
 fn parse_limited_string(
     value: &str,
     label: &str,
@@ -736,7 +830,7 @@ fn normalize_recipients(
         }
 
         normalized.push(NormalizedRecipient {
-            r#type: if allow_agent { Some(entry_type) } else { None },
+            r#type: Some(entry_type),
             address,
             githubUserId: github_user_id,
             githubUsername: github_username,
@@ -938,7 +1032,7 @@ fn normalize_follow_sell(
         &raw.targetBlockOffset,
         &format!("{fallback_action_id}.targetBlockOffset"),
         Some(0),
-        Some(32),
+        Some(22),
         None,
     )?
     .map(|value| value as u8);
@@ -1091,7 +1185,7 @@ fn normalize_follow_launch(
             &entry.targetBlockOffset,
             &format!("followLaunch.snipes[{index}].targetBlockOffset"),
             Some(0),
-            Some(5),
+            Some(22),
             None,
         )?
         .map(|value| value as u8);
@@ -1209,11 +1303,14 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         "agent-custom",
         "agent-unlocked",
         "agent-locked",
+        "bags-2-2",
+        "bags-025-1",
+        "bags-1-025",
     ]
     .contains(&mode.as_str())
     {
         return Err(ConfigError::Message(format!(
-            "mode must be one of regular, bonkers, cashback, agent-custom, agent-unlocked, agent-locked. Got: {mode}"
+            "mode must be one of regular, bonkers, cashback, agent-custom, agent-unlocked, agent-locked, bags-2-2, bags-025-1, bags-1-025. Got: {mode}"
         )));
     }
 
@@ -1223,6 +1320,11 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         &["pump", "bonk", "bagsapp"],
         "pump",
     )?;
+    let mode = if launchpad == "bagsapp" {
+        normalize_bags_mode(&mode)
+    } else {
+        mode
+    };
     let quote_asset = normalize_quote_asset(&raw, &launchpad)?;
     let post_launch_strategy = parse_choice(
         &raw.postLaunch.strategy,
@@ -1317,6 +1419,17 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             recipients: fee_recipients,
         },
         creatorFee: normalize_creator_fee(&raw.creatorFee, &mode)?,
+        bags: NormalizedBags {
+            configType: bags_config_type_for_mode(&mode).to_string(),
+            identityMode: if raw.bags.identityMode.trim().eq_ignore_ascii_case("linked") {
+                "linked".to_string()
+            } else {
+                "wallet-only".to_string()
+            },
+            agentUsername: raw.bags.agentUsername.trim().to_string(),
+            authToken: raw.bags.authToken.trim().to_string(),
+            identityVerifiedWallet: raw.bags.identityVerifiedWallet.trim().to_string(),
+        },
         execution: NormalizedExecution {
             simulate: parse_bool(&raw.execution.simulate, false),
             send: parse_bool(&raw.execution.send, false),
@@ -1387,6 +1500,12 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             buySlippagePercent: raw.execution.buySlippagePercent.trim().to_string(),
             buyMaxPriorityFeeSol: raw.execution.buyMaxPriorityFeeSol.trim().to_string(),
             buyMaxTipSol: raw.execution.buyMaxTipSol.trim().to_string(),
+            sellAutoGas: parse_bool(&raw.execution.sellAutoGas, false),
+            sellAutoMode: if is_blank(&raw.execution.sellAutoMode) {
+                "sellAuto".to_string()
+            } else {
+                raw.execution.sellAutoMode.trim().to_string()
+            },
             sellProvider: parse_choice(
                 &raw.execution.sellProvider,
                 "execution.sellProvider",
@@ -1406,6 +1525,8 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             sellPriorityFeeSol: raw.execution.sellPriorityFeeSol.trim().to_string(),
             sellTipSol: raw.execution.sellTipSol.trim().to_string(),
             sellSlippagePercent: raw.execution.sellSlippagePercent.trim().to_string(),
+            sellMaxPriorityFeeSol: raw.execution.sellMaxPriorityFeeSol.trim().to_string(),
+            sellMaxTipSol: raw.execution.sellMaxTipSol.trim().to_string(),
         },
         devBuy: normalize_dev_buy(&raw)?,
         postLaunch: NormalizedPostLaunch {
@@ -1453,6 +1574,19 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
 
     if normalized.token.uri.is_empty() {
         return Err(ConfigError::Message("token.uri is required.".to_string()));
+    }
+
+    if normalized.launchpad == "bagsapp" && normalized.bags.identityMode == "linked" {
+        if normalized.bags.authToken.is_empty() {
+            return Err(ConfigError::Message(
+                "Bags linked identity requires a valid auth token.".to_string(),
+            ));
+        }
+        if normalized.bags.identityVerifiedWallet.is_empty() {
+            return Err(ConfigError::Message(
+                "Bags linked identity requires a verified linked wallet.".to_string(),
+            ));
+        }
     }
 
     if mode == "regular" || mode == "cashback" {
@@ -1575,6 +1709,8 @@ mod tests {
                 "buyEndpointProfile": "global",
                 "buyAutoGas": true,
                 "buyAutoMode": "buyAuto",
+                "sellAutoGas": false,
+                "sellAutoMode": "sellAuto",
                 "sellProvider": "helius-sender",
                 "sellEndpointProfile": "global"
             },
@@ -1615,8 +1751,7 @@ mod tests {
         raw.execution.buyPolicy = "fast".to_string();
         raw.execution.sellPolicy = "safe".to_string();
 
-        let normalized =
-            normalize_raw_config(raw).expect("legacy policy fields should be ignored");
+        let normalized = normalize_raw_config(raw).expect("legacy policy fields should be ignored");
 
         assert_eq!(normalized.execution.provider, "helius-sender");
         assert_eq!(normalized.execution.buyProvider, "helius-sender");
@@ -1685,8 +1820,7 @@ mod tests {
             shareBps: Some(json!(10_000)),
         }];
 
-        let error =
-            normalize_raw_config(raw).expect_err("bonk should reject fee-sharing setup");
+        let error = normalize_raw_config(raw).expect_err("bonk should reject fee-sharing setup");
         assert_eq!(
             error.to_string(),
             "Bonk does not support fee-sharing setup yet."

@@ -1,86 +1,180 @@
 # Providers
 
+This page explains the current execution providers exposed in LaunchDeck, what they are good for, and the rules the engine enforces when you select them.
+
 ## Supported Provider IDs
 
 - `helius-sender`
 - `standard-rpc`
 - `jito-bundle`
 
-## User-Facing Labels
+User-facing labels:
 
 - `Helius Sender`
 - `Standard RPC`
 - `Jito Bundle`
 
-## Intent
+All three providers are active in the runtime registry, but `Helius Sender` is the current default recommendation for most operators.
 
-- `helius-sender`: low-latency Sender transport with strict Sender requirements
-- `standard-rpc`: explicit standard Solana RPC path
-- `jito-bundle`: bundle-oriented Jito path
+## How Provider Resolution Works
 
-## Current Runtime Behavior
+LaunchDeck lets you choose provider settings separately for:
 
-The app exposes provider availability and support state through `/api/status` and `/api/settings`.
+- creation
+- buy
+- sell
 
-The Rust host also includes provider and launchpad state in `/api/bootstrap`, so the browser can initialize directly from the same single-process backend that owns execution.
+From those selections, the engine resolves:
 
-The transport layer resolves:
+- the provider actually used
+- the execution class: `single`, `sequential`, or `bundle`
+- the transport type
+- endpoint or endpoint profile
+- send requirements such as tip, preflight behavior, and ordering
 
-- requested provider
-- resolved provider
-- execution class: `single`, `sequential`, or `bundle`
-- transport type
-- ordering
-- endpoint selection
-- send requirements
+The UI stores your intent. The engine decides final wire behavior.
 
-## Transport Rules
+## Provider Profiles
 
-### Helius Sender
+Only these providers support endpoint profiles:
 
-- recommended/default provider
-- requires inline tip
-- requires inline compute unit price
-- requires `skipPreflight=true`
-- requires `maxRetries=0`
-- hard-fails instead of silently downgrading
-- supports endpoint profiles: `Global`, `US`, `EU`, `West`, `Asia`
+- `Helius Sender`
+- `Jito Bundle`
 
-`Global` uses the global Sender endpoint.
+Supported profile values:
 
-Regional profiles resolve to the documented regional Sender hosts in ordered groups.
+- `global`
+- `us`
+- `eu`
+- `west`
+- `asia`
 
-Current send behavior fans out the same signed transaction across the endpoints in the selected profile group.
+When a profile is selected, LaunchDeck fans out across the endpoints in that profile group. It does not simply pick one endpoint.
 
-### Standard RPC
+For most operators, this is the recommended setup. Using `USER_REGION` or a provider-specific region override is usually faster and more reliable than pinning a single endpoint because the runtime can fan out across the region's endpoint group instead of depending on one host.
 
-- uses standard sequential Solana sending for dependent flows
+Region resolution order:
+
+1. provider-specific override such as `USER_REGION_HELIUS_SENDER`
+2. shared `USER_REGION`
+3. provider default or global fallback
+
+If you set explicit endpoint overrides, profile-based routing is bypassed. Use explicit endpoints only when you have a specific reason to force one host or one private integration.
+
+## Helius Sender
+
+`Helius Sender` is the default, fastest, and most reliable starting point in the current runtime for most operators.
+
+Use it when you want:
+
+- the main supported low-latency path
+- endpoint-profile support
+- predictable Sender-specific transport behavior
+- instant execution in typical low-latency setups
+
+How it works:
+
+- supports `single` execution
+- supports `sequential` execution
+- does not support bundle execution
+- supports endpoint profiles
+
+Required behavior:
+
+- inline tip is required
+- inline compute-unit price is required
+- `skipPreflight=true` is required
+- incompatible requests are rejected rather than silently downgraded
+
+Code-enforced requirements:
+
+- `execution.skipPreflight` must be `true`
+- `tx.computeUnitPriceMicroLamports` must be greater than `0`
+- `tx.jitoTipLamports` must be at least `200000`
+
+Practical note:
+
+- if `SOLANA_RPC_URL` is not configured, LaunchDeck can still use the default Sender endpoint, but you should set a dedicated confirmation RPC for real operation
+- in normal average-latency setups this is the provider we recommend first
+
+## Standard RPC
+
+`Standard RPC` is the plain Solana RPC path.
+
+Use it when you want:
+
+- the most conventional transport behavior
+- standard confirmation semantics
+- no Sender or bundle-specific requirements
+
+How it works:
+
+- supports `single` execution
+- supports `sequential` execution
+- does not support `bundle`
+- does not support endpoint profiles
 - does not use tip
-- keeps standard RPC confirmation behavior
 
-### Jito Bundle
+Practical note:
 
-- uses bundle send/status endpoints
-- keeps separate bundle-compatible tip behavior
+- this is the most predictable fallback if you want explicit RPC semantics, but it does not have Sender-specific low-latency behavior
+
+## Jito Bundle
+
+`Jito Bundle` is the bundle-oriented path.
+
+Use it when you want:
+
+- bundle submission semantics
+- bundle-specific tip behavior
+- regional Jito endpoint fanout
+
+How it works:
+
+- supports `single` execution
+- does not support `sequential`
+- supports `bundle`
+- supports endpoint profiles
+
+Practical note:
+
 - bundle members are treated as an ordered grouped send
-- supports endpoint profiles: `Global`, `US`, `EU`, `West`, `Asia`
-- current send behavior fans out bundle submission across every endpoint in the selected profile group
+- bundle submission is fanned out across the selected profile group when profiles are used
 
-## Engine vs UI
+## Upcoming Relay Integrations
 
-The UI lets the user express intent, but the engine is the source of truth for what gets applied.
+Additional private relay integrations are planned but not yet live in the current runtime.
+
+Current roadmap includes:
+
+- `bloxroute`
+- `astralane`
+- `hello moon`
+
+## Engine-Owned Overrides
+
+The provider selection is not a raw pass-through. The engine owns final shaping.
 
 Examples:
 
-- `Standard RPC` should not ask for or apply tip.
-- `Helius Sender` can reject a launch before send if Sender requirements are not satisfied.
-- `Jito Bundle` creation may accept both tip and priority in the UI, but the engine may intentionally drop creation priority for multi-transaction creation flows.
+- `standard-rpc` ignores tip even if an old preset still contains a tip value
+- `helius-sender` rejects incompatible requests instead of silently falling back
+- `jito-bundle` may accept both tip and priority in the UI, but the engine can intentionally drop creation priority in some multi-transaction creation flows
 
-This now happens fully inside the Rust host rather than through a separate Node-side bridge layer.
+This is by design. Operators should treat the provider as a routing intent, not a guarantee that every individual fee field will be applied exactly as typed.
 
-## Legacy Mapping
+## Availability And Bootstrap
 
-Older stored provider values are migrated into the current model:
+Provider availability is exposed through the runtime bootstrap and status APIs so the browser can initialize from the same backend that owns execution.
+
+The important operator takeaway is simple:
+
+- the UI reads provider availability from the Rust host
+- execution still happens according to runtime validation and transport planning
+
+## Legacy Provider Mapping
+
+Older saved provider values are migrated forward when settings are loaded:
 
 - `auto` -> `helius-sender`
 - `helius` -> `helius-sender`
@@ -88,3 +182,5 @@ Older stored provider values are migrated into the current model:
 - `astralane` -> `standard-rpc`
 - `bloxroute` -> `standard-rpc`
 - `hellomoon` -> `standard-rpc`
+
+These values should not be used as live provider IDs in current config.

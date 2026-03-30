@@ -3,8 +3,14 @@
 use serde_json::Value;
 
 use crate::{
+    bags_native::{
+        NativeBagsArtifacts,
+        compile_atomic_follow_buy_transaction as compile_atomic_bags_follow_buy,
+        quote_launch as quote_bags_launch, try_compile_native_bags,
+    },
     bonk_native::{
-        NativeBonkArtifacts, compile_atomic_follow_buy_transaction as compile_atomic_bonk_follow_buy,
+        NativeBonkArtifacts,
+        compile_atomic_follow_buy_transaction as compile_atomic_bonk_follow_buy,
         quote_launch as quote_bonk_launch, try_compile_native_bonk,
     },
     config::{NormalizedConfig, NormalizedExecution},
@@ -53,6 +59,19 @@ impl From<NativeBonkArtifacts> for NativeLaunchArtifacts {
     }
 }
 
+impl From<NativeBagsArtifacts> for NativeLaunchArtifacts {
+    fn from(value: NativeBagsArtifacts) -> Self {
+        Self {
+            compiled_transactions: value.compiled_transactions,
+            report: value.report,
+            text: value.text,
+            compile_timings: value.compile_timings,
+            mint: value.mint,
+            launch_creator: value.launch_creator,
+        }
+    }
+}
+
 pub async fn try_compile_native_launchpad(
     rpc_url: &str,
     config: &NormalizedConfig,
@@ -85,6 +104,17 @@ pub async fn try_compile_native_launchpad(
         )
         .await
         .map(|result| result.map(Into::into)),
+        "bagsapp" => try_compile_native_bags(
+            rpc_url,
+            config,
+            transport_plan,
+            wallet_secret,
+            built_at,
+            creator_public_key,
+            config_path,
+        )
+        .await
+        .map(|result| result.map(Into::into)),
         _ => Ok(None),
     }
 }
@@ -93,12 +123,14 @@ pub async fn quote_launch_for_launchpad(
     rpc_url: &str,
     launchpad: &str,
     quote_asset: &str,
+    launch_mode: &str,
     mode: &str,
     amount: &str,
 ) -> Result<Option<LaunchQuote>, String> {
     match launchpad {
         "pump" => quote_pump_launch(rpc_url, mode, amount).await,
-        "bonk" => quote_bonk_launch(rpc_url, quote_asset, mode, amount).await,
+        "bonk" => quote_bonk_launch(rpc_url, quote_asset, launch_mode, mode, amount).await,
+        "bagsapp" => quote_bags_launch(rpc_url, launch_mode, mode, amount).await,
         _ => Ok(None),
     }
 }
@@ -145,6 +177,23 @@ pub async fn compile_atomic_follow_buy_for_launchpad(
             )
             .await
         }
-        other => Err(format!("Unsupported launchpad for same-time sniper buys: {other}")),
+        "bagsapp" => {
+            compile_atomic_bags_follow_buy(
+                rpc_url,
+                launch_mode,
+                quote_asset,
+                execution,
+                token_mayhem_mode,
+                jito_tip_account,
+                wallet_secret,
+                mint,
+                launch_creator,
+                buy_amount_sol,
+            )
+            .await
+        }
+        other => Err(format!(
+            "Unsupported launchpad for same-time sniper buys: {other}"
+        )),
     }
 }

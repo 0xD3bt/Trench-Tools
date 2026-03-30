@@ -1,10 +1,27 @@
 # Launchpads
 
+This page documents the launchpads exposed in LaunchDeck and separates the supported paths from the experimental ones.
+
+## Support Summary
+
+### Supported
+
+- `pump`
+- `bonk`
+
+### Experimental
+
+- `bagsapp`
+
+If you want the most predictable path, start with Pump or Bonk before trying Bagsapp.
+
 ## Pump
 
-Pump is an active verified launch flow in `LaunchDeck`.
+Status: `supported`
 
-The current implementation supports:
+Pump is the most native launch path in LaunchDeck today.
+
+Supported modes:
 
 - `regular`
 - `cashback`
@@ -12,103 +29,141 @@ The current implementation supports:
 - `agent-unlocked`
 - `agent-locked`
 
-Current runtime notes for Pump:
+Current Pump characteristics:
 
-- the Rust engine builds these launch modes natively
-- launch transactions use measured versioned transaction selection rather than fixed legacy formatting
-- default lookup tables are warmed and persisted locally to reduce compile latency
-- agent launch modes keep `AgentInitialize` in the creation transaction when size allows, with follow-up transactions only where the flow still requires them
-- regular Pump launches with an immediate dev buy can include the expected Pump account-extension and Token-2022 ATA setup instructions before the buy executes
+- launch assembly is native Rust
+- transaction shaping is native Rust
+- versioned transaction choice is measured rather than hard-coded
+- default lookup tables are warmed and persisted locally
+- immediate dev-buy support can include the account extension and ATA setup needed before the buy path
 
-### Pump Mode Semantics
+### Pump Mode Guide
 
 #### `regular`
 
-- standard Pump token creation path
-- creator fee routing stays on the deployer unless deferred fee-sharing is explicitly enabled
-- may optionally include an immediate dev buy in the same launch transaction
+Use this for the standard Pump launch path.
+
+- normal Pump creation flow
+- creator fee stays on the deployer by default
+- can include an immediate dev buy
+- can optionally generate later fee-sharing setup
 
 #### `cashback`
 
+Use this for the Pump cashback creation variant.
+
 - same core creation flow as `regular`
-- creation marks cashback behavior in the Pump `CreateV2` payload
-- deferred fee-sharing follow-up can still be generated when configured
+- cashback behavior is marked in the Pump creation payload
+- later fee-sharing setup can still be used when configured
 
 #### `agent-unlocked`
 
-- initializes the agent during the creation transaction
-- keeps creator reward distribution untouched on launch
-- does not generate an agent follow-up transaction
-- buyback percentage is configurable and not hard-forced to `100%`
+Use this when you want an agent launch without a later agent setup transaction.
+
+- agent is initialized during creation
+- creator rewards are not rerouted into the locked escrow model
+- no follow-up `agent-setup` transaction is emitted
+- `buybackBps` is required
 
 #### `agent-custom`
 
-- initializes the agent during the creation transaction
-- defers final custom reward distribution setup to a follow-up `agent-setup` transaction
-- follow-up applies the configured recipient split after launch
+Use this when you want a custom post-launch recipient setup.
+
+- agent is initialized during creation
+- final custom recipient setup is deferred to `agent-setup`
+- the follow-up applies the configured recipient split
+- `buybackBps` is required
 
 #### `agent-locked`
 
-- initializes the agent during the creation transaction
-- locks creator rewards to the agent payments escrow model
-- emits a follow-up `agent-setup` transaction for the final fee-sharing setup path
+Use this when you want the locked agent escrow path.
 
-### Transaction Shape By Mode
+- agent is initialized during creation
+- creator rewards route through the locked escrow model
+- a follow-up `agent-setup` transaction is emitted
+- `buybackBps` is required
 
-The current verified native Pump path uses these high-level transaction shapes:
+### Pump Restrictions And Rules
 
-- `regular` / `cashback`
-  - one launch transaction by default
-  - optional deferred `follow-up` transaction only when `generateLaterSetup` fee sharing is enabled
-- `agent-unlocked`
-  - one launch transaction only
-- `agent-custom`
-  - launch transaction
-  - `agent-setup` follow-up transaction for custom recipient setup
-- `agent-locked`
-  - launch transaction
-  - `agent-setup` follow-up transaction for locked agent escrow fee setup
-
-When a Pump launch also includes an immediate dev buy, the launch transaction can additionally include:
-
-- Pump `ExtendAccount`
-- Token-2022 associated token account creation via `create_associated_token_account_idempotent`
-- Pump `Buy`
+- `feeSharing.generateLaterSetup` is supported only in `regular`
+- later fee-sharing setup requires fee recipients
+- fee-sharing recipients must total `10000` bps
+- agent modes require `buybackBps`
 
 ## Bonk
 
-Bonk is an active verified launch target.
+Status: `supported`
 
-Current Bonk coverage:
+Supported Bonk coverage:
 
 - `regular`
 - `bonkers`
-- `sol` quote asset
-- `usd1` quote asset with automatic SOL -> USD1 top-up when needed
+- quote asset `sol`
+- quote asset `usd1`
 - immediate dev buy
 - same-time sniper buys
-- follow buys
-- follow sells
+- snipe buys
+- snipe sells
 - automatic dev sell
 
-Current runtime notes for Bonk:
+Current Bonk characteristics:
 
-- the Rust engine owns Bonk validation, transport planning, reporting, simulation/send orchestration, and follow-daemon integration
-- Bonk launch assembly uses the Raydium LaunchLab SDK-backed helper bridge
+- validation, transport planning, reporting, simulation, and send orchestration are Rust-owned
+- launch assembly uses the Raydium LaunchLab-backed helper bridge
 - `regular` routes through LetsBonk
-- `bonkers` routes through the Bonkers platform config on Raydium LaunchLab
-- same-time Bonk sniper buys use a non-bundle safeguard so the launch tx lands before the buy path is sent
-- `usd1` mode prefers Raydium route-based top-up handling before Bonk buys when the wallet is short on USD1
+- `bonkers` routes through the Bonkers path on Raydium LaunchLab
+- `usd1` uses a pinned Raydium `SOL -> USD1` route pool for top-up behavior when the wallet needs USD1 before buying
+- `usd1` same-time sniper buys are assembled as atomic swap-and-buy transactions
+- same-time buys use launch-first safeguards so the buy path does not outrun the creation path
+- immediate dev buy on `usd1` attempts atomic launch-plus-buy assembly and can fall back to split transactions if the combined message is too large
 
-Current Bonk restrictions:
+### Bonk Restrictions
 
+- only `regular` and `bonkers` are supported
 - Pump-only modes such as `cashback`, `agent-custom`, `agent-unlocked`, and `agent-locked` are rejected
 - fee-sharing setup is rejected
 - `mayhem` is rejected
-- per-sniper `postBuySell` chaining is not shipped yet
+- per-sniper `postBuySell` chaining is not supported yet
 
 ## Bagsapp
 
-Bagsapp is not active in the current initial version.
+Status: `experimental`
 
-Do not treat Bagsapp as a supported launch target yet.
+Bagsapp is available when Bags credentials are configured, but it is still experimental in this repo.
+
+Current Bags behavior includes:
+
+- `bags-2-2`
+- `bags-025-1`
+- `bags-1-025`
+- quote asset `sol`
+- wallet-only identity
+- linked identity when the selected LaunchDeck wallet belongs to the authenticated Bags account
+- immediate dev buy
+- same-time sniper buys
+- snipe buys
+- snipe sells
+- automatic dev sell
+- LaunchDeck fee-split UI mapped into Bags fee-claimer rows
+
+Current Bags characteristics:
+
+- launch assembly uses the hosted Bags API or SDK bridge
+- linked identity is validated against the selected LaunchDeck wallet
+- same-time buy compilation is deferred until after launch submission so the trade route can resolve against the live mint
+- history persists the identity mode and display name, but not sensitive auth material
+
+### Bags Restrictions
+
+- `sol` is the only current quote asset
+- Pump-only modes are rejected
+- `mayhem` is rejected
+- creator fee must remain the deployer wallet
+
+## Launchpad Choice Guidance
+
+Choose `pump` if you want the most native LaunchDeck path.
+
+Choose `bonk` if you want the supported Bonk and Bonkers path, including `usd1` and follow automation.
+
+Choose `bagsapp` only if you are comfortable using an experimental path.

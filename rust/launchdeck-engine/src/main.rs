@@ -1,7 +1,9 @@
+mod bags_native;
+mod bonk_native;
 mod config;
 mod follow;
+mod fs_utils;
 mod image_library;
-mod bonk_native;
 mod launchpad_dispatch;
 mod launchpads;
 mod observability;
@@ -20,15 +22,18 @@ mod vamp;
 mod wallet;
 
 use crate::{
-    bonk_native::compile_sol_to_usd1_topup_transaction,
+    bags_native::{
+        PreparedBagsSendArtifacts, compile_launch_transaction as compile_bags_launch_transaction,
+        prepare_native_bags_send, summarize_transactions as summarize_bags_transactions,
+    },
     config::{NormalizedConfig, NormalizedFollowLaunch, RawConfig, normalize_raw_config},
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
         FollowJobResponse, FollowReadyRequest, FollowReserveRequest,
     },
+    fs_utils::atomic_write,
     image_library::{
-        build_image_library_payload, create_category, delete_image, save_image_bytes,
-        update_image,
+        build_image_library_payload, create_category, delete_image, save_image_bytes, update_image,
     },
     launchpad_dispatch::{
         compile_atomic_follow_buy_for_launchpad, quote_launch_for_launchpad,
@@ -39,15 +44,15 @@ use crate::{
         log_event, new_trace_context, persist_launch_report, update_persisted_launch_report,
     },
     providers::{provider_availability_registry, provider_registry},
-    pump_native::{
-        warm_default_lookup_tables, warm_pump_global_state,
-    },
+    pump_native::{warm_default_lookup_tables, warm_pump_global_state},
     report::{LaunchReport, build_report, render_report},
     reports_browser::{list_persisted_reports, read_persisted_report_bundle},
     rpc::{
-        CompiledTransaction, confirm_submitted_transactions_for_transport, simulate_transactions,
-        spawn_blockhash_refresh_task, submit_independent_transactions_for_transport,
-        submit_transactions_for_transport,
+        CompiledTransaction, confirm_submitted_transactions_for_transport,
+        confirm_transactions_with_websocket_fallback, send_transactions_bundle,
+        simulate_transactions, spawn_blockhash_refresh_task,
+        submit_independent_transactions_for_transport, submit_transactions_for_transport,
+        submit_transactions_sequential,
     },
     runtime::{
         RuntimeRegistry, RuntimeRequest, RuntimeResponse, fail_worker, heartbeat_worker,
@@ -82,6 +87,7 @@ use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    fs,
     net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -138,6 +144,64 @@ struct SettingsSaveRequest {
     config: Option<Value>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct BagsStoredCredentials {
+    #[serde(default)]
+    #[serde(rename = "apiKey")]
+    api_key: String,
+    #[serde(default)]
+    #[serde(rename = "authToken")]
+    auth_token: String,
+    #[serde(default)]
+    #[serde(rename = "agentUsername")]
+    agent_username: String,
+    #[serde(default)]
+    #[serde(rename = "verifiedWallet")]
+    verified_wallet: String,
+}
+
+#[derive(Deserialize, Default)]
+struct BagsIdentityInitRequest {
+    #[serde(default)]
+    #[serde(rename = "apiKey")]
+    api_key: String,
+    #[serde(default)]
+    #[serde(rename = "saveApiKey")]
+    save_api_key: bool,
+    #[serde(default)]
+    #[serde(rename = "agentUsername")]
+    agent_username: String,
+}
+
+#[derive(Deserialize, Default)]
+struct BagsIdentityVerifyRequest {
+    #[serde(default)]
+    #[serde(rename = "apiKey")]
+    api_key: String,
+    #[serde(default)]
+    #[serde(rename = "saveApiKey")]
+    save_api_key: bool,
+    #[serde(default)]
+    #[serde(rename = "agentUsername")]
+    agent_username: String,
+    #[serde(default)]
+    #[serde(rename = "publicIdentifier")]
+    public_identifier: String,
+    #[serde(default)]
+    secret: String,
+    #[serde(default)]
+    #[serde(rename = "postId")]
+    post_id: String,
+    #[serde(default)]
+    #[serde(rename = "walletEnvKey")]
+    wallet_env_key: String,
+}
+
+#[derive(Deserialize, Default)]
+struct BagsIdentityStatusQuery {
+    wallet: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 struct ReportsQuery {
     sort: Option<String>,
@@ -152,6 +216,7 @@ struct ReportViewQuery {
 struct QuoteQuery {
     launchpad: Option<String>,
     quoteAsset: Option<String>,
+    launchMode: Option<String>,
     mode: Option<String>,
     amount: Option<String>,
 }
@@ -369,7 +434,10 @@ fn cache_control_for_path(path: &std::path::Path) -> &'static str {
     if path.to_string_lossy().contains("uploads") {
         return "public, max-age=86400";
     }
-    if matches!(extension.as_str(), "js" | "css" | "svg" | "png" | "jpg" | "jpeg" | "webp" | "gif") {
+    if matches!(
+        extension.as_str(),
+        "js" | "css" | "svg" | "png" | "jpg" | "jpeg" | "webp" | "gif"
+    ) {
         return "no-cache";
     }
     "no-store"
@@ -455,6 +523,19 @@ fn append_execution_warning(report: &mut Value, warning: &str) {
     execution["warnings"] = Value::Array(existing_warnings);
 }
 
+fn append_execution_note(report: &mut Value, note: &str) {
+    let Some(execution) = report.get_mut("execution") else {
+        return;
+    };
+    let mut existing_notes = execution
+        .get("notes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    existing_notes.push(Value::String(note.to_string()));
+    execution["notes"] = Value::Array(existing_notes);
+}
+
 fn set_report_timing(report: &mut Value, key: &str, value_ms: u128) {
     if let Some(execution) = report.get_mut("execution") {
         if execution.get("timings").is_none()
@@ -516,11 +597,18 @@ fn attach_follow_daemon_report(
     transport: Option<&str>,
     reserved: Option<&FollowJobResponse>,
     armed: Option<&FollowJobResponse>,
+    latest: Option<&FollowJobResponse>,
+    original_follow_launch: Option<&NormalizedFollowLaunch>,
 ) {
-    let latest = armed.or(reserved);
-    let job = latest.and_then(|response| response.job.clone());
-    let health = latest.map(|response| response.health.clone());
-    let timing_profiles = latest
+    let latest_response = latest.or(armed).or(reserved);
+    let mut job = latest_response.and_then(|response| response.job.clone());
+    if let Some(job_record) = job.as_mut()
+        && let Some(original_follow_launch) = original_follow_launch
+    {
+        job_record.followLaunch = original_follow_launch.clone();
+    }
+    let health = latest_response.map(|response| response.health.clone());
+    let timing_profiles = latest_response
         .map(|response| response.timingProfiles.clone())
         .unwrap_or_default();
     report["followDaemon"] = json!({
@@ -537,7 +625,10 @@ fn attach_follow_daemon_report(
 
 fn split_same_time_snipes(
     follow_launch: &NormalizedFollowLaunch,
-) -> (Vec<crate::config::NormalizedFollowLaunchSnipe>, NormalizedFollowLaunch) {
+) -> (
+    Vec<crate::config::NormalizedFollowLaunchSnipe>,
+    NormalizedFollowLaunch,
+) {
     let mut same_time = Vec::new();
     let mut deferred = follow_launch.clone();
     deferred.snipes = follow_launch
@@ -628,17 +719,470 @@ fn format_lamports_to_sol_decimal(value: u64) -> String {
     format!("{whole}.{fractional_text}")
 }
 
-fn apply_same_time_creation_fee_guard(normalized: &mut NormalizedConfig) -> Option<String> {
-    if !has_same_time_snipes(&normalized.followLaunch) {
+const HELIUS_SENDER_TIP_ACCOUNTS: [&str; 10] = [
+    "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+    "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+    "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
+    "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+    "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+    "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
+    "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
+    "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+    "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+    "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
+];
+const JITO_TIP_ACCOUNTS: [&str; 8] = [
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+];
+const DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL: &str = "veryhigh";
+const DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE: &str = "p99";
+
+#[derive(Debug, Default, Clone)]
+struct FeeMarketSnapshot {
+    helius_priority_lamports: Option<u64>,
+    jito_tip_p99_lamports: Option<u64>,
+}
+
+fn auto_fee_helius_priority_level() -> String {
+    let value = std::env::var("LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL")
+        .unwrap_or_else(|_| DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL.to_string());
+    let trimmed = value.trim().to_lowercase();
+    match trimmed.as_str() {
+        "none" | "low" | "medium" | "high" => trimmed,
+        "veryhigh" | "very_high" | "very-high" => "veryHigh".to_string(),
+        "unsafemax" | "unsafe_max" | "unsafe-max" => "unsafeMax".to_string(),
+        "recommended" => "recommended".to_string(),
+        _ => "veryHigh".to_string(),
+    }
+}
+
+fn auto_fee_jito_tip_percentile() -> String {
+    let value = std::env::var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE")
+        .unwrap_or_else(|_| DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE.to_string());
+    let trimmed = value.trim().to_lowercase();
+    match trimmed.as_str() {
+        "p25" | "25" | "25th" => "p25".to_string(),
+        "p50" | "50" | "50th" | "median" => "p50".to_string(),
+        "p75" | "75" | "75th" => "p75".to_string(),
+        "p95" | "95" | "95th" => "p95".to_string(),
+        "p99" | "99" | "99th" => "p99".to_string(),
+        _ => DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE.to_string(),
+    }
+}
+
+fn lamports_to_priority_fee_micro_lamports(priority_fee_lamports: u64) -> u64 {
+    if priority_fee_lamports == 0 {
+        0
+    } else {
+        priority_fee_lamports
+    }
+}
+
+fn pick_tip_account_for_provider(provider: &str) -> String {
+    match provider.trim() {
+        "helius-sender" => HELIUS_SENDER_TIP_ACCOUNTS[0].to_string(),
+        "jito-bundle" => JITO_TIP_ACCOUNTS[0].to_string(),
+        _ => String::new(),
+    }
+}
+
+fn normalize_estimate_to_lamports(value: Option<&Value>) -> Option<u64> {
+    let numeric = match value {
+        Some(Value::Number(raw)) => raw.as_f64()?,
+        Some(Value::String(raw)) => raw.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !numeric.is_finite() || numeric <= 0.0 {
         return None;
     }
-    let creation_priority = parse_sol_decimal_to_lamports(&normalized.execution.priorityFeeSol)?;
-    let buy_priority = parse_sol_decimal_to_lamports(&normalized.execution.buyPriorityFeeSol)?;
-    let creation_tip = parse_sol_decimal_to_lamports(&normalized.execution.tipSol)?;
-    let buy_tip = parse_sol_decimal_to_lamports(&normalized.execution.buyTipSol)?;
+    let lamports = if numeric < 1.0 {
+        (numeric * 1_000_000_000.0).round()
+    } else {
+        numeric.round()
+    };
+    if lamports <= 0.0 {
+        None
+    } else {
+        Some(lamports as u64)
+    }
+}
+
+fn parse_auto_fee_cap_lamports(value: &str) -> Option<u64> {
+    parse_sol_decimal_to_lamports(value).filter(|lamports| *lamports > 0)
+}
+
+fn cap_auto_fee_lamports(estimate_lamports: u64, cap_lamports: Option<u64>) -> u64 {
+    match cap_lamports {
+        Some(cap) if cap > 0 => estimate_lamports.min(cap),
+        _ => estimate_lamports,
+    }
+}
+
+async fn fetch_fee_market_snapshot(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
+    let helius_priority_level = auto_fee_helius_priority_level();
+    let jito_tip_percentile = auto_fee_jito_tip_percentile();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let helius_options = if helius_priority_level == "recommended" {
+        json!({
+            "recommended": true
+        })
+    } else {
+        json!({
+            "includeAllPriorityFeeLevels": true
+        })
+    };
+    let helius_request = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": "launchdeck-helius-priority-estimate",
+            "method": "getPriorityFeeEstimate",
+            "params": [{
+                "options": helius_options
+            }]
+        }))
+        .send();
+    let jito_request = client
+        .get("https://bundles.jito.wtf/api/v1/bundles/tip_floor")
+        .send();
+    let (helius_response, jito_response) = tokio::join!(helius_request, jito_request);
+
+    let helius_priority_lamports = match helius_response {
+        Ok(response) => {
+            let payload = response
+                .json::<Value>()
+                .await
+                .map_err(|error| format!("Failed to decode Helius fee estimate: {error}"))?;
+            if let Some(error) = payload.get("error") {
+                return Err(format!("Helius priority estimate failed: {error}"));
+            }
+            let result = payload.get("result").unwrap_or(&payload);
+            normalize_estimate_to_lamports(
+                match helius_priority_level.as_str() {
+                    "recommended" => result
+                        .get("priorityFeeEstimate")
+                        .or_else(|| result.get("recommended")),
+                    selected_level => result
+                        .get("priorityFeeLevels")
+                        .and_then(|levels| levels.get(selected_level)),
+                }
+                    .or_else(|| {
+                        result
+                            .get("priorityFeeLevels")
+                            .and_then(|levels| levels.get("veryHigh"))
+                    })
+                    .or_else(|| {
+                        result
+                            .get("priorityFeeEstimate")
+                            .or_else(|| result.get("recommended"))
+                    })
+                    .or_else(|| {
+                        result
+                            .get("priorityFeeLevels")
+                            .and_then(|levels| levels.get("high"))
+                    }),
+            )
+        }
+        Err(error) => return Err(format!("Helius priority estimate request failed: {error}")),
+    };
+
+    let jito_tip_p99_lamports = match jito_response {
+        Ok(response) => {
+            let payload = response
+                .json::<Value>()
+                .await
+                .map_err(|error| format!("Failed to decode Jito tip floor: {error}"))?;
+            let sample = payload
+                .as_array()
+                .and_then(|entries| entries.first())
+                .unwrap_or(&payload);
+            normalize_estimate_to_lamports(
+                match jito_tip_percentile.as_str() {
+                    "p25" => sample
+                        .get("p25")
+                        .or_else(|| sample.get("percentile25"))
+                        .or_else(|| sample.get("tipFloor25"))
+                        .or_else(|| sample.get("landed_tips_25th_percentile")),
+                    "p50" => sample
+                        .get("p50")
+                        .or_else(|| sample.get("percentile50"))
+                        .or_else(|| sample.get("tipFloor50"))
+                        .or_else(|| sample.get("landed_tips_50th_percentile")),
+                    "p75" => sample
+                        .get("p75")
+                        .or_else(|| sample.get("percentile75"))
+                        .or_else(|| sample.get("tipFloor75"))
+                        .or_else(|| sample.get("landed_tips_75th_percentile")),
+                    "p95" => sample
+                        .get("p95")
+                        .or_else(|| sample.get("percentile95"))
+                        .or_else(|| sample.get("tipFloor95"))
+                        .or_else(|| sample.get("landed_tips_95th_percentile")),
+                    _ => sample
+                        .get("p99")
+                        .or_else(|| sample.get("percentile99"))
+                        .or_else(|| sample.get("tipFloor99"))
+                        .or_else(|| sample.get("landed_tips_99th_percentile")),
+                },
+            )
+        }
+        Err(error) => return Err(format!("Jito tip floor request failed: {error}")),
+    };
+
+    Ok(FeeMarketSnapshot {
+        helius_priority_lamports,
+        jito_tip_p99_lamports,
+    })
+}
+
+async fn resolve_auto_execution_fees(
+    rpc_url: &str,
+    normalized: &mut NormalizedConfig,
+    transport_plan: &crate::transport::TransportPlan,
+) -> Result<Vec<String>, String> {
+    let needs_auto = normalized.execution.autoGas
+        || normalized.execution.buyAutoGas
+        || normalized.execution.sellAutoGas;
+    if !needs_auto {
+        return Ok(vec![]);
+    }
+    let market = fetch_fee_market_snapshot(rpc_url).await?;
+    let mut notes = Vec::new();
+
+    if normalized.execution.autoGas {
+        let cap_lamports = parse_auto_fee_cap_lamports(
+            if !normalized.execution.maxPriorityFeeSol.trim().is_empty() {
+                &normalized.execution.maxPriorityFeeSol
+            } else {
+                &normalized.execution.maxTipSol
+            },
+        );
+        let provider = normalized.execution.provider.as_str();
+        let uses_priority = match provider {
+            "standard-rpc" => true,
+            "helius-sender" => true,
+            "jito-bundle" => transport_plan.executionClass != "bundle",
+            _ => true,
+        };
+        let uses_tip = matches!(provider, "helius-sender")
+            || (provider == "jito-bundle");
+
+        if uses_priority {
+            let estimated = market.helius_priority_lamports.ok_or_else(|| {
+                "Creation auto fee is enabled but no Helius priority estimate was returned."
+                    .to_string()
+            })?;
+            let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
+            normalized.execution.priorityFeeSol = format_lamports_to_sol_decimal(resolved);
+            normalized.tx.computeUnitPriceMicroLamports =
+                Some(lamports_to_priority_fee_micro_lamports(resolved) as i64);
+        } else {
+            normalized.execution.priorityFeeSol.clear();
+            normalized.tx.computeUnitPriceMicroLamports = Some(0);
+        }
+
+        if uses_tip {
+            let estimated = market.jito_tip_p99_lamports.ok_or_else(|| {
+                "Creation auto fee is enabled but no Jito tip estimate was returned.".to_string()
+            })?;
+            let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
+            if provider == "helius-sender" && resolved > 0 && resolved < 200_000 {
+                if cap_lamports.is_some() && cap_lamports.unwrap_or_default() < 200_000 {
+                    return Err(
+                        "Creation max auto fee is below the Helius Sender minimum tip of 0.0002 SOL."
+                            .to_string(),
+                    );
+                }
+                resolved = 200_000;
+            }
+            normalized.execution.tipSol = format_lamports_to_sol_decimal(resolved);
+            normalized.tx.jitoTipLamports = resolved as i64;
+            normalized.tx.jitoTipAccount = pick_tip_account_for_provider(provider);
+        } else {
+            normalized.execution.tipSol.clear();
+            normalized.tx.jitoTipLamports = 0;
+            normalized.tx.jitoTipAccount.clear();
+        }
+
+        notes.push(format!(
+            "Creation auto fee resolved{}: priority={} SOL | tip={} SOL",
+            cap_lamports
+                .map(|cap| format!(" with cap {} SOL", format_lamports_to_sol_decimal(cap)))
+                .unwrap_or_default(),
+            if normalized.execution.priorityFeeSol.trim().is_empty() {
+                "off".to_string()
+            } else {
+                normalized.execution.priorityFeeSol.clone()
+            },
+            if normalized.execution.tipSol.trim().is_empty() {
+                "off".to_string()
+            } else {
+                normalized.execution.tipSol.clone()
+            }
+        ));
+    }
+
+    if normalized.execution.buyAutoGas {
+        let cap_lamports = parse_auto_fee_cap_lamports(
+            if !normalized.execution.buyMaxPriorityFeeSol.trim().is_empty() {
+                &normalized.execution.buyMaxPriorityFeeSol
+            } else {
+                &normalized.execution.buyMaxTipSol
+            },
+        );
+        let provider = normalized.execution.buyProvider.as_str();
+        let uses_priority = provider != "jito-bundle" || true;
+        let uses_tip = provider == "helius-sender" || provider == "jito-bundle";
+
+        if uses_priority {
+            let estimated = market.helius_priority_lamports.ok_or_else(|| {
+                "Buy auto fee is enabled but no Helius priority estimate was returned.".to_string()
+            })?;
+            let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
+            normalized.execution.buyPriorityFeeSol = format_lamports_to_sol_decimal(resolved);
+        } else {
+            normalized.execution.buyPriorityFeeSol.clear();
+        }
+
+        if uses_tip {
+            let estimated = market.jito_tip_p99_lamports.ok_or_else(|| {
+                "Buy auto fee is enabled but no Jito tip estimate was returned.".to_string()
+            })?;
+            let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
+            if provider == "helius-sender" && resolved > 0 && resolved < 200_000 {
+                if cap_lamports.is_some() && cap_lamports.unwrap_or_default() < 200_000 {
+                    return Err(
+                        "Buy max auto fee is below the Helius Sender minimum tip of 0.0002 SOL."
+                            .to_string(),
+                    );
+                }
+                resolved = 200_000;
+            }
+            normalized.execution.buyTipSol = format_lamports_to_sol_decimal(resolved);
+        } else {
+            normalized.execution.buyTipSol.clear();
+        }
+
+        notes.push(format!(
+            "Buy auto fee resolved{}: priority={} SOL | tip={} SOL",
+            cap_lamports
+                .map(|cap| format!(" with cap {} SOL", format_lamports_to_sol_decimal(cap)))
+                .unwrap_or_default(),
+            if normalized.execution.buyPriorityFeeSol.trim().is_empty() {
+                "off".to_string()
+            } else {
+                normalized.execution.buyPriorityFeeSol.clone()
+            },
+            if normalized.execution.buyTipSol.trim().is_empty() {
+                "off".to_string()
+            } else {
+                normalized.execution.buyTipSol.clone()
+            }
+        ));
+    }
+
+    if normalized.execution.sellAutoGas {
+        let cap_lamports = parse_auto_fee_cap_lamports(
+            if !normalized.execution.sellMaxPriorityFeeSol.trim().is_empty() {
+                &normalized.execution.sellMaxPriorityFeeSol
+            } else {
+                &normalized.execution.sellMaxTipSol
+            },
+        );
+        let provider = normalized.execution.sellProvider.as_str();
+        let uses_priority = provider != "jito-bundle" || true;
+        let uses_tip = provider == "helius-sender" || provider == "jito-bundle";
+
+        if uses_priority {
+            let estimated = market.helius_priority_lamports.ok_or_else(|| {
+                "Sell auto fee is enabled but no Helius priority estimate was returned."
+                    .to_string()
+            })?;
+            let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
+            normalized.execution.sellPriorityFeeSol = format_lamports_to_sol_decimal(resolved);
+        } else {
+            normalized.execution.sellPriorityFeeSol.clear();
+        }
+
+        if uses_tip {
+            let estimated = market.jito_tip_p99_lamports.ok_or_else(|| {
+                "Sell auto fee is enabled but no Jito tip estimate was returned.".to_string()
+            })?;
+            let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
+            if provider == "helius-sender" && resolved > 0 && resolved < 200_000 {
+                if cap_lamports.is_some() && cap_lamports.unwrap_or_default() < 200_000 {
+                    return Err(
+                        "Sell max auto fee is below the Helius Sender minimum tip of 0.0002 SOL."
+                            .to_string(),
+                    );
+                }
+                resolved = 200_000;
+            }
+            normalized.execution.sellTipSol = format_lamports_to_sol_decimal(resolved);
+        } else {
+            normalized.execution.sellTipSol.clear();
+        }
+
+        notes.push(format!(
+            "Sell auto fee resolved{}: priority={} SOL | tip={} SOL",
+            cap_lamports
+                .map(|cap| format!(" with cap {} SOL", format_lamports_to_sol_decimal(cap)))
+                .unwrap_or_default(),
+            if normalized.execution.sellPriorityFeeSol.trim().is_empty() {
+                "off".to_string()
+            } else {
+                normalized.execution.sellPriorityFeeSol.clone()
+            },
+            if normalized.execution.sellTipSol.trim().is_empty() {
+                "off".to_string()
+            } else {
+                normalized.execution.sellTipSol.clone()
+            }
+        ));
+    }
+
+    Ok(notes)
+}
+
+fn apply_same_time_creation_fee_guard(
+    normalized: &mut NormalizedConfig,
+) -> Result<Option<String>, String> {
+    if !has_same_time_snipes(&normalized.followLaunch) {
+        return Ok(None);
+    }
+    let creation_priority = parse_sol_decimal_to_lamports(&normalized.execution.priorityFeeSol)
+        .ok_or_else(|| "Invalid creation priority fee while applying same-time guard.".to_string())?;
+    let buy_priority = parse_sol_decimal_to_lamports(&normalized.execution.buyPriorityFeeSol)
+        .ok_or_else(|| "Invalid buy priority fee while applying same-time guard.".to_string())?;
+    let creation_tip = parse_sol_decimal_to_lamports(&normalized.execution.tipSol)
+        .ok_or_else(|| "Invalid creation tip while applying same-time guard.".to_string())?;
+    let buy_tip = parse_sol_decimal_to_lamports(&normalized.execution.buyTipSol)
+        .ok_or_else(|| "Invalid buy tip while applying same-time guard.".to_string())?;
     let mut adjusted_fields = Vec::new();
     if creation_priority <= buy_priority {
         let next_priority = buy_priority.saturating_add(1);
+        if normalized.execution.autoGas {
+            if let Some(cap_lamports) =
+                parse_auto_fee_cap_lamports(&normalized.execution.maxPriorityFeeSol)
+            {
+                if next_priority > cap_lamports {
+                    return Err(
+                        "Same-time sniper safeguard needs a higher launch priority fee than your Creation max auto fee allows."
+                            .to_string(),
+                    );
+                }
+            }
+        }
         let next_priority_text = format_lamports_to_sol_decimal(next_priority);
         normalized.execution.priorityFeeSol = next_priority_text.clone();
         normalized.execution.maxPriorityFeeSol = next_priority_text;
@@ -646,6 +1190,17 @@ fn apply_same_time_creation_fee_guard(normalized: &mut NormalizedConfig) -> Opti
     }
     if creation_tip <= buy_tip {
         let next_tip = buy_tip.saturating_add(1);
+        if normalized.execution.autoGas {
+            if let Some(cap_lamports) = parse_auto_fee_cap_lamports(&normalized.execution.maxTipSol)
+            {
+                if next_tip > cap_lamports {
+                    return Err(
+                        "Same-time sniper safeguard needs a higher launch tip than your Creation max auto fee allows."
+                            .to_string(),
+                    );
+                }
+            }
+        }
         let next_tip_text = format_lamports_to_sol_decimal(next_tip);
         normalized.execution.tipSol = next_tip_text.clone();
         normalized.execution.maxTipSol = next_tip_text;
@@ -653,12 +1208,12 @@ fn apply_same_time_creation_fee_guard(normalized: &mut NormalizedConfig) -> Opti
         adjusted_fields.push("tip");
     }
     if adjusted_fields.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(format!(
+        Ok(Some(format!(
             "Same-time sniper safeguard raised launch {} above same-time buy fees.",
             adjusted_fields.join(" and ")
-        ))
+        )))
     }
 }
 
@@ -671,26 +1226,6 @@ async fn compile_same_time_snipes(
 ) -> Result<Vec<CompiledTransaction>, String> {
     let tasks = snipes.iter().enumerate().map(|(index, snipe)| async move {
         let wallet_secret = load_solana_wallet_by_env_key(&snipe.walletEnvKey)?;
-        let mut compiled = Vec::new();
-        if normalized.launchpad == "bonk" && normalized.quoteAsset == "usd1" {
-            if let Some(mut topup_tx) = compile_sol_to_usd1_topup_transaction(
-                rpc_url,
-                &normalized.execution,
-                &normalized.tx.jitoTipAccount,
-                &wallet_secret,
-                &snipe.buyAmountSol,
-                &format!("sniper-topup-{}", index + 1),
-            )
-            .await?
-            {
-                topup_tx.label = format!(
-                    "sniper-topup-{}-wallet-{}",
-                    index + 1,
-                    same_time_wallet_label(&snipe.walletEnvKey)
-                );
-                compiled.push(topup_tx);
-            }
-        }
         let mut tx = compile_atomic_follow_buy_for_launchpad(
             &normalized.launchpad,
             &normalized.mode,
@@ -710,8 +1245,7 @@ async fn compile_same_time_snipes(
             index + 1,
             same_time_wallet_label(&snipe.walletEnvKey)
         );
-        compiled.push(tx);
-        Ok::<Vec<CompiledTransaction>, String>(compiled)
+        Ok::<Vec<CompiledTransaction>, String>(vec![tx])
     });
     join_all(tasks)
         .await
@@ -726,7 +1260,8 @@ async fn build_status_payload(
     strict_wallet_selection: bool,
 ) -> Result<Value, String> {
     let mut payload = build_bootstrap_fast_payload(requested_wallet, strict_wallet_selection)?;
-    let wallet_status = build_wallet_status_payload(requested_wallet, strict_wallet_selection).await?;
+    let wallet_status =
+        build_wallet_status_payload(requested_wallet, strict_wallet_selection).await?;
     let runtime_status = build_runtime_status_payload(state).await;
     payload["rpcUrl"] = wallet_status
         .get("rpcUrl")
@@ -787,10 +1322,7 @@ fn resolve_selected_wallet_key(
             .iter()
             .any(|wallet| wallet.envKey == requested_wallet);
     if strict_wallet_selection && !requested_wallet_is_known {
-        return Err(format!(
-            "Unknown wallet env key: {}",
-            requested_wallet
-        ));
+        return Err(format!("Unknown wallet env key: {}", requested_wallet));
     }
     Ok(selected_wallet_key_or_default_from_wallets(
         if requested_wallet_is_known {
@@ -863,10 +1395,8 @@ async fn build_wallet_status_payload(
 }
 
 async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
-    let (runtime_workers, follow_daemon) = tokio::join!(
-        list_workers(&state.runtime),
-        follow_daemon_status_payload(),
-    );
+    let (runtime_workers, follow_daemon) =
+        tokio::join!(list_workers(&state.runtime), follow_daemon_status_payload(),);
     json!({
         "ok": true,
         "service": "launchdeck-engine",
@@ -1028,7 +1558,6 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
-    let same_time_fee_guard_warning = apply_same_time_creation_fee_guard(&mut normalized);
     let normalize_config_ms = current_time_ms().saturating_sub(normalize_started_ms);
     log_event(
         "engine_action_received",
@@ -1088,6 +1617,35 @@ async fn execute_engine_action_payload(
         &normalized.execution,
         estimate_transaction_count(&normalized),
     );
+    let rpc_url = configured_rpc_url();
+    let auto_fee_notes = resolve_auto_execution_fees(
+        &rpc_url,
+        &mut normalized,
+        &transport_plan,
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error,
+                "traceId": trace.traceId,
+            })),
+        )
+    })?;
+    let same_time_fee_guard_warning = apply_same_time_creation_fee_guard(&mut normalized).map_err(
+        |error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                    "traceId": trace.traceId,
+                })),
+            )
+        },
+    )?;
     let should_persist_report = normalized.tx.writeReport || action == "send";
     if action == "build" {
         let report_build_started_ms = current_time_ms();
@@ -1115,6 +1673,9 @@ async fn execute_engine_action_payload(
         })?;
         if let Some(warning) = same_time_fee_guard_warning.as_deref() {
             append_execution_warning(&mut report_value, warning);
+        }
+        for note in &auto_fee_notes {
+            append_execution_note(&mut report_value, note);
         }
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report_value, "formToRawConfigMs", value);
@@ -1191,7 +1752,7 @@ async fn execute_engine_action_payload(
             "elapsedMs": current_time_ms().saturating_sub(trace.startedAtMs),
             "receivedForm": payload.form.is_some(),
             "receivedRawConfig": true,
-            "normalizedConfig": normalized,
+            "normalizedConfig": redacted_normalized_config(&normalized),
             "transportPlan": transport_plan,
             "report": report_value,
             "sendLogPath": send_log_path,
@@ -1200,26 +1761,53 @@ async fn execute_engine_action_payload(
         }));
     }
     let compile_started_ms = current_time_ms();
-    let native_artifacts = try_compile_native_launchpad(
-        &configured_rpc_url(),
-        &normalized,
-        &transport_plan,
-        &wallet_secret,
-        now_timestamp_string(),
-        creator_public_key.clone(),
-        Some("Rust native compile".to_string()),
-    )
-    .await
-    .map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": error,
-                "traceId": trace.traceId,
-            })),
+    let mut prepared_bags_send: Option<PreparedBagsSendArtifacts> = None;
+    let native_artifacts = if action == "send" && normalized.launchpad == "bagsapp" {
+        let prepared = prepare_native_bags_send(
+            &configured_rpc_url(),
+            &normalized,
+            &transport_plan,
+            &wallet_secret,
+            now_timestamp_string(),
+            creator_public_key.clone(),
+            Some("Rust native compile".to_string()),
         )
-    })?;
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                    "traceId": trace.traceId,
+                })),
+            )
+        })?;
+        let native = prepared.native_artifacts.clone();
+        prepared_bags_send = Some(prepared);
+        Some(native.into())
+    } else {
+        try_compile_native_launchpad(
+            &configured_rpc_url(),
+            &normalized,
+            &transport_plan,
+            &wallet_secret,
+            now_timestamp_string(),
+            creator_public_key.clone(),
+            Some("Rust native compile".to_string()),
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                    "traceId": trace.traceId,
+                })),
+            )
+        })?
+    };
     let compile_transactions_ms = current_time_ms().saturating_sub(compile_started_ms);
     let native = native_artifacts.ok_or_else(|| {
         (
@@ -1254,6 +1842,9 @@ async fn execute_engine_action_payload(
     );
     if let Some(warning) = same_time_fee_guard_warning.as_deref() {
         append_execution_warning(&mut report_value, warning);
+    }
+    for note in &auto_fee_notes {
+        append_execution_note(&mut report_value, note);
     }
     set_report_timing(
         &mut report_value,
@@ -1425,7 +2016,7 @@ async fn execute_engine_action_payload(
             "elapsedMs": current_time_ms().saturating_sub(trace.startedAtMs),
             "receivedForm": payload.form.is_some(),
             "receivedRawConfig": true,
-            "normalizedConfig": normalized,
+            "normalizedConfig": redacted_normalized_config(&normalized),
             "transportPlan": transport_plan,
             "assemblyExecutor": assembly_executor,
             "report": report,
@@ -1437,7 +2028,8 @@ async fn execute_engine_action_payload(
 
     if action == "send" {
         let execution_class = transport_plan.executionClass.clone();
-        let (same_time_snipes, deferred_follow_launch) = split_same_time_snipes(&normalized.followLaunch);
+        let (same_time_snipes, deferred_follow_launch) =
+            split_same_time_snipes(&normalized.followLaunch);
         let same_time_retry_enabled = same_time_snipes.iter().any(|snipe| snipe.retryOnFailure);
         let follow_daemon_transport = configured_follow_daemon_transport().map_err(|error| {
             (
@@ -1459,7 +2051,19 @@ async fn execute_engine_action_payload(
         let mut same_time_sniper_compile_ms = 0u128;
         let mut same_time_independent_compiled: Vec<CompiledTransaction> = Vec::new();
         let mut same_time_sent: Vec<crate::rpc::SentResult> = Vec::new();
+        let mut post_send_warnings: Vec<String> = Vec::new();
+        let mut send_phase_errors: Vec<String> = Vec::new();
+        let mut launch_confirmed = false;
+        let mut same_time_failure_count = 0usize;
+        let mut report_persisted = !should_persist_report;
+        let mut report_finalized = !should_persist_report;
+        let bags_same_time_compile_after_launch =
+            normalized.launchpad == "bagsapp" && !same_time_snipes.is_empty();
         let rpc_url = configured_rpc_url();
+        let mut bags_setup_sent: Vec<crate::rpc::SentResult> = Vec::new();
+        let mut bags_setup_warnings: Vec<String> = Vec::new();
+        let mut bags_setup_submit_ms = 0u128;
+        let mut bags_setup_confirm_ms = 0u128;
         if let Some(client) = follow_daemon_client.as_ref() {
             let ready = client
                 .ready(&FollowReadyRequest {
@@ -1519,7 +2123,115 @@ async fn execute_engine_action_payload(
                     })?,
             );
         }
-        if !same_time_snipes.is_empty() {
+        if let Some(prepared) = prepared_bags_send.as_ref() {
+            for bundle in &prepared.setup_bundles {
+                let (mut bundle_sent, bundle_warnings, bundle_timing) = send_transactions_bundle(
+                    &rpc_url,
+                    &transport_plan.jitoBundleEndpoints,
+                    bundle,
+                    &normalized.execution.commitment,
+                    normalized.execution.trackSendBlockHeight,
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Bags setup bundle send failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?;
+                bags_setup_submit_ms += bundle_timing.submit_ms;
+                bags_setup_confirm_ms += bundle_timing.confirm_ms;
+                bags_setup_warnings.extend(bundle_warnings);
+                bags_setup_sent.append(&mut bundle_sent);
+            }
+            if !prepared.setup_transactions.is_empty() {
+                let (mut setup_sent, setup_warnings, setup_submit_ms) =
+                    submit_transactions_sequential(
+                        &rpc_url,
+                        &prepared.setup_transactions,
+                        &normalized.execution.commitment,
+                        normalized.execution.skipPreflight,
+                        normalized.execution.trackSendBlockHeight,
+                    )
+                    .await
+                    .map_err(|error| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": format!("Bags setup transaction send failed: {error}"),
+                                "traceId": trace.traceId,
+                            })),
+                        )
+                    })?;
+                let (setup_confirm_warnings, setup_confirm_ms) = confirm_transactions_with_websocket_fallback(
+                    &rpc_url,
+                    transport_plan
+                        .watchEndpoint
+                        .as_deref()
+                        .or_else(|| transport_plan.watchEndpoints.first().map(String::as_str)),
+                    &mut setup_sent,
+                    &normalized.execution.commitment,
+                    normalized.execution.trackSendBlockHeight,
+                    225,
+                    400,
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Bags setup transaction confirmation failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?;
+                bags_setup_submit_ms += setup_submit_ms;
+                bags_setup_confirm_ms += setup_confirm_ms;
+                bags_setup_warnings.extend(setup_warnings);
+                bags_setup_warnings.extend(setup_confirm_warnings);
+                bags_setup_sent.append(&mut setup_sent);
+            }
+            let launch_compiled = compile_bags_launch_transaction(
+                &rpc_url,
+                &normalized,
+                &wallet_secret,
+                &compiled_mint,
+                &prepared.config_key,
+                &prepared.metadata_uri,
+            )
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Bags launch transaction build failed after setup send: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
+            compiled_transactions = vec![launch_compiled];
+            if let Some(transactions) = report_value
+                .get_mut("transactions")
+                .and_then(Value::as_array_mut)
+            {
+                let mut launch_summaries = serde_json::to_value(summarize_bags_transactions(
+                    &compiled_transactions,
+                    normalized.tx.dumpBase64,
+                ))
+                .unwrap_or_else(|_| Value::Array(vec![]));
+                if let Some(items) = launch_summaries.as_array_mut() {
+                    transactions.append(items);
+                }
+            }
+        }
+        if !same_time_snipes.is_empty() && !bags_same_time_compile_after_launch {
             let same_time_compile_started_ms = current_time_ms();
             let same_time_compiled = compile_same_time_snipes(
                 &rpc_url,
@@ -1548,7 +2260,9 @@ async fn execute_engine_action_payload(
             }
         }
         let submit_started_ms = current_time_ms();
-        let (mut launch_sent, mut warnings, submit_ms) = if same_time_independent_compiled.is_empty() {
+        let (mut launch_sent, mut warnings, submit_ms) = if same_time_independent_compiled
+            .is_empty()
+        {
             submit_transactions_for_transport(
                 &rpc_url,
                 &transport_plan,
@@ -1613,13 +2327,9 @@ async fn execute_engine_action_payload(
                     ));
                 }
                 Err(error) => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": error,
-                            "traceId": trace.traceId,
-                        })),
+                    same_time_failure_count = same_time_failure_count.saturating_add(1);
+                    launch_warnings.push(format!(
+                        "Same-time sniper submit failed after Bonk launch submit: {error}"
                     ));
                 }
             }
@@ -1668,13 +2378,9 @@ async fn execute_engine_action_payload(
                     ));
                 }
                 Err(error) => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": error,
-                            "traceId": trace.traceId,
-                        })),
+                    same_time_failure_count = same_time_failure_count.saturating_add(1);
+                    launch_warnings.push(format!(
+                        "Same-time sniper submit failed after launch submit: {error}"
                     ));
                 }
             }
@@ -1684,6 +2390,11 @@ async fn execute_engine_action_payload(
                 current_time_ms().saturating_sub(submit_started_ms),
             )
         };
+        if !bags_setup_warnings.is_empty() {
+            let launch_warnings = std::mem::take(&mut warnings);
+            warnings = bags_setup_warnings;
+            warnings.extend(launch_warnings);
+        }
         let launch_signature = launch_sent
             .first()
             .and_then(|result| result.signature.clone())
@@ -1697,6 +2408,78 @@ async fn execute_engine_action_payload(
                     })),
                 )
             })?;
+        if bags_same_time_compile_after_launch {
+            let same_time_compile_started_ms = current_time_ms();
+            match compile_same_time_snipes(
+                &rpc_url,
+                &normalized,
+                &compiled_mint,
+                &compiled_launch_creator,
+                &same_time_snipes,
+            )
+            .await
+            {
+                Ok(same_time_compiled) => {
+                    same_time_sniper_compile_ms = same_time_sniper_compile_ms.saturating_add(
+                        current_time_ms().saturating_sub(same_time_compile_started_ms),
+                    );
+                    match submit_independent_transactions_for_transport(
+                        &rpc_url,
+                        &transport_plan,
+                        &same_time_compiled,
+                        &normalized.execution.commitment,
+                        normalized.execution.skipPreflight,
+                        normalized.execution.trackSendBlockHeight,
+                    )
+                    .await
+                    {
+                        Ok((sent, same_time_warnings, _same_time_submit_ms)) => {
+                            same_time_sent = sent;
+                            if let Some(execution) = report_value.get_mut("execution") {
+                                let mut existing_warnings = execution
+                                    .get("warnings")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                existing_warnings.push(Value::String(
+                                    "Bags same-time snipes are compiled immediately after the launch transaction is submitted so the trade route can resolve against the live mint."
+                                        .to_string(),
+                                ));
+                                existing_warnings
+                                    .extend(same_time_warnings.into_iter().map(Value::String));
+                                execution["warnings"] = Value::Array(existing_warnings);
+                            }
+                        }
+                        Err(error) if same_time_retry_enabled => {
+                            append_execution_warning(
+                                &mut report_value,
+                                &format!(
+                                    "Same-time Bags sniper submit failed after launch submit; daemon retry is armed for one retry attempt: {error}"
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            same_time_failure_count = same_time_failure_count.saturating_add(1);
+                            append_execution_warning(
+                                &mut report_value,
+                                &format!(
+                                    "Same-time Bags sniper submit failed after launch submit: {error}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    same_time_failure_count = same_time_failure_count.saturating_add(1);
+                    append_execution_warning(
+                        &mut report_value,
+                        &format!(
+                            "Same-time Bags sniper compile failed after launch submit: {error}"
+                        ),
+                    );
+                }
+            }
+        }
         let mut report = report_value;
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report, "formToRawConfigMs", value);
@@ -1733,9 +2516,23 @@ async fn execute_engine_action_payload(
             "compileTxSerializeMs",
             compile_breakdown.tx_serialize_ms,
         );
-        set_report_timing(&mut report, "sendMs", submit_ms);
-        set_report_timing(&mut report, "sendSubmitMs", submit_ms);
-        set_report_timing(&mut report, "sendConfirmMs", 0);
+        set_report_timing(
+            &mut report,
+            "sendMs",
+            bags_setup_submit_ms
+                .saturating_add(bags_setup_confirm_ms)
+                .saturating_add(submit_ms),
+        );
+        set_report_timing(
+            &mut report,
+            "sendSubmitMs",
+            bags_setup_submit_ms.saturating_add(submit_ms),
+        );
+        set_report_timing(&mut report, "sendConfirmMs", bags_setup_confirm_ms);
+        if bags_setup_submit_ms > 0 || bags_setup_confirm_ms > 0 {
+            set_report_timing(&mut report, "bagsSetupSubmitMs", bags_setup_submit_ms);
+            set_report_timing(&mut report, "bagsSetupConfirmMs", bags_setup_confirm_ms);
+        }
         attach_follow_daemon_report(
             &mut report,
             if deferred_follow_launch.enabled {
@@ -1745,92 +2542,104 @@ async fn execute_engine_action_payload(
             },
             reserved_follow_job.as_ref(),
             None,
+            None,
+            Some(&normalized.followLaunch),
         );
         let send_log_path = if should_persist_report {
             let persist_started_ms = current_time_ms();
-            let path = persist_launch_report(&trace.traceId, &action, &transport_plan, &report)
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": error,
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?;
-            set_report_timing(
-                &mut report,
-                "persistReportMs",
-                current_time_ms().saturating_sub(persist_started_ms),
-            );
-            report["outPath"] = Value::String(path.clone());
-            Some(path)
+            match persist_launch_report(&trace.traceId, &action, &transport_plan, &report) {
+                Ok(path) => {
+                    report_persisted = true;
+                    set_report_timing(
+                        &mut report,
+                        "persistReportMs",
+                        current_time_ms().saturating_sub(persist_started_ms),
+                    );
+                    report["outPath"] = Value::String(path.clone());
+                    Some(path)
+                }
+                Err(error) => {
+                    let warning = format!(
+                        "Launch was submitted, but the initial report could not be persisted: {error}"
+                    );
+                    post_send_warnings.push(warning.clone());
+                    send_phase_errors.push(warning);
+                    None
+                }
+            }
         } else {
             None
         };
         if let Some(client) = follow_daemon_client.as_ref() {
-            armed_follow_job = Some(
-                client
+            match client
                 .arm(&FollowArmRequest {
                     traceId: trace.traceId.clone(),
                     mint: compiled_mint.clone(),
                     launchCreator: compiled_launch_creator.clone(),
-                    launchSignature: launch_signature,
+                    launchSignature: launch_signature.clone(),
                     submitAtMs: current_time_ms(),
-                    sendObservedBlockHeight: launch_sent.first().and_then(|result| result.sendObservedBlockHeight),
+                    sendObservedBlockHeight: launch_sent
+                        .first()
+                        .and_then(|result| result.sendObservedBlockHeight),
+                    confirmedObservedBlockHeight: launch_sent
+                        .first()
+                        .and_then(|result| result.confirmedObservedBlockHeight),
                     reportPath: send_log_path.clone(),
                     transportPlan: transport_plan.clone(),
                 })
                 .await
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": format!("Launch submitted but follow daemon arm failed: {error}"),
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?,
-            );
+            {
+                Ok(response) => {
+                    armed_follow_job = Some(response);
+                }
+                Err(error) => {
+                    let warning =
+                        format!("Launch submitted, but follow daemon arm failed: {error}");
+                    post_send_warnings.push(warning.clone());
+                    send_phase_errors.push(warning);
+                }
+            }
             attach_follow_daemon_report(
                 &mut report,
                 Some(follow_daemon_transport.as_str()),
                 reserved_follow_job.as_ref(),
                 armed_follow_job.as_ref(),
+                None,
+                Some(&normalized.followLaunch),
             );
         }
-        let (mut confirm_warnings, mut confirm_ms) = match confirm_submitted_transactions_for_transport(
-            &rpc_url,
-            &transport_plan,
-            &mut launch_sent,
-            &normalized.execution.commitment,
-            normalized.execution.trackSendBlockHeight,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                if let Some(client) = follow_daemon_client.as_ref() {
-                    let _ = client
-                        .cancel(&FollowCancelRequest {
-                            traceId: trace.traceId.clone(),
-                            actionId: None,
-                            note: Some(format!("Launch confirmation failed: {error}")),
-                        })
-                        .await;
+        let (mut confirm_warnings, mut confirm_ms) =
+            match confirm_submitted_transactions_for_transport(
+                &rpc_url,
+                &transport_plan,
+                &mut launch_sent,
+                &normalized.execution.commitment,
+                normalized.execution.trackSendBlockHeight,
+            )
+            .await
+            {
+                Ok(value) => {
+                    launch_confirmed = true;
+                    value
                 }
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "ok": false,
-                        "error": error,
-                        "traceId": trace.traceId,
-                    })),
-                ));
-            }
-        };
+                Err(error) => {
+                    if let Some(client) = follow_daemon_client.as_ref() {
+                        let _ = client
+                            .cancel(&FollowCancelRequest {
+                                traceId: trace.traceId.clone(),
+                                actionId: None,
+                                note: Some(format!("Launch confirmation failed: {error}")),
+                            })
+                            .await;
+                    }
+                    let warning = format!(
+                        "Launch was submitted, but confirmation failed or remained incomplete: {error}"
+                    );
+                    post_send_warnings.push(warning.clone());
+                    send_phase_errors.push(warning.clone());
+                    (vec![warning], 0)
+                }
+            };
         if !same_time_sent.is_empty() {
             match confirm_submitted_transactions_for_transport(
                 &rpc_url,
@@ -1856,27 +2665,59 @@ async fn execute_engine_action_payload(
                             .cancel(&FollowCancelRequest {
                                 traceId: trace.traceId.clone(),
                                 actionId: None,
-                                note: Some(format!("Same-time sniper confirmation failed: {error}")),
+                                note: Some(format!(
+                                    "Same-time sniper confirmation failed: {error}"
+                                )),
                             })
                             .await;
                     }
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": error,
-                            "traceId": trace.traceId,
-                        })),
+                    same_time_failure_count = same_time_failure_count.saturating_add(1);
+                    confirm_warnings.push(format!(
+                        "Same-time sniper confirmation failed or remained incomplete: {error}"
                     ));
                 }
             }
         }
-        let mut sent = launch_sent;
+        let latest_follow_job_status = if let Some(client) = follow_daemon_client.as_ref() {
+            if reserved_follow_job.is_some() || armed_follow_job.is_some() {
+                match client.status(&trace.traceId).await {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        post_send_warnings.push(format!(
+                            "Follow daemon final status refresh failed: {error}"
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut sent = bags_setup_sent;
+        sent.append(&mut launch_sent);
         sent.append(&mut same_time_sent);
         warnings.extend(confirm_warnings);
-        set_report_timing(&mut report, "sendMs", submit_ms.saturating_add(confirm_ms));
-        set_report_timing(&mut report, "sendSubmitMs", submit_ms);
-        set_report_timing(&mut report, "sendConfirmMs", confirm_ms);
+        let response_warning_count = warnings.len().saturating_add(post_send_warnings.len());
+        set_report_timing(
+            &mut report,
+            "sendMs",
+            bags_setup_submit_ms
+                .saturating_add(bags_setup_confirm_ms)
+                .saturating_add(submit_ms)
+                .saturating_add(confirm_ms),
+        );
+        set_report_timing(
+            &mut report,
+            "sendSubmitMs",
+            bags_setup_submit_ms.saturating_add(submit_ms),
+        );
+        set_report_timing(
+            &mut report,
+            "sendConfirmMs",
+            bags_setup_confirm_ms.saturating_add(confirm_ms),
+        );
         if let Some(execution) = report.get_mut("execution") {
             execution["sent"] = serde_json::to_value(sent).unwrap_or(Value::Array(vec![]));
             let mut existing_warnings = execution
@@ -1885,6 +2726,7 @@ async fn execute_engine_action_payload(
                 .cloned()
                 .unwrap_or_default();
             existing_warnings.extend(warnings.into_iter().map(Value::String));
+            existing_warnings.extend(post_send_warnings.iter().cloned().map(Value::String));
             execution["warnings"] = Value::Array(existing_warnings);
         }
         set_report_timing(
@@ -1901,26 +2743,43 @@ async fn execute_engine_action_payload(
             },
             reserved_follow_job.as_ref(),
             armed_follow_job.as_ref(),
+            latest_follow_job_status.as_ref(),
+            Some(&normalized.followLaunch),
         );
         refresh_report_benchmark(&mut report);
         if let Some(path) = send_log_path.as_ref() {
-            update_persisted_launch_report(
+            match update_persisted_launch_report(
                 path,
                 &trace.traceId,
                 &action,
                 &transport_plan,
                 &report,
-            )
-            .map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "ok": false,
-                        "error": format!("Action completed but failed to finalize persisted report: {error}"),
-                        "traceId": trace.traceId,
-                    })),
-                )
-            })?;
+            ) {
+                Ok(()) => {
+                    report_finalized = true;
+                }
+                Err(error) => {
+                    let warning = format!(
+                        "Launch completed, but the persisted report could not be finalized: {error}"
+                    );
+                    post_send_warnings.push(warning.clone());
+                    send_phase_errors.push(warning);
+                }
+            }
+        }
+        if let Some(execution) = report.get_mut("execution") {
+            let mut existing_warnings = execution
+                .get("warnings")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for warning in &post_send_warnings {
+                let value = Value::String(warning.clone());
+                if !existing_warnings.contains(&value) {
+                    existing_warnings.push(value);
+                }
+            }
+            execution["warnings"] = Value::Array(existing_warnings);
         }
         log_event(
             "engine_action_completed",
@@ -1944,11 +2803,32 @@ async fn execute_engine_action_payload(
             "elapsedMs": current_time_ms().saturating_sub(trace.startedAtMs),
             "receivedForm": payload.form.is_some(),
             "receivedRawConfig": true,
-            "normalizedConfig": normalized,
+            "normalizedConfig": redacted_normalized_config(&normalized),
             "transportPlan": transport_plan,
             "assemblyExecutor": assembly_executor,
             "report": report,
             "sendLogPath": send_log_path,
+            "plainSummary": build_send_plain_summary(
+                launch_confirmed,
+                same_time_failure_count,
+                report_persisted,
+                report_finalized,
+                reserved_follow_job.is_some(),
+                armed_follow_job.is_some(),
+                response_warning_count,
+            ),
+            "sendOutcome": {
+                "launchSubmitted": true,
+                "launchSignature": launch_signature,
+                "launchConfirmed": launch_confirmed,
+                "sameTimeFailureCount": same_time_failure_count,
+                "reportPersisted": report_persisted,
+                "reportFinalized": report_finalized,
+                "followDaemonReserved": reserved_follow_job.is_some(),
+                "followDaemonArmed": armed_follow_job.is_some(),
+                "warnings": post_send_warnings,
+                "errors": send_phase_errors,
+            },
             "followDaemonTransport": if deferred_follow_launch.enabled {
                 Some(follow_daemon_transport)
             } else {
@@ -1981,7 +2861,7 @@ async fn execute_engine_action_payload(
         "elapsedMs": current_time_ms().saturating_sub(trace.startedAtMs),
         "receivedForm": payload.form.is_some(),
         "receivedRawConfig": true,
-        "normalizedConfig": normalized,
+        "normalizedConfig": redacted_normalized_config(&normalized),
         "transportPlan": transport_plan,
         "assemblyExecutor": assembly_executor,
         "report": report_value,
@@ -2015,6 +2895,472 @@ fn build_settings_payload() -> Value {
     })
 }
 
+fn bags_api_base_url() -> String {
+    std::env::var("BAGS_API_BASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://public-api-v2.bags.fm/api/v1".to_string())
+}
+
+fn read_bags_credentials_file(path: std::path::PathBuf) -> BagsStoredCredentials {
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    if raw.trim().is_empty() {
+        BagsStoredCredentials::default()
+    } else {
+        serde_json::from_str::<BagsStoredCredentials>(&raw).unwrap_or_default()
+    }
+}
+
+fn write_bags_credentials_file(
+    path: std::path::PathBuf,
+    credentials: &BagsStoredCredentials,
+) -> Result<(), String> {
+    atomic_write(
+        &path,
+        &serde_json::to_vec_pretty(credentials).map_err(|error| error.to_string())?,
+    )
+}
+
+fn read_persisted_bags_credentials() -> BagsStoredCredentials {
+    read_bags_credentials_file(paths::bags_credentials_path())
+}
+
+fn read_session_bags_credentials() -> BagsStoredCredentials {
+    read_bags_credentials_file(paths::bags_session_path())
+}
+
+fn read_active_bags_credentials() -> BagsStoredCredentials {
+    let persisted = read_persisted_bags_credentials();
+    let session = read_session_bags_credentials();
+    BagsStoredCredentials {
+        api_key: if session.api_key.trim().is_empty() {
+            persisted.api_key
+        } else {
+            session.api_key
+        },
+        auth_token: if session.auth_token.trim().is_empty() {
+            persisted.auth_token
+        } else {
+            session.auth_token
+        },
+        agent_username: if session.agent_username.trim().is_empty() {
+            persisted.agent_username
+        } else {
+            session.agent_username
+        },
+        verified_wallet: if session.verified_wallet.trim().is_empty() {
+            persisted.verified_wallet
+        } else {
+            session.verified_wallet
+        },
+    }
+}
+
+fn persist_bags_credentials(
+    credentials: BagsStoredCredentials,
+    save_api_key: bool,
+) -> Result<(), String> {
+    let session_path = paths::bags_session_path();
+    let persisted_path = paths::bags_credentials_path();
+    if save_api_key {
+        write_bags_credentials_file(persisted_path, &credentials)?;
+        if session_path.exists() {
+            let _ = fs::remove_file(session_path);
+        }
+        return Ok(());
+    }
+    write_bags_credentials_file(session_path, &credentials)
+}
+
+fn clear_bags_session_credentials() {
+    let path = paths::bags_session_path();
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn redacted_normalized_config(config: &NormalizedConfig) -> Value {
+    let mut value = serde_json::to_value(config).unwrap_or_else(|_| Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        if let Some(signer) = object.get_mut("signer").and_then(Value::as_object_mut) {
+            signer.insert(
+                "secretKey".to_string(),
+                Value::String("[redacted]".to_string()),
+            );
+        }
+        if let Some(bags) = object.get_mut("bags").and_then(Value::as_object_mut) {
+            if bags.contains_key("authToken") {
+                bags.insert(
+                    "authToken".to_string(),
+                    Value::String("[redacted]".to_string()),
+                );
+            }
+        }
+        if object.contains_key("vanityPrivateKey") {
+            object.insert(
+                "vanityPrivateKey".to_string(),
+                Value::String("[redacted]".to_string()),
+            );
+        }
+    }
+    value
+}
+
+fn build_send_plain_summary(
+    launch_confirmed: bool,
+    same_time_failures: usize,
+    report_persisted: bool,
+    report_finalized: bool,
+    follow_reserved: bool,
+    follow_armed: bool,
+    warning_count: usize,
+) -> String {
+    let mut parts = vec![if launch_confirmed {
+        "Launch submitted and confirmed.".to_string()
+    } else {
+        "Launch submitted, but confirmation is incomplete or failed.".to_string()
+    }];
+    if same_time_failures > 0 {
+        parts.push(format!(
+            "{same_time_failures} same-time sniper stage(s) failed or remain unconfirmed."
+        ));
+    }
+    if !report_persisted {
+        parts.push("Initial report persistence failed.".to_string());
+    } else if !report_finalized {
+        parts.push("Report persistence completed only partially.".to_string());
+    }
+    if follow_reserved && !follow_armed {
+        parts.push("Follow automation was reserved but not armed.".to_string());
+    }
+    if warning_count > 0 {
+        parts.push(format!("{warning_count} warning(s) were recorded."));
+    }
+    parts.join(" ")
+}
+
+fn resolve_wallet_public_key_for_bags(wallet_env_key: &str) -> Result<String, String> {
+    let key = wallet_env_key.trim();
+    if key.is_empty() {
+        return Ok(String::new());
+    }
+    let secret = load_solana_wallet_by_env_key(key)?;
+    public_key_from_secret(&secret)
+}
+
+fn extract_string_field(value: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+async fn bags_api_request(
+    method: reqwest::Method,
+    route: &str,
+    api_key: &str,
+    auth_token: Option<&str>,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("Failed to build Bags HTTP client: {error}"))?;
+    let url = format!("{}{}", bags_api_base_url(), route);
+    let mut request = client
+        .request(method, &url)
+        .header("x-api-key", api_key)
+        .header("content-type", "application/json");
+    if let Some(token) = auth_token.filter(|value| !value.trim().is_empty()) {
+        request = request.bearer_auth(token.trim());
+    }
+    if let Some(payload) = body {
+        request = request.json(&payload);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Bags API request failed: {error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to decode Bags API response: {error}"))?;
+    if payload
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(status.is_success())
+    {
+        Ok(payload.get("response").cloned().unwrap_or(payload))
+    } else {
+        Err(payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Bags API request failed.")
+            .to_string())
+    }
+}
+
+async fn bags_identity_wallet_matches(
+    api_key: &str,
+    auth_token: &str,
+    expected_wallet: &str,
+) -> Result<(bool, String), String> {
+    if expected_wallet.trim().is_empty() {
+        return Ok((false, String::new()));
+    }
+    let payload = bags_api_request(
+        reqwest::Method::GET,
+        "/agent/wallet/list",
+        api_key,
+        Some(auth_token),
+        None,
+    )
+    .await?;
+    let wallets = if let Some(array) = payload.as_array() {
+        array.clone()
+    } else {
+        payload
+            .get("wallets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut resolved_username = String::new();
+    for wallet in wallets {
+        if !resolved_username.trim().is_empty() {
+            // Keep the first useful username while still checking all wallets.
+        } else {
+            resolved_username =
+                extract_string_field(&wallet, &["providerUsername", "agentUsername", "username"]);
+        }
+        let wallet_address = extract_string_field(&wallet, &["wallet", "address", "publicKey"]);
+        if !wallet_address.is_empty() && wallet_address == expected_wallet.trim() {
+            let username =
+                extract_string_field(&wallet, &["providerUsername", "agentUsername", "username"]);
+            return Ok((
+                true,
+                if username.is_empty() {
+                    resolved_username
+                } else {
+                    username
+                },
+            ));
+        }
+    }
+    Ok((false, resolved_username))
+}
+
+async fn api_bags_identity_status(
+    Query(query): Query<BagsIdentityStatusQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let active = read_active_bags_credentials();
+    let wallet_env_key = query.wallet.unwrap_or_default();
+    let wallet = resolve_wallet_public_key_for_bags(&wallet_env_key).unwrap_or_default();
+    let mut verified = false;
+    let mut resolved_username = active.agent_username.clone();
+    if !wallet.is_empty()
+        && !active.api_key.trim().is_empty()
+        && !active.auth_token.trim().is_empty()
+    {
+        if let Ok((matched, username)) =
+            bags_identity_wallet_matches(&active.api_key, &active.auth_token, &wallet).await
+        {
+            verified = matched;
+            if !username.trim().is_empty() {
+                resolved_username = username;
+            }
+        }
+    }
+    Ok(Json(attach_timing(
+        json!({
+            "ok": true,
+            "configuredApiKey": !active.api_key.trim().is_empty(),
+            "verified": verified,
+            "mode": if verified { "linked" } else { "wallet-only" },
+            "agentUsername": resolved_username,
+            "verifiedWallet": if verified { wallet } else { String::new() },
+            "authToken": if verified { active.auth_token } else { String::new() },
+        }),
+        started_at_ms,
+    )))
+}
+
+async fn api_bags_identity_init(
+    Json(payload): Json<BagsIdentityInitRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let current = read_active_bags_credentials();
+    let api_key = if payload.api_key.trim().is_empty() {
+        current.api_key
+    } else {
+        payload.api_key.trim().to_string()
+    };
+    if api_key.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "Bags API key is required." })),
+        ));
+    }
+    let response = bags_api_request(
+        reqwest::Method::POST,
+        "/agent/auth/init",
+        &api_key,
+        None,
+        Some(json!({
+            "agentUsername": payload.agent_username.trim(),
+        })),
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": error })),
+        )
+    })?;
+    let init_agent_username = {
+        let resolved = extract_string_field(&response, &["agentUsername", "providerUsername"]);
+        if resolved.trim().is_empty() {
+            payload.agent_username.trim().to_string()
+        } else {
+            resolved
+        }
+    };
+    persist_bags_credentials(
+        BagsStoredCredentials {
+            api_key: api_key.clone(),
+            auth_token: current.auth_token,
+            agent_username: init_agent_username.clone(),
+            verified_wallet: current.verified_wallet,
+        },
+        payload.save_api_key,
+    )
+    .map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": error })),
+        )
+    })?;
+    Ok(Json(attach_timing(
+        json!({
+            "ok": true,
+            "configuredApiKey": true,
+            "agentUsername": init_agent_username,
+            "publicIdentifier": extract_string_field(&response, &["publicIdentifier"]),
+            "secret": extract_string_field(&response, &["secret"]),
+            "verificationPostContent": extract_string_field(&response, &["verificationPostContent", "content", "message"]),
+        }),
+        started_at_ms,
+    )))
+}
+
+async fn api_bags_identity_verify(
+    Json(payload): Json<BagsIdentityVerifyRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let current = read_active_bags_credentials();
+    let api_key = if payload.api_key.trim().is_empty() {
+        current.api_key
+    } else {
+        payload.api_key.trim().to_string()
+    };
+    if api_key.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "Bags API key is required." })),
+        ));
+    }
+    let wallet = resolve_wallet_public_key_for_bags(&payload.wallet_env_key).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": error })),
+        )
+    })?;
+    let login_response = bags_api_request(
+        reqwest::Method::POST,
+        "/agent/auth/login",
+        &api_key,
+        None,
+        Some(json!({
+            "agentUsername": payload.agent_username.trim(),
+            "publicIdentifier": payload.public_identifier.trim(),
+            "secret": payload.secret.trim(),
+            "postId": payload.post_id.trim(),
+        })),
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": error })),
+        )
+    })?;
+    let auth_token = extract_string_field(&login_response, &["token", "authToken", "jwt"]);
+    if auth_token.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "Bags login did not return an auth token." })),
+        ));
+    }
+    let (verified, resolved_username) =
+        bags_identity_wallet_matches(&api_key, &auth_token, &wallet)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "ok": false, "error": error })),
+                )
+            })?;
+    if !verified {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "Linked Bags identity requires the selected LaunchDeck wallet to belong to the authenticated Bags account.",
+            })),
+        ));
+    }
+    let agent_username = if resolved_username.trim().is_empty() {
+        payload.agent_username.trim().to_string()
+    } else {
+        resolved_username
+    };
+    persist_bags_credentials(
+        BagsStoredCredentials {
+            api_key: api_key,
+            auth_token: auth_token.clone(),
+            agent_username: agent_username.clone(),
+            verified_wallet: wallet.clone(),
+        },
+        payload.save_api_key,
+    )
+    .map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": error })),
+        )
+    })?;
+    Ok(Json(attach_timing(
+        json!({
+            "ok": true,
+            "configuredApiKey": true,
+            "verified": true,
+            "agentUsername": agent_username,
+            "authToken": auth_token,
+            "verifiedWallet": wallet,
+        }),
+        started_at_ms,
+    )))
+}
+
+async fn api_bags_identity_clear() -> Json<Value> {
+    clear_bags_session_credentials();
+    Json(json!({ "ok": true }))
+}
+
 async fn api_bootstrap_fast(
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -2045,15 +3391,17 @@ async fn api_bootstrap(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let started_at_ms = current_time_ms();
     let requested_wallet = query.wallet.unwrap_or_default();
-    let mut payload = build_status_payload(&state, &requested_wallet, false).await.map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": error,
-            })),
-        )
-    })?;
+    let mut payload = build_status_payload(&state, &requested_wallet, false)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })?;
     payload["backend"] = Value::String("rust".to_string());
     payload["signerSource"] = Value::String(resolve_signer_source(
         payload
@@ -2105,15 +3453,17 @@ async fn api_wallet_status(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let started_at_ms = current_time_ms();
     let wallet = query.wallet.unwrap_or_default();
-    let mut payload = build_wallet_status_payload(&wallet, true).await.map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": error,
-            })),
-        )
-    })?;
+    let mut payload = build_wallet_status_payload(&wallet, true)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })?;
     payload["backend"] = Value::String("rust".to_string());
     payload["signerSource"] = Value::String(resolve_signer_source(
         payload
@@ -2270,18 +3620,23 @@ async fn api_quote(
     let started_at_ms = current_time_ms();
     let launchpad = query.launchpad.unwrap_or_else(|| "pump".to_string());
     let quote_asset = query.quoteAsset.unwrap_or_else(|| "sol".to_string());
+    let launch_mode = query.launchMode.unwrap_or_default();
     let mode = query.mode.unwrap_or_default();
     let amount = query.amount.unwrap_or_default();
     if mode.trim().is_empty() || amount.trim().is_empty() {
-        return Ok(Json(attach_timing(json!({
-            "ok": true,
-            "quote": Value::Null,
-        }), started_at_ms)));
+        return Ok(Json(attach_timing(
+            json!({
+                "ok": true,
+                "quote": Value::Null,
+            }),
+            started_at_ms,
+        )));
     }
     let quote = quote_launch_for_launchpad(
         &configured_rpc_url(),
         &launchpad,
         &quote_asset,
+        &launch_mode,
         &mode,
         &amount,
     )
@@ -2295,10 +3650,13 @@ async fn api_quote(
             })),
         )
     })?;
-    Ok(Json(attach_timing(json!({
-        "ok": true,
-        "quote": quote,
-    }), started_at_ms)))
+    Ok(Json(attach_timing(
+        json!({
+            "ok": true,
+            "quote": quote,
+        }),
+        started_at_ms,
+    )))
 }
 
 async fn api_settings_get() -> Json<Value> {
@@ -2339,11 +3697,14 @@ async fn api_reports_list(Query(query): Query<ReportsQuery>) -> Json<Value> {
     } else {
         "newest"
     };
-    Json(attach_timing(json!({
-        "ok": true,
-        "sort": sort,
-        "reports": list_persisted_reports(sort),
-    }), started_at_ms))
+    Json(attach_timing(
+        json!({
+            "ok": true,
+            "sort": sort,
+            "reports": list_persisted_reports(sort),
+        }),
+        started_at_ms,
+    ))
 }
 
 async fn api_reports_view(
@@ -2360,12 +3721,15 @@ async fn api_reports_view(
             })),
         )
     })?;
-    Ok(Json(attach_timing(json!({
-        "ok": true,
-        "entry": entry,
-        "text": text,
-        "payload": payload,
-    }), started_at_ms)))
+    Ok(Json(attach_timing(
+        json!({
+            "ok": true,
+            "entry": entry,
+            "text": text,
+            "payload": payload,
+        }),
+        started_at_ms,
+    )))
 }
 
 async fn api_upload_image(
@@ -2389,15 +3753,19 @@ async fn api_upload_image(
         }
         filename = field.file_name().unwrap_or("image").to_string();
         content_type = field.content_type().unwrap_or_default().to_string();
-        bytes = field.bytes().await.map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "ok": false,
-                    "error": error.to_string(),
-                })),
-            )
-        })?.to_vec();
+        bytes = field
+            .bytes()
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": error.to_string(),
+                    })),
+                )
+            })?
+            .to_vec();
         break;
     }
     if bytes.is_empty() {
@@ -2421,7 +3789,7 @@ async fn api_upload_image(
                     "ok": false,
                     "error": "Only png, jpg, webp, and gif images are supported.",
                 })),
-            ))
+            ));
         }
     };
     let record = save_image_bytes(&bytes, extension, &filename, None).map_err(|error| {
@@ -2433,18 +3801,21 @@ async fn api_upload_image(
             })),
         )
     })?;
-    Ok(Json(attach_timing(json!({
-        "ok": true,
-        "id": record.id,
-        "fileName": record.fileName,
-        "name": record.name,
-        "tags": record.tags,
-        "category": record.category,
-        "isFavorite": record.isFavorite,
-        "createdAt": record.createdAt,
-        "updatedAt": record.updatedAt,
-        "previewUrl": record.previewUrl,
-    }), started_at_ms)))
+    Ok(Json(attach_timing(
+        json!({
+            "ok": true,
+            "id": record.id,
+            "fileName": record.fileName,
+            "name": record.name,
+            "tags": record.tags,
+            "category": record.category,
+            "isFavorite": record.isFavorite,
+            "createdAt": record.createdAt,
+            "updatedAt": record.updatedAt,
+            "previewUrl": record.previewUrl,
+        }),
+        started_at_ms,
+    )))
 }
 
 async fn api_metadata_upload(
@@ -2461,10 +3832,13 @@ async fn api_metadata_upload(
             })),
         )
     })?;
-    Ok(Json(attach_timing(json!({
-        "ok": true,
-        "metadataUri": metadata_uri,
-    }), started_at_ms)))
+    Ok(Json(attach_timing(
+        json!({
+            "ok": true,
+            "metadataUri": metadata_uri,
+        }),
+        started_at_ms,
+    )))
 }
 
 async fn api_images_list(
@@ -2589,7 +3963,8 @@ async fn api_vamp_import(
             })),
         )
     })?;
-    let imported = fetch_imported_token_metadata(&mint.to_string())
+    let rpc_url = configured_rpc_url();
+    let imported = fetch_imported_token_metadata(&mint.to_string(), &rpc_url)
         .await
         .map_err(|error| {
             (
@@ -2642,7 +4017,11 @@ async fn api_vamp_import(
             "website": imported.website,
             "twitter": imported.twitter,
             "telegram": imported.telegram,
+            "launchpad": imported.launchpad,
             "mode": imported.mode,
+            "quoteAsset": imported.quoteAsset,
+            "routes": imported.routes,
+            "detection": imported.detection,
         },
         "image": image,
         "warning": warning,
@@ -2789,6 +4168,7 @@ mod tests {
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
+    clear_bags_session_credentials();
     let rpc_url = configured_rpc_url();
     let state = Arc::new(AppState {
         auth_token: configured_auth_token(),
@@ -2818,6 +4198,10 @@ async fn main() {
         .route("/api/run", post(api_run))
         .route("/api/engine/health", get(api_engine_health))
         .route("/api/quote", get(api_quote))
+        .route("/api/bags/identity/status", get(api_bags_identity_status))
+        .route("/api/bags/identity/init", post(api_bags_identity_init))
+        .route("/api/bags/identity/verify", post(api_bags_identity_verify))
+        .route("/api/bags/identity/clear", post(api_bags_identity_clear))
         .route(
             "/api/settings",
             get(api_settings_get).post(api_settings_save),

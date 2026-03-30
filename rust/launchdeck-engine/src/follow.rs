@@ -2,6 +2,7 @@
 
 use crate::{
     config::{NormalizedExecution, NormalizedFollowLaunch},
+    fs_utils::{atomic_write, quarantine_corrupt_file},
     transport::TransportPlan,
 };
 use reqwest::Client;
@@ -143,6 +144,8 @@ pub struct FollowJobRecord {
     pub launchSignature: Option<String>,
     pub submitAtMs: Option<u128>,
     pub sendObservedBlockHeight: Option<u64>,
+    #[serde(default)]
+    pub confirmedObservedBlockHeight: Option<u64>,
     pub reportPath: Option<String>,
     pub transportPlan: Option<TransportPlan>,
     pub followLaunch: NormalizedFollowLaunch,
@@ -264,6 +267,8 @@ pub struct FollowArmRequest {
     pub launchSignature: String,
     pub submitAtMs: u128,
     pub sendObservedBlockHeight: Option<u64>,
+    #[serde(default)]
+    pub confirmedObservedBlockHeight: Option<u64>,
     pub reportPath: Option<String>,
     pub transportPlan: TransportPlan,
 }
@@ -502,8 +507,10 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
 impl FollowDaemonStore {
     pub fn load_or_default(state_path: PathBuf) -> Self {
         let state = match fs::read_to_string(&state_path) {
-            Ok(raw) => serde_json::from_str::<FollowDaemonStateFile>(&raw)
-                .unwrap_or_else(|_| Self::default_state(state_path.clone())),
+            Ok(raw) => serde_json::from_str::<FollowDaemonStateFile>(&raw).unwrap_or_else(|_| {
+                let _ = quarantine_corrupt_file(&state_path, "follow daemon state");
+                Self::default_state(state_path.clone())
+            }),
             Err(_) => Self::default_state(state_path.clone()),
         };
         Self {
@@ -569,13 +576,16 @@ impl FollowDaemonStore {
         let _persist_guard = self.persist_lock.lock().await;
         let mut last_error = None;
         for attempt in 0..5 {
-            match fs::write(&self.state_path, &payload) {
+            match atomic_write(&self.state_path, &payload) {
                 Ok(()) => return Ok(()),
-                Err(error) if is_retryable_persist_error(&error) && attempt < 4 => {
-                    last_error = Some(error);
+                Err(error)
+                    if is_retryable_persist_error(&std::io::Error::other(error.clone()))
+                        && attempt < 4 =>
+                {
+                    last_error = Some(std::io::Error::other(error));
                     sleep(Duration::from_millis(20 * (attempt + 1) as u64)).await;
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(error),
             }
         }
         Err(last_error
@@ -652,6 +662,7 @@ impl FollowDaemonStore {
             launchSignature: None,
             submitAtMs: None,
             sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
             reportPath: None,
             transportPlan: None,
             followLaunch: request.followLaunch,
@@ -723,6 +734,9 @@ impl FollowDaemonStore {
         if job.sendObservedBlockHeight.is_none() {
             job.sendObservedBlockHeight = request.sendObservedBlockHeight;
         }
+        if job.confirmedObservedBlockHeight.is_none() {
+            job.confirmedObservedBlockHeight = request.confirmedObservedBlockHeight;
+        }
         if job.reportPath.is_none() {
             job.reportPath = request.reportPath;
         }
@@ -772,7 +786,6 @@ impl FollowDaemonStore {
             .iter_mut()
             .find(|job| job.traceId == request.traceId)
             .ok_or_else(|| format!("Unknown follow job traceId: {}", request.traceId))?;
-        job.cancelRequested = true;
         job.updatedAtMs = now;
         if let Some(action_id) = request.actionId.as_deref() {
             if let Some(action) = job
@@ -784,6 +797,7 @@ impl FollowDaemonStore {
                 action.lastError = request.note.clone();
             }
         } else {
+            job.cancelRequested = true;
             job.state = FollowJobState::Cancelled;
             for action in &mut job.actions {
                 if !matches!(

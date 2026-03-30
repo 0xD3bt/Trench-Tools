@@ -4,17 +4,20 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    io::Write,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Stdio,
+    sync::{Arc, OnceLock},
 };
-use tokio::time::{Duration, sleep};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::Semaphore,
+    time::{Duration, sleep, timeout},
+};
 
 use crate::{
     config::{NormalizedConfig, NormalizedExecution, validate_launchpad_support},
-    report::{
-        FeeSettings, InstructionSummary, TransactionSummary, build_report, render_report,
-    },
+    report::{FeeSettings, InstructionSummary, TransactionSummary, build_report, render_report},
     rpc::CompiledTransaction,
     transport::TransportPlan,
 };
@@ -23,6 +26,30 @@ use crate::pump_native::{LaunchQuote, NativeCompileTimings};
 
 const PACKET_LIMIT_BYTES: usize = 1232;
 const FIXED_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
+const DEFAULT_HELPER_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_HELPER_MAX_CONCURRENCY: usize = 4;
+
+fn helper_timeout_ms() -> u64 {
+    std::env::var("LAUNCHDECK_LAUNCHPAD_HELPER_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HELPER_TIMEOUT_MS)
+}
+
+fn helper_semaphore() -> Arc<Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEMAPHORE
+        .get_or_init(|| {
+            let limit = std::env::var("LAUNCHDECK_LAUNCHPAD_HELPER_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_HELPER_MAX_CONCURRENCY);
+            Arc::new(Semaphore::new(limit))
+        })
+        .clone()
+}
 
 #[derive(Debug, Clone)]
 pub struct NativeBonkArtifacts {
@@ -46,6 +73,23 @@ pub struct BonkMarketSnapshot {
     pub complete: bool,
     pub marketCapLamports: String,
     pub marketCapSol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BonkImportContext {
+    pub launchpad: String,
+    pub mode: String,
+    pub quoteAsset: String,
+    #[serde(default)]
+    pub creator: String,
+    #[serde(default)]
+    pub platformId: String,
+    #[serde(default)]
+    pub configId: String,
+    #[serde(default)]
+    pub poolId: String,
+    #[serde(default)]
+    pub detectionSource: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +124,10 @@ struct HelperLaunchResponse {
     mint: String,
     launchCreator: String,
     compiledTransactions: Vec<HelperCompiledTransaction>,
+    #[serde(default)]
+    atomicCombined: bool,
+    #[serde(default)]
+    atomicFallbackReason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,9 +158,56 @@ fn helper_script_path() -> Result<PathBuf, String> {
     Ok(project_root()?.join("scripts/bonk-launchpad.js"))
 }
 
-async fn run_helper<T: Serialize, R: for<'de> Deserialize<'de>>(
-    request: &T,
+fn parse_helper_output<R: for<'de> Deserialize<'de>>(
+    output_stdout: &[u8],
+    helper_name: &str,
 ) -> Result<R, String> {
+    let stdout = String::from_utf8_lossy(output_stdout);
+    let trimmed = stdout.trim();
+    let mut candidates = Vec::new();
+    if !trimmed.is_empty() {
+        candidates.push(trimmed.to_string());
+        if let Some(last_line) = trimmed.lines().rev().find(|line| !line.trim().is_empty()) {
+            let last_line = last_line.trim();
+            if !last_line.is_empty() && !candidates.iter().any(|entry| entry == last_line) {
+                candidates.push(last_line.to_string());
+            }
+        }
+        for (index, ch) in trimmed.char_indices().rev() {
+            if ch != '{' && ch != '[' {
+                continue;
+            }
+            let candidate = trimmed[index..].trim();
+            if candidate.is_empty() || candidates.iter().any(|entry| entry == candidate) {
+                continue;
+            }
+            candidates.push(candidate.to_string());
+            if candidates.len() >= 12 {
+                break;
+            }
+        }
+    }
+    for candidate in &candidates {
+        if let Ok(parsed) = serde_json::from_str::<R>(candidate) {
+            return Ok(parsed);
+        }
+    }
+    let preview = trimmed.chars().take(240).collect::<String>();
+    Err(format!(
+        "Failed to parse {helper_name} helper output. stdout preview: {}",
+        if preview.is_empty() {
+            "(empty)".to_string()
+        } else {
+            preview.replace('\n', "\\n")
+        }
+    ))
+}
+
+async fn run_helper<T: Serialize, R: for<'de> Deserialize<'de>>(request: &T) -> Result<R, String> {
+    let _permit = helper_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|_| "Bonk helper semaphore closed unexpectedly.".to_string())?;
     let script_path = helper_script_path()?;
     let request_bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
     let mut child = Command::new("node")
@@ -126,21 +221,61 @@ async fn run_helper<T: Serialize, R: for<'de> Deserialize<'de>>(
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(&request_bytes)
+            .await
             .map_err(|error| format!("Failed to send Bonk helper request: {error}"))?;
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("Bonk helper failed to complete: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Bonk helper stdout was unavailable.".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Bonk helper stderr was unavailable.".to_string())?;
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout
+            .read_to_end(&mut bytes)
+            .await
+            .map(|_| bytes)
+            .map_err(|error| error.to_string())
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .await
+            .map(|_| bytes)
+            .map_err(|error| error.to_string())
+    });
+    let status = match timeout(Duration::from_millis(helper_timeout_ms()), child.wait()).await {
+        Ok(result) => result.map_err(|error| format!("Bonk helper failed to complete: {error}"))?,
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(format!(
+                "Bonk helper timed out after {}ms.",
+                helper_timeout_ms()
+            ));
+        }
+    };
+    let output_stdout = stdout_task
+        .await
+        .map_err(|error| format!("Bonk helper stdout task failed: {error}"))?
+        .map_err(|error| format!("Failed to read Bonk helper stdout: {error}"))?;
+    let output_stderr = stderr_task
+        .await
+        .map_err(|error| format!("Bonk helper stderr task failed: {error}"))?
+        .map_err(|error| format!("Failed to read Bonk helper stderr: {error}"))?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&output_stderr).trim().to_string();
         return Err(if stderr.is_empty() {
             "Bonk helper exited with a non-zero status.".to_string()
         } else {
             format!("Bonk helper error: {stderr}")
         });
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("Failed to parse Bonk helper output: {error}"))
+    parse_helper_output(&output_stdout, "Bonk")
 }
 
 fn helper_tx_config(
@@ -271,6 +406,7 @@ pub fn supports_native_bonk_compile(config: &NormalizedConfig) -> bool {
 pub async fn quote_launch(
     rpc_url: &str,
     quote_asset: &str,
+    launch_mode: &str,
     mode: &str,
     amount: &str,
 ) -> Result<Option<LaunchQuote>, String> {
@@ -282,6 +418,7 @@ pub async fn quote_launch(
         "action": "quote",
         "rpcUrl": rpc_url,
         "quoteAsset": quote_asset,
+        "launchMode": launch_mode,
         "mode": if trimmed_mode.is_empty() { "sol" } else { trimmed_mode.as_str() },
         "amount": amount,
         "commitment": "confirmed",
@@ -317,7 +454,9 @@ pub async fn compile_sol_to_usd1_topup_transaction(
         ),
     }))
     .await?;
-    Ok(response.compiledTransaction.map(convert_compiled_transaction))
+    Ok(response
+        .compiledTransaction
+        .map(convert_compiled_transaction))
 }
 
 pub async fn try_compile_native_bonk(
@@ -334,31 +473,6 @@ pub async fn try_compile_native_bonk(
     }
     validate_bonk_config(config)?;
     let tip_lamports = u64::try_from(config.tx.jitoTipLamports.max(0)).unwrap_or_default();
-    let usd1_topup = if config.quoteAsset == "usd1" {
-        if let Some(dev_buy) = config.devBuy.as_ref() {
-            let required_quote_amount = if dev_buy.mode == "tokens" {
-                quote_launch(rpc_url, &config.quoteAsset, "tokens", &dev_buy.amount)
-                    .await?
-                    .ok_or_else(|| "Unable to compute USD1 top-up amount for Bonk dev buy.".to_string())?
-                    .estimatedQuoteAmount
-            } else {
-                dev_buy.amount.clone()
-            };
-            compile_sol_to_usd1_topup_transaction(
-                rpc_url,
-                &config.execution,
-                &config.tx.jitoTipAccount,
-                wallet_secret,
-                &required_quote_amount,
-                "launch-usd1-topup",
-            )
-            .await?
-        } else {
-            None
-        }
-    } else {
-        None
-    };
     let response: HelperLaunchResponse = run_helper(&json!({
         "action": "build-launch",
         "mode": config.mode,
@@ -388,14 +502,11 @@ pub async fn try_compile_native_bonk(
         })),
     }))
     .await?;
-    let mut compiled_transactions = response
+    let compiled_transactions = response
         .compiledTransactions
         .into_iter()
         .map(convert_compiled_transaction)
         .collect::<Vec<_>>();
-    if let Some(topup_tx) = usd1_topup {
-        compiled_transactions.insert(0, topup_tx);
-    }
     let mut report = build_report(
         config,
         transport_plan,
@@ -407,10 +518,18 @@ pub async fn try_compile_native_bonk(
         config_path,
         vec![],
     );
-    report.execution.warnings.push(
-        "Bonk launch assembly uses the Raydium LaunchLab SDK-backed compile bridge."
-            .to_string(),
+    report.execution.notes.push(
+        "Bonk launch assembly uses the Raydium LaunchLab SDK-backed compile bridge.".to_string(),
     );
+    if response.atomicCombined {
+        report.execution.notes.push(
+            "USD1 dev buy was assembled atomically with the launch transaction.".to_string(),
+        );
+    } else if let Some(reason) = response.atomicFallbackReason.as_ref() {
+        report.execution.warnings.push(format!(
+            "USD1 dev buy atomic assembly fell back to split transactions: {reason}"
+        ));
+    }
     report.transactions = build_transaction_summaries(&compiled_transactions, config.tx.dumpBase64);
     let text = render_report(&report);
     let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
@@ -522,7 +641,9 @@ pub async fn compile_follow_sell_transaction(
         ),
     }))
     .await?;
-    Ok(response.compiledTransaction.map(convert_compiled_transaction))
+    Ok(response
+        .compiledTransaction
+        .map(convert_compiled_transaction))
 }
 
 pub async fn fetch_bonk_market_snapshot(
@@ -536,6 +657,19 @@ pub async fn fetch_bonk_market_snapshot(
         "commitment": "processed",
         "mint": mint,
         "quoteAsset": quote_asset,
+    }))
+    .await
+}
+
+pub async fn detect_bonk_import_context(
+    rpc_url: &str,
+    mint: &str,
+) -> Result<Option<BonkImportContext>, String> {
+    run_helper(&json!({
+        "action": "detect-import-context",
+        "rpcUrl": rpc_url,
+        "commitment": "processed",
+        "mint": mint,
     }))
     .await
 }

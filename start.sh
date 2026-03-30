@@ -154,13 +154,14 @@ start_launchdeck_processes() {
       >"$stdout_path" 2>"$stderr_path" </dev/null &
   )
 
-  if wait_for_health_endpoint "http://127.0.0.1:$engine_port/health" "LaunchDeck Rust host" 20 0.5; then
+  if wait_for_health_endpoint "http://127.0.0.1:$engine_port/health" "LaunchDeck Rust host" 60 0.5; then
     echo "LaunchDeck Rust host ready on port $engine_port."
     if command -v xdg-open >/dev/null 2>&1; then
       xdg-open "http://127.0.0.1:$engine_port" >/dev/null 2>&1 || true
     fi
   else
-    echo "Warning: Check .local/launchdeck/engine-error.log if the Rust host failed to start." >&2
+    echo "Warning: LaunchDeck Rust host did not report healthy startup before timeout at http://127.0.0.1:$engine_port/health. It may still be compiling." >&2
+    echo "Warning: Check .local/launchdeck/engine-error.log if the Rust host actually failed to start." >&2
   fi
 }
 

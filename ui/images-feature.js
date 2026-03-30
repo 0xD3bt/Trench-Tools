@@ -66,6 +66,14 @@
 
     let eventsBound = false;
 
+    function resolveImagePreviewUrl(image) {
+      if (!image || typeof image !== "object") return "";
+      const previewUrl = String(image.previewUrl || "").trim();
+      if (previewUrl) return previewUrl;
+      const fileName = String(image.fileName || "").trim();
+      return fileName ? `/uploads/${encodeURIComponent(fileName)}` : "";
+    }
+
     function hideItemMenu() {
       if (!imageItemMenu) return;
       imageItemMenu.hidden = true;
@@ -135,7 +143,7 @@
       }
       imageStatus.textContent = "";
       imagePath.textContent = "";
-      setImagePreview(image.previewUrl);
+      setImagePreview(resolveImagePreviewUrl(image));
       scheduleMetadataPreupload({ immediate: true });
     }
 
@@ -157,7 +165,7 @@
       const state = getImageLibraryState();
       const imageTiles = state.images.map((image) => `
         <div class="image-library-item${image.id === state.activeImageId ? " active" : ""}" data-image-id="${escapeHTML(image.id)}" tabindex="0" role="button" aria-label="${escapeHTML(image.name || image.fileName || "image")}">
-          <img src="${escapeHTML(image.previewUrl)}" alt="${escapeHTML(image.name || image.fileName || "image")}">
+          <img src="${escapeHTML(resolveImagePreviewUrl(image))}" alt="${escapeHTML(image.name || image.fileName || "image")}">
           <button type="button" class="image-library-item-menu-trigger" data-image-menu-id="${escapeHTML(image.id)}">&hellip;</button>
         </div>
       `);
@@ -209,7 +217,7 @@
           state.activeImageId = selected.id;
           if (!getUploadedImage() || getUploadedImage().id !== selected.id) {
             setUploadedImage(selected);
-            setImagePreview(selected.previewUrl);
+            setImagePreview(resolveImagePreviewUrl(selected));
           }
         }
       }

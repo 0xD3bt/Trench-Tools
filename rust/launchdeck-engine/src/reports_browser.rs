@@ -1,6 +1,9 @@
 #![allow(non_snake_case, dead_code)]
 
-use crate::paths;
+use crate::{
+    paths,
+    report::{LaunchReport, render_report},
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -244,6 +247,9 @@ fn report_summary_cache() -> &'static Mutex<Option<ReportSummaryCache>> {
 
 fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> String {
     let report = payload.get("report").cloned().unwrap_or(Value::Null);
+    if let Ok(parsed) = serde_json::from_value::<LaunchReport>(report.clone()) {
+        return render_report(&parsed);
+    }
     let execution = report.get("execution").cloned().unwrap_or(Value::Null);
     let mut lines = vec![
         format!(

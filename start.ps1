@@ -135,7 +135,7 @@ function Wait-ForHealthEndpoint {
     }
   }
 
-  Write-Warning "$Name did not report healthy startup at $Url."
+  Write-Warning "$Name did not report healthy startup before timeout at $Url. It may still be compiling."
   return $false
 }
 
@@ -173,7 +173,7 @@ function Start-LaunchDeckProcesses {
   $engineHealthy = Wait-ForHealthEndpoint `
     -Url "http://127.0.0.1:$($ports.EnginePort)/health" `
     -Name "LaunchDeck Rust host" `
-    -MaxAttempts 20 `
+    -MaxAttempts 60 `
     -DelayMilliseconds 500
 
   if ($daemonHealthy) {
@@ -186,7 +186,7 @@ function Start-LaunchDeckProcesses {
     Write-Host "LaunchDeck Rust host ready on port $($ports.EnginePort)."
     Start-Process "http://127.0.0.1:$($ports.EnginePort)" | Out-Null
   } else {
-    Write-Warning "Check .local\launchdeck\engine-error.log if the Rust host failed to start."
+    Write-Warning "Check .local\launchdeck\engine-error.log if the Rust host actually failed to start."
   }
 }
 

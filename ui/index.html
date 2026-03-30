@@ -57,11 +57,37 @@
                     <div id="top-preset-chip-bar" class="preset-chip-bar top-preset-chip-bar"></div>
                   </div>
                   <button id="open-vamp-button" type="button" class="preset-chip compact wallet-chip-button">Vamp</button>
-                  <button id="open-popout-button" type="button" class="preset-chip compact wallet-chip-button">Popout</button>
                   <button id="toggle-output-button" type="button" class="preset-chip compact wallet-chip-button">Output</button>
-                  <button id="toggle-reports-button" type="button" class="preset-chip compact wallet-chip-button">Reports</button>
-                  <button id="toggle-theme-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Switch to white mode" aria-label="Switch to white mode">&#9728;</button>
-                  <button id="open-settings-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Settings" aria-label="Settings">&#9881;</button>
+                  <button id="toggle-reports-button" type="button" class="preset-chip compact wallet-chip-button">History</button>
+                  <button id="toggle-theme-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Switch to white mode" aria-label="Switch to white mode">
+                    <span class="icon-chip-glyph theme-icon theme-icon-sun" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" focusable="false">
+                        <circle cx="12" cy="12" r="4.5"></circle>
+                        <path d="M12 2.5v3"></path>
+                        <path d="M12 18.5v3"></path>
+                        <path d="M21.5 12h-3"></path>
+                        <path d="M5.5 12h-3"></path>
+                        <path d="M18.7 5.3l-2.1 2.1"></path>
+                        <path d="M7.4 16.6l-2.1 2.1"></path>
+                        <path d="M18.7 18.7l-2.1-2.1"></path>
+                        <path d="M7.4 7.4L5.3 5.3"></path>
+                      </svg>
+                    </span>
+                    <span class="icon-chip-glyph theme-icon theme-icon-moon" aria-hidden="true" hidden>
+                      <svg viewBox="0 0 24 24" focusable="false">
+                        <path d="M18.5 14.2A7.5 7.5 0 0 1 9.8 5.5 8.5 8.5 0 1 0 18.5 14.2Z"></path>
+                      </svg>
+                    </span>
+                  </button>
+                  <button id="open-popout-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Popout" aria-label="Popout">&#x29C9;</button>
+                  <button id="open-settings-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Settings" aria-label="Settings">
+                    <span class="icon-chip-glyph settings-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" focusable="false">
+                        <path d="M10.6 2.8h2.8l.5 2.3a7.5 7.5 0 0 1 1.8.8l2-1.2 2 2-1.2 2a7.5 7.5 0 0 1 .8 1.8l2.3.5v2.8l-2.3.5a7.5 7.5 0 0 1-.8 1.8l1.2 2-2 2-2-1.2a7.5 7.5 0 0 1-1.8.8l-.5 2.3h-2.8l-.5-2.3a7.5 7.5 0 0 1-1.8-.8l-2 1.2-2-2 1.2-2a7.5 7.5 0 0 1-.8-1.8l-2.3-.5v-2.8l2.3-.5a7.5 7.5 0 0 1 .8-1.8l-1.2-2 2-2 2 1.2a7.5 7.5 0 0 1 1.8-.8z"></path>
+                        <circle cx="12" cy="12" r="3.2"></circle>
+                      </svg>
+                    </span>
+                  </button>
                 </div>
               </div>
               <div id="wallet-dropdown" class="wallet-dropdown" hidden>
@@ -132,7 +158,6 @@
                 </button>
               </div>
               <div class="image-meta">
-                <div id="image-status" class="muted small"></div>
                 <div id="image-path" class="mono small"></div>
               </div>
             </div>
@@ -199,6 +224,10 @@
             </div>
             <input id="metadata-uri" type="hidden" value="">
             <input id="metadata-status" type="hidden" value="">
+            <input name="bagsIdentityMode" type="hidden" value="wallet-only">
+            <input name="bagsAgentUsername" type="hidden" value="">
+            <input name="bagsAuthToken" type="hidden" value="">
+            <input name="bagsIdentityVerifiedWallet" type="hidden" value="">
           </div>
         </div>
 
@@ -214,6 +243,21 @@
               <input type="radio" name="mode" value="bonkers">
               <span class="mode-title">bonkers</span>
               <span class="tooltip-dot" title="Bonk-only launch mode that routes through the Bonkers platform on Raydium LaunchLab.">?</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="bags-2-2">
+              <span class="mode-title">2% / 2%</span>
+              <span class="tooltip-dot" title="Bags-only fee mode with 2% fees before and after migration.">?</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="bags-025-1">
+              <span class="mode-title">0.25% / 1%</span>
+              <span class="tooltip-dot" title="Bags-only fee mode with 0.25% fees before migration and 1% after migration.">?</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="bags-1-025">
+              <span class="mode-title">1% / 0.25%</span>
+              <span class="tooltip-dot" title="Bags-only fee mode with 1% fees before migration and 0.25% after migration.">?</span>
             </label>
             <button
               type="button"
@@ -285,6 +329,9 @@
             <button type="button" id="fee-split-pill" class="button subtle mode-action-button fee-split-action-button" title="Enable fee-sharing split after launch.">
               <span class="mode-title">Fee Split</span>
             </button>
+            <button type="button" id="bags-identity-button" class="button subtle mode-action-button" hidden>
+              <span class="mode-title" id="bags-identity-button-label">Wallet Only</span>
+            </button>
             <button id="mode-vanity-button" type="button" class="button subtle mode-action-button">
               <span class="mode-title">Vanity</span>
             </button>
@@ -320,12 +367,10 @@
                         <strong id="auto-sell-trigger-value">Safe</strong>
                       </div>
                       <div class="auto-sell-trigger-grid">
-                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-trigger-mode="confirmation">Safe Confirmed</button>
                         <button type="button" class="auto-sell-trigger-chip" data-auto-sell-trigger-mode="submit-delay">On Submit + Delay</button>
-                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-trigger-mode="block-offset">Block Offset</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-trigger-mode="block-offset">On Confirmed Block</button>
                       </div>
-                      <div id="auto-sell-trigger-description" class="auto-sell-help-text"></div>
-                      <input name="automaticDevSellTriggerMode" type="hidden" value="confirmation">
+                      <input name="automaticDevSellTriggerMode" type="hidden" value="block-offset">
                     </div>
                     <div id="auto-sell-delay-control" class="auto-sell-slider-block" hidden>
                       <div class="auto-sell-slider-head">
@@ -338,18 +383,34 @@
                     </div>
                     <div id="auto-sell-block-control" class="auto-sell-trigger-block" hidden>
                       <div class="auto-sell-slider-head">
-                        <span>Target Block</span>
-                        <strong id="auto-sell-block-value">Block 0</strong>
+                        <span>On Confirmed Block</span>
+                        <strong id="auto-sell-block-value">0</strong>
                       </div>
                       <div class="auto-sell-trigger-grid auto-sell-block-grid">
-                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="0">Block 0</button>
-                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="1">Block 1</button>
-                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="2">Block 2</button>
-                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="3">Block 3</button>
-                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="4">Block 4</button>
-                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="5">Block 5</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="0">0</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="1">1</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="2">2</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="3">3</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="4">4</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="5">5</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="6">6</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="7">7</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="8">8</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="9">9</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="10">10</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="11">11</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="12">12</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="13">13</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="14">14</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="15">15</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="16">16</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="17">17</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="18">18</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="19">19</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="20">20</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="21">21</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="22">22</button>
                       </div>
-                      <div class="auto-sell-help-text">Send the sell transaction as soon as the launcher reaches the selected observed block offset.</div>
                       <input name="automaticDevSellBlockOffset" type="hidden" value="0">
                       <div class="field-error" data-error-for="automaticDevSellBlockOffset"></div>
                     </div>
@@ -419,8 +480,8 @@
                 </label>
                 <button id="dev-buy-custom-deploy" type="button" class="button deploy dev-buy-custom-deploy">Deploy</button>
               </div>
+              <div id="image-status" class="deploy-status-bar muted small" aria-live="polite"></div>
             </div>
-            <div id="quote-output" class="quote muted" hidden>No dev buy selected.</div>
           </div>
         </div>
 
@@ -428,10 +489,9 @@
           <div class="output-head">
             <h2>Output</h2>
             <div class="output-head-actions">
-              <button type="button" data-action="build" class="button subtle output-head-button">Build</button>
-              <button type="button" data-action="simulate" class="button subtle output-head-button">Simulate</button>
-              <button id="test-fill-button" type="button" class="button subtle output-head-button output-dev-button">Test</button>
-              <span id="status" class="status">Idle</span>
+              <button type="button" data-action="build" class="preset-chip compact wallet-chip-button output-head-button">Build</button>
+              <button type="button" data-action="simulate" class="preset-chip compact wallet-chip-button output-head-button">Simulate</button>
+              <button id="test-fill-button" type="button" class="preset-chip compact wallet-chip-button output-head-button output-dev-button">Prefill</button>
             </div>
           </div>
           <div id="meta" class="meta muted"></div>
@@ -443,12 +503,16 @@
       <aside id="reports-terminal-section" class="card reports-terminal" hidden>
         <div class="reports-terminal-head">
           <div>
-            <h2>Reports Terminal</h2>
-            <div id="reports-terminal-meta" class="meta muted">Browse persisted build, simulate, and send logs.</div>
+            <h2>History</h2>
+            <div id="reports-terminal-meta" class="meta muted">Latest 25 transactions.</div>
           </div>
           <div class="reports-terminal-actions">
-            <button id="reports-sort-button" type="button" class="button subtle output-head-button">Newest</button>
-            <button id="reports-refresh-button" type="button" class="button subtle output-head-button">Refresh</button>
+            <div class="reports-terminal-button-group">
+              <button id="reports-transactions-button" type="button" class="preset-chip compact reports-terminal-chip active">Transactions</button>
+              <button id="reports-launches-button" type="button" class="preset-chip compact reports-terminal-chip">Launches</button>
+            </div>
+            <button id="reports-sort-button" type="button" class="preset-chip compact reports-terminal-chip">Newest</button>
+            <button id="reports-refresh-button" type="button" class="preset-chip compact reports-terminal-chip">Refresh</button>
           </div>
         </div>
         <div class="reports-terminal-body">
@@ -475,7 +539,7 @@
             <h3>Settings</h3>
             <div class="settings-modal-subtitle">Preset routes, fee defaults, and backend routing summary.</div>
           </div>
-          <button type="button" id="settings-close" class="modal-close">&times;</button>
+          <button type="button" id="settings-close" class="modal-close" hidden>&times;</button>
         </div>
         <div class="modal-body settings-modal-body">
           <div class="settings-modal-layout">
@@ -491,13 +555,13 @@
               <div class="settings-main-panel-body">
                 <section class="settings-row-group">
                   <div class="settings-row-header">
-                  <div>
+                  <div class="settings-row-title-line">
                     <h4>Creation</h4>
                     <p class="settings-section-copy">Launch route plus default fee values for the active preset.</p>
                   </div>
                   <span class="settings-section-pill">Creation</span>
                   </div>
-                  <div class="settings-grid settings-grid-three settings-route-grid">
+                  <div class="settings-grid settings-grid-four settings-route-grid">
                   <label>
                     <span>Route</span>
                     <select name="creationProvider" id="provider-select">
@@ -506,28 +570,46 @@
                       <option value="jito-bundle">Jito Bundle</option>
                     </select>
                   </label>
-                  <label>
-                    <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                    <input name="creationPriorityFeeSol" id="creation-priority-input" type="text" placeholder="0.001">
+                  <label class="settings-fee-field">
+                    <span>Priority Fee</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="creationPriorityFeeSol" id="creation-priority-input" type="text" placeholder="0.001">
+                    </span>
                     <div class="field-error" data-error-for="creationPriorityFeeSol"></div>
                   </label>
-                  <label>
-                    <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                    <input name="creationTipSol" id="creation-tip-input" type="text" placeholder="0.01">
+                  <label class="settings-fee-field">
+                    <span>Tip</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="creationTipSol" id="creation-tip-input" type="text" placeholder="0.01">
+                    </span>
                     <div class="field-error" data-error-for="creationTipSol"></div>
                   </label>
+                  <div class="settings-route-meta">
+                    <input name="creationAutoFeeEnabled" id="creation-auto-fee-input" type="checkbox" hidden>
+                    <button type="button" id="creation-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, LaunchDeck fetches fresh priority and Jito tip estimates for this row based on the selected route. Manual priority and tip inputs are ignored until Auto Fee is turned off. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                    <label class="settings-auto-fee-cap settings-fee-field">
+                      <span>Max Fee</span>
+                      <span class="settings-fee-input-wrap">
+                        <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                        <input name="creationMaxFeeSol" id="creation-max-fee-input" type="text" placeholder="recommended">
+                      </span>
+                      <div class="field-error" data-error-for="creationMaxFeeSol"></div>
+                    </label>
+                  </div>
                   </div>
                 </section>
 
                 <section class="settings-row-group">
                   <div class="settings-row-header">
-                  <div>
+                  <div class="settings-row-title-line">
                     <h4>Buy</h4>
                     <p class="settings-section-copy">Sniper and post-launch buy defaults for the active preset.</p>
                   </div>
                   <span class="settings-section-pill">Buy</span>
                   </div>
-                  <div class="settings-grid settings-grid-four settings-route-grid">
+                  <div class="settings-grid settings-grid-five settings-route-grid">
                   <label>
                     <span>Route</span>
                     <select name="buyProvider" id="buy-provider-select">
@@ -536,14 +618,20 @@
                       <option value="jito-bundle">Jito Bundle</option>
                     </select>
                   </label>
-                  <label>
-                    <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                    <input name="buyPriorityFeeSol" id="buy-priority-fee-input" type="text" placeholder="0.009">
+                  <label class="settings-fee-field">
+                    <span>Priority Fee</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="buyPriorityFeeSol" id="buy-priority-fee-input" type="text" placeholder="0.009">
+                    </span>
                     <div class="field-error" data-error-for="buyPriorityFeeSol"></div>
                   </label>
-                  <label>
-                    <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                    <input name="buyTipSol" id="buy-tip-input" type="text" placeholder="0.01">
+                  <label class="settings-fee-field">
+                    <span>Tip</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="buyTipSol" id="buy-tip-input" type="text" placeholder="0.01">
+                    </span>
                     <div class="field-error" data-error-for="buyTipSol"></div>
                   </label>
                   <label>
@@ -551,19 +639,31 @@
                     <input name="buySlippagePercent" id="buy-slippage-input" type="text" placeholder="90">
                     <div class="field-error" data-error-for="buySlippagePercent"></div>
                   </label>
+                  <div class="settings-route-meta">
+                    <input name="buyAutoFeeEnabled" id="buy-auto-fee-input" type="checkbox" hidden>
+                    <button type="button" id="buy-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, buy-side fees use fresh provider-aware estimates. For standard RPC this means auto priority fee. For Helius Sender and Jito it also resolves a tip when that path supports one. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                    <label class="settings-auto-fee-cap settings-fee-field">
+                      <span>Max Fee</span>
+                      <span class="settings-fee-input-wrap">
+                        <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                        <input name="buyMaxFeeSol" id="buy-max-fee-input" type="text" placeholder="recommended">
+                      </span>
+                      <div class="field-error" data-error-for="buyMaxFeeSol"></div>
+                    </label>
+                  </div>
                   </div>
                   <div id="buy-standard-rpc-warning" class="modal-warning settings-provider-warning" hidden></div>
                 </section>
 
                 <section class="settings-row-group">
                   <div class="settings-row-header">
-                  <div>
+                  <div class="settings-row-title-line">
                     <h4>Sell</h4>
                     <p class="settings-section-copy">Sniper sell and dev auto-sell defaults for the active preset.</p>
                   </div>
                   <span class="settings-section-pill">Sell</span>
                   </div>
-                  <div class="settings-grid settings-grid-four settings-route-grid">
+                  <div class="settings-grid settings-grid-five settings-route-grid">
                   <label>
                     <span>Route</span>
                     <select name="sellProvider" id="sell-provider-select">
@@ -572,14 +672,20 @@
                       <option value="jito-bundle">Jito Bundle</option>
                     </select>
                   </label>
-                  <label>
-                    <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                    <input name="sellPriorityFeeSol" id="sell-priority-fee-input" type="text" placeholder="0.009">
+                  <label class="settings-fee-field">
+                    <span>Priority Fee</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="sellPriorityFeeSol" id="sell-priority-fee-input" type="text" placeholder="0.009">
+                    </span>
                     <div class="field-error" data-error-for="sellPriorityFeeSol"></div>
                   </label>
-                  <label>
-                    <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                    <input name="sellTipSol" id="sell-tip-input" type="text" placeholder="0.01">
+                  <label class="settings-fee-field">
+                    <span>Tip</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="sellTipSol" id="sell-tip-input" type="text" placeholder="0.01">
+                    </span>
                     <div class="field-error" data-error-for="sellTipSol"></div>
                   </label>
                   <label>
@@ -587,6 +693,18 @@
                     <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="90">
                     <div class="field-error" data-error-for="sellSlippagePercent"></div>
                   </label>
+                  <div class="settings-route-meta">
+                    <input name="sellAutoFeeEnabled" id="sell-auto-fee-input" type="checkbox" hidden>
+                    <button type="button" id="sell-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, sell-side fees are resolved from live fee market data for the selected route. This keeps snipe sells and dev auto-sells aligned with current conditions without editing the manual fee boxes. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                    <label class="settings-auto-fee-cap settings-fee-field">
+                      <span>Max Fee</span>
+                      <span class="settings-fee-input-wrap">
+                        <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                        <input name="sellMaxFeeSol" id="sell-max-fee-input" type="text" placeholder="recommended">
+                      </span>
+                      <div class="field-error" data-error-for="sellMaxFeeSol"></div>
+                    </label>
+                  </div>
                   </div>
                   <div id="sell-standard-rpc-warning" class="modal-warning settings-provider-warning" hidden></div>
                 </section>
@@ -613,7 +731,7 @@
           <input name="skipPreflight" type="hidden" value="false">
         </div>
         <div class="modal-footer settings-modal-footer">
-          <button type="button" id="settings-cancel" class="button subtle">Close</button>
+          <button type="button" id="settings-cancel" class="button subtle">Cancel</button>
           <button type="button" id="save-settings-button" class="button deploy">Save</button>
         </div>
       </div>
@@ -729,10 +847,53 @@
             <div id="fee-split-bar" class="fee-split-bar"></div>
             <div id="fee-split-legend-list" class="fee-split-legend-list"></div>
           </div>
+          <div id="fee-split-modal-error" class="sniper-modal-error muted small"></div>
         </div>
         <div class="modal-footer">
-          <button type="button" id="fee-split-disable" class="button">Disable</button>
+          <button type="button" id="fee-split-disable" class="button">Cancel</button>
           <button type="button" id="fee-split-save" class="button deploy">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="bags-identity-modal" class="modal-overlay" hidden>
+      <div class="modal fee-split-modal bags-identity-modal">
+        <div class="modal-header">
+          <div>
+            <h3>Bags Identity</h3>
+            <div class="muted small">Wallet-only launches use the selected LaunchDeck wallet. Linked identity requires the selected wallet to belong to the authenticated Bags account.</div>
+          </div>
+          <button type="button" id="bags-identity-close" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body stack">
+          <div id="bags-identity-current" class="modal-warning" hidden></div>
+          <label>
+            <span>Bags API Key</span>
+            <input id="bags-api-key-input" type="password" placeholder="Enter Bags API key if missing or replacing">
+          </label>
+          <label class="checkbox-row">
+            <input id="bags-api-key-save" type="checkbox" checked>
+            <span>Save API key for future launches</span>
+          </label>
+          <label>
+            <span>Agent Username</span>
+            <input id="bags-agent-username-input" type="text" placeholder="Moltbook username">
+          </label>
+          <button type="button" id="bags-identity-init-button" class="button subtle">Generate Verification</button>
+          <label>
+            <span>Verification Post Content</span>
+            <textarea id="bags-verification-content" rows="4" readonly placeholder="Generate verification first"></textarea>
+          </label>
+          <label>
+            <span>Moltbook Post ID</span>
+            <input id="bags-post-id-input" type="text" placeholder="Paste the verification post id">
+          </label>
+          <div class="muted small">Linked mode stays enabled only when the selected LaunchDeck wallet belongs to the authenticated Bags account. If the account context or wallet does not match, LaunchDeck falls back to wallet-only mode.</div>
+          <div id="bags-identity-error" class="field-error"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="bags-identity-cancel" class="button subtle">Cancel</button>
+          <button type="button" id="bags-identity-verify" class="button deploy">Verify</button>
         </div>
       </div>
     </div>

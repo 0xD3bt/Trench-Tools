@@ -50,6 +50,14 @@ pub fn app_config_path() -> PathBuf {
     local_root_dir().join("app-config.json")
 }
 
+pub fn bags_credentials_path() -> PathBuf {
+    local_root_dir().join("bags-credentials.json")
+}
+
+pub fn bags_session_path() -> PathBuf {
+    local_root_dir().join("bags-session.json")
+}
+
 pub fn lookup_table_cache_path() -> PathBuf {
     local_root_dir().join("lookup-tables.json")
 }

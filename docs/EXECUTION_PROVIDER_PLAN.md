@@ -1,10 +1,12 @@
 # Execution Provider Plan
 
-This is the merged in-repo execution design for `LaunchDeck`.
+> Note: This is a planning/reference document for provider design, not part of the main operator documentation set. Use `docs/PROVIDERS.md` for current supported provider behavior.
+
+This document captures the execution-provider design as it exists in the repo today.
 
 ## Product Model
 
-The standalone product supports:
+The current product surface includes:
 
 - launchpads: `pump`, `bonk`, `bagsapp`
 - providers: `helius-sender`, `standard-rpc`, `jito-bundle`
@@ -17,9 +19,9 @@ The code is split into:
 
 - `rust/launchdeck-engine`: native UI/API host, config normalization, transaction assembly, simulation, send path, image/report/settings persistence, vamp import, and runtime workers
 - `rust/launchdeck-engine/src/bin/launchdeck-cli.rs`: native CLI for build/simulate/send from config files
-- `providers/provider-adapters.js`: provider routing and execution-class decisions
-- `launchpads/`: launchpad registry and launchpad capability metadata
-- `strategies/`: post-launch strategy metadata
+- `rust/launchdeck-engine/src/providers.rs`: provider routing and execution-class decisions
+- `rust/launchdeck-engine/src/launchpads.rs`: launchpad registry and capability metadata
+- `rust/launchdeck-engine/src/strategies.rs`: post-launch strategy metadata
 
 The browser UI now talks directly to the Rust host on the local UI port.
 
@@ -33,6 +35,8 @@ The browser also pre-uploads launch metadata when possible so deploy-time latenc
 
 Providers with multiple documented endpoint groups can also expose endpoint profiles such as `Global`, `US`, `EU`, `West`, and `Asia`.
 
+For most operators, profile-based routing is the right default. Using `USER_REGION` is usually faster and more reliable than pinning one specific endpoint because the runtime can fan out across the region's endpoint group.
+
 ## Engine-Owned Shaping
 
 The UI captures user intent, but the engine owns final transport shaping.
@@ -41,31 +45,32 @@ Examples:
 
 - `Helius Sender` hard-requires inline tip, inline priority fee, `skipPreflight=true`, and `maxRetries=0`.
 - `Standard RPC` does not use tip.
-- `Jito Bundle` creation can accept both tip and priority in the UI, but the engine may intentionally drop creation priority for multi-transaction launch flows.
+- `Jito Bundle` creation can accept both tip and priority in the UI, but the engine may drop creation priority for multi-transaction launch flows.
 
 ## Launchpad Rules
 
 ### Pump
 
-- current verified native execution path
+- current supported native execution path
 - LaunchDeck launch modes are built by the Rust engine rather than the legacy JS planner
-- verified native coverage currently includes `regular`, `cashback`, `agent-custom`, `agent-unlocked`, and `agent-locked`
+- supported native coverage currently includes `regular`, `cashback`, `agent-custom`, `agent-unlocked`, and `agent-locked`
 - default lookup tables are warmed on app load, cached locally, and reused in the compile path
 - blockhash and Pump global state are cached in the Rust runtime to reduce compile latency
 - benchmark reports expose `total`, `backendTotal`, `preRequest`, compile sub-timings, and send sub-timings
 
 ### Bonk
 
-- not active in the current initial version
-- should not be treated as a supported launch flow yet
-- future implementation should use official Raydium SDK surfaces
-- community repos are reference-only, not implementation sources
+- active launch flow in the current runtime
+- supported modes currently include `regular` and `bonkers`
+- supported quote assets currently include `sol` and `usd1`
+- launch assembly uses the Raydium LaunchLab helper bridge with Rust-owned validation, reporting, and send orchestration
+- `usd1` uses a pinned `SOL -> USD1` route pool and atomic same-time sniper assembly on the supported Bonk path
 
 ### Bagsapp
 
-- not active in the current initial version
-- should not be treated as a supported launch flow yet
-- future implementation should use official Bags SDK/docs
+- active but experimental launch flow in the current runtime
+- launch/trade assembly uses the Bags API or SDK bridge
+- should not be treated as a fully supported launch path yet
 - creator BPS must be explicit
 - total fee-claimer BPS must equal `10000`
 - LUT-aware config creation may be required for larger fee-claimer sets
@@ -77,7 +82,7 @@ The UI learns provider and launchpad support state from backend status before de
 The backend reports:
 
 - `available`
-- `verified`
+- `supported`
 - `supportState`
 - `reason`
 - bundle/sequential/single support flags
@@ -85,14 +90,16 @@ The backend reports:
 ## Current Runtime Notes
 
 - Pump and Bonk are active launch flows in the code today.
+- Bagsapp is active but experimental in the code today.
 - `Helius Sender`, `Standard RPC`, and `Jito Bundle` are the current explicit provider choices.
+- `Helius Sender` is the current default recommendation for most operators.
 - `Standard RPC` and `Helius Sender` keep dependent launch/follow-up flows sequential.
 - `Jito Bundle` owns the current bundle transport path.
+- additional private relay integrations such as `bloxroute`, `astralane`, and `hello moon` are planned but not yet live.
 - metadata upload provider is configurable:
   - default: `pump-fun`
-  - optional custom provider: `pinata`
+  - optional custom provider: [`pinata`](https://pinata.cloud/)
   - Pinata reuses uploaded image CIDs across metadata-only edits within the current app session
-- Bags may appear in model/planning surfaces, but it is not an active launch builder in the current initial version.
 
 ## Documentation Pointers
 

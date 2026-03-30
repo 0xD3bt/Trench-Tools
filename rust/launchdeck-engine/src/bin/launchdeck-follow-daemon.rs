@@ -8,11 +8,15 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use launchdeck_engine::{
+    bags_native::{
+        compile_follow_buy_transaction as compile_bags_follow_buy_transaction,
+        compile_follow_sell_transaction as compile_bags_follow_sell_transaction,
+        fetch_bags_market_snapshot,
+    },
     bonk_native::{
         compile_follow_buy_transaction as compile_bonk_follow_buy_transaction,
         compile_follow_sell_transaction as compile_bonk_follow_sell_transaction,
-        compile_sol_to_usd1_topup_transaction,
-        fetch_bonk_market_snapshot,
+        compile_sol_to_usd1_topup_transaction, fetch_bonk_market_snapshot,
     },
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FOLLOW_TELEMETRY_SCHEMA_VERSION, FollowActionKind,
@@ -25,17 +29,17 @@ use launchdeck_engine::{
     paths,
     pump_native::{
         PreparedFollowBuyRuntime, PreparedFollowBuyStatic, compile_follow_sell_transaction,
-        finalize_follow_buy_transaction, prepare_follow_buy_runtime, prepare_follow_buy_static,
-        fetch_pump_market_snapshot, pump_bonding_curve_address,
+        fetch_pump_market_snapshot, finalize_follow_buy_transaction, prepare_follow_buy_runtime,
+        prepare_follow_buy_static, pump_bonding_curve_address,
     },
     rpc::{
-        confirm_submitted_transactions_for_transport, spawn_blockhash_refresh_task,
-        submit_transactions_for_transport,
+        confirm_submitted_transactions_for_transport, fetch_current_block_height,
+        spawn_blockhash_refresh_task, submit_transactions_for_transport,
     },
     transport::configured_watch_endpoints_for_provider,
     wallet::{
-        fetch_balance_lamports, fetch_token_balance, public_key_from_secret, read_keypair_bytes,
-        selected_wallet_key_or_default,
+        fetch_balance_lamports, fetch_token_balance, load_solana_wallet_by_env_key,
+        public_key_from_secret, selected_wallet_key_or_default,
     },
 };
 use serde_json::{Value, json};
@@ -82,9 +86,9 @@ struct CachedFollowBuyRuntime {
 }
 
 struct JobWatchHub {
-    slot_tx: watch::Sender<Option<u64>>,
-    signature_tx: watch::Sender<Option<Result<(), String>>>,
-    market_tx: watch::Sender<Option<u64>>,
+    slot_tx: watch::Sender<Option<Result<u64, String>>>,
+    signature_tx: watch::Sender<Option<Result<u64, String>>>,
+    market_tx: watch::Sender<Option<Result<u64, String>>>,
     started: Mutex<JobWatchStarted>,
 }
 
@@ -276,9 +280,7 @@ async fn set_watcher_health(
 }
 
 async fn wallet_public_key(wallet_key: &str) -> Result<String, String> {
-    let wallet_secret = env::var(wallet_key)
-        .map_err(|_| format!("Wallet env var is missing: {wallet_key}"))
-        .and_then(|value| read_keypair_bytes(&value))?;
+    let wallet_secret = load_solana_wallet_by_env_key(wallet_key)?;
     public_key_from_secret(&wallet_secret)
 }
 
@@ -442,9 +444,7 @@ async fn prepare_follow_job_buy_caches(state: Arc<AppState>, job: &FollowJobReco
         async move {
             let wallet_key = selected_wallet_key_or_default(&action.walletEnvKey)
                 .ok_or_else(|| format!("Wallet env key not found: {}", action.walletEnvKey))?;
-            let wallet_secret = env::var(&wallet_key)
-                .map_err(|_| format!("Wallet env var is missing: {wallet_key}"))
-                .and_then(|value| read_keypair_bytes(&value))?;
+            let wallet_secret = load_solana_wallet_by_env_key(&wallet_key)?;
             let buy_amount = action
                 .buyAmountSol
                 .as_deref()
@@ -541,8 +541,8 @@ async fn required_action_precheck(
                     FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS
                 ));
             }
-            if usd1_balance + 0.000_001 < required_usd1 && balance_lamports
-                < FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS.saturating_mul(2)
+            if usd1_balance + 0.000_001 < required_usd1
+                && balance_lamports < FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS.saturating_mul(2)
             {
                 return Err(format!(
                     "Wallet {wallet_key} is short on USD1 and does not have enough SOL headroom to fund an automatic top-up."
@@ -1220,6 +1220,9 @@ async fn record_creation_sample(state: &Arc<AppState>, job: &FollowJobRecord) {
     if let Some(block_height) = job.sendObservedBlockHeight {
         detail_parts.push(format!("sendObservedBlockHeight={block_height}"));
     }
+    if let Some(block_height) = job.confirmedObservedBlockHeight {
+        detail_parts.push(format!("confirmedObservedBlockHeight={block_height}"));
+    }
     let _ = state
         .store
         .record_sample(FollowTelemetrySample {
@@ -1332,9 +1335,7 @@ async fn execute_action(
     sync_follow_job_report(&state, &trace_id).await;
     let wallet_key = selected_wallet_key_or_default(&action.walletEnvKey)
         .ok_or_else(|| format!("Wallet env key not found: {}", action.walletEnvKey))?;
-    let wallet_secret = env::var(&wallet_key)
-        .map_err(|_| format!("Wallet env var is missing: {wallet_key}"))
-        .and_then(|value| read_keypair_bytes(&value))?;
+    let wallet_secret = load_solana_wallet_by_env_key(&wallet_key)?;
     if action.precheckRequired {
         required_action_precheck(&state.rpc_url, &job.quoteAsset, action).await?;
     }
@@ -1419,6 +1420,20 @@ async fn execute_action(
                     )
                     .await?,
                 )
+            } else if job.launchpad == "bagsapp" {
+                Some(
+                    compile_bags_follow_buy_transaction(
+                        &state.rpc_url,
+                        &job.execution,
+                        job.tokenMayhemMode,
+                        &job.jitoTipAccount,
+                        &wallet_secret,
+                        mint,
+                        launch_creator,
+                        amount,
+                    )
+                    .await?,
+                )
             } else {
                 let prepared = resolve_prepared_follow_buy(
                     &state,
@@ -1447,6 +1462,19 @@ async fn execute_action(
         FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
             if job.launchpad == "bonk" {
                 compile_bonk_follow_sell_transaction(
+                    &state.rpc_url,
+                    &job.execution,
+                    job.tokenMayhemMode,
+                    &job.jitoTipAccount,
+                    &wallet_secret,
+                    mint,
+                    launch_creator,
+                    sell_percent.unwrap_or_default(),
+                    job.preferPostSetupCreatorVaultForSell,
+                )
+                .await?
+            } else if job.launchpad == "bagsapp" {
+                compile_bags_follow_sell_transaction(
                     &state.rpc_url,
                     &job.execution,
                     job.tokenMayhemMode,
@@ -1507,7 +1535,9 @@ async fn execute_action(
         let confirmed_topup = topup_confirm_input.pop().unwrap_or(topup_sent);
         let mut note = format!(
             "USD1 top-up completed before buy: {}",
-            confirmed_topup.signature.unwrap_or_else(|| "(missing-signature)".to_string())
+            confirmed_topup
+                .signature
+                .unwrap_or_else(|| "(missing-signature)".to_string())
         );
         if !topup_warnings.is_empty() {
             note.push_str(" | ");
@@ -1529,7 +1559,12 @@ async fn execute_action(
         .await
         {
             Ok((submitted, warnings, submit_ms)) => {
-                break (submitted, warnings, submit_ms, started.elapsed().as_millis());
+                break (
+                    submitted,
+                    warnings,
+                    submit_ms,
+                    started.elapsed().as_millis(),
+                );
             }
             Err(error)
                 if !retried_creator_vault
@@ -1836,9 +1871,12 @@ async fn wait_for_action_eligibility(
     job: &FollowJobRecord,
     action: &FollowActionRecord,
 ) -> Result<(), String> {
-    if action.requireConfirmation {
-        wait_for_signature_confirmation(state.clone(), job, &action.actionId).await?;
-    }
+    let confirmed_launch_block_height =
+        if action.requireConfirmation || action.targetBlockOffset.is_some() {
+            Some(wait_for_signature_confirmation(state.clone(), job, &action.actionId).await?)
+        } else {
+            None
+        };
     match action.kind {
         FollowActionKind::SniperBuy => {
             if let Some(schedule_ms) = action.scheduledForMs {
@@ -1851,8 +1889,14 @@ async fn wait_for_action_eligibility(
                 .await?;
             }
             if let Some(offset) = action.targetBlockOffset {
-                wait_for_slot_offset(state.clone(), job, &action.actionId, u64::from(offset))
-                    .await?;
+                wait_for_slot_offset(
+                    state.clone(),
+                    job,
+                    &action.actionId,
+                    confirmed_launch_block_height,
+                    u64::from(offset),
+                )
+                .await?;
             }
         }
         FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
@@ -1861,7 +1905,13 @@ async fn wait_for_action_eligibility(
             let has_slot = action.targetBlockOffset.is_some();
             if has_slot && has_market {
                 tokio::select! {
-                    result = wait_for_slot_offset(state.clone(), job, &action.actionId, u64::from(action.targetBlockOffset.unwrap())) => result?,
+                    result = wait_for_slot_offset(
+                        state.clone(),
+                        job,
+                        &action.actionId,
+                        confirmed_launch_block_height,
+                        u64::from(action.targetBlockOffset.unwrap()),
+                    ) => result?,
                     result = wait_for_market_cap_trigger(state.clone(), job, action, &action.actionId) => result?,
                 }
             } else if has_slot {
@@ -1869,6 +1919,7 @@ async fn wait_for_action_eligibility(
                     state.clone(),
                     job,
                     &action.actionId,
+                    confirmed_launch_block_height,
                     u64::from(action.targetBlockOffset.unwrap()),
                 )
                 .await?;
@@ -1987,7 +2038,7 @@ async fn handle_watcher_retry(
 async fn ensure_signature_watcher(
     state: Arc<AppState>,
     job: &FollowJobRecord,
-) -> watch::Receiver<Option<Result<(), String>>> {
+) -> watch::Receiver<Option<Result<u64, String>>> {
     let hub = get_job_watch_hub(&state, &job.traceId).await;
     let mut started = hub.started.lock().await;
     if !started.signature {
@@ -2006,7 +2057,7 @@ async fn ensure_signature_watcher(
 async fn ensure_slot_watcher(
     state: Arc<AppState>,
     job: &FollowJobRecord,
-) -> watch::Receiver<Option<u64>> {
+) -> watch::Receiver<Option<Result<u64, String>>> {
     let hub = get_job_watch_hub(&state, &job.traceId).await;
     let mut started = hub.started.lock().await;
     if !started.slot {
@@ -2025,7 +2076,7 @@ async fn ensure_slot_watcher(
 async fn ensure_market_watcher(
     state: Arc<AppState>,
     job: &FollowJobRecord,
-) -> watch::Receiver<Option<u64>> {
+) -> watch::Receiver<Option<Result<u64, String>>> {
     let hub = get_job_watch_hub(&state, &job.traceId).await;
     let mut started = hub.started.lock().await;
     if !started.market {
@@ -2044,7 +2095,7 @@ async fn ensure_market_watcher(
 async fn run_signature_watcher(
     state: Arc<AppState>,
     job: FollowJobRecord,
-    tx: watch::Sender<Option<Result<(), String>>>,
+    tx: watch::Sender<Option<Result<u64, String>>>,
 ) {
     let Some(signature) = job.launchSignature.clone() else {
         let _ = tx.send(Some(
@@ -2060,7 +2111,7 @@ async fn run_signature_watcher(
     };
     let mut attempt: u32 = 0;
     loop {
-        let session = async {
+        let session: Result<u64, String> = async {
             let mut ws = open_subscription_socket(&endpoint).await?;
             subscribe(
                 &mut ws,
@@ -2068,8 +2119,7 @@ async fn run_signature_watcher(
                 json!([
                     signature,
                     {
-                        "commitment": "processed",
-                        "enableReceivedNotification": true
+                        "commitment": "confirmed"
                     }
                 ]),
             )
@@ -2089,14 +2139,16 @@ async fn run_signature_watcher(
                             "Launch signature notification reported error: {err}"
                         ));
                     }
-                    return Ok(());
+                    let confirmed_block_height =
+                        fetch_current_block_height(&state.rpc_url, "confirmed").await?;
+                    return Ok(confirmed_block_height);
                 }
             }
         }
         .await;
         match session {
-            Ok(()) => {
-                let _ = tx.send(Some(Ok(())));
+            Ok(confirmed_block_height) => {
+                let _ = tx.send(Some(Ok(confirmed_block_height)));
                 set_watcher_health(
                     &state,
                     WatcherKind::Signature,
@@ -2130,27 +2182,24 @@ async fn run_signature_watcher(
 async fn run_slot_watcher(
     state: Arc<AppState>,
     job: FollowJobRecord,
-    tx: watch::Sender<Option<u64>>,
+    tx: watch::Sender<Option<Result<u64, String>>>,
 ) {
-    let Ok(endpoint) = resolve_job_watch_endpoint(&job) else {
-        return;
-    };
     let mut attempt: u32 = 0;
     loop {
-        let session = async {
-            let mut ws = open_subscription_socket(&endpoint).await?;
-            subscribe(&mut ws, "slotSubscribe", json!([])).await?;
+        let session: Result<(), String> = async {
             loop {
                 ensure_job_not_cancelled(&state, &job.traceId).await?;
-                let message = next_json_message(&mut ws).await?;
-                let slot = message
-                    .get("params")
-                    .and_then(|params| params.get("result"))
-                    .and_then(|result| result.get("slot"))
-                    .and_then(Value::as_u64);
-                if let Some(slot) = slot {
-                    let _ = tx.send(Some(slot));
-                }
+                let block_height = fetch_current_block_height(&state.rpc_url, "confirmed").await?;
+                let _ = tx.send(Some(Ok(block_height)));
+                set_watcher_health(
+                    &state,
+                    WatcherKind::Slot,
+                    FollowWatcherHealth::Healthy,
+                    Some(state.rpc_url.clone()),
+                    None,
+                )
+                .await;
+                sleep(Duration::from_millis(200)).await;
             }
         }
         .await;
@@ -2158,17 +2207,19 @@ async fn run_slot_watcher(
             Ok(()) => return,
             Err(error) => {
                 attempt = attempt.saturating_add(1);
+                let terminal_error = error.clone();
                 if handle_watcher_retry(
                     &state,
                     &job.traceId,
                     WatcherKind::Slot,
-                    &endpoint,
+                    &state.rpc_url,
                     attempt,
                     error,
                 )
                 .await
                 .is_err()
                 {
+                    let _ = tx.send(Some(Err(terminal_error)));
                     return;
                 }
             }
@@ -2179,18 +2230,22 @@ async fn run_slot_watcher(
 async fn run_market_watcher(
     state: Arc<AppState>,
     job: FollowJobRecord,
-    tx: watch::Sender<Option<u64>>,
+    tx: watch::Sender<Option<Result<u64, String>>>,
 ) {
     let Some(mint) = job.mint.clone() else {
+        let _ = tx.send(Some(Err("Market watcher missing mint.".to_string())));
         return;
     };
     let Ok(endpoint) = resolve_job_watch_endpoint(&job) else {
+        let _ = tx.send(Some(Err(
+            "Missing watch endpoint for market watcher.".to_string()
+        )));
         return;
     };
     if job.launchpad == "bonk" {
         let mut attempt: u32 = 0;
         loop {
-            let session = async {
+            let session: Result<(), String> = async {
                 loop {
                     ensure_job_not_cancelled(&state, &job.traceId).await?;
                     let snapshot =
@@ -2199,7 +2254,7 @@ async fn run_market_watcher(
                         .marketCapLamports
                         .parse::<u64>()
                         .map_err(|error| format!("Invalid Bonk market cap payload: {error}"))?;
-                    let _ = tx.send(Some(market_cap));
+                    let _ = tx.send(Some(Ok(market_cap)));
                     sleep(Duration::from_millis(750)).await;
                 }
             }
@@ -2208,6 +2263,7 @@ async fn run_market_watcher(
                 Ok(()) => return,
                 Err(error) => {
                     attempt = attempt.saturating_add(1);
+                    let terminal_error = error.clone();
                     if handle_watcher_retry(
                         &state,
                         &job.traceId,
@@ -2219,6 +2275,46 @@ async fn run_market_watcher(
                     .await
                     .is_err()
                     {
+                        let _ = tx.send(Some(Err(terminal_error)));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if job.launchpad == "bagsapp" {
+        let mut attempt: u32 = 0;
+        loop {
+            let session: Result<(), String> = async {
+                loop {
+                    ensure_job_not_cancelled(&state, &job.traceId).await?;
+                    let snapshot = fetch_bags_market_snapshot(&state.rpc_url, &mint).await?;
+                    let market_cap = snapshot
+                        .marketCapLamports
+                        .parse::<u64>()
+                        .map_err(|error| format!("Invalid Bags market cap payload: {error}"))?;
+                    let _ = tx.send(Some(Ok(market_cap)));
+                    sleep(Duration::from_millis(1000)).await;
+                }
+            }
+            .await;
+            match session {
+                Ok(()) => return,
+                Err(error) => {
+                    attempt = attempt.saturating_add(1);
+                    let terminal_error = error.clone();
+                    if handle_watcher_retry(
+                        &state,
+                        &job.traceId,
+                        WatcherKind::Market,
+                        &endpoint,
+                        attempt,
+                        error,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = tx.send(Some(Err(terminal_error)));
                         return;
                     }
                 }
@@ -2226,11 +2322,14 @@ async fn run_market_watcher(
         }
     }
     let Ok(bonding_curve) = pump_bonding_curve_address(&mint) else {
+        let _ = tx.send(Some(Err(
+            "Failed to derive Pump bonding curve address.".to_string()
+        )));
         return;
     };
     let mut attempt: u32 = 0;
     loop {
-        let session = async {
+        let session: Result<(), String> = async {
             let mut ws = open_subscription_socket(&endpoint).await?;
             subscribe(
                 &mut ws,
@@ -2248,7 +2347,7 @@ async fn run_market_watcher(
                 ensure_job_not_cancelled(&state, &job.traceId).await?;
                 let _ = next_json_message(&mut ws).await?;
                 let snapshot = fetch_pump_market_snapshot(&state.rpc_url, &mint).await?;
-                let _ = tx.send(Some(snapshot.marketCapLamports));
+                let _ = tx.send(Some(Ok(snapshot.marketCapLamports)));
             }
         }
         .await;
@@ -2256,6 +2355,7 @@ async fn run_market_watcher(
             Ok(()) => return,
             Err(error) => {
                 attempt = attempt.saturating_add(1);
+                let terminal_error = error.clone();
                 if handle_watcher_retry(
                     &state,
                     &job.traceId,
@@ -2267,6 +2367,7 @@ async fn run_market_watcher(
                 .await
                 .is_err()
                 {
+                    let _ = tx.send(Some(Err(terminal_error)));
                     return;
                 }
             }
@@ -2278,13 +2379,13 @@ async fn wait_for_signature_confirmation(
     state: Arc<AppState>,
     job: &FollowJobRecord,
     action_id: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let mut rx = ensure_signature_watcher(state.clone(), job).await;
     loop {
         ensure_action_not_cancelled(&state, &job.traceId, action_id).await?;
         let current = rx.borrow().clone();
         match current {
-            Some(Ok(())) => return Ok(()),
+            Some(Ok(confirmed_block_height)) => return Ok(confirmed_block_height),
             Some(Err(error)) => return Err(error),
             None => {
                 rx.changed()
@@ -2299,17 +2400,27 @@ async fn wait_for_slot_offset(
     state: Arc<AppState>,
     job: &FollowJobRecord,
     action_id: &str,
+    confirmed_launch_block_height: Option<u64>,
     target_offset: u64,
 ) -> Result<(), String> {
     let mut rx = ensure_slot_watcher(state.clone(), job).await;
-    let mut base_slot: Option<u64> = None;
+    let base_block_height = confirmed_launch_block_height
+        .or(job.confirmedObservedBlockHeight)
+        .ok_or_else(|| {
+            "Launch confirmation block height was unavailable for On Confirmed Block trigger."
+                .to_string()
+        })?;
     loop {
         ensure_action_not_cancelled(&state, &job.traceId, action_id).await?;
-        let current_slot = *rx.borrow();
-        if let Some(slot) = current_slot {
-            let baseline = *base_slot.get_or_insert(slot);
-            if slot >= baseline.saturating_add(target_offset) {
-                return Ok(());
+        let current_block_height = rx.borrow().clone();
+        if let Some(result) = current_block_height {
+            match result {
+                Ok(block_height) => {
+                    if block_height >= base_block_height.saturating_add(target_offset) {
+                        return Ok(());
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         rx.changed()
@@ -2337,24 +2448,29 @@ async fn wait_for_market_cap_trigger(
     let mut rx = ensure_market_watcher(state.clone(), job).await;
     loop {
         ensure_action_not_cancelled(&state, &job.traceId, action_id).await?;
-        let current_market_cap = *rx.borrow();
-        if let Some(market_cap) = current_market_cap {
-            let matches = match trigger.direction.as_str() {
-                "lte" => market_cap <= threshold,
-                _ => market_cap >= threshold,
-            };
-            if matches {
-                set_watcher_health(
-                    &state,
-                    WatcherKind::Market,
-                    FollowWatcherHealth::Healthy,
-                    job.transportPlan
-                        .as_ref()
-                        .and_then(|plan| plan.watchEndpoint.clone()),
-                    None,
-                )
-                .await;
-                return Ok(());
+        let current_market_cap = rx.borrow().clone();
+        if let Some(result) = current_market_cap {
+            match result {
+                Ok(market_cap) => {
+                    let matches = match trigger.direction.as_str() {
+                        "lte" => market_cap <= threshold,
+                        _ => market_cap >= threshold,
+                    };
+                    if matches {
+                        set_watcher_health(
+                            &state,
+                            WatcherKind::Market,
+                            FollowWatcherHealth::Healthy,
+                            job.transportPlan
+                                .as_ref()
+                                .and_then(|plan| plan.watchEndpoint.clone()),
+                            None,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         rx.changed()
@@ -2379,7 +2495,9 @@ fn resolve_job_watch_endpoint(job: &FollowJobRecord) -> Result<String, String> {
     configured_watch_endpoints_for_provider(&job.execution.provider, &job.execution.endpointProfile)
         .into_iter()
         .next()
-        .ok_or_else(|| "No websocket watch endpoint configured for follow job. Set SOLANA_WS_URL.".to_string())
+        .ok_or_else(|| {
+            "No websocket watch endpoint configured for follow job. Set SOLANA_WS_URL.".to_string()
+        })
 }
 
 type WsStream =

@@ -43,6 +43,7 @@
       sniperModalError,
     } = elements;
 
+    const sniperModalCard = sniperModal ? sniperModal.querySelector(".sniper-modal") : null;
     let sniperState = {
       enabled: false,
       wallets: {},
@@ -67,7 +68,7 @@
     function normalizeBlockOffset(value) {
       const numeric = Number(value || 0);
       if (!Number.isFinite(numeric)) return 0;
-      return Math.max(0, Math.min(5, Math.round(numeric)));
+      return Math.max(0, Math.min(22, Math.round(numeric)));
     }
 
     function normalizeWalletState(entry = {}) {
@@ -90,8 +91,9 @@
           return accumulator;
         }, {})
         : {};
+      const hasSelectedWallet = Object.values(wallets).some((entry) => entry && entry.selected);
       return {
-        enabled: Boolean(value && value.enabled),
+        enabled: Boolean(value && value.enabled) && hasSelectedWallet,
         wallets,
       };
     }
@@ -215,7 +217,7 @@
         return delayMs > 0 ? `Submit + ${delayMs}ms` : "On Submit";
       }
       if (triggerMode === "block-offset") {
-        return `Block ${normalizeBlockOffset(entry.targetBlockOffset)}`;
+        return `On Confirmed Block + ${normalizeBlockOffset(entry.targetBlockOffset)}`;
       }
       return "On Submit";
     }
@@ -232,7 +234,7 @@
           : "Sent right after launch submit is observed.";
       }
       if (triggerMode === "block-offset") {
-        return `Send the buy transaction when launch reaches block ${normalizeBlockOffset(entry.targetBlockOffset)}.`;
+        return `Send the buy transaction on confirmed block + ${normalizeBlockOffset(entry.targetBlockOffset)} from launch confirmation.`;
       }
       return "";
     }
@@ -411,8 +413,10 @@
         <div class="sniper-wallet-config"${!state.selected || disabled ? " hidden" : ""}>
           <div class="sniper-wallet-config-top">
             <label class="sniper-wallet-amount">
-              <span>Amount:</span>
-              <input type="text" inputmode="decimal" value="${escapeHTML(state.amountSol || "")}" data-sniper-wallet-amount="${escapeHTML(wallet.envKey)}" placeholder="0">
+              <span class="sniper-wallet-amount-input-wrap">
+                <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo sniper-wallet-amount-icon">
+                <input type="text" inputmode="decimal" value="${escapeHTML(state.amountSol || "")}" data-sniper-wallet-amount="${escapeHTML(wallet.envKey)}" placeholder="0">
+              </span>
             </label>
             <div class="sniper-wallet-presets">
               ${balancePresets.map((preset) => `
@@ -425,17 +429,19 @@
           ${amountWarning ? `<div class="sniper-wallet-warning">${escapeHTML(amountWarning)}</div>` : ""}
           <div class="sniper-wallet-trigger">
             <div class="sniper-wallet-trigger-grid">
-              <button type="button" class="sniper-trigger-chip${state.triggerMode === "same-time" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="same-time" data-tooltip="${escapeHTML(getTriggerTooltip("same-time", state))}">Same Time</button>
-              <button type="button" class="sniper-trigger-chip${state.triggerMode === "on-submit" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="on-submit" data-tooltip="${escapeHTML(getTriggerTooltip("on-submit", state))}">On Submit + Delay</button>
-              <button type="button" class="sniper-trigger-chip${state.triggerMode === "block-offset" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="block-offset" data-tooltip="${escapeHTML(getTriggerTooltip("block-offset", state))}">Block</button>
+              <button type="button" class="sniper-trigger-chip${state.triggerMode === "same-time" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="same-time" title="${escapeHTML(getTriggerTooltip("same-time", state))}">Same Time</button>
+              <button type="button" class="sniper-trigger-chip${state.triggerMode === "on-submit" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="on-submit" title="${escapeHTML(getTriggerTooltip("on-submit", state))}">On Submit + Delay</button>
+              <button type="button" class="sniper-trigger-chip${state.triggerMode === "block-offset" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="block-offset" title="${escapeHTML(getTriggerTooltip("block-offset", state))}">On Confirmed Block</button>
             </div>
             ${state.triggerMode === "same-time" && feeGuardNotice ? `<div class="sniper-modal-notice${feeGuardNotice.kind === "warning" ? " is-warning" : ""}">${escapeHTML(feeGuardNotice.message)}</div>` : ""}
             <div class="sniper-wallet-trigger-detail"${state.triggerMode === "on-submit" ? "" : " hidden"}>
-              <label class="sniper-wallet-delay">
-                <span>Delay</span>
-                <input type="range" min="0" max="1500" step="25" value="${state.submitDelayMs}" data-sniper-wallet-delay="${escapeHTML(wallet.envKey)}">
-                <strong>${escapeHTML(`${state.submitDelayMs}ms`)}</strong>
-              </label>
+              <div class="auto-sell-slider-block sniper-delay-slider-block">
+                <div class="auto-sell-slider-head">
+                  <span>Delay</span>
+                  <strong>${escapeHTML(`${state.submitDelayMs}ms`)}</strong>
+                </div>
+                <input class="auto-sell-slider" type="range" min="0" max="1500" step="25" value="${state.submitDelayMs}" data-sniper-wallet-delay="${escapeHTML(wallet.envKey)}">
+              </div>
             </div>
             <div class="sniper-wallet-trigger-detail sniper-wallet-retry-row"${state.triggerMode === "same-time" ? "" : " hidden"}>
               <button
@@ -446,13 +452,9 @@
               >${state.retryOnce ? "Retry On" : "Retry Off"}</button>
             </div>
             <div class="sniper-wallet-trigger-detail"${state.triggerMode === "block-offset" ? "" : " hidden"}>
-              <div class="sniper-wallet-trigger-head">
-                <span>Block</span>
-                <strong>${escapeHTML(`Block ${state.targetBlockOffset}`)}</strong>
-              </div>
               <div class="sniper-wallet-trigger-grid sniper-wallet-block-grid">
-                ${[0, 1, 2, 3, 4, 5].map((offset) => `
-                  <button type="button" class="sniper-trigger-chip${state.targetBlockOffset === offset ? " active" : ""}" data-sniper-block-offset="${escapeHTML(wallet.envKey)}" data-sniper-block-value="${offset}">Block ${offset}</button>
+                ${[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22].map((offset) => `
+                  <button type="button" class="sniper-trigger-chip${state.targetBlockOffset === offset ? " active" : ""}" data-sniper-block-offset="${escapeHTML(wallet.envKey)}" data-sniper-block-value="${offset}">${offset}</button>
                 `).join("")}
               </div>
             </div>
@@ -471,6 +473,9 @@
     function renderUI() {
       applyStateToForm();
       renderButtonState();
+      if (sniperModalCard) {
+        sniperModalCard.classList.toggle("is-expanded", sniperState.enabled);
+      }
       renderWalletList();
     }
 
@@ -590,6 +595,25 @@
           renderUI();
         });
         sniperWalletList.addEventListener("input", (event) => {
+          const delayInput = event.target.closest("[data-sniper-wallet-delay]");
+          if (!delayInput) return;
+          const envKey = delayInput.getAttribute("data-sniper-wallet-delay");
+          if (!envKey) return;
+          const normalizedDelayMs = normalizeDelayMs(delayInput.value);
+          sniperState.wallets[envKey] = {
+            ...normalizeWalletState(sniperState.wallets[envKey] || {}),
+            selected: true,
+            triggerMode: "on-submit",
+            submitDelayMs: normalizedDelayMs,
+          };
+          applyStateToForm();
+          setModalError("");
+          const valueLabel = delayInput
+            .closest(".sniper-delay-slider-block")
+            ?.querySelector(".auto-sell-slider-head strong");
+          if (valueLabel) valueLabel.textContent = `${normalizedDelayMs}ms`;
+        });
+        sniperWalletList.addEventListener("change", (event) => {
           const delayInput = event.target.closest("[data-sniper-wallet-delay]");
           if (!delayInput) return;
           const envKey = delayInput.getAttribute("data-sniper-wallet-delay");

@@ -1,68 +1,86 @@
 # Architecture
 
-`LaunchDeck` is organized as a standalone publishable product.
+This document explains how LaunchDeck is organized today from an operator perspective: what runs locally, what each process is responsible for, how a launch request moves through the system, and where local state is stored.
 
-## Layers
+## High-Level Shape
 
-- `ui/`: browser form, preview, validation, and status rendering
-- `rust/launchdeck-engine`: native UI/API host plus launch config validation, transaction assembly, transport planning, simulation, sending, durable send logs, runtime workers, local settings persistence, image library APIs, reports browsing, vamp import, and follow-daemon client orchestration
-- `rust/launchdeck-engine/src/bin/launchdeck-follow-daemon.rs`: dedicated realtime follow-action daemon for sniper buys, dev auto-sells, sniper sells, watcher health, and follow telemetry
-- `rust/launchdeck-engine/src/bin/launchdeck-cli.rs`: Rust-native CLI for build/simulate/send from config files
-- `providers/`: provider adapter layer and execution routing
-- `launchpads/`: launchpad registry and launchpad-specific capability metadata
+LaunchDeck is a local multi-process application with three main layers:
 
-## Execution Flow
+- `ui/`: the browser application for form entry, presets, settings, image management, reporting, and follow-action configuration
+- `rust/launchdeck-engine`: the main Rust host that serves the UI and owns config normalization, launch execution, reporting, and local persistence
+- `rust/launchdeck-engine/src/bin/launchdeck-follow-daemon.rs`: a separate Rust daemon for follow actions that need to keep running after the main launch request has been submitted
 
-1. UI reads backend status and defaults.
-2. UI pre-uploads launch metadata when possible and submits normalized form data to `/api/run`.
-3. `rust/launchdeck-engine` converts UI form state into raw launch config and normalizes the request.
-4. The Rust engine builds a provider-aware transport plan.
-5. The Rust engine validates provider requirements, builds native transactions, and applies provider-specific tx shaping.
-6. The Rust engine simulates and/or sends transactions through the selected transport.
-7. When follow behavior is enabled, the Rust host reserves and later arms a follow job with the local follow daemon.
-8. The Rust engine persists execution/send report output for later auditing.
+There is also an operator CLI:
 
-## Transport Layer
+- `rust/launchdeck-engine/src/bin/launchdeck-cli.rs`
 
-The runtime now uses explicit transport types instead of implicit provider fallback:
+That CLI uses the same normalization, launchpad dispatch, transport, and reporting stack as the UI host.
 
-- `helius-sender`
-- `standard-rpc-sequential`
-- `jito-bundle`
+## Process Model
 
-The selected transport controls:
+LaunchDeck normally runs as two local Rust processes:
 
-- whether tip is inline or separate
-- whether priority fee is required, allowed, or intentionally dropped
-- `skipPreflight`
-- `maxRetries`
-- endpoint selection
-- endpoint profile selection where the provider supports multiple documented endpoint groups
-- sequential vs bundle send semantics
+- the main host on `LAUNCHDECK_PORT`, default `8789`
+- the follow daemon on `LAUNCHDECK_FOLLOW_DAEMON_PORT`, default `8790`
 
-## Engine-Owned Decisions
+### Main Host Responsibilities
 
-The UI collects requested settings, but the engine owns final transaction shaping.
+The main host is responsible for:
 
-Important examples:
+- serving `GET /` and the static browser assets
+- serving browser-facing `/api/*` routes
+- serving internal `/engine/*` routes
+- serving uploaded files under `/uploads/*`
+- reading and writing persisted app settings
+- loading wallet inventory from `SOLANA_PRIVATE_KEY*`
+- normalizing launch configs from the UI
+- choosing provider-aware transport behavior
+- building, simulating, and sending launch transactions
+- reserving and arming follow jobs with the daemon
+- writing durable reports
+- exposing the image library, report browser, and Bags identity control plane
 
-- `Helius Sender` requires inline tip and compute unit price, and hard-fails if the request is incompatible.
-- `Standard RPC` remains sequential for dependent launch/follow-up flows.
-- `Jito Bundle` creation may accept both tip and priority in the UI, but the engine can intentionally drop creation priority for multi-transaction launch flows where it is not useful.
+### Follow Daemon Responsibilities
 
-The same engine-owned shaping applies to:
+The follow daemon is responsible for:
 
-- measured versioned transaction selection for Pump launch flows
-- curated address lookup table usage per transaction shape
-- metadata upload provider selection and send-time metadata fallback
-- same-time buy fee safeguards
-- delayed follow-buy pre-resolution and finalize behavior
+- accepting reserved and armed follow jobs
+- maintaining websocket-backed watchers for slots, signatures, and market conditions
+- executing delayed sniper buys
+- executing automatic dev sells
+- executing snipe sells
+- tracking job state outside the main request lifecycle
+- persisting follow telemetry, watcher health, and timing profiles
 
-## Current Boundary
+Same-time sniper buys are compiled and submitted by the main host, not the daemon, because they must land alongside the launch path itself.
 
-The current active launch paths are Pump and Bonk.
+## Request Flow
 
-Verified Pump coverage currently includes:
+A normal UI-driven launch follows this path:
+
+1. the browser loads bootstrap and settings data from the Rust host
+2. the operator fills token metadata, launch settings, provider settings, and optional follow actions
+3. the browser pre-uploads metadata when possible and sends the request to the main host
+4. the host converts UI state into the raw config shape and normalizes it
+5. the host validates launchpad rules, provider rules, and follow-action rules
+6. the host builds launchpad-specific transactions and a provider-specific transport plan
+7. the host simulates and/or sends the launch flow
+8. if follow behavior is enabled, the host reserves and then arms a follow job with launch-specific context
+9. the follow daemon takes over delayed and watcher-driven actions
+10. reports are persisted for later review in History
+
+## Launchpad Boundaries
+
+### Pump
+
+Pump is the most native path in the current runtime.
+
+- launch assembly is native Rust
+- transaction shaping is Rust-owned
+- reporting is Rust-owned
+- follow integration is Rust-owned
+
+Verified Pump modes:
 
 - `regular`
 - `cashback`
@@ -70,96 +88,121 @@ Verified Pump coverage currently includes:
 - `agent-unlocked`
 - `agent-locked`
 
-Verified Bonk coverage currently includes:
+### Bonk
+
+Bonk is Rust-orchestrated but not fully Rust-assembled.
+
+- validation is Rust-owned
+- transport planning is Rust-owned
+- reporting is Rust-owned
+- follow integration is Rust-owned
+- launch assembly uses the Raydium LaunchLab-backed helper bridge
+
+Verified Bonk support includes:
 
 - `regular`
 - `bonkers`
-- `sol` and `usd1` quote assets
+- `sol`
+- `usd1`
 - immediate dev buy
 - same-time sniper buys
-- follow buy and follow sell execution
+- snipe buys
+- snipe sells
 - automatic dev sell
 
-Boundary notes:
+### Bagsapp
 
-- Pump launch assembly is native Rust
-- Bonk validation/send/reporting are Rust-owned, but Bonk launch assembly currently goes through the Raydium LaunchLab SDK-backed helper bridge
-- Bagsapp is still not an active launch flow yet
+Bagsapp is available when configured, but it is still experimental.
 
-## Runtime Shape
+- availability depends on Bags credentials
+- launch/trade assembly uses the hosted Bags API or SDK bridge
+- Rust still owns normalization, transport planning, reporting, and the UI integration layer
 
-LaunchDeck now runs as two local Rust processes:
+## Provider And Transport Layer
 
-- Rust host on the UI/API port
-- follow daemon on the follow-daemon port
+LaunchDeck uses explicit provider choices rather than hidden provider fallback.
 
-Current boundary:
+Current providers:
 
-- `GET /`, `/app.js`, `/styles.css`, root image assets, and `/uploads/*` are served directly by the Rust host.
-- Browser-facing `/api/*` routes call Rust internals directly rather than proxying through a Node bridge.
-- `/engine/*` routes remain available on the same process for engine-oriented tooling and compatibility.
-- Follow jobs are reserved and armed by the Rust host, then executed by the follow daemon.
-- Existing `.local/launchdeck` files remain the source of persistent UI settings, uploads, send reports, and follow-daemon state.
+- `helius-sender`
+- `standard-rpc`
+- `jito-bundle`
 
-The runtime also maintains a local lookup table cache under `.local/launchdeck/lookup-tables.json`.
+From those providers, the engine resolves a transport class:
 
-## Follow-Daemon Responsibilities
+- `single`
+- `sequential`
+- `bundle`
 
-The follow daemon is responsible for:
+The selected provider controls:
 
-- running websocket-backed slot, signature, and market watchers
-- executing delayed sniper buys, automatic dev sells, and sniper sells
-- maintaining action/job state independently from the main request lifecycle
-- persisting watcher health, follow telemetry samples, and timing profiles
+- whether tip is used
+- whether priority fee is required or optional
+- whether `skipPreflight` must be forced
+- whether sends are standard sequential sends or bundle sends
+- whether endpoint profiles are available
+- which endpoint group is used
 
-Same-time sniper buys are still compiled by the Rust host because they must be submitted alongside the launch path itself.
+The browser expresses intent, but the engine owns final transaction shaping.
 
-## Current Performance Model
+Examples:
 
-The hot path now relies on:
+- `standard-rpc` ignores tip
+- `helius-sender` hard-fails if Sender requirements are not satisfied
+- `jito-bundle` may drop creation priority in some multi-transaction launch flows
+
+## Engine-Owned Decisions
+
+The engine, not the UI, decides:
+
+- validation of supported launchpad and mode combinations
+- provider compatibility checks
+- transaction format choice such as `legacy`, `v0`, or `v0-alt`
+- address lookup table usage
+- metadata upload fallback behavior
+- same-time fee safeguards
+- delayed snipe-buy prepare versus finalize timing
+
+This is why the same saved preset can produce different final wire behavior depending on provider, transaction count, and launch shape.
+
+## Persistence Model
+
+By default LaunchDeck stores operator data under `.local/launchdeck`:
+
+- `app-config.json`
+- `image-library.json`
+- `lookup-tables.json`
+- `follow-daemon-state.json`
+- `uploads/`
+- `send-reports/`
+
+Other runtime state lives here:
+
+- `.local/engine-runtime.json` for host runtime worker state by default
+
+The important point for operators is that settings, images, uploads, and historical reports survive restarts unless you explicitly remove the local data directory.
+
+## Performance-Oriented Runtime Features
+
+The current runtime uses several caching and warm-up paths to reduce launch latency:
 
 - background metadata pre-upload from the browser
-- warmed and persisted default lookup tables
-- cached blockhash refresh in the backend
-- cached Pump global state for dev-buy compile paths
-- arm-time pre-resolution of delayed follow-buy state
-- daemon-side hot runtime refresh for delayed follow buys
-- concurrent same-time compile and non-bundle submit where safe
-- benchmark reports that separate `preRequest`, `backendTotal`, compile breakdowns, and send breakdowns
+- warmed lookup tables cached in memory and persisted locally
+- cached blockhash refresh in the host and daemon
+- cached Pump global state for compile-time launch assembly and dev-buy quoting
+- arm-time preparation of delayed snipe buys
+- daemon-side hot-state refresh for delayed follow jobs
+- concurrency for same-time compile and non-bundle submit paths that preserve launch ordering
 
-Delayed follow buys now use a split model:
+Reports separate user-visible wait from backend execution so operators can tell whether latency came from metadata, compile, or chain confirmation.
 
-- `prepare`: wallet- and launch-specific static state is cached at job-arm time
-- `finalize`: fresh quote/blockhash/signing happens close to action fire time
+## Frontend Module Layout
 
-## Lookup Table Strategy
-
-Pump transaction assembly does not blindly force one static transaction format.
-
-Current runtime behavior:
-
-- the engine loads curated default lookup tables for known Pump launch and follow-up flows
-- lookup tables are warmed on page load, cached in memory, and persisted locally under `.local/launchdeck/lookup-tables.json`
-- compile measures candidate transaction sizes and prefers the smallest valid versioned shape for the current instruction set
-- reports expose the chosen format and size diagnostics so near-limit transactions are visible during testing
-
-In practice this means:
-
-- `v0-alt` is used when lookup tables materially reduce packet size
-- plain `v0` remains available when lookup tables are not beneficial or not required for that transaction shape
-- different transactions in the same launch flow can use different lookup-table sets depending on whether they are the launch tx, follow-up tx, or tip-only tx
-
-## Frontend Structure
-
-The browser UI has also been split into feature-oriented modules rather than keeping all behavior in one file.
-
-Current extracted UI feature modules include:
+The UI is still one browser app, but several operator-facing features are broken into dedicated modules:
 
 - `ui/sniper-feature.js`
 - `ui/auto-sell-feature.js`
 - `ui/images-feature.js`
 - `ui/reports-feature.js`
-- `ui/request-utils.js`
-- `ui/render-utils.js`
 
-This keeps the Rust runtime architecture unchanged while making the browser-side state and event wiring easier to evolve.
+This is mainly useful to know when you are trying to understand which part of the app owns a specific feature, such as snipers, auto-sell, image library behavior, or History rendering.

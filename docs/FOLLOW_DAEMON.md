@@ -1,119 +1,123 @@
 # Follow Daemon
 
-## Overview
+This page explains the dedicated follow daemon that LaunchDeck uses for delayed and watcher-driven post-launch actions.
 
-`LaunchDeck` now uses a dedicated local Rust follow daemon for launch-follow actions that need to continue after the creation request has already been submitted.
+## What The Daemon Is For
 
-Current follow action types:
+The follow daemon exists so LaunchDeck can keep working on follow actions after the main launch request has already returned.
+
+Current follow action families:
 
 - `SniperBuy`
 - `DevAutoSell`
 - `SniperSell`
 
-Current limitation:
+The daemon is meant to:
 
-- `followLaunch.snipes[].postBuySell` chaining is still rejected; today the daemon supports delayed sniper buys, dev auto-sells, and sniper sells as separate follow actions
+- keep running between launches
+- accept follow jobs quickly
+- watch launch progress using realtime watchers
+- compile and send follow actions without blocking the main host
+- persist follow-job state, watcher health, telemetry, and timing profiles
 
-The daemon is designed to:
-
-- stay running between launches
-- accept new follow jobs immediately
-- watch launch progress over websocket-backed watchers
-- compile and send follow actions without blocking the main UI host
-- persist follow-job state, telemetry, timing profiles, and watcher health
-
-Default local follow-daemon URL:
+Default local URL:
 
 - `http://127.0.0.1:8790`
 
-## Runtime Shape
+## Host Vs Daemon
 
-LaunchDeck now has two local Rust processes:
+### Main Host
 
-- Rust host on the UI/API port
-- follow daemon on the follow-daemon port
+The main host is responsible for:
 
-The Rust host is responsible for:
+- serving the UI
+- handling `/api/*`
+- normalizing and validating launch requests
+- compiling and sending the launch
+- compiling and submitting same-time sniper buys
+- reserving and arming follow jobs
 
-- serving the browser UI
-- handling `/api/*` requests
-- compiling launch transactions
-- submitting launch creation and any immediate same-time follow buys
-- reserving and arming follow jobs with the daemon
+### Follow Daemon
 
-The follow daemon is responsible for:
+The daemon is responsible for:
 
-- receiving reserved follow jobs
-- arming them once mint/signature/send context is known
-- running websocket-backed slot, signature, and market watchers
-- executing delayed sniper buys, dev auto-sells, and sniper sells
-- persisting job state and telemetry during and after execution
+- accepting reserved jobs
+- arming jobs once launch-specific context is known
+- running slot, signature, and market watchers
+- executing delayed sniper buys
+- executing dev auto-sells
+- executing snipe sells
+- persisting independent follow-job state
 
 ## Job Lifecycle
 
 The current lifecycle is:
 
-1. The Rust host reserves a follow job before send when follow behavior is enabled.
-2. The host sends the creation flow and captures launch metadata such as mint, launch creator, signature, and observed send block.
-3. The host arms the reserved follow job with that launch-specific information.
-4. The daemon marks actions as armed and starts the job runner if needed.
-5. Each action waits for its trigger, compiles, sends, confirms, and reports independently.
+1. the main host reserves a follow job before send when follow behavior is enabled
+2. the launch is sent and launch-specific context is captured
+3. the host arms the reserved job with mint, signature, send block, and related context
+4. the daemon marks actions as armed
+5. each action waits for its trigger
+6. the daemon compiles, sends, confirms, and records each action independently
 
-This keeps follow behavior off the main request path while still allowing immediate post-send actions.
+This keeps delayed follow behavior off the main request path while still letting the UI work with a single launch action.
 
 ## Trigger Modes
 
-### Same Time
+### `Same Time`
 
-`Same Time` sniper buys are submitted alongside launch creation rather than waiting for the daemon trigger path.
+Same-time sniper buys are not primarily daemon-triggered. They are submitted alongside launch creation.
 
-Current behavior:
+Use this mainly when your latency is high enough that waiting for observed submit timing may leave you behind. In normal low-latency setups, it is usually better to use a daemon-triggered mode.
 
-- all selected same-time buys compile concurrently
-- non-bundle transport can submit launch and same-time sniper transactions concurrently
-- same-time buys are protected by a creation-fee safeguard when buy fees exceed launch fees
-- same-time buys can optionally arm a one-time daemon retry if the first landing fails
+How it works:
 
-Current same-time retry behavior:
+- selected same-time buys compile alongside the launch
+- Bonk uses launch-first submission on non-bundle transports so the buy path does not outrun creation
+- Bonk `usd1` same-time sniper buys compile as atomic swap-and-buy transactions
+- if a same-time buy lands before creation, it fails
+- a same-time fee safeguard warns when buy-side fees are higher than launch fees
+- eligible same-time buys can arm a one-time daemon retry if the first landing fails
+
+Retry behavior:
 
 - retry is only available for same-time sniper buys
-- retry is cloned into a deferred daemon buy rather than reusing the same transaction
-- the fallback retry uses a small submit delay
-- the retry is skipped if the wallet already holds the launch token
+- the retry is a new deferred buy, not reuse of the original same-time transaction
+- the retry is skipped if the wallet already holds the token
 
-### On Submit + Delay
+### `On Submit + Delay`
 
-For sniper buys and dev auto-sell, `On Submit + Delay` means the action schedules from observed launch submission time.
+Use this for sniper buys or auto-sell actions scheduled from observed launch submission.
 
-Current behavior:
+How it works:
 
-- `0ms` is effectively immediate after submit observation
-- non-zero values add an explicit delay from launch submit observation
-- this path is daemon-executed rather than same-time compiled into the launch path
+- `0ms` means send on observed submit
+- non-zero values wait from observed submit plus the configured delay
+- execution happens in the daemon, not inline with the launch flow
+- this mode is faster than `On Confirmed Block`, but it can still fail if the buy reaches chain execution before creation is live
 
-### Block Offset
+### `On Confirmed Block`
 
-`Block Offset` means the action is sent when the watcher observes the configured launch-relative block.
+Use this when you want the safest currently shipped buy trigger. This is the default recommendation for most users.
 
-Current supported range:
+How it works:
 
-- `0-5`
+- the daemon watches launch-relative block progress
+- the action fires when the configured confirmed-block target is observed
+- because it waits for observed launch state, it is more conservative than `Same Time`
+- use the current UI-configured range rather than older stale docs that referenced a smaller range
 
-This is useful when you want block-based timing rather than millisecond timing.
-
-### Confirmation / Delayed Follow Sells
+### Sell Triggers
 
 Sell-side follow actions can also wait on:
 
-- delay after launch
+- delay-based timing
 - market-cap triggers
 - confirmation requirements
 
-Those actions remain daemon-executed and watcher-driven.
-
 ## Watchers
 
-The daemon uses dedicated realtime watchers for trading behavior.
+The daemon uses dedicated watchers for realtime trading behavior.
 
 Current watcher types:
 
@@ -121,103 +125,99 @@ Current watcher types:
 - signature watcher
 - market watcher
 
-Current behavior:
+Operational notes:
 
-- realtime trading watchers rely on websocket endpoints
-- watcher health is tracked and persisted
-- reconnect/backoff rules are explicit
-- diagnostics and status tooling can still use non-realtime reads, but the trading watcher path is websocket-first
+- watchers rely on websocket connectivity for best realtime behavior
+- watcher health is persisted
+- reconnect and backoff behavior are explicit
+- if websocket connectivity is poor, follow timing quality can degrade
 
-## Current Delayed-Buy Hot Path
+## Delayed-Buy Hot Path
 
-Delayed sniper buys now use a hotter daemon-side compile path than before.
+Delayed buys use a hotter path than a cold rebuild-from-scratch model.
 
-Current improvements:
+How it works:
 
-- launch-specific follow-buy state is pre-resolved when the job is armed
-- per-action static buy preparation is cached at arm time
-- hot runtime follow-buy state is refreshed in the daemon while the job is alive
-- delayed buys now use a split `prepare -> finalize` path instead of paying the full cold compile path every time
-- warm-up across sniper wallets is prepared concurrently at arm time
+- launch-specific follow state is pre-resolved when the job is armed
+- static buy preparation is cached per action at arm time
+- hot runtime follow state is refreshed while the job is alive
+- delayed buys use a `prepare -> finalize` split model
 
-In practice this means the delayed-buy trigger path now mainly pays for:
+In practice, the trigger-time work focuses on:
 
-- fresh blockhash attach
-- fresh quote/finalize step
+- fresh blockhash attachment
+- fresh quote or finalize work
 - signing and serialization
 
-rather than redoing the whole setup path from scratch on every trigger.
+That keeps delayed triggers lighter than a full cold compile.
 
-## Blockhash and Runtime Caching
+## Shared Cache Behavior
 
-The shared RPC cache still stores blockhashes on demand and also supports background warming.
+The runtime uses warmed blockhash caches in both the host and daemon.
 
-Current behavior:
+How it works:
 
-- blockhash refresh interval: `30s`
-- blockhash max age before forced miss: `45s`
-- the Rust host warms `processed`, `confirmed`, and `finalized`
-- the follow daemon also warms `processed`, `confirmed`, and `finalized`
+- blockhashes are warmed for `processed`, `confirmed`, and `finalized`
+- cache hits can make `compileBlockhashFetchMs` look like `0ms` in reports
+- lookup tables and follow-runtime state are also warmed where relevant
 
-Important note:
+## Same-Time Fee Safeguard
 
-- `compileBlockhashFetchMs = 0` in reports usually means a hot cache hit rounded down to `0ms`, not that no blockhash was used
+The same-time safeguard exists to reduce the chance that a sniper buy lands before the creation transaction.
 
-Additional daemon-side warm state now includes:
+How it works:
 
-- prepared delayed-buy static state per action
-- hot launch-specific runtime state per job
+- it applies only when same-time fees are strictly higher than creation fees
+- the UI shows the additional creator fee impact inline
+- the safeguard is a warning and shaping aid, not a guarantee
 
-## Same-Time Safeguard
+## Agent-Mode Sell Hardening
 
-When same-time sniper buys are enabled, LaunchDeck can automatically raise launch fees above same-time buy fees.
+Agent launch modes receive extra handling on the sell side.
 
-Current behavior:
+How it works:
 
-- safeguard only applies when same-time buy fee settings are strictly higher than creation fees
-- the UI shows the extra creator fee cost
-- the notice is shown inline under the affected same-time trigger control
+- `agent-custom` and `agent-locked` prefer the post-setup creator-vault authority path
+- creator-vault seed mismatch can trigger targeted sell retry behavior
+- daemon-side snipe sells track attempt counters in reports
 
-This is intended to reduce the chance that same-time buys land before the creation transaction.
+## Telemetry And Timing Profiles
 
-## Agent Launch Hardening
+The daemon persists telemetry that later appears in reports.
 
-Agent launch modes now have additional follow-action handling.
+Current telemetry includes:
 
-Current hardening:
-
-- `agent-custom` and `agent-locked` sells prefer the post-setup creator vault authority
-- creator-vault seed mismatch can trigger a targeted sell retry
-- daemon-side follow sells keep explicit state and attempt counters in reports
-
-## Telemetry and Timing Profiles
-
-The daemon writes follow telemetry samples and timing profiles that are later surfaced in persisted reports.
-
-Current telemetry captures:
-
-- provider and endpoint profile
+- provider
+- endpoint profile
 - transport type
 - trigger type
 - delay and jitter settings
 - submit latency
 - confirm latency
 - launch-to-action latency
-- launch-to-action blocks
+- launch-to-action block distance
 - schedule slip
-- outcome and quality labels
+- action outcome and quality labels
 
-Current timing profiles summarize historical submit performance, including:
+Timing profiles include historical percentiles such as:
 
 - `P50 Submit`
 - `P75 Submit`
 - `P90 Submit`
 
-These values are historical percentiles used for visibility and timing suggestions. They do not automatically slow current execution.
+These are visibility aids. They do not automatically slow or retime current actions.
 
-## Configuration
+## Current Limitation
 
-Key follow-daemon env variables:
+The daemon does not currently support per-sniper `postBuySell` chaining.
+
+This config is explicitly rejected:
+
+- `followLaunch.snipes[].postBuySell`
+
+## Relevant Configuration
+
+Key daemon env vars:
 
 - `LAUNCHDECK_FOLLOW_DAEMON_TRANSPORT`
 - `LAUNCHDECK_FOLLOW_DAEMON_URL`
@@ -228,16 +228,3 @@ Key follow-daemon env variables:
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS`
 - `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS`
 - `LAUNCHDECK_FOLLOW_DAEMON_STATE_PATH`
-
-Current local helper scripts:
-
-- `npm start`: cleanly stops old Rust host/follow-daemon processes, starts both, and opens the UI
-- `npm stop`: stops both local processes
-- `npm restart`: runs the same clean recycle behavior explicitly
-
-## Suggested Reading
-
-- `docs/ARCHITECTURE.md`
-- `docs/CONFIG.md`
-- `docs/STRATEGIES.md`
-- `docs/FRONTEND_REGRESSION_CHECKLIST.md`

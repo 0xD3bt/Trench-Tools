@@ -350,7 +350,13 @@ pub async fn enrich_wallet_statuses(
             let public_key = wallet.publicKey.clone().unwrap_or_default();
             let (balance_result, token_result) = tokio::join!(
                 fetch_balance_lamports_with_client(&client, &rpc_url, &public_key),
-                fetch_token_balance_with_client(&client, &rpc_url, &public_key, &usd1_mint, "confirmed"),
+                fetch_token_balance_with_client(
+                    &client,
+                    &rpc_url,
+                    &public_key,
+                    &usd1_mint,
+                    "confirmed"
+                ),
             );
             match (balance_result, token_result) {
                 (Ok(balance_lamports), Ok(usd1_balance)) => WalletStatusSummary {

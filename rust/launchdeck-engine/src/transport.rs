@@ -199,9 +199,9 @@ pub fn configured_helius_sender_endpoint() -> String {
     configured_helius_sender_endpoints_for_profile(&default_endpoint_profile_for_provider(
         "helius-sender",
     ))
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| DEFAULT_HELIUS_SENDER_ENDPOINT.to_string())
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| DEFAULT_HELIUS_SENDER_ENDPOINT.to_string())
 }
 
 pub fn configured_watch_endpoints_for_provider(

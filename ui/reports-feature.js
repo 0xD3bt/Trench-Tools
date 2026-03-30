@@ -15,6 +15,10 @@
       renderList,
       loadEntry,
       refreshReports,
+      getView,
+      setView,
+      reuseEntry,
+      relaunchEntry,
       normalizeTab,
       shortenAddress,
       openPopoutWindow,
@@ -31,6 +35,8 @@
       toggleReportsButton,
       reportsRefreshButton,
       reportsSortButton,
+      reportsTransactionsButton,
+      reportsLaunchesButton,
     } = elements;
 
     const {
@@ -239,12 +245,43 @@
           }
         });
       }
+      if (reportsTransactionsButton) {
+        reportsTransactionsButton.addEventListener("click", async () => {
+          if (getView() === "transactions") return;
+          setView("transactions");
+          try {
+            await refreshReports({ preserveSelection: true });
+          } catch (error) {
+            if (reportsTerminalOutput) {
+              state.activePayload = null;
+              state.activeText = error.message || "Failed to load transactions.";
+              renderOutput();
+            }
+          }
+        });
+      }
+      if (reportsLaunchesButton) {
+        reportsLaunchesButton.addEventListener("click", async () => {
+          if (getView() === "launches") return;
+          setView("launches");
+          try {
+            await refreshReports({ preserveSelection: false });
+          } catch (error) {
+            if (reportsTerminalOutput) {
+              state.activePayload = null;
+              state.activeText = error.message || "Failed to load launches.";
+              renderOutput();
+            }
+          }
+        });
+      }
       if (reportsTerminalList) {
         reportsTerminalList.addEventListener("click", async (event) => {
+          if (getView() !== "transactions") return;
           const button = event.target.closest("[data-report-id]");
           if (!button) return;
           try {
-            await loadEntry(button.getAttribute("data-report-id") || "");
+            await loadEntry(button.getAttribute("data-report-id") || "", { syncMainOutput: true });
           } catch (error) {
             if (reportsTerminalOutput) {
               state.activePayload = null;
@@ -256,6 +293,32 @@
       }
       if (reportsTerminalOutput) {
         reportsTerminalOutput.addEventListener("click", async (event) => {
+          const reuseButton = event.target.closest("[data-report-reuse-id]");
+          if (reuseButton) {
+            try {
+              await reuseEntry(reuseButton.getAttribute("data-report-reuse-id") || "");
+            } catch (error) {
+              if (reportsTerminalOutput) {
+                state.activePayload = null;
+                state.activeText = error.message || "Failed to reuse saved launch.";
+                renderOutput();
+              }
+            }
+            return;
+          }
+          const relaunchButton = event.target.closest("[data-report-relaunch-id]");
+          if (relaunchButton) {
+            try {
+              await relaunchEntry(relaunchButton.getAttribute("data-report-relaunch-id") || "");
+            } catch (error) {
+              if (reportsTerminalOutput) {
+                state.activePayload = null;
+                state.activeText = error.message || "Failed to relaunch from saved launch.";
+                renderOutput();
+              }
+            }
+            return;
+          }
           const button = event.target.closest("[data-report-tab]");
           if (button) {
             state.activeTab = normalizeTab(button.getAttribute("data-report-tab"));
@@ -268,9 +331,8 @@
           if (!value) return;
           try {
             await navigator.clipboard.writeText(value);
-            if (reportsTerminalMeta) reportsTerminalMeta.textContent = `Copied hash: ${shortenAddress(value, 8)}`;
           } catch (_error) {
-            if (reportsTerminalMeta) reportsTerminalMeta.textContent = "Failed to copy hash.";
+            // Ignore clipboard failures here and keep the terminal subtitle stable.
           }
         });
       }

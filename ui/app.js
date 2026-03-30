@@ -23,6 +23,8 @@ const walletSummaryUsd = document.getElementById("wallet-summary-usd");
 const topPresetChipBar = document.getElementById("top-preset-chip-bar");
 const openVampButton = document.getElementById("open-vamp-button");
 const themeToggleButton = document.getElementById("toggle-theme-button");
+const themeToggleSunIcon = themeToggleButton ? themeToggleButton.querySelector(".theme-icon-sun") : null;
+const themeToggleMoonIcon = themeToggleButton ? themeToggleButton.querySelector(".theme-icon-moon") : null;
 const feeSplitPill = document.getElementById("fee-split-pill");
 const imageInput = document.getElementById("image-input");
 const openImageLibraryButton = document.getElementById("open-image-library-button");
@@ -96,10 +98,27 @@ const bonkQuoteAssetInput = getNamedInput("quoteAsset");
 const bonkQuoteAssetToggle = document.getElementById("bonk-quote-asset-toggle");
 const bonkQuoteAssetToggleSolIcon = document.getElementById("bonk-quote-asset-toggle-sol-icon");
 const bonkQuoteAssetToggleUsd1Icon = document.getElementById("bonk-quote-asset-toggle-usd1-icon");
+const bagsIdentityButton = document.getElementById("bags-identity-button");
+const bagsIdentityButtonLabel = document.getElementById("bags-identity-button-label");
+const bagsIdentityModal = document.getElementById("bags-identity-modal");
+const bagsIdentityClose = document.getElementById("bags-identity-close");
+const bagsIdentityCancel = document.getElementById("bags-identity-cancel");
+const bagsIdentityVerifyButton = document.getElementById("bags-identity-verify");
+const bagsIdentityInitButton = document.getElementById("bags-identity-init-button");
+const bagsIdentityCurrent = document.getElementById("bags-identity-current");
+const bagsApiKeyInput = document.getElementById("bags-api-key-input");
+const bagsApiKeySave = document.getElementById("bags-api-key-save");
+const bagsAgentUsernameInput = document.getElementById("bags-agent-username-input");
+const bagsVerificationContent = document.getElementById("bags-verification-content");
+const bagsPostIdInput = document.getElementById("bags-post-id-input");
+const bagsIdentityError = document.getElementById("bags-identity-error");
 const devBuyQuotePrefixIcon = document.getElementById("dev-buy-quote-prefix-icon");
 const devBuyQuotePrefixText = document.getElementById("dev-buy-quote-prefix-text");
 const creationTipInput = document.getElementById("creation-tip-input");
 const creationPriorityInput = document.getElementById("creation-priority-input");
+const creationAutoFeeInput = document.getElementById("creation-auto-fee-input");
+const creationAutoFeeButton = document.getElementById("creation-auto-fee-button");
+const creationMaxFeeInput = document.getElementById("creation-max-fee-input");
 const launchpadInputs = Array.from(document.querySelectorAll('input[name="launchpad"]'));
 const providerSelect = document.getElementById("provider-select");
 const buyProviderSelect = document.getElementById("buy-provider-select");
@@ -108,10 +127,16 @@ const settingsBackendRegionSummary = document.getElementById("settings-backend-r
 const buyPriorityFeeInput = document.getElementById("buy-priority-fee-input");
 const buyTipInput = document.getElementById("buy-tip-input");
 const buySlippageInput = document.getElementById("buy-slippage-input");
+const buyAutoFeeInput = document.getElementById("buy-auto-fee-input");
+const buyAutoFeeButton = document.getElementById("buy-auto-fee-button");
+const buyMaxFeeInput = document.getElementById("buy-max-fee-input");
 const buyStandardRpcWarning = document.getElementById("buy-standard-rpc-warning");
 const sellPriorityFeeInput = document.getElementById("sell-priority-fee-input");
 const sellTipInput = document.getElementById("sell-tip-input");
 const sellSlippageInput = document.getElementById("sell-slippage-input");
+const sellAutoFeeInput = document.getElementById("sell-auto-fee-input");
+const sellAutoFeeButton = document.getElementById("sell-auto-fee-button");
+const sellMaxFeeInput = document.getElementById("sell-max-fee-input");
 const sellStandardRpcWarning = document.getElementById("sell-standard-rpc-warning");
 const settingsPresetChipBar = document.getElementById("settings-preset-chip-bar");
 const presetEditToggle = document.getElementById("preset-edit-toggle");
@@ -140,6 +165,7 @@ const feeSplitModal = document.getElementById("fee-split-modal");
 const feeSplitClose = document.getElementById("fee-split-close");
 const feeSplitDisable = document.getElementById("fee-split-disable");
 const feeSplitSave = document.getElementById("fee-split-save");
+const feeSplitModalError = document.getElementById("fee-split-modal-error");
 const deployModal = document.getElementById("deploy-modal");
 const modalBody = document.getElementById("modal-body");
 const modalClose = document.getElementById("modal-close");
@@ -151,6 +177,8 @@ const toggleOutputButton = document.getElementById("toggle-output-button");
 const toggleReportsButton = document.getElementById("toggle-reports-button");
 const reportsRefreshButton = document.getElementById("reports-refresh-button");
 const reportsSortButton = document.getElementById("reports-sort-button");
+const reportsTransactionsButton = document.getElementById("reports-transactions-button");
+const reportsLaunchesButton = document.getElementById("reports-launches-button");
 const openSettingsButton = document.getElementById("open-settings-button");
 const saveSettingsButton = document.getElementById("save-settings-button");
 const settingsModal = document.getElementById("settings-modal");
@@ -163,7 +191,6 @@ const devAutoSellPanel = document.getElementById("dev-auto-sell-panel");
 const autoSellEnabledInput = document.getElementById("auto-sell-enabled-input");
 const autoSellToggleState = document.getElementById("auto-sell-toggle-state");
 const autoSellTriggerValue = document.getElementById("auto-sell-trigger-value");
-const autoSellTriggerDescription = document.getElementById("auto-sell-trigger-description");
 const autoSellDelaySlider = document.getElementById("auto-sell-delay-slider");
 const autoSellDelayControl = document.getElementById("auto-sell-delay-control");
 const autoSellPercentSlider = document.getElementById("auto-sell-percent-slider");
@@ -200,6 +227,8 @@ const vampImport = document.getElementById("vamp-import");
 const vampContractInput = document.getElementById("vamp-contract-input");
 const vampStatus = document.getElementById("vamp-status");
 const vampError = document.getElementById("vamp-error");
+let vampAutoImportTimer = null;
+let vampInFlightAddress = "";
 const OUTPUT_SECTION_VISIBILITY_KEY = "launchdeck.outputSectionVisible";
 const REPORTS_TERMINAL_VISIBILITY_KEY = "launchdeck.reportsTerminalVisible";
 const REPORTS_TERMINAL_SORT_KEY = "launchdeck.reportsTerminalSort";
@@ -213,6 +242,12 @@ const SELECTED_MODE_STORAGE_KEY = "launchdeck.selectedMode";
 const SELECTED_BONK_QUOTE_ASSET_STORAGE_KEY = "launchdeck.bonkQuoteAsset";
 const FEE_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.feeSplitDraft.v1";
 const AGENT_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.agentSplitDraft.v1";
+let settingsModalInitialConfig = null;
+const bagsIdentityModeInput = getNamedInput("bagsIdentityMode");
+const bagsAgentUsernameHiddenInput = getNamedInput("bagsAgentUsername");
+const bagsAuthTokenInput = getNamedInput("bagsAuthToken");
+const bagsIdentityVerifiedWalletInput = getNamedInput("bagsIdentityVerifiedWallet");
+
 const POPOUT_FORM_WIDTH = 532;
 const POPOUT_REPORTS_WIDTH = 560;
 const POPOUT_WORKSPACE_GAP = 12;
@@ -254,6 +289,25 @@ let uploadedImage = null;
 let latestWalletStatus = null;
 let latestRuntimeStatus = null;
 let latestLaunchpadRegistry = {};
+let bagsIdentityState = {
+  mode: "wallet-only",
+  configuredApiKey: false,
+  verified: false,
+  agentUsername: "",
+  authToken: "",
+  verifiedWallet: "",
+  publicIdentifier: "",
+  secret: "",
+  verificationPostContent: "",
+  error: "",
+};
+let importedCreatorFeeState = {
+  mode: "",
+  address: "",
+  githubUsername: "",
+  githubUserId: "",
+};
+let feeSplitModalSnapshot = null;
 let walletStatusRequestSerial = 0;
 let appBootstrapState = {
   started: false,
@@ -309,22 +363,40 @@ let tickerClearedForManualEntry = false;
 let syncingDevBuyInputs = false;
 let devBuyPresetEditorOpen = false;
 let lastDevBuyEditSource = "sol";
+const DEV_BUY_QUOTE_CACHE_TTL_MS = 30_000;
+const DEV_BUY_QUOTE_DEBOUNCE_MS = 100;
+const devBuyQuoteCache = new Map();
+const devBuyQuoteWarmInFlight = new Set();
 let syncingPresetInputs = false;
 let lastTopPresetMarkup = "";
 let lastSettingsPresetMarkup = "";
 let lastQuickDevBuyMarkup = "";
 let reportsTerminalState = {
+  allEntries: [],
   entries: [],
+  launches: [],
+  launchBundles: {},
+  launchMetadataByUri: {},
   activeId: "",
   activePayload: null,
   activeText: "",
   activeTab: "overview",
+  view: "transactions",
   sort: getStoredReportsTerminalSort(),
 };
 let reportsTerminalResizeState = null;
+let outputFollowRefreshState = {
+  serial: 0,
+  timer: null,
+  reportId: "",
+  startedAtMs: 0,
+};
 const REPORTS_TERMINAL_DEFAULT_LIST_WIDTH = 152;
 const REPORTS_TERMINAL_MIN_LIST_WIDTH = 120;
 const REPORTS_TERMINAL_MAX_LIST_WIDTH = 240;
+const REPORTS_TERMINAL_ITEM_LIMIT = 25;
+const OUTPUT_FOLLOW_REFRESH_INTERVAL_MS = 1500;
+const OUTPUT_FOLLOW_REFRESH_TIMEOUT_MS = 90000;
 const SPLIT_COLORS = ["#5b7cff", "#ff5d5d", "#14c38e", "#ffb020", "#7c5cff", "#00b8d9", "#ef5da8", "#8b5cf6"];
 const DEFAULT_QUICK_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
 const DEFAULT_PRESET_ID = "preset1";
@@ -372,8 +444,26 @@ const TEST_PRESET = {
   devBuyAmount: "0.001",
 };
 
+function setStatusLabel(label = "") {
+  const normalized = String(label || "").trim();
+  const hidden = !normalized || /^(idle|ready)$/i.test(normalized);
+  if (statusNode) {
+    statusNode.textContent = hidden ? "" : normalized;
+    statusNode.hidden = hidden;
+  }
+  if (imageStatus) {
+    imageStatus.textContent = hidden ? "" : normalized;
+  }
+}
+
+function currentStatusLabel() {
+  if (imageStatus && imageStatus.textContent.trim()) return imageStatus.textContent.trim();
+  if (statusNode && statusNode.textContent.trim()) return statusNode.textContent.trim();
+  return "";
+}
+
 function setBusy(busy, label) {
-  statusNode.textContent = label;
+  setStatusLabel(label);
   buttons.forEach((button) => {
     button.disabled = busy;
   });
@@ -402,6 +492,11 @@ function setNamedValue(name, value) {
   if (input) input.value = value;
 }
 
+function setNamedChecked(name, checked) {
+  const input = getNamedInput(name);
+  if (input) input.checked = Boolean(checked);
+}
+
 function isNamedChecked(name) {
   const input = getNamedInput(name);
   return Boolean(input && input.checked);
@@ -415,10 +510,34 @@ function formatSliderValue(value, suffix, digits = 0) {
 
 function normalizeLaunchMode(value) {
   const mode = String(value || "").trim();
-  if (["regular", "bonkers", "cashback", "agent-custom", "agent-unlocked", "agent-locked"].includes(mode)) {
+  if ([
+    "regular",
+    "bonkers",
+    "cashback",
+    "agent-custom",
+    "agent-unlocked",
+    "agent-locked",
+    "bags-2-2",
+    "bags-025-1",
+    "bags-1-025",
+  ].includes(mode)) {
     return mode;
   }
   return "regular";
+}
+
+function defaultLaunchModeForLaunchpad(launchpad) {
+  const normalizedLaunchpad = normalizeLaunchpad(launchpad);
+  if (normalizedLaunchpad === "bagsapp") return "bags-2-2";
+  return "regular";
+}
+
+function normalizeLaunchModeForLaunchpad(mode, launchpad = getLaunchpad()) {
+  const normalizedMode = normalizeLaunchMode(mode);
+  const allowedModes = getLaunchpadUiCapabilities(normalizeLaunchpad(launchpad)).allowedModes || ["regular"];
+  return allowedModes.includes(normalizedMode)
+    ? normalizedMode
+    : (allowedModes[0] || defaultLaunchModeForLaunchpad(launchpad));
 }
 
 function normalizeLaunchpad(value) {
@@ -490,9 +609,11 @@ function setStoredBonkQuoteAsset(asset) {
 function serializeFeeSplitDraft() {
   return {
     enabled: Boolean(feeSplitEnabled && feeSplitEnabled.checked),
+    suppressDefaultRow: feeSplitList ? feeSplitList.dataset.suppressDefaultRow === "true" : false,
     rows: getFeeSplitRows().map((row) => ({
       type: row.dataset.type || "wallet",
       value: row.querySelector(".recipient-target")?.value?.trim() || "",
+      githubUserId: row.dataset.githubUserId || "",
       sharePercent: row.querySelector(".recipient-share")?.value?.trim() || "",
       defaultReceiver: row.dataset.defaultReceiver === "true",
       targetLocked: row.dataset.targetLocked === "true",
@@ -505,6 +626,7 @@ function normalizeFeeSplitDraft(value) {
     ? value.rows.map((entry) => ({
       type: entry && entry.type === "github" ? "github" : "wallet",
       value: String(entry && entry.value || "").trim(),
+      githubUserId: String(entry && entry.githubUserId || "").trim(),
       sharePercent: normalizeDecimalInput(entry && entry.sharePercent || "", 2),
       defaultReceiver: Boolean(entry && entry.defaultReceiver),
       targetLocked: Boolean(entry && entry.targetLocked),
@@ -512,6 +634,7 @@ function normalizeFeeSplitDraft(value) {
     : [];
   return {
     enabled: Boolean(value && value.enabled),
+    suppressDefaultRow: Boolean(value && value.suppressDefaultRow),
     rows,
   };
 }
@@ -543,6 +666,11 @@ function applyFeeSplitDraft(value, { persist = false } = {}) {
   const draft = normalizeFeeSplitDraft(value);
   if (feeSplitEnabled) feeSplitEnabled.checked = draft.enabled;
   if (feeSplitList) {
+    if (draft.suppressDefaultRow) {
+      feeSplitList.dataset.suppressDefaultRow = "true";
+    } else {
+      delete feeSplitList.dataset.suppressDefaultRow;
+    }
     feeSplitList.innerHTML = "";
     draft.rows.forEach((entry) => {
       feeSplitList.appendChild(createFeeSplitRow(entry));
@@ -616,6 +744,112 @@ function applyAgentSplitDraft(value, { persist = false } = {}) {
   if (persist) setStoredAgentSplitDraft(draft);
 }
 
+function formatShareBpsAsPercent(shareBps) {
+  const numeric = Number(shareBps);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "";
+  const raw = (numeric / 100).toFixed(2);
+  return raw.replace(/\.00$/, "").replace(/(\.\d*[1-9])0$/, "$1");
+}
+
+function parseGithubRecipientTarget(value) {
+  const normalized = String(value || "").trim().replace(/^@+/, "");
+  if (!normalized) {
+    return { githubUsername: "", githubUserId: "" };
+  }
+  if (/^\d+$/.test(normalized)) {
+    return { githubUsername: "", githubUserId: normalized };
+  }
+  return { githubUsername: normalized, githubUserId: "" };
+}
+
+function looksLikeSolanaAddress(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized || normalized.startsWith("@")) return false;
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(normalized);
+}
+
+function normalizeImportedCreatorFeeState(value) {
+  const mode = String(value && value.mode || "").trim().toLowerCase();
+  return {
+    mode,
+    address: String(value && value.address || "").trim(),
+    githubUsername: String(value && value.githubUsername || "").trim().replace(/^@+/, ""),
+    githubUserId: String(value && value.githubUserId || "").trim(),
+  };
+}
+
+function setImportedCreatorFeeState(value) {
+  importedCreatorFeeState = normalizeImportedCreatorFeeState(value);
+}
+
+function buildFeeSplitDraftFromRecipients(recipients, { enabled = false } = {}) {
+  return {
+    enabled,
+    suppressDefaultRow: Array.isArray(recipients) && recipients.length > 0,
+    rows: Array.isArray(recipients)
+      ? recipients.map((entry) => ({
+        type: entry && entry.type === "github" ? "github" : "wallet",
+        value: entry && entry.type === "github"
+          ? String(entry.githubUsername || entry.githubUserId || "").trim().replace(/^@+/, "")
+          : String(entry && entry.address || "").trim(),
+        githubUserId: String(entry && entry.githubUserId || "").trim(),
+        sharePercent: formatShareBpsAsPercent(entry && entry.shareBps),
+        defaultReceiver: false,
+        targetLocked: false,
+      })).filter((entry) => entry.value || entry.sharePercent)
+      : [],
+  };
+}
+
+function buildAgentSplitDraftFromRecipients(recipients) {
+  return {
+    rows: Array.isArray(recipients)
+      ? recipients.map((entry) => {
+        const type = String(entry && entry.type || "wallet").trim().toLowerCase();
+        if (type === "agent") {
+          return {
+            locked: true,
+            type: "wallet",
+            value: "",
+            sharePercent: formatShareBpsAsPercent(entry && entry.shareBps),
+            defaultReceiver: false,
+            targetLocked: true,
+          };
+        }
+        return {
+          locked: false,
+          type: type === "github" ? "github" : "wallet",
+          value: type === "github"
+            ? String(entry && entry.githubUsername || "").trim().replace(/^@+/, "")
+            : String(entry && entry.address || "").trim(),
+          sharePercent: formatShareBpsAsPercent(entry && entry.shareBps),
+          defaultReceiver: false,
+          targetLocked: false,
+        };
+      }).filter((entry) => entry.value || entry.sharePercent || entry.locked)
+      : [],
+  };
+}
+
+function applyImportedRouteState({
+  launchpad = getLaunchpad(),
+  feeSharingRecipients = null,
+  agentFeeRecipients = null,
+  creatorFee = null,
+} = {}) {
+  const nextLaunchpad = normalizeLaunchpad(launchpad);
+  const feeRecipients = Array.isArray(feeSharingRecipients) ? feeSharingRecipients : [];
+  const agentRecipients = Array.isArray(agentFeeRecipients) ? agentFeeRecipients : [];
+  applyFeeSplitDraft(
+    buildFeeSplitDraftFromRecipients(feeRecipients, {
+      enabled: nextLaunchpad === "bagsapp" || feeRecipients.length > 0,
+    }),
+    { persist: false },
+  );
+  applyAgentSplitDraft(buildAgentSplitDraftFromRecipients(agentRecipients), { persist: false });
+  setImportedCreatorFeeState(creatorFee || null);
+}
+
 function normalizeDecimalInput(value, maxDecimals = 6) {
   const raw = String(value || "").replace(/,/g, ".").trim();
   if (!raw) return "";
@@ -639,6 +873,8 @@ const reportsFeature = window.ReportsFeature.create({
     toggleReportsButton,
     reportsRefreshButton,
     reportsSortButton,
+    reportsTransactionsButton,
+    reportsLaunchesButton,
   },
   storage: {
     visibilityKey: REPORTS_TERMINAL_VISIBILITY_KEY,
@@ -661,8 +897,15 @@ const reportsFeature = window.ReportsFeature.create({
   refreshOnVisible: () => refreshReportsTerminal(),
   renderOutput: () => renderReportsTerminalOutput(),
   renderList: () => renderReportsTerminalList(),
-  loadEntry: (id) => loadReportsTerminalEntry(id),
+  loadEntry: (id, options) => loadReportsTerminalEntry(id, options),
   refreshReports: (options) => refreshReportsTerminal(options),
+  getView: () => reportsTerminalState.view,
+  setView: (value) => {
+    reportsTerminalState.view = normalizeReportsTerminalView(value);
+    syncReportsTerminalChrome();
+  },
+  reuseEntry: (id) => reuseFromHistory(id),
+  relaunchEntry: (id) => relaunchFromHistory(id),
   normalizeTab: (tab) => normalizeReportsTerminalTab(tab),
   shortenAddress,
   openPopoutWindow,
@@ -694,6 +937,7 @@ setReportsTerminalVisible(
   { persist: false },
 );
 setReportsTerminalListWidth(getStoredReportsTerminalListWidth(), { persist: false });
+syncReportsTerminalChrome();
 
 const imagesFeature = window.ImagesFeature.create({
   elements: {
@@ -857,7 +1101,6 @@ const autoSellFeature = window.AutoSellFeature.create({
     autoSellEnabledInput,
     autoSellToggleState,
     autoSellTriggerValue,
-    autoSellTriggerDescription,
     autoSellDelaySlider,
     autoSellDelayControl,
     autoSellPercentSlider,
@@ -1159,7 +1402,7 @@ async function saveDevBuyPresetEditor() {
     renderBackendRegionSummary(payload.regionRouting);
     setDevBuyPresetEditorOpen(false);
   } catch (error) {
-    statusNode.textContent = "Error";
+    setStatusLabel("Error");
     output.textContent = error.message;
   } finally {
     if (saveDevBuyPresetsButton) saveDevBuyPresetsButton.disabled = false;
@@ -1191,6 +1434,8 @@ function createFallbackConfig() {
           provider: "helius-sender",
           tipSol: "0.01",
           priorityFeeSol: "0.001",
+          autoFee: false,
+          maxFeeSol: "",
           devBuySol: amount,
         },
         buySettings: {
@@ -1198,6 +1443,8 @@ function createFallbackConfig() {
           priorityFeeSol: "0.009",
           tipSol: "0.01",
           slippagePercent: "90",
+          autoFee: false,
+          maxFeeSol: "",
           snipeBuyAmountSol: "",
         },
         sellSettings: {
@@ -1205,11 +1452,13 @@ function createFallbackConfig() {
           priorityFeeSol: "0.009",
           tipSol: "0.01",
           slippagePercent: "90",
+          autoFee: false,
+          maxFeeSol: "",
         },
         automaticDevSell: {
           enabled: false,
           percent: 100,
-          triggerMode: "confirmation",
+          triggerMode: "block-offset",
           delayMs: 0,
           targetBlockOffset: 0,
         },
@@ -1271,6 +1520,14 @@ function setConfig(nextConfig) {
   renderQuickDevBuyButtons(nextConfig);
 }
 
+function normalizeAutoFeeCapValue(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  const numeric = Number(trimmed);
+  if (!Number.isFinite(numeric)) return trimmed;
+  return numeric <= 0 ? "" : trimmed;
+}
+
 function setRegionRouting(nextRegionRouting) {
   if (!latestWalletStatus) {
     latestWalletStatus = {
@@ -1314,29 +1571,30 @@ function renderBackendRegionSummary(regionRouting = latestWalletStatus && latest
     const entry = providers[provider] || {};
     const configured = formatBackendRegionValue(entry.configured, "None");
     const effective = formatBackendRegionValue(entry.effective);
-    const overrideNote = entry.endpointOverrideActive
-      ? '<div class="settings-region-note">Explicit endpoint override active. Region fanout is bypassed.</div>'
-      : "";
+    const metaText = entry.endpointOverrideActive
+      ? `Override: ${configured} | endpoint pinned`
+      : `Override: ${configured}`;
     return `
       <div class="settings-region-card">
         <div class="settings-region-card-head">
           <strong>${escapeHTML(PROVIDER_LABELS[provider] || provider)}</strong>
           <span class="settings-region-effective">${escapeHTML(effective)}</span>
         </div>
-        <div class="settings-region-meta">Override: ${escapeHTML(configured)}</div>
-        ${overrideNote}
+        <div class="settings-region-meta">${escapeHTML(metaText)}</div>
       </div>
     `;
   }).join("");
   const markup = `
-    <div class="settings-region-card settings-region-card-shared">
-      <div class="settings-region-card-head">
-        <strong>Shared backend region</strong>
-        <span class="settings-region-effective">${escapeHTML(sharedEffective)}</span>
+    <div class="settings-region-row">
+      <div class="settings-region-card settings-region-card-shared">
+        <div class="settings-region-card-head">
+          <strong>Shared</strong>
+          <span class="settings-region-effective">${escapeHTML(sharedEffective)}</span>
+        </div>
+        <div class="settings-region-meta">Configured: ${escapeHTML(sharedConfigured)}</div>
       </div>
-      <div class="settings-region-meta">Configured: ${escapeHTML(sharedConfigured)}</div>
+      ${providerRows}
     </div>
-    ${providerRows}
     <div class="settings-sidebar-note">
       Region defaults are recommended because provider fanout usually reaches more nearby supported endpoints and lands faster and more reliably than pinning one endpoint. Change backend env values, then run <code>npm restart</code>.
     </div>
@@ -1387,32 +1645,206 @@ function setDevBuyHiddenState(mode, amount) {
   if (devBuyAmountInput) devBuyAmountInput.value = amount || "";
 }
 
+function setDevBuyPercentDisplay(value) {
+  const normalized = normalizeDecimalInput(String(value || ""), 4);
+  if (devBuyPercentInput) {
+    devBuyPercentInput.value = normalized;
+    devBuyPercentInput.placeholder = normalized || "0";
+  }
+}
+
+function getDevBuyQuoteRequestShape(modeOverride, amountOverride) {
+  return {
+    launchpad: getLaunchpad(),
+    quoteAsset: getQuoteAsset(),
+    launchMode: getMode(),
+    mode: String(modeOverride || getDevBuyMode() || "sol").trim().toLowerCase(),
+    amount: String(amountOverride != null ? amountOverride : (getNamedValue("devBuyAmount") || "")).trim(),
+  };
+}
+
+function getDevBuyQuoteCacheKey(shape) {
+  return [
+    shape.launchpad,
+    shape.quoteAsset,
+    shape.launchMode,
+    shape.mode,
+    shape.amount,
+  ].join("|");
+}
+
+function getCachedDevBuyQuote(shape) {
+  const key = getDevBuyQuoteCacheKey(shape);
+  const entry = devBuyQuoteCache.get(key);
+  if (!entry) return null;
+  if ((Date.now() - entry.cachedAt) > DEV_BUY_QUOTE_CACHE_TTL_MS) {
+    devBuyQuoteCache.delete(key);
+    return null;
+  }
+  return entry.quote || null;
+}
+
+function setCachedDevBuyQuote(shape, quote) {
+  if (!quote || !shape.amount) return;
+  devBuyQuoteCache.set(getDevBuyQuoteCacheKey(shape), {
+    quote,
+    cachedAt: Date.now(),
+  });
+}
+
+function renderDevBuyQuoteMessage(quote, mode, { provisional = false } = {}) {
+  if (!quoteOutput || !quote) return;
+  const quoteLabel = getQuoteAssetLabel(quote.quoteAsset || getQuoteAsset());
+  quoteOutput.hidden = false;
+  quoteOutput.textContent = mode === "sol"
+    ? `${provisional ? "Preview: " : ""}Estimated tokens out: ${quote.estimatedTokens} (${quote.estimatedSupplyPercent}% supply)`
+    : `${provisional ? "Preview: " : ""}Estimated ${quoteLabel} required: ${(quote.estimatedQuoteAmount || quote.estimatedSol)} for ${quote.estimatedSupplyPercent}% supply`;
+}
+
+function findNearestCachedDevBuyQuote(shape) {
+  let nearest = null;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const [key, entry] of devBuyQuoteCache.entries()) {
+    if ((Date.now() - entry.cachedAt) > DEV_BUY_QUOTE_CACHE_TTL_MS) {
+      devBuyQuoteCache.delete(key);
+      continue;
+    }
+    const [launchpad, quoteAsset, launchMode, mode] = key.split("|");
+    if (
+      launchpad !== shape.launchpad
+      || quoteAsset !== shape.quoteAsset
+      || launchMode !== shape.launchMode
+      || mode !== shape.mode
+    ) {
+      continue;
+    }
+    const cachedAmount = Number(entry.quote && entry.quote.input);
+    const requestedAmount = Number(shape.amount);
+    if (!Number.isFinite(cachedAmount) || !Number.isFinite(requestedAmount) || cachedAmount <= 0 || requestedAmount <= 0) {
+      continue;
+    }
+    const distance = Math.abs(cachedAmount - requestedAmount);
+    if (distance < nearestDistance) {
+      nearest = entry.quote;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+function renderProvisionalDevBuyPreview(shape) {
+  if (!quoteOutput || !shape.amount) return;
+  if (shape.mode === "tokens") {
+    const percent = tokenAmountToPercent(shape.amount);
+    if (percent) setDevBuyPercentDisplay(percent);
+    quoteOutput.hidden = false;
+    quoteOutput.textContent = `Estimating ${getQuoteAssetLabel(shape.quoteAsset)} required${percent ? ` for ${percent}% supply` : ""}...`;
+    return;
+  }
+  const nearest = findNearestCachedDevBuyQuote(shape);
+  if (nearest) {
+    const requestedAmount = Number(shape.amount);
+    const cachedAmount = Number(nearest.input || shape.amount);
+    const cachedTokens = Number(nearest.estimatedTokens || "0");
+    const cachedPercent = Number(nearest.estimatedSupplyPercent || "0");
+    if (
+      Number.isFinite(requestedAmount)
+      && Number.isFinite(cachedAmount)
+      && Number.isFinite(cachedTokens)
+      && Number.isFinite(cachedPercent)
+      && cachedAmount > 0
+    ) {
+      const ratio = requestedAmount / cachedAmount;
+      const previewQuote = {
+        ...nearest,
+        input: shape.amount,
+        estimatedQuoteAmount: shape.amount,
+        estimatedSol: shape.amount,
+        estimatedTokens: normalizeDecimalInput(String(cachedTokens * ratio), 6),
+        estimatedSupplyPercent: normalizeDecimalInput(String(cachedPercent * ratio), 4),
+      };
+      setDevBuyPercentDisplay(previewQuote.estimatedSupplyPercent);
+      renderDevBuyQuoteMessage(previewQuote, shape.mode, { provisional: true });
+      return;
+    }
+  }
+  quoteOutput.hidden = false;
+  quoteOutput.textContent = `Estimating ${getQuoteAssetLabel(shape.quoteAsset)} curve position...`;
+}
+
+function warmDevBuyQuoteCache() {
+  const baseShape = getDevBuyQuoteRequestShape("sol", "");
+  const amounts = Array.from(new Set(
+    getQuickDevBuyPresetAmounts()
+      .map((value) => normalizeDecimalInput(value, 9))
+      .filter(Boolean),
+  ));
+  amounts.forEach((amount) => {
+    const shape = { ...baseShape, amount };
+    if (getCachedDevBuyQuote(shape)) return;
+    const key = getDevBuyQuoteCacheKey(shape);
+    if (devBuyQuoteWarmInFlight.has(key)) return;
+    devBuyQuoteWarmInFlight.add(key);
+    const url = `/api/quote?launchpad=${encodeURIComponent(shape.launchpad)}&quoteAsset=${encodeURIComponent(shape.quoteAsset)}&launchMode=${encodeURIComponent(shape.launchMode)}&mode=${encodeURIComponent(shape.mode)}&amount=${encodeURIComponent(shape.amount)}`;
+    fetch(url)
+      .then((response) => response.json().then((payload) => ({ response, payload })))
+      .then(({ response, payload }) => {
+        if (response.ok && payload && payload.ok && payload.quote) {
+          setCachedDevBuyQuote(shape, payload.quote);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        devBuyQuoteWarmInFlight.delete(key);
+      });
+  });
+}
+
+function applyDevBuyQuotePayload(quote, mode) {
+  if (!quote) return;
+  syncingDevBuyInputs = true;
+  if (mode === "sol") {
+    setDevBuyPercentDisplay(quote.estimatedSupplyPercent);
+  } else {
+    if (devBuySolInput) {
+      const nextQuoteAmount = quote.estimatedQuoteAmount || quote.estimatedSol || "";
+      devBuySolInput.value = nextQuoteAmount;
+      devBuySolInput.placeholder = nextQuoteAmount || "0.0";
+    }
+    setDevBuyPercentDisplay(quote.estimatedSupplyPercent);
+  }
+  syncingDevBuyInputs = false;
+}
+
 function clearDevBuyState() {
   setDevBuyHiddenState("sol", "");
   syncingDevBuyInputs = true;
   if (devBuySolInput) devBuySolInput.value = "";
-  if (devBuyPercentInput) devBuyPercentInput.value = "";
+  if (devBuySolInput) devBuySolInput.placeholder = "0.0";
+  setDevBuyPercentDisplay("");
   syncingDevBuyInputs = false;
-  quoteOutput.textContent = "No dev buy selected.";
-  syncActivePresetDevBuy("");
-}
-
-function syncActivePresetDevBuy(amount) {
-  if (!isPresetEditing(getConfig())) return;
-  const config = cloneConfig(getConfig());
-  const activePreset = getActivePreset(config);
-  if (!activePreset) return;
-  activePreset.creationSettings = {
-    ...activePreset.creationSettings,
-    devBuySol: String(amount || "").trim(),
-  };
-  setConfig(config);
+  if (quoteOutput) {
+    quoteOutput.hidden = true;
+    quoteOutput.textContent = "No dev buy selected.";
+  }
 }
 
 function percentToTokenAmount(percentValue) {
   const percentRaw = parseDecimalToBigInt(percentValue, 4);
   const rawTokens = (TOTAL_SUPPLY_TOKENS * (10n ** BigInt(TOKEN_DECIMALS)) * percentRaw) / 1_000_000n;
   return formatBigIntDecimal(rawTokens, TOKEN_DECIMALS, TOKEN_DECIMALS);
+}
+
+function tokenAmountToPercent(tokenAmount) {
+  try {
+    const rawTokens = parseDecimalToBigInt(tokenAmount, TOKEN_DECIMALS);
+    if (rawTokens <= 0n) return "";
+    const denominator = TOTAL_SUPPLY_TOKENS * (10n ** BigInt(TOKEN_DECIMALS));
+    const scaledPercent = (rawTokens * 1_000_000n) / denominator;
+    return formatBigIntDecimal(scaledPercent, 4, 4);
+  } catch (_error) {
+    return "";
+  }
 }
 
 async function updateDevBuyFromSolInput(value) {
@@ -1426,8 +1858,8 @@ async function updateDevBuyFromSolInput(value) {
     return;
   }
   setDevBuyHiddenState("sol", amount);
-  syncActivePresetDevBuy(amount);
-  await updateQuote();
+  renderProvisionalDevBuyPreview(getDevBuyQuoteRequestShape("sol", amount));
+  queueQuoteUpdate();
 }
 
 async function updateDevBuyFromPercentInput(value) {
@@ -1447,10 +1879,14 @@ async function updateDevBuyFromPercentInput(value) {
       return;
     }
     setDevBuyHiddenState("tokens", tokenAmount);
-    await updateQuote();
+    renderProvisionalDevBuyPreview(getDevBuyQuoteRequestShape("tokens", tokenAmount));
+    queueQuoteUpdate();
   } catch (_error) {
     setDevBuyHiddenState("tokens", "");
-    quoteOutput.textContent = "Enter a valid percentage.";
+    if (quoteOutput) {
+      quoteOutput.hidden = false;
+      quoteOutput.textContent = "Enter a valid percentage.";
+    }
   }
 }
 
@@ -1561,8 +1997,7 @@ function getMode() {
 }
 
 function setMode(mode) {
-  const normalized = String(mode || "").trim();
-  const target = normalized || "regular";
+  const target = normalizeLaunchModeForLaunchpad(mode, getLaunchpad());
   const next = form.querySelector(`input[name="mode"][value="${CSS.escape(target)}"]`)
     || form.querySelector('input[name="mode"][value="regular"]');
   if (!next) return;
@@ -1593,6 +2028,10 @@ function getQuoteAssetLabel(asset = getQuoteAsset()) {
   return normalizeQuoteAsset(asset) === "usd1" ? "USD1" : "SOL";
 }
 
+function getDevBuyAssetLabel(launchpad = getLaunchpad(), quoteAsset = getQuoteAsset()) {
+  return launchpad === "bonk" ? "SOL" : getQuoteAssetLabel(quoteAsset);
+}
+
 function getQuoteAssetButtonLabel(asset = getQuoteAsset()) {
   return normalizeQuoteAsset(asset) === "usd1" ? "usd1" : "solana";
 }
@@ -1618,19 +2057,206 @@ function syncBonkQuoteAssetUI() {
   if (bonkQuoteAssetToggleSolIcon) bonkQuoteAssetToggleSolIcon.hidden = asset !== "sol";
   if (bonkQuoteAssetToggleUsd1Icon) bonkQuoteAssetToggleUsd1Icon.hidden = asset !== "usd1";
   if (visible) setStoredBonkQuoteAsset(asset);
-  if (devBuyQuotePrefixIcon) devBuyQuotePrefixIcon.hidden = asset !== "sol";
+  if (devBuyQuotePrefixIcon) devBuyQuotePrefixIcon.hidden = false;
   if (devBuyQuotePrefixText) {
-    devBuyQuotePrefixText.hidden = asset === "sol";
-    devBuyQuotePrefixText.textContent = getQuoteAssetLabel(asset);
+    devBuyQuotePrefixText.hidden = true;
+    devBuyQuotePrefixText.textContent = "SOL";
   }
 }
 
-function setLaunchpad(launchpad) {
+function getBagsIdentityMode() {
+  return String(bagsIdentityModeInput && bagsIdentityModeInput.value || "wallet-only").trim().toLowerCase() === "linked"
+    ? "linked"
+    : "wallet-only";
+}
+
+function setBagsIdentityStateInputs(nextState = {}) {
+  bagsIdentityState = {
+    ...bagsIdentityState,
+    ...nextState,
+  };
+  if (bagsIdentityModeInput) bagsIdentityModeInput.value = bagsIdentityState.mode === "linked" ? "linked" : "wallet-only";
+  if (bagsAgentUsernameHiddenInput) bagsAgentUsernameHiddenInput.value = bagsIdentityState.agentUsername || "";
+  if (bagsAuthTokenInput) bagsAuthTokenInput.value = bagsIdentityState.authToken || "";
+  if (bagsIdentityVerifiedWalletInput) bagsIdentityVerifiedWalletInput.value = bagsIdentityState.verifiedWallet || "";
+}
+
+function describeBagsIdentity() {
+  if (getBagsIdentityMode() !== "linked") return "Wallet Only";
+  if (bagsIdentityState.agentUsername) return `Linked Bags Identity (@${bagsIdentityState.agentUsername})`;
+  return "Linked Bags Identity";
+}
+
+function syncBagsIdentityUI() {
+  const visible = getLaunchpad() === "bagsapp";
+  if (bagsIdentityButton) bagsIdentityButton.hidden = !visible;
+  if (bagsIdentityButtonLabel) {
+    bagsIdentityButtonLabel.textContent = getBagsIdentityMode() === "linked"
+      ? (bagsIdentityState.agentUsername ? `Linked Identity (@${bagsIdentityState.agentUsername})` : "Linked Identity")
+      : "Wallet Only";
+  }
+  if (bagsIdentityButton) {
+    bagsIdentityButton.classList.toggle("active", visible && getBagsIdentityMode() === "linked");
+    bagsIdentityButton.title = visible
+      ? describeBagsIdentity()
+      : "";
+  }
+}
+
+function setBagsIdentityError(message = "") {
+  if (bagsIdentityError) bagsIdentityError.textContent = message;
+}
+
+function showBagsIdentityModal() {
+  if (!bagsIdentityModal) return;
+  if (bagsIdentityCurrent) {
+    const message = bagsIdentityState.configuredApiKey
+      ? `Configured API key detected. Selected wallet must belong to the same Bags account to keep linked mode enabled.`
+      : "No Bags API key is configured yet.";
+    bagsIdentityCurrent.hidden = false;
+    bagsIdentityCurrent.textContent = message;
+  }
+  if (bagsAgentUsernameInput) bagsAgentUsernameInput.value = bagsIdentityState.agentUsername || "";
+  if (bagsVerificationContent) bagsVerificationContent.value = bagsIdentityState.verificationPostContent || "";
+  if (bagsPostIdInput) bagsPostIdInput.value = "";
+  setBagsIdentityError("");
+  bagsIdentityModal.hidden = false;
+}
+
+function hideBagsIdentityModal({ preserveLinked = false } = {}) {
+  if (!bagsIdentityModal) return;
+  bagsIdentityModal.hidden = true;
+  if (!preserveLinked && getBagsIdentityMode() === "linked" && !bagsIdentityState.verified) {
+    setBagsIdentityStateInputs({
+      mode: "wallet-only",
+      agentUsername: "",
+      authToken: "",
+      verifiedWallet: "",
+      publicIdentifier: "",
+      secret: "",
+      verificationPostContent: "",
+      error: "",
+    });
+    syncBagsIdentityUI();
+  }
+}
+
+async function refreshBagsIdentityStatus() {
+  const walletKey = selectedWalletKey();
+  const query = walletKey ? `?wallet=${encodeURIComponent(walletKey)}` : "";
+  const response = await fetch(`/api/bags/identity/status${query}`);
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to load Bags identity status.");
+  }
+  setBagsIdentityStateInputs({
+    configuredApiKey: Boolean(payload.configuredApiKey),
+    verified: Boolean(payload.verified),
+    agentUsername: payload.agentUsername || "",
+    authToken: payload.authToken || "",
+    verifiedWallet: payload.verifiedWallet || "",
+    mode: payload.mode === "linked" && payload.verified ? "linked" : getBagsIdentityMode(),
+  });
+  if (getBagsIdentityMode() === "linked" && !payload.verified) {
+    setBagsIdentityStateInputs({ mode: "wallet-only" });
+  }
+  syncBagsIdentityUI();
+  return payload;
+}
+
+async function initBagsIdentityVerification() {
+  const response = await fetch("/api/bags/identity/init", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      apiKey: bagsApiKeyInput ? bagsApiKeyInput.value.trim() : "",
+      saveApiKey: Boolean(bagsApiKeySave && bagsApiKeySave.checked),
+      agentUsername: bagsAgentUsernameInput ? bagsAgentUsernameInput.value.trim() : "",
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to initialize Bags identity verification.");
+  }
+  setBagsIdentityStateInputs({
+    configuredApiKey: Boolean(payload.configuredApiKey),
+    agentUsername: payload.agentUsername || "",
+    publicIdentifier: payload.publicIdentifier || "",
+    secret: payload.secret || "",
+    verificationPostContent: payload.verificationPostContent || "",
+  });
+  if (bagsVerificationContent) bagsVerificationContent.value = payload.verificationPostContent || "";
+  if (bagsAgentUsernameInput) bagsAgentUsernameInput.value = payload.agentUsername || "";
+  syncBagsIdentityUI();
+  return payload;
+}
+
+async function verifyBagsIdentity() {
+  const response = await fetch("/api/bags/identity/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      apiKey: bagsApiKeyInput ? bagsApiKeyInput.value.trim() : "",
+      saveApiKey: Boolean(bagsApiKeySave && bagsApiKeySave.checked),
+      agentUsername: bagsAgentUsernameInput ? bagsAgentUsernameInput.value.trim() : "",
+      publicIdentifier: bagsIdentityState.publicIdentifier || "",
+      secret: bagsIdentityState.secret || "",
+      postId: bagsPostIdInput ? bagsPostIdInput.value.trim() : "",
+      walletEnvKey: selectedWalletKey(),
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to verify Bags identity.");
+  }
+  setBagsIdentityStateInputs({
+    mode: "linked",
+    configuredApiKey: Boolean(payload.configuredApiKey),
+    verified: Boolean(payload.verified),
+    agentUsername: payload.agentUsername || "",
+    authToken: payload.authToken || "",
+    verifiedWallet: payload.verifiedWallet || "",
+  });
+  syncBagsIdentityUI();
+  hideBagsIdentityModal({ preserveLinked: true });
+}
+
+function setLaunchpad(launchpad, { resetMode = false, persistMode = false } = {}) {
   const normalized = normalizeLaunchpad(launchpad);
   const target = document.querySelector(`input[name="launchpad"][value="${CSS.escape(normalized)}"]`)
     || document.querySelector('input[name="launchpad"][value="pump"]');
   if (!target || target.disabled) return;
   target.checked = true;
+  if (resetMode) {
+    setImportedCreatorFeeState(null);
+    const nextMode = defaultLaunchModeForLaunchpad(normalized);
+    setMode(nextMode);
+    if (persistMode) setStoredLaunchMode(nextMode);
+  }
+}
+
+function applyImportedLaunchContext(token = {}) {
+  const launchpad = normalizeLaunchpad(token.launchpad || getLaunchpad());
+  setLaunchpad(launchpad, { resetMode: true, persistMode: false });
+  setMode(token.mode || defaultLaunchModeForLaunchpad(launchpad));
+  if (launchpad === "bonk") {
+    setNamedValue("quoteAsset", normalizeQuoteAsset(token.quoteAsset || "sol"));
+  } else {
+    setNamedValue("quoteAsset", "sol");
+  }
+  applyImportedRouteState({
+    launchpad,
+    feeSharingRecipients: token.routes && Array.isArray(token.routes.feeSharingRecipients)
+      ? token.routes.feeSharingRecipients
+      : [],
+    agentFeeRecipients: token.routes && Array.isArray(token.routes.agentFeeRecipients)
+      ? token.routes.agentFeeRecipients
+      : [],
+    creatorFee: token.routes && token.routes.creatorFee ? token.routes.creatorFee : null,
+  });
+  syncLaunchpadModeOptions();
+  syncBonkQuoteAssetUI();
+  syncBagsIdentityUI();
 }
 
 function getLaunchpadUiCapabilities(launchpad = getLaunchpad()) {
@@ -1652,6 +2278,16 @@ function getLaunchpadUiCapabilities(launchpad = getLaunchpad()) {
       mayhem: false,
       feeSplit: false,
       vanity: true,
+      sniper: supportsStrategies["snipe-own-launch"] !== false,
+      autoSell: supportsStrategies["automatic-dev-sell"] !== false,
+    };
+  }
+  if (launchpad === "bagsapp") {
+    return {
+      allowedModes: ["bags-2-2", "bags-025-1", "bags-1-025"],
+      mayhem: false,
+      feeSplit: true,
+      vanity: false,
       sniper: supportsStrategies["snipe-own-launch"] !== false,
       autoSell: supportsStrategies["automatic-dev-sell"] !== false,
     };
@@ -1731,6 +2367,19 @@ function setFieldEnabled(input, enabled) {
   if (label) label.classList.toggle("is-disabled", !enabled);
 }
 
+function syncAutoFeeButtonState(button, input) {
+  if (!button || !input) return;
+  button.classList.toggle("active", Boolean(input.checked));
+  button.setAttribute("aria-pressed", input.checked ? "true" : "false");
+  button.disabled = Boolean(input.disabled);
+}
+
+function syncAutoFeeButtons() {
+  syncAutoFeeButtonState(creationAutoFeeButton, creationAutoFeeInput);
+  syncAutoFeeButtonState(buyAutoFeeButton, buyAutoFeeInput);
+  syncAutoFeeButtonState(sellAutoFeeButton, sellAutoFeeInput);
+}
+
 function setFieldVisibility(input, visible) {
   if (!input) return;
   const label = input.closest("label");
@@ -1784,6 +2433,29 @@ function syncStandardRpcWarnings() {
   }
 }
 
+function syncAutoFeeControls() {
+  const editing = isPresetEditing(getConfig());
+  const creationAuto = Boolean(creationAutoFeeInput && creationAutoFeeInput.checked);
+  const buyAuto = Boolean(buyAutoFeeInput && buyAutoFeeInput.checked);
+  const sellAuto = Boolean(sellAutoFeeInput && sellAutoFeeInput.checked);
+  const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
+  const buyCapabilities = getRouteCapabilities(getBuyProvider(), "buy");
+  const sellCapabilities = getRouteCapabilities(getSellProvider(), "sell");
+
+  setFieldEnabled(creationPriorityInput, editing && creationCapabilities.priority && !creationAuto);
+  setFieldEnabled(creationTipInput, editing && creationCapabilities.tip && !creationAuto);
+  setFieldEnabled(creationMaxFeeInput, editing && (creationCapabilities.priority || creationCapabilities.tip) && creationAuto);
+
+  setFieldEnabled(buyPriorityFeeInput, editing && buyCapabilities.priority && !buyAuto);
+  setFieldEnabled(buyTipInput, editing && buyCapabilities.tip && !buyAuto);
+  setFieldEnabled(buyMaxFeeInput, editing && (buyCapabilities.priority || buyCapabilities.tip) && buyAuto);
+
+  setFieldEnabled(sellPriorityFeeInput, editing && sellCapabilities.priority && !sellAuto);
+  setFieldEnabled(sellTipInput, editing && sellCapabilities.tip && !sellAuto);
+  setFieldEnabled(sellMaxFeeInput, editing && (sellCapabilities.priority || sellCapabilities.tip) && sellAuto);
+  syncAutoFeeButtons();
+}
+
 function syncSettingsCapabilities() {
   const editing = isPresetEditing(getConfig());
   const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
@@ -1801,14 +2473,12 @@ function syncSettingsCapabilities() {
   setFieldVisibility(sellPriorityFeeInput, sellCapabilities.priority);
   setFieldVisibility(sellTipInput, sellCapabilities.tip);
   setFieldVisibility(sellSlippageInput, sellCapabilities.slippage);
-  setFieldEnabled(creationTipInput, editing && creationCapabilities.tip);
-  setFieldEnabled(creationPriorityInput, editing && creationCapabilities.priority);
-  setFieldEnabled(buyPriorityFeeInput, editing && buyCapabilities.priority);
-  setFieldEnabled(buyTipInput, editing && buyCapabilities.tip);
+  setFieldEnabled(creationAutoFeeInput, editing && (creationCapabilities.priority || creationCapabilities.tip));
+  setFieldEnabled(buyAutoFeeInput, editing && (buyCapabilities.priority || buyCapabilities.tip));
+  setFieldEnabled(sellAutoFeeInput, editing && (sellCapabilities.priority || sellCapabilities.tip));
   setFieldEnabled(buySlippageInput, editing && buyCapabilities.slippage);
-  setFieldEnabled(sellPriorityFeeInput, editing && sellCapabilities.priority);
-  setFieldEnabled(sellTipInput, editing && sellCapabilities.tip);
   setFieldEnabled(sellSlippageInput, editing && sellCapabilities.slippage);
+  syncAutoFeeControls();
   syncStandardRpcWarnings();
 }
 
@@ -1819,14 +2489,20 @@ function applyPresetToSettingsInputs(preset, options = {}) {
   if (providerSelect) providerSelect.value = preset.creationSettings.provider || "helius-sender";
   if (creationTipInput) creationTipInput.value = preset.creationSettings.tipSol || "";
   if (creationPriorityInput) creationPriorityInput.value = preset.creationSettings.priorityFeeSol || "";
+  if (creationAutoFeeInput) creationAutoFeeInput.checked = Boolean(preset.creationSettings.autoFee);
+  if (creationMaxFeeInput) creationMaxFeeInput.value = preset.creationSettings.maxFeeSol || "";
   if (buyProviderSelect) buyProviderSelect.value = preset.buySettings.provider || "helius-sender";
   if (buyPriorityFeeInput) buyPriorityFeeInput.value = preset.buySettings.priorityFeeSol || "";
   if (buyTipInput) buyTipInput.value = preset.buySettings.tipSol || "";
   if (buySlippageInput) buySlippageInput.value = preset.buySettings.slippagePercent || "";
+  if (buyAutoFeeInput) buyAutoFeeInput.checked = Boolean(preset.buySettings.autoFee);
+  if (buyMaxFeeInput) buyMaxFeeInput.value = preset.buySettings.maxFeeSol || "";
   if (sellProviderSelect) sellProviderSelect.value = preset.sellSettings.provider || "helius-sender";
   if (sellPriorityFeeInput) sellPriorityFeeInput.value = preset.sellSettings.priorityFeeSol || "";
   if (sellTipInput) sellTipInput.value = preset.sellSettings.tipSol || "";
   if (sellSlippageInput) sellSlippageInput.value = preset.sellSettings.slippagePercent || "";
+  if (sellAutoFeeInput) sellAutoFeeInput.checked = Boolean(preset.sellSettings.autoFee);
+  if (sellMaxFeeInput) sellMaxFeeInput.value = preset.sellSettings.maxFeeSol || "";
   syncingPresetInputs = false;
   const standardizedDefaultsApplied =
     ensureStandardRpcSlippageDefault(buySlippageInput, getBuyProvider())
@@ -1855,6 +2531,8 @@ function syncActivePresetFromInputs() {
     provider: getProvider(),
     tipSol: creationTipInput ? creationTipInput.value.trim() : "",
     priorityFeeSol: creationPriorityInput ? creationPriorityInput.value.trim() : "",
+    autoFee: Boolean(creationAutoFeeInput && creationAutoFeeInput.checked),
+    maxFeeSol: normalizeAutoFeeCapValue(creationMaxFeeInput ? creationMaxFeeInput.value : ""),
     devBuySol: activePreset.creationSettings && activePreset.creationSettings.devBuySol
       ? activePreset.creationSettings.devBuySol.trim()
       : "",
@@ -1865,6 +2543,8 @@ function syncActivePresetFromInputs() {
     priorityFeeSol: buyPriorityFeeInput ? buyPriorityFeeInput.value.trim() : "",
     tipSol: buyTipInput ? buyTipInput.value.trim() : "",
     slippagePercent: buySlippageInput ? buySlippageInput.value.trim() : "",
+    autoFee: Boolean(buyAutoFeeInput && buyAutoFeeInput.checked),
+    maxFeeSol: normalizeAutoFeeCapValue(buyMaxFeeInput ? buyMaxFeeInput.value : ""),
   };
   activePreset.sellSettings = {
     ...activePreset.sellSettings,
@@ -1872,6 +2552,8 @@ function syncActivePresetFromInputs() {
     priorityFeeSol: sellPriorityFeeInput ? sellPriorityFeeInput.value.trim() : "",
     tipSol: sellTipInput ? sellTipInput.value.trim() : "",
     slippagePercent: sellSlippageInput ? sellSlippageInput.value.trim() : "",
+    autoFee: Boolean(sellAutoFeeInput && sellAutoFeeInput.checked),
+    maxFeeSol: normalizeAutoFeeCapValue(sellMaxFeeInput ? sellMaxFeeInput.value : ""),
   };
   setConfig(config);
   syncSettingsCapabilities();
@@ -1899,14 +2581,20 @@ function setPresetEditing(editing) {
     providerSelect,
     creationTipInput,
     creationPriorityInput,
+    creationAutoFeeInput,
+    creationMaxFeeInput,
     buyProviderSelect,
     buyPriorityFeeInput,
     buyTipInput,
     buySlippageInput,
+    buyAutoFeeInput,
+    buyMaxFeeInput,
     sellProviderSelect,
     sellPriorityFeeInput,
     sellTipInput,
     sellSlippageInput,
+    sellAutoFeeInput,
+    sellMaxFeeInput,
   ];
   inputs.forEach((input) => {
     if (!input) return;
@@ -1944,6 +2632,10 @@ function showVampModal() {
 }
 
 function hideVampModal() {
+  if (vampAutoImportTimer) {
+    window.clearTimeout(vampAutoImportTimer);
+    vampAutoImportTimer = null;
+  }
   if (vampModal) vampModal.hidden = true;
 }
 
@@ -1951,6 +2643,28 @@ function setVampStatus(message = "") {
   if (!vampStatus) return;
   vampStatus.hidden = !message;
   vampStatus.textContent = message;
+}
+
+function looksLikeSolanaAddress(value) {
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(value || "").trim());
+}
+
+function scheduleVampAutoImport() {
+  if (vampAutoImportTimer) {
+    window.clearTimeout(vampAutoImportTimer);
+    vampAutoImportTimer = null;
+  }
+  if (!vampModal || vampModal.hidden || !vampContractInput) return;
+  const contractAddress = vampContractInput.value.trim();
+  if (!looksLikeSolanaAddress(contractAddress)) return;
+  vampAutoImportTimer = window.setTimeout(() => {
+    vampAutoImportTimer = null;
+    if (!vampModal || vampModal.hidden || !vampContractInput) return;
+    if (vampContractInput.value.trim() !== contractAddress) return;
+    if (contractAddress === vampInFlightAddress) return;
+    if (vampImport && vampImport.disabled) return;
+    importVampToken().catch(() => {});
+  }, 150);
 }
 
 async function importVampToken() {
@@ -1961,6 +2675,7 @@ async function importVampToken() {
   }
   if (vampError) vampError.textContent = "";
   setVampStatus("Importing token metadata...");
+  vampInFlightAddress = contractAddress;
   if (vampImport) vampImport.disabled = true;
   if (vampCancel) vampCancel.disabled = true;
   if (vampClose) vampClose.disabled = true;
@@ -1991,29 +2706,49 @@ async function importVampToken() {
     if (websiteInput) websiteInput.value = payload.token && payload.token.website ? payload.token.website : "";
     if (twitterInput) twitterInput.value = payload.token && payload.token.twitter ? payload.token.twitter : "";
     if (telegramInput) telegramInput.value = payload.token && payload.token.telegram ? payload.token.telegram : "";
-    setMode(payload.token && payload.token.mode ? payload.token.mode : "regular");
+    applyImportedLaunchContext(payload.token || {});
     clearMetadataUploadCache({ clearInput: true });
     updateTokenFieldCounts();
 
     if (payload.image) {
+      const importedPreviewUrl = String(payload.image.previewUrl || "").trim()
+        || (payload.image.fileName ? `/uploads/${encodeURIComponent(payload.image.fileName)}` : "");
       imageLibraryState.activeImageId = payload.image.id || "";
       setSelectedImage(payload.image);
+      if (importedPreviewUrl) {
+        setImagePreview(importedPreviewUrl);
+      }
       try {
         await fetchImageLibrary();
+        const refreshedImportedImage = imageLibraryState.images.find((entry) => entry.id === imageLibraryState.activeImageId);
+        if (refreshedImportedImage) {
+          setSelectedImage(refreshedImportedImage);
+        } else if (importedPreviewUrl) {
+          setImagePreview(importedPreviewUrl);
+        }
       } catch (_error) {
         // Keep the imported image selected even if the library refresh fails.
+        if (importedPreviewUrl) {
+          setImagePreview(importedPreviewUrl);
+        }
       }
     }
 
-    imageStatus.textContent = payload.image
-      ? "Token image imported to library."
-      : (payload.warning || "");
+    const detectionNotes = payload.token && payload.token.detection && Array.isArray(payload.token.detection.notes)
+      ? payload.token.detection.notes.filter(Boolean)
+      : [];
+    imageStatus.textContent = [
+      payload.image ? "Token image imported to library." : "",
+      payload.warning || "",
+      detectionNotes.join(" "),
+    ].filter(Boolean).join(" ");
     imagePath.textContent = "";
     hideVampModal();
   } catch (error) {
     if (vampError) vampError.textContent = error.message;
     setVampStatus("");
   } finally {
+    if (vampInFlightAddress === contractAddress) vampInFlightAddress = "";
     if (vampImport) vampImport.disabled = false;
     if (vampCancel) vampCancel.disabled = false;
     if (vampClose) vampClose.disabled = false;
@@ -2088,7 +2823,7 @@ function hasBootstrapConfig() {
 
 function ensureInteractiveBootstrapReady(message = "App settings are still loading from the backend.") {
   if (hasBootstrapConfig()) return true;
-  statusNode.textContent = "Loading";
+  setStatusLabel("Loading");
   metaNode.textContent = message;
   return false;
 }
@@ -2165,6 +2900,16 @@ function walletDisplayName(wallet) {
   return `#${index}`;
 }
 
+function formatWalletHistoryLabel(envKey) {
+  const normalizedKey = String(envKey || "").trim();
+  if (!normalizedKey) return "";
+  const index = walletIndexFromEnvKey(normalizedKey);
+  const wallets = latestWalletStatus && Array.isArray(latestWalletStatus.wallets) ? latestWalletStatus.wallets : [];
+  const wallet = wallets.find((entry) => entry && entry.envKey === normalizedKey) || null;
+  const customName = wallet && wallet.customName ? String(wallet.customName).trim() : "";
+  return customName ? `Wallet #${index} ${customName}` : `Wallet #${index}`;
+}
+
 function walletBalanceSol(wallet) {
   if (!wallet || wallet.balanceSol == null || Number.isNaN(Number(wallet.balanceSol))) return null;
   return Number(wallet.balanceSol);
@@ -2222,8 +2967,14 @@ function renderWalletDropdownList(wallets = [], selectedKey = "") {
           <span class="wallet-option-meta">${escapeHTML(shortenAddress(wallet.publicKey || "Unavailable"))}</span>
         </span>
         <span class="wallet-option-balances">
-          <span class="wallet-option-sol">${escapeHTML(formatWalletDropdownAmount(solValue))} SOL</span>
-          <span class="wallet-option-usd">${escapeHTML(formatWalletDropdownAmount(usdValue))} USD1</span>
+          <span class="wallet-option-sol">
+            <img src="/solana-mark.png" alt="SOL" class="wallet-balance-icon">
+            <span>${escapeHTML(formatWalletDropdownAmount(solValue))}</span>
+          </span>
+          <span class="wallet-option-usd">
+            <img src="/usd1-mark.png" alt="USD1" class="wallet-balance-icon wallet-balance-icon-usd1">
+            <span>${escapeHTML(formatWalletDropdownAmount(usdValue))}</span>
+          </span>
         </span>
       </button>
     `;
@@ -2253,6 +3004,59 @@ function shortenAddress(addr, chars = 6) {
   return addr.slice(0, chars) + "..." + addr.slice(-chars);
 }
 
+function formatLegendRecipientLabel(type, value, fallback = "wallet") {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return { full: fallback, short: fallback };
+  }
+  if (type === "github") {
+    const full = `@${normalized.replace(/^@+/, "")}`;
+    return {
+      full,
+      short: full.length > 14 ? `${full.slice(0, 7)}...${full.slice(-4)}` : full,
+    };
+  }
+  return {
+    full: normalized,
+    short: shortenAddress(normalized, 3) || fallback,
+  };
+}
+
+function setFeeSplitModalError(message = "") {
+  if (feeSplitModalError) feeSplitModalError.textContent = message;
+}
+
+function getDeployerFeeSplitAddress() {
+  return String(latestWalletStatus && latestWalletStatus.wallet || "").trim();
+}
+
+function hasMeaningfulFeeSplitRecipients(recipients) {
+  const entries = Array.isArray(recipients) ? recipients.filter(Boolean) : [];
+  if (entries.length === 0) return false;
+  if (entries.length !== 1) return true;
+  const [entry] = entries;
+  if (!entry || entry.type !== "wallet") return true;
+  const deployerAddress = getDeployerFeeSplitAddress();
+  if (!deployerAddress) return true;
+  return String(entry.address || "").trim() !== deployerAddress || Number(entry.shareBps || 0) !== 10_000;
+}
+
+function hasMeaningfulFeeSplitConfiguration() {
+  return hasMeaningfulFeeSplitRecipients(collectFeeSplitRecipients());
+}
+
+function finalizeFeeSplitDraftForMode() {
+  const draft = normalizeFeeSplitDraft(serializeFeeSplitDraft());
+  const mode = getMode();
+  if (mode === "regular" && !hasMeaningfulFeeSplitConfiguration()) {
+    return normalizeFeeSplitDraft({ enabled: false, rows: [] });
+  }
+  if (mode === "regular") {
+    draft.enabled = true;
+  }
+  return draft;
+}
+
 function connectedWalletShort() {
   return latestWalletStatus && latestWalletStatus.wallet
     ? shortenAddress(latestWalletStatus.wallet)
@@ -2267,6 +3071,11 @@ function createFeeSplitRow(entry = {}) {
   const row = document.createElement("div");
   row.className = "fee-split-row";
   row.dataset.type = entry.type || "wallet";
+  if (row.dataset.type === "github") {
+    const parsedGithubTarget = parseGithubRecipientTarget(entry.value || "");
+    const githubUserId = String(entry.githubUserId || parsedGithubTarget.githubUserId || "").trim();
+    if (githubUserId) row.dataset.githubUserId = githubUserId;
+  }
   if (entry.defaultReceiver) row.dataset.defaultReceiver = "true";
   row.innerHTML = `
     <div class="fee-split-row-top">
@@ -2299,11 +3108,12 @@ function createFeeSplitRow(entry = {}) {
 
 function updateFeeSplitRowType(row, type) {
   row.dataset.type = type;
+  if (type !== "github") delete row.dataset.githubUserId;
   row.querySelectorAll(".recipient-type-tab").forEach((button) => {
     button.classList.toggle("active", button.dataset.type === type);
   });
   const target = row.querySelector(".recipient-target");
-  target.placeholder = type === "github" ? "GitHub username" : "Wallet address";
+  target.placeholder = type === "github" ? "GitHub username or user id" : "Wallet address";
 }
 
 function setRecipientTargetLocked(row, locked) {
@@ -2311,16 +3121,23 @@ function setRecipientTargetLocked(row, locked) {
   const target = row.querySelector(".recipient-target");
   const toggle = row.querySelector(".recipient-lock-toggle");
   if (!target || !toggle) return;
+  target.setCustomValidity("");
 
   if (locked) {
     if (!target.value.trim()) {
       target.focus();
       return;
     }
+    if (row.dataset.type === "github" && looksLikeSolanaAddress(target.value)) {
+      target.setCustomValidity("GitHub recipients must use a GitHub username or numeric user id, not a Solana address.");
+      target.reportValidity();
+      target.focus();
+      return;
+    }
     row.dataset.targetLocked = "true";
     target.readOnly = true;
     target.title = target.value.trim();
-    toggle.textContent = "Set";
+    toggle.textContent = "Edit";
     toggle.classList.add("is-set");
   } else {
     delete row.dataset.targetLocked;
@@ -2337,6 +3154,11 @@ function setRecipientTargetLocked(row, locked) {
 
 function ensureFeeSplitDefaultRow() {
   if (!feeSplitList) return;
+  const hasNonDefaultRows = getFeeSplitRows().some((row) => row.dataset.defaultReceiver !== "true");
+  if (feeSplitList.dataset.suppressDefaultRow === "true") {
+    if (hasNonDefaultRows) return;
+    delete feeSplitList.dataset.suppressDefaultRow;
+  }
   const deployerAddress = latestWalletStatus && latestWalletStatus.wallet ? latestWalletStatus.wallet : "";
   let defaultRow = getFeeSplitRows().find((row) => row.dataset.defaultReceiver === "true");
   if (!defaultRow) {
@@ -2386,19 +3208,17 @@ function syncFeeSplitTotals() {
     const share = Number(row.querySelector(".recipient-share").value || 0);
     const color = SPLIT_COLORS[index % SPLIT_COLORS.length];
     const targetValue = row.querySelector(".recipient-target").value.trim();
-    const label = targetValue
-      ? row.dataset.type === "github"
-        ? `@${targetValue.replace(/^@+/, "")}`
-        : targetValue
-      : row.dataset.type === "github"
-        ? "@github"
-        : "wallet";
+    const label = formatLegendRecipientLabel(
+      row.dataset.type === "github" ? "github" : "wallet",
+      targetValue,
+      row.dataset.type === "github" ? "@github" : "wallet"
+    );
     if (share > 0) {
       const start = running;
       running += share;
       gradientStops.push(`${color} ${start}%`, `${color} ${running}%`);
       legendItems.push(
-        `<span class="legend-chip"><span class="legend-dot" style="background:${color}"></span>${label} ${share.toFixed(2).replace(/\.00$/, "")}%</span>`
+        `<span class="legend-chip" title="${escapeHTML(label.full)}"><span class="legend-dot" style="background:${color}"></span><span class="legend-chip-label">${escapeHTML(label.short)}</span><span class="legend-chip-share">${share.toFixed(2).replace(/\.00$/, "")}%</span></span>`
       );
     }
   });
@@ -2415,21 +3235,26 @@ function syncFeeSplitTotals() {
 
 function updateFeeSplitVisibility() {
   const mode = getMode();
-  const active = mode === "agent-custom" || (mode === "regular" && feeSplitEnabled.checked);
+  const isBagsMode = mode.startsWith("bags-");
+  const active = mode === "agent-custom"
+    || (mode === "regular" && feeSplitEnabled.checked && hasMeaningfulFeeSplitConfiguration())
+    || (isBagsMode && hasMeaningfulFeeSplitConfiguration());
   feeSplitPill.classList.toggle("active", active);
-  feeSplitPill.disabled = mode !== "regular" && mode !== "agent-custom";
-  if (mode === "regular" && active) ensureFeeSplitDefaultRow();
-  if (mode !== "regular" && feeSplitModal) feeSplitModal.hidden = true;
+  feeSplitPill.disabled = mode !== "regular" && mode !== "agent-custom" && !isBagsMode;
+  if ((mode === "regular" && feeSplitEnabled.checked) || isBagsMode) ensureFeeSplitDefaultRow();
+  if (mode !== "regular" && !isBagsMode && feeSplitModal) feeSplitModal.hidden = true;
   syncFeeSplitTotals();
   syncSettingsCapabilities();
 }
 
 function showFeeSplitModal() {
   const mode = getMode();
-  if (mode === "regular") {
+  if (mode === "regular" || mode.startsWith("bags-")) {
+    feeSplitModalSnapshot = normalizeFeeSplitDraft(serializeFeeSplitDraft());
     feeSplitEnabled.checked = true;
     updateFeeSplitVisibility();
-    setStoredFeeSplitDraft(serializeFeeSplitDraft());
+    ensureFeeSplitDefaultRow();
+    setFeeSplitModalError("");
     if (feeSplitModal) feeSplitModal.hidden = false;
     return;
   }
@@ -2439,7 +3264,31 @@ function showFeeSplitModal() {
 }
 
 function hideFeeSplitModal() {
+  setFeeSplitModalError("");
   if (feeSplitModal) feeSplitModal.hidden = true;
+}
+
+function attemptCloseFeeSplitModal() {
+  const errors = validateFeeSplit();
+  if (errors.length > 0) {
+    setFeeSplitModalError(errors[0]);
+    return false;
+  }
+  const nextDraft = finalizeFeeSplitDraftForMode();
+  applyFeeSplitDraft(nextDraft, { persist: false });
+  updateFeeSplitVisibility();
+  setStoredFeeSplitDraft(nextDraft);
+  feeSplitModalSnapshot = nextDraft;
+  hideFeeSplitModal();
+  return true;
+}
+
+function cancelFeeSplitModal() {
+  applyFeeSplitDraft(feeSplitModalSnapshot, { persist: false });
+  updateFeeSplitVisibility();
+  setStoredFeeSplitDraft(normalizeFeeSplitDraft(serializeFeeSplitDraft()));
+  feeSplitModalSnapshot = null;
+  hideFeeSplitModal();
 }
 
 function createAgentSplitRow(entry = {}) {
@@ -2526,18 +3375,18 @@ function syncAgentSplitTotals() {
     const color = SPLIT_COLORS[index % SPLIT_COLORS.length];
     const targetValue = row.querySelector(".recipient-target").value.trim();
     const label = row.dataset.locked
-      ? "Agent Buyback"
-      : targetValue
-        ? row.dataset.type === "github"
-          ? `@${targetValue.replace(/^@+/, "")}`
-          : shortenAddress(targetValue, 4) || "wallet"
-        : "wallet";
+      ? { full: "Agent Buyback", short: "Agent" }
+      : formatLegendRecipientLabel(
+        row.dataset.type === "github" ? "github" : "wallet",
+        targetValue,
+        "wallet"
+      );
     if (share > 0) {
       const start = running;
       running += share;
       gradientStops.push(`${color} ${start}%`, `${color} ${running}%`);
       legendItems.push(
-        `<span class="legend-chip"><span class="legend-dot" style="background:${color}"></span>${label} ${share.toFixed(2).replace(/\.00$/, "")}%</span>`
+        `<span class="legend-chip" title="${escapeHTML(label.full)}"><span class="legend-dot" style="background:${color}"></span><span class="legend-chip-label">${escapeHTML(label.short)}</span><span class="legend-chip-share">${share.toFixed(2).replace(/\.00$/, "")}%</span></span>`
       );
     }
   });
@@ -2672,13 +3521,15 @@ function collectAgentSplitRecipients() {
     }
     const type = row.dataset.type || "wallet";
     const value = row.querySelector(".recipient-target").value.trim();
+    const parsedGithubTarget = parseGithubRecipientTarget(value);
     const sharePercent = row.querySelector(".recipient-share").value.trim();
     if (!value && !sharePercent) return null;
     const numericShare = Number(sharePercent);
     return {
       type,
       address: type === "wallet" ? value : "",
-      githubUsername: type === "github" ? value.replace(/^@+/, "") : "",
+      githubUsername: type === "github" ? parsedGithubTarget.githubUsername : "",
+      githubUserId: type === "github" ? parsedGithubTarget.githubUserId : "",
       shareBps: Number.isFinite(numericShare) ? Math.round(numericShare * 100) : NaN,
     };
   }).filter(Boolean);
@@ -2708,6 +3559,7 @@ function updateLockedModeFields() {
 function updateModeVisibility() {
   syncLaunchpadModeOptions();
   syncBonkQuoteAssetUI();
+  syncBagsIdentityUI();
   const mode = getMode();
   document.querySelectorAll("[data-mode-panel]").forEach((node) => {
     node.hidden = node.getAttribute("data-mode-panel") !== mode;
@@ -2784,6 +3636,7 @@ function applyLaunchpadAvailability(launchpads = {}) {
 function applyPersistentDefaults(config) {
   if (!config || defaultsApplied) return;
   const defaults = config.defaults || {};
+  setImportedCreatorFeeState(null);
   const storedSniperDraft = getStoredSniperDraft();
   const storedMode = getStoredLaunchMode();
   const storedLaunchpad = getStoredLaunchpad();
@@ -2794,6 +3647,7 @@ function applyPersistentDefaults(config) {
   if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = normalizeQuoteAsset(storedBonkQuoteAsset || "sol");
   setConfig(config);
   applyPresetToSettingsInputs(getActivePreset(config));
+  warmDevBuyQuoteCache();
   if (defaults.automaticDevSell) {
     if (autoSellEnabledInput) autoSellEnabledInput.checked = Boolean(defaults.automaticDevSell.enabled);
     setNamedValue(
@@ -2806,7 +3660,7 @@ function applyPersistentDefaults(config) {
       "automaticDevSellTriggerMode",
       normalizeAutoSellTriggerMode(
         defaults.automaticDevSell.triggerMode
-          || (Number(defaults.automaticDevSell.delaySeconds || 0) > 0 ? "submit-delay" : "confirmation"),
+          || (Number(defaults.automaticDevSell.delaySeconds || 0) > 0 ? "submit-delay" : "block-offset"),
       ),
     );
     setNamedValue(
@@ -2825,6 +3679,14 @@ function applyPersistentDefaults(config) {
     storedAgentSplitDraft || (defaults.misc && defaults.misc.agentSplitDraft) || null,
     { persist: false },
   );
+  if (defaults.misc && defaults.misc.bagsIdentity) {
+    setBagsIdentityStateInputs({
+      mode: String(defaults.misc.bagsIdentity.mode || "wallet-only").trim().toLowerCase() === "linked"
+        ? "linked"
+        : "wallet-only",
+      agentUsername: defaults.misc.bagsIdentity.agentUsername || "",
+    });
+  }
   setMode(storedMode || defaults.mode || "regular");
   syncDevAutoSellUI();
   setPresetEditing(Boolean(defaults.presetEditing));
@@ -2842,13 +3704,16 @@ function collectFeeSplitRecipients() {
     .map((row) => {
       const type = row.dataset.type || "wallet";
       const value = row.querySelector(".recipient-target").value.trim();
+      const githubUserId = String(row.dataset.githubUserId || "").trim();
+      const parsedGithubTarget = parseGithubRecipientTarget(value);
       const sharePercent = row.querySelector(".recipient-share").value.trim();
       if (!value && !sharePercent) return null;
       const numericShare = Number(sharePercent);
       return {
         type,
         address: type === "wallet" ? value : "",
-        githubUsername: type === "github" ? value.replace(/^@+/, "") : "",
+        githubUsername: type === "github" ? parsedGithubTarget.githubUsername : "",
+        githubUserId: type === "github" ? (githubUserId || parsedGithubTarget.githubUserId) : "",
         shareBps: Number.isFinite(numericShare) ? Math.round(numericShare * 100) : NaN,
       };
     })
@@ -2863,6 +3728,8 @@ function readForm() {
   const buyCapabilities = getRouteCapabilities(getBuyProvider(), "buy");
   const sellCapabilities = getRouteCapabilities(getSellProvider(), "sell");
   const devBuyAmount = String(values.devBuyAmount || "").trim();
+  const autoSellRequested = isNamedChecked("automaticDevSellEnabled");
+  const automaticDevSellEnabled = autoSellRequested && Boolean(devBuyAmount);
   const agentSplitRecipients = mode === "agent-custom" ? collectAgentSplitRecipients() : [];
   const agentBuyback = agentSplitRecipients.find((entry) => entry.type === "agent");
   let sniperWallets = [];
@@ -2874,6 +3741,10 @@ function readForm() {
   } catch (_error) {
     sniperWallets = [];
   }
+
+  const creationMaxFeeSol = normalizeAutoFeeCapValue(getNamedValue("creationMaxFeeSol"));
+  const buyMaxFeeSol = normalizeAutoFeeCapValue(getNamedValue("buyMaxFeeSol"));
+  const sellMaxFeeSol = normalizeAutoFeeCapValue(getNamedValue("sellMaxFeeSol"));
 
   return {
     selectedWalletKey: selectedWalletKey(),
@@ -2899,32 +3770,47 @@ function readForm() {
     agentSplitRecipients,
     devBuyMode: devBuyAmount ? getDevBuyMode() : "",
     devBuyAmount,
-    autoGas: true,
-    buyAutoGas: true,
+    autoGas: isNamedChecked("creationAutoFeeEnabled"),
+    buyAutoGas: isNamedChecked("buyAutoFeeEnabled"),
+    sellAutoGas: isNamedChecked("sellAutoFeeEnabled"),
+    creationAutoFeeEnabled: isNamedChecked("creationAutoFeeEnabled"),
+    buyAutoFeeEnabled: isNamedChecked("buyAutoFeeEnabled"),
+    sellAutoFeeEnabled: isNamedChecked("sellAutoFeeEnabled"),
     priorityFeeSol: creationCapabilities.priority ? (getNamedValue("creationPriorityFeeSol") || "") : "",
     creationTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
-    maxPriorityFeeSol: creationCapabilities.priority ? (getNamedValue("creationPriorityFeeSol") || "") : "",
-    maxTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
+    creationMaxFeeSol,
+    maxPriorityFeeSol: isNamedChecked("creationAutoFeeEnabled") ? creationMaxFeeSol : (creationCapabilities.priority ? (getNamedValue("creationPriorityFeeSol") || "") : ""),
+    maxTipSol: isNamedChecked("creationAutoFeeEnabled") ? creationMaxFeeSol : (creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : ""),
     buyPriorityFeeSol: buyCapabilities.priority ? (getNamedValue("buyPriorityFeeSol") || "") : "",
     buyTipSol: buyCapabilities.tip ? (getNamedValue("buyTipSol") || "") : "",
     buySlippagePercent: getNamedValue("buySlippagePercent") || "",
-    buyMaxPriorityFeeSol: buyCapabilities.priority ? (getNamedValue("buyPriorityFeeSol") || "") : "",
-    buyMaxTipSol: buyCapabilities.tip ? (getNamedValue("buyTipSol") || "") : "",
+    buyMaxFeeSol,
+    buyMaxPriorityFeeSol: isNamedChecked("buyAutoFeeEnabled") ? buyMaxFeeSol : (buyCapabilities.priority ? (getNamedValue("buyPriorityFeeSol") || "") : ""),
+    buyMaxTipSol: isNamedChecked("buyAutoFeeEnabled") ? buyMaxFeeSol : (buyCapabilities.tip ? (getNamedValue("buyTipSol") || "") : ""),
     sellPriorityFeeSol: sellCapabilities.priority ? (getNamedValue("sellPriorityFeeSol") || "") : "",
     sellTipSol: sellCapabilities.tip ? (getNamedValue("sellTipSol") || "") : "",
     sellSlippagePercent: getNamedValue("sellSlippagePercent") || "",
+    sellMaxFeeSol,
+    sellMaxPriorityFeeSol: isNamedChecked("sellAutoFeeEnabled") ? sellMaxFeeSol : (sellCapabilities.priority ? (getNamedValue("sellPriorityFeeSol") || "") : ""),
+    sellMaxTipSol: isNamedChecked("sellAutoFeeEnabled") ? sellMaxFeeSol : (sellCapabilities.tip ? (getNamedValue("sellTipSol") || "") : ""),
     enableJito: getProvider() === "jito-bundle" || Number(getNamedValue("creationTipSol") || 0) > 0,
     jitoTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
     skipPreflight: getNamedValue("skipPreflight") === "true",
     trackSendBlockHeight: true,
-    feeSplitEnabled: mode === "regular" && feeSplitEnabled.checked,
-    feeSplitRecipients: mode === "regular" && feeSplitEnabled.checked ? collectFeeSplitRecipients() : [],
+    feeSplitEnabled: mode === "regular" ? feeSplitEnabled.checked : mode.startsWith("bags-"),
+    feeSplitRecipients: mode === "regular"
+      ? (feeSplitEnabled.checked ? collectFeeSplitRecipients() : [])
+      : (mode.startsWith("bags-") ? collectFeeSplitRecipients() : []),
+    creatorFeeMode: importedCreatorFeeState.mode || "",
+    creatorFeeAddress: importedCreatorFeeState.address || "",
+    creatorFeeGithubUsername: importedCreatorFeeState.githubUsername || "",
+    creatorFeeGithubUserId: importedCreatorFeeState.githubUserId || "",
     postLaunchStrategy: getNamedValue("postLaunchStrategy") || "none",
     snipeBuyAmountSol: getNamedValue("snipeBuyAmountSol") || "",
     sniperEnabled: getNamedValue("sniperEnabled") === "true",
     sniperWallets,
     sniperConfigJson: getNamedValue("sniperConfigJson") || "[]",
-    automaticDevSellEnabled: isNamedChecked("automaticDevSellEnabled"),
+    automaticDevSellEnabled,
     automaticDevSellPercent: getNamedValue("automaticDevSellPercent") || "0",
     automaticDevSellTriggerMode: getAutoSellTriggerMode(),
     automaticDevSellDelayMs: String(getAutoSellDelayMs()),
@@ -2932,6 +3818,10 @@ function readForm() {
     vanityPrivateKey: getNamedValue("vanityPrivateKey") || "",
     imageFileName: uploadedImage ? uploadedImage.fileName : "",
     metadataUri: metadataUri.value || "",
+    bagsIdentityMode: getBagsIdentityMode(),
+    bagsAgentUsername: bagsIdentityState.agentUsername || "",
+    bagsAuthToken: bagsIdentityState.authToken || "",
+    bagsIdentityVerifiedWallet: bagsIdentityState.verifiedWallet || "",
   };
 }
 
@@ -3192,7 +4082,7 @@ function applySelectedWalletLocally(nextKey) {
       ? "--"
       : `${Number(latestWalletStatus.balanceSol).toFixed(4)} SOL`;
   }
-  metaNode.textContent = `Using ${walletLabel(selectedWallet)}`;
+  metaNode.textContent = "";
   updateLockedModeFields();
 }
 
@@ -3289,8 +4179,7 @@ function applyWalletStatusPayload(payload) {
       ? "--"
       : `${Number(latestWalletStatus.balanceSol).toFixed(4)} SOL`;
   }
-  const selectedWallet = wallets.find((walletEntry) => walletEntry.envKey === selectedWalletKeyValue);
-  metaNode.textContent = selectedWallet ? `Using ${walletLabel(selectedWallet)}` : "Wallet ready";
+  metaNode.textContent = "";
   updateLockedModeFields();
   schedulePopoutAutosize();
 }
@@ -3314,6 +4203,7 @@ async function bootstrapApp() {
   }
   applyBootstrapFastPayload(payload);
   refreshWalletStatus(true).catch(() => {});
+  refreshBagsIdentityStatus().catch(() => {});
   refreshRuntimeStatus().catch(() => {});
   fetch("/api/lookup-tables/warm", { method: "POST" }).catch(() => {});
   fetch("/api/pump-global/warm", { method: "POST" }).catch(() => {});
@@ -3338,9 +4228,13 @@ async function refreshRuntimeStatus() {
 }
 
 async function updateQuote() {
-  const buyAmount = getNamedValue("devBuyAmount").trim();
+  const shape = getDevBuyQuoteRequestShape();
+  const buyAmount = shape.amount;
   if (!buyAmount) {
-    quoteOutput.textContent = "No dev buy selected.";
+    if (quoteOutput) {
+      quoteOutput.hidden = true;
+      quoteOutput.textContent = "No dev buy selected.";
+    }
     if (!syncingDevBuyInputs) {
       syncingDevBuyInputs = true;
       if (devBuyPercentInput) devBuyPercentInput.value = "";
@@ -3351,10 +4245,14 @@ async function updateQuote() {
   }
 
   try {
-    const mode = getDevBuyMode();
-    const launchpad = getLaunchpad();
-    const quoteAsset = getQuoteAsset();
-    const url = `/api/quote?launchpad=${encodeURIComponent(launchpad)}&quoteAsset=${encodeURIComponent(quoteAsset)}&mode=${encodeURIComponent(mode)}&amount=${encodeURIComponent(buyAmount)}`;
+    const mode = shape.mode;
+    const cachedQuote = getCachedDevBuyQuote(shape);
+    if (cachedQuote) {
+      applyDevBuyQuotePayload(cachedQuote, mode);
+      renderDevBuyQuoteMessage(cachedQuote, mode);
+      return;
+    }
+    const url = `/api/quote?launchpad=${encodeURIComponent(shape.launchpad)}&quoteAsset=${encodeURIComponent(shape.quoteAsset)}&launchMode=${encodeURIComponent(shape.launchMode)}&mode=${encodeURIComponent(mode)}&amount=${encodeURIComponent(buyAmount)}`;
     const result = RequestUtils.fetchJsonLatest
       ? await RequestUtils.fetchJsonLatest("quote", url, {}, requestStates.quote)
       : null;
@@ -3366,38 +4264,34 @@ async function updateQuote() {
       throw new Error(payload.error || "Quote failed.");
     }
     if (!payload.quote) {
-      quoteOutput.textContent = "Enter a valid dev buy amount.";
+      if (quoteOutput) {
+        quoteOutput.hidden = false;
+        quoteOutput.textContent = "Enter a valid dev buy amount.";
+      }
       return;
     }
-    syncingDevBuyInputs = true;
-    if (mode === "sol") {
-      if (devBuyPercentInput) devBuyPercentInput.value = payload.quote.estimatedSupplyPercent;
-    } else {
-      if (devBuySolInput) devBuySolInput.value = payload.quote.estimatedQuoteAmount || payload.quote.estimatedSol;
-      if (devBuyPercentInput) devBuyPercentInput.value = payload.quote.estimatedSupplyPercent;
-    }
-    syncingDevBuyInputs = false;
-    const quoteLabel = getQuoteAssetLabel();
-    quoteOutput.textContent =
-      mode === "sol"
-        ? `Estimated tokens out: ${payload.quote.estimatedTokens} (${payload.quote.estimatedSupplyPercent}% supply)`
-        : `Estimated ${quoteLabel} required: ${(payload.quote.estimatedQuoteAmount || payload.quote.estimatedSol)} for ${payload.quote.estimatedSupplyPercent}% supply`;
+    setCachedDevBuyQuote(shape, payload.quote);
+    applyDevBuyQuotePayload(payload.quote, mode);
+    renderDevBuyQuoteMessage(payload.quote, mode);
   } catch (error) {
-    quoteOutput.textContent = error.message;
+    if (quoteOutput) {
+      quoteOutput.hidden = false;
+      quoteOutput.textContent = error.message;
+    }
   }
 }
 
 function queueQuoteUpdate() {
   if (RequestUtils.scheduleDebounced) {
-    RequestUtils.scheduleDebounced(requestStates.quote, 250, () => {
+    RequestUtils.scheduleDebounced(requestStates.quote, DEV_BUY_QUOTE_DEBOUNCE_MS, () => {
       updateQuote().catch((error) => {
-        quoteOutput.textContent = error.message;
+        if (quoteOutput) quoteOutput.textContent = error.message;
       });
     });
     return;
   }
   clearTimeout(quoteTimer);
-  quoteTimer = setTimeout(updateQuote, 250);
+  quoteTimer = setTimeout(updateQuote, DEV_BUY_QUOTE_DEBOUNCE_MS);
 }
 
 async function uploadSelectedImage(file) {
@@ -3510,6 +4404,12 @@ const fieldValidators = {
     if (isNaN(n) || n < 0) return "Must be a valid number";
     return "";
   },
+  creationMaxFeeSol(v) {
+    if (!v) return "";
+    const n = Number(v);
+    if (isNaN(n) || n < 0) return "Must be a valid number";
+    return "";
+  },
   buyPriorityFeeSol(v) {
     if (!v) return "";
     const n = Number(v);
@@ -3523,6 +4423,12 @@ const fieldValidators = {
     return "";
   },
   buySlippagePercent(v) {
+    if (!v) return "";
+    const n = Number(v);
+    if (isNaN(n) || n < 0) return "Must be a valid number";
+    return "";
+  },
+  buyMaxFeeSol(v) {
     if (!v) return "";
     const n = Number(v);
     if (isNaN(n) || n < 0) return "Must be a valid number";
@@ -3546,6 +4452,12 @@ const fieldValidators = {
     if (isNaN(n) || n < 0) return "Must be a valid number";
     return "";
   },
+  sellMaxFeeSol(v) {
+    if (!v) return "";
+    const n = Number(v);
+    if (isNaN(n) || n < 0) return "Must be a valid number";
+    return "";
+  },
   automaticDevSellPercent(v) {
     if (!isNamedChecked("automaticDevSellEnabled")) return "";
     const n = Number(v);
@@ -3561,7 +4473,7 @@ const fieldValidators = {
   automaticDevSellBlockOffset(v) {
     if (!isNamedChecked("automaticDevSellEnabled") || getAutoSellTriggerMode() !== "block-offset") return "";
     const n = Number(v);
-    if (isNaN(n) || n < 0 || n > 5) return "Must be between 0 and 5";
+    if (isNaN(n) || n < 0 || n > 22) return "Must be between 0 and 22";
     return "";
   },
   agentUnlockedBuybackPercent(v) {
@@ -3628,8 +4540,11 @@ function validateAgentSplit() {
     if (entry.type === "wallet" && !entry.address) {
       errors.push(`Agent split recipient ${index + 1} is missing a wallet address.`);
     }
-    if (entry.type === "github" && !entry.githubUsername) {
-      errors.push(`Agent split recipient ${index + 1} is missing a GitHub username.`);
+    if (entry.type === "github" && looksLikeSolanaAddress(entry.githubUsername || entry.githubUserId)) {
+      errors.push(`Agent split recipient ${index + 1} cannot use a Solana address while GitHub is selected.`);
+    }
+    if (entry.type === "github" && !entry.githubUsername && !entry.githubUserId) {
+      errors.push(`Agent split recipient ${index + 1} is missing a GitHub username or user id.`);
     }
   });
 
@@ -3638,10 +4553,34 @@ function validateAgentSplit() {
 
 function validateFeeSplit() {
   const errors = [];
-  if (getMode() !== "regular" || !feeSplitEnabled.checked) return errors;
+  const mode = getMode();
+  const isBagsMode = mode.startsWith("bags-");
+  if (mode !== "regular" && !isBagsMode) return errors;
+  if (!isBagsMode && !feeSplitEnabled.checked) return errors;
   const recipients = collectFeeSplitRecipients();
   if (recipients.length > MAX_FEE_SPLIT_RECIPIENTS) {
     errors.push(`Fee split supports at most ${MAX_FEE_SPLIT_RECIPIENTS} recipients.`);
+  }
+  recipients.forEach((entry, index) => {
+    if (!Number.isFinite(entry.shareBps) || entry.shareBps <= 0) {
+      errors.push(`Fee split recipient ${index + 1} has an invalid %.`);
+      return;
+    }
+    if (entry.type === "wallet" && !entry.address) {
+      errors.push(`Fee split recipient ${index + 1} is missing a wallet address.`);
+      return;
+    }
+    if (entry.type === "github" && !entry.githubUsername && !entry.githubUserId) {
+      errors.push(`Fee split recipient ${index + 1} is missing a GitHub username or user id.`);
+      return;
+    }
+    if (entry.type === "github" && looksLikeSolanaAddress(entry.githubUsername || entry.githubUserId)) {
+      errors.push(`Fee split recipient ${index + 1} cannot use a Solana address while GitHub is selected.`);
+    }
+  });
+  const total = recipients.reduce((sum, entry) => sum + (Number(entry.shareBps) || 0), 0);
+  if (recipients.length > 0 && total !== 10_000) {
+    errors.push("Fee split must total 100%.");
   }
   return errors;
 }
@@ -3696,10 +4635,10 @@ function buildDeployPreviewHTML() {
     : `<div class="modal-token-img-empty">No img</div>`;
 
   const devBuyText = f.devBuyAmount
-    ? `${f.devBuyAmount} ${f.devBuyMode === "tokens" ? "tokens" : getQuoteAssetLabel(f.quoteAsset)}`
+    ? `${f.devBuyAmount} ${f.devBuyMode === "tokens" ? "tokens" : getDevBuyAssetLabel(f.launchpad, f.quoteAsset)}`
     : "None";
 
-  const quoteText = quoteOutput.textContent || "";
+  const quoteText = quoteOutput ? (quoteOutput.textContent || "") : "";
 
   const modeLabels = {
     regular: "Regular",
@@ -3708,6 +4647,9 @@ function buildDeployPreviewHTML() {
     "agent-custom": "Agent Custom",
     "agent-unlocked": "Agent Unlocked",
     "agent-locked": "Agent Locked",
+    "bags-2-2": "2% / 2%",
+    "bags-025-1": "0.25% / 1%",
+    "bags-1-025": "1% / 0.25%",
   };
 
   let feesText = "Default (deployer)";
@@ -3727,10 +4669,13 @@ function buildDeployPreviewHTML() {
     feesText = `Fee split (${f.feeSplitRecipients.length} recipients)`;
   }
 
-  let txSettingsText = usesBundledJito()
-    ? "Priority: custom"
-    : `Priority: ${f.priorityFeeSol || "off"}`;
-  if (f.jitoTipSol) txSettingsText += ` | Tip: ${f.jitoTipSol || "default"} SOL`;
+  const creationAutoFeeCap = normalizeAutoFeeCapValue(getNamedValue("creationMaxFeeSol"));
+  let txSettingsText = isNamedChecked("creationAutoFeeEnabled")
+    ? `Auto fee${creationAutoFeeCap ? ` <= ${creationAutoFeeCap} SOL` : ""}`
+    : (usesBundledJito()
+      ? "Priority: custom"
+      : `Priority: ${f.priorityFeeSol || "off"}`);
+  if (!isNamedChecked("creationAutoFeeEnabled") && f.jitoTipSol) txSettingsText += ` | Tip: ${f.jitoTipSol || "default"} SOL`;
   if (f.skipPreflight) txSettingsText += " | Preflight off";
 
   const buybackText = f.mode === "agent-locked" ? "100%"
@@ -3764,6 +4709,7 @@ function buildDeployPreviewHTML() {
       cls: "secondary",
     },
     { label: "Mode", value: `${modeLabels[f.mode] || f.mode}${f.mayhemMode ? " + Mayhem" : ""}`, cls: "" },
+    ...(f.launchpad === "bagsapp" ? [{ label: "Identity", value: describeBagsIdentity(), cls: "secondary" }] : []),
     ...(f.mode.startsWith("agent") ? [{ label: "Buyback", value: buybackText, cls: "" }] : []),
     { label: "Fees", value: feesText, cls: "secondary" },
     { label: "Dev Buy", value: devBuyText, cls: "" },
@@ -3811,6 +4757,128 @@ function hideDeployModal() {
   deployModal.hidden = true;
 }
 
+function buildOutputMetaTextFromReport(report) {
+  const normalizedReport = report && typeof report === "object" ? report : {};
+  const execution = normalizedReport.execution && typeof normalizedReport.execution === "object"
+    ? normalizedReport.execution
+    : {};
+  const followMeta = normalizedReport.followDaemon && normalizedReport.followDaemon.enabled
+    ? ` | Follow: ${normalizedReport.followDaemon.job && normalizedReport.followDaemon.job.state ? normalizedReport.followDaemon.job.state : "armed"}`
+    : "";
+  return `${normalizedReport.launchpad || "pump"} | ${execution.resolvedProvider || execution.provider || "helius-sender"} | Mint: ${shortAddress(normalizedReport.mint)}${followMeta}`;
+}
+
+function isTerminalFollowJobState(state) {
+  const normalized = String(state || "").trim().toLowerCase();
+  return ["completed", "completed-with-failures", "cancelled", "failed"].includes(normalized);
+}
+
+function stopOutputFollowRefresh() {
+  outputFollowRefreshState.serial += 1;
+  if (outputFollowRefreshState.timer) {
+    window.clearTimeout(outputFollowRefreshState.timer);
+  }
+  outputFollowRefreshState.timer = null;
+  outputFollowRefreshState.reportId = "";
+  outputFollowRefreshState.startedAtMs = 0;
+}
+
+function updateReportsTerminalSummaryEntry(entry) {
+  if (!entry || !entry.id) return;
+  const normalizedId = String(entry.id).trim();
+  if (!normalizedId) return;
+  let didUpdate = false;
+  reportsTerminalState.entries = reportsTerminalState.entries.map((item) => {
+    if (item && item.id === normalizedId) {
+      didUpdate = true;
+      return entry;
+    }
+    return item;
+  });
+  reportsTerminalState.allEntries = reportsTerminalState.allEntries.map((item) => {
+    if (item && item.id === normalizedId) {
+      return entry;
+    }
+    return item;
+  });
+  reportsTerminalState.launches = reportsTerminalState.launches.map((launch) => {
+    if (launch && launch.id === normalizedId) {
+      return { ...launch, entry };
+    }
+    return launch;
+  });
+  if (!didUpdate) return;
+  renderReportsTerminalList();
+  if (normalizeReportsTerminalView(reportsTerminalState.view) === "launches") {
+    renderReportsTerminalOutput();
+  }
+}
+
+function applyLiveReportSnapshotToOutput(payload) {
+  const entryId = payload && payload.entry && payload.entry.id ? payload.entry.id : "";
+  const bundle = payload && payload.payload && typeof payload.payload === "object" ? payload.payload : null;
+  const report = bundle && bundle.report && typeof bundle.report === "object" ? bundle.report : null;
+  if (payload && payload.entry && typeof payload.entry === "object") {
+    updateReportsTerminalSummaryEntry(payload.entry);
+  }
+  if (typeof payload.text === "string" && payload.text) {
+    output.textContent = payload.text;
+  }
+  if (report) {
+    metaNode.textContent = buildOutputMetaTextFromReport(report);
+  }
+  if (entryId && reportsTerminalState.activeId === entryId && normalizeReportsTerminalView(reportsTerminalState.view) === "transactions") {
+    reportsTerminalState.activePayload = bundle;
+    reportsTerminalState.activeText = payload.text || reportsTerminalState.activeText;
+    renderReportsTerminalOutput();
+  }
+}
+
+async function pollOutputFollowReport(reportId, refreshSerial) {
+  if (!reportId || refreshSerial !== outputFollowRefreshState.serial) return;
+  try {
+    const response = await fetch(`/api/reports/view?id=${encodeURIComponent(reportId)}`);
+    const payload = await response.json();
+    if (refreshSerial !== outputFollowRefreshState.serial) return;
+    if (response.ok && payload.ok) {
+      applyLiveReportSnapshotToOutput(payload);
+      const report = payload.payload && payload.payload.report && typeof payload.payload.report === "object"
+        ? payload.payload.report
+        : null;
+      const followState = report && report.followDaemon && report.followDaemon.job
+        ? report.followDaemon.job.state
+        : "";
+      const elapsedMs = Date.now() - outputFollowRefreshState.startedAtMs;
+      if (isTerminalFollowJobState(followState) || elapsedMs >= OUTPUT_FOLLOW_REFRESH_TIMEOUT_MS) {
+        stopOutputFollowRefresh();
+        return;
+      }
+    }
+  } catch (_error) {
+    if (refreshSerial !== outputFollowRefreshState.serial) return;
+    const elapsedMs = Date.now() - outputFollowRefreshState.startedAtMs;
+    if (elapsedMs >= OUTPUT_FOLLOW_REFRESH_TIMEOUT_MS) {
+      stopOutputFollowRefresh();
+      return;
+    }
+  }
+  if (refreshSerial !== outputFollowRefreshState.serial) return;
+  outputFollowRefreshState.timer = window.setTimeout(() => {
+    pollOutputFollowReport(reportId, refreshSerial);
+  }, OUTPUT_FOLLOW_REFRESH_INTERVAL_MS);
+}
+
+function startOutputFollowRefresh(reportId) {
+  stopOutputFollowRefresh();
+  if (!reportId) return;
+  outputFollowRefreshState.reportId = reportId;
+  outputFollowRefreshState.startedAtMs = Date.now();
+  const refreshSerial = outputFollowRefreshState.serial;
+  outputFollowRefreshState.timer = window.setTimeout(() => {
+    pollOutputFollowReport(reportId, refreshSerial);
+  }, OUTPUT_FOLLOW_REFRESH_INTERVAL_MS);
+}
+
 async function run(action) {
   if (!ensureInteractiveBootstrapReady()) return;
   const actualAction = action === "deploy" ? "send" : action;
@@ -3818,6 +4886,7 @@ async function run(action) {
   const clientActionStartedAt = performance.now();
   setBusy(true, label);
   output.textContent = "Working...";
+  stopOutputFollowRefresh();
 
   try {
     await new Promise((resolve) => requestAnimationFrame(() => resolve()));
@@ -3838,24 +4907,19 @@ async function run(action) {
       throw new Error(payload.error || "Request failed.");
     }
 
-    statusNode.textContent = action === "deploy" ? "Deployed" : action === "simulate" ? "Simulated" : "Built";
-    const wallet = latestWalletStatus && latestWalletStatus.selectedWalletKey
-      ? `Using #${walletIndexFromEnvKey(latestWalletStatus.selectedWalletKey)}`
-      : "Wallet ready";
-    const followMeta = payload.report && payload.report.followDaemon && payload.report.followDaemon.enabled
-      ? ` | Follow: ${payload.report.followDaemon.job && payload.report.followDaemon.job.state ? payload.report.followDaemon.job.state : "armed"}`
-      : "";
-    metaNode.textContent = `${wallet} | ${payload.report.launchpad || "pump"} | ${payload.report.execution.resolvedProvider || payload.report.execution.provider || "helius-sender"} | Mint: ${shortAddress(payload.report.mint)}${followMeta}`;
+    setStatusLabel(action === "deploy" ? "Deployed" : action === "simulate" ? "Simulated" : "Built");
+    metaNode.textContent = buildOutputMetaTextFromReport(payload.report);
     metadataUri.value = payload.metadataUri || "";
     if (payload.metadataUri) {
       metadataUploadState.completedFingerprint = metadataFingerprintFromForm(readForm());
     }
     output.textContent = payload.text;
-    setBusy(false, statusNode.textContent || "Idle");
+    setBusy(false, currentStatusLabel());
     if (payload.sendLogPath) {
+      const reportId = extractReportIdFromPath(payload.sendLogPath);
       refreshReportsTerminal({
         preserveSelection: false,
-        preferId: extractReportIdFromPath(payload.sendLogPath),
+        preferId: reportId,
       }).catch((error) => {
         if (reportsTerminalOutput && reportsTerminalSection && !reportsTerminalSection.hidden) {
           reportsTerminalState.activePayload = null;
@@ -3863,14 +4927,17 @@ async function run(action) {
           renderReportsTerminalOutput();
         }
       });
+      if (actualAction === "send" && payload.report && payload.report.followDaemon && payload.report.followDaemon.enabled) {
+        startOutputFollowRefresh(reportId);
+      }
     }
     refreshWalletStatus(true).catch(() => {});
   } catch (error) {
-    statusNode.textContent = "Error";
+    setStatusLabel("Error");
     output.textContent = error.message;
   } finally {
     if (buttons.some((button) => button.disabled)) {
-      setBusy(false, statusNode.textContent || "Idle");
+      setBusy(false, currentStatusLabel());
     }
   }
 }
@@ -3885,15 +4952,19 @@ function buildSavedConfigFromForm() {
     launchpad: f.launchpad || "pump",
     mode: f.mode || "regular",
     activePresetId: f.activePresetId || DEFAULT_PRESET_ID,
-    presetEditing: isPresetEditing(base),
+    presetEditing: false,
     misc: {
       ...(base.defaults && base.defaults.misc ? base.defaults.misc : {}),
       sniperDraft: normalizeSniperDraftState(sniperFeature.getState()),
       feeSplitDraft: normalizeFeeSplitDraft(serializeFeeSplitDraft()),
       agentSplitDraft: normalizeAgentSplitDraft(serializeAgentSplitDraft()),
+      bagsIdentity: {
+        mode: getBagsIdentityMode(),
+        agentUsername: bagsIdentityState.agentUsername || "",
+      },
     },
     automaticDevSell: {
-      enabled: Boolean(f.automaticDevSellEnabled),
+      enabled: isNamedChecked("automaticDevSellEnabled"),
       percent: Number(f.automaticDevSellPercent || 100),
       triggerMode: normalizeAutoSellTriggerMode(f.automaticDevSellTriggerMode),
       delayMs: Number(f.automaticDevSellDelayMs || 0),
@@ -3910,6 +4981,8 @@ function buildSavedConfigFromForm() {
           provider: f.provider || "helius-sender",
           tipSol: f.creationTipSol || "",
           priorityFeeSol: f.priorityFeeSol || "",
+          autoFee: Boolean(f.creationAutoFeeEnabled),
+          maxFeeSol: f.creationMaxFeeSol || "",
           devBuySol: (preset.creationSettings && preset.creationSettings.devBuySol) || "",
         },
         buySettings: {
@@ -3918,6 +4991,8 @@ function buildSavedConfigFromForm() {
           priorityFeeSol: f.buyPriorityFeeSol || "",
           tipSol: f.buyTipSol || "",
           slippagePercent: f.buySlippagePercent || "",
+          autoFee: Boolean(f.buyAutoFeeEnabled),
+          maxFeeSol: f.buyMaxFeeSol || "",
         },
         sellSettings: {
           ...preset.sellSettings,
@@ -3925,6 +5000,8 @@ function buildSavedConfigFromForm() {
           priorityFeeSol: f.sellPriorityFeeSol || "",
           tipSol: f.sellTipSol || "",
           slippagePercent: f.sellSlippagePercent || "",
+          autoFee: Boolean(f.sellAutoFeeEnabled),
+          maxFeeSol: f.sellMaxFeeSol || "",
         },
       }
     : preset);
@@ -3934,18 +5011,19 @@ function buildSavedConfigFromForm() {
 
 async function saveSettings() {
   if (!hasBootstrapConfig()) {
-    statusNode.textContent = "Loading";
+    setStatusLabel("Loading");
     metaNode.textContent = "Settings are still loading from the backend.";
     return;
   }
   setBusy(true, "Saving defaults...");
   try {
+    const configToSave = buildSavedConfigFromForm();
     const result = RequestUtils.fetchJsonLatest
       ? await RequestUtils.fetchJsonLatest("settings-save", "/api/settings", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          config: buildSavedConfigFromForm(),
+          config: configToSave,
         }),
       })
       : null;
@@ -3953,26 +5031,29 @@ async function saveSettings() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        config: buildSavedConfigFromForm(),
+        config: configToSave,
       }),
     });
     const payload = result ? result.payload : await response.json();
     if (!response.ok || !payload.ok) {
       throw new Error(payload.error || "Failed to save settings.");
     }
-    statusNode.textContent = "Defaults saved";
+    const savedConfig = cloneConfig(payload.config || configToSave);
+    if (!savedConfig.defaults) savedConfig.defaults = {};
+    savedConfig.defaults.presetEditing = false;
+    setStatusLabel("Defaults saved");
     setRegionRouting(payload.regionRouting || (latestWalletStatus && latestWalletStatus.regionRouting));
-    setConfig(payload.config);
+    setConfig(savedConfig);
     metaNode.textContent = "Launch defaults and selected presets saved.";
-    renderQuickDevBuyButtons(payload.config);
-    populateDevBuyPresetEditor(payload.config);
+    renderQuickDevBuyButtons(savedConfig);
+    populateDevBuyPresetEditor(savedConfig);
     renderBackendRegionSummary(payload.regionRouting);
-    hideSettingsModal();
+    hideSettingsModal("save");
   } catch (error) {
-    statusNode.textContent = "Error";
+    setStatusLabel("Error");
     output.textContent = error.message;
   } finally {
-    setBusy(false, statusNode.textContent || "Ready");
+    setBusy(false, currentStatusLabel());
   }
 }
 
@@ -3988,11 +5069,29 @@ function showSettingsModal() {
   applyPresetToSettingsInputs(getActivePreset(getConfig()), { syncToMainForm: false });
   setPresetEditing(isPresetEditing(getConfig()));
   renderBackendRegionSummary();
+  settingsModalInitialConfig = cloneConfig(getConfig());
   if (settingsModal) settingsModal.hidden = false;
 }
 
-function hideSettingsModal() {
-  if (settingsModal) settingsModal.hidden = true;
+function hideSettingsModal(reason = "dismiss") {
+  if (!settingsModal) return false;
+  if (reason === "cancel") {
+    if (settingsModalInitialConfig) {
+      const restoredConfig = cloneConfig(settingsModalInitialConfig);
+      if (!restoredConfig.defaults) restoredConfig.defaults = {};
+      restoredConfig.defaults.presetEditing = false;
+      setConfig(restoredConfig);
+      applyPresetToSettingsInputs(getActivePreset(restoredConfig), { syncToMainForm: false });
+      renderBackendRegionSummary();
+    }
+  } else if (reason === "save") {
+    setPresetEditing(false);
+  } else {
+    return false;
+  }
+  settingsModal.hidden = true;
+  settingsModalInitialConfig = null;
+  return true;
 }
 
 function getStoredOutputSectionVisible() {
@@ -4084,6 +5183,165 @@ function getCurrentReportsTerminalListWidth() {
     if (Number.isFinite(parsedInlineWidth)) return clampReportsTerminalListWidth(parsedInlineWidth);
   }
   return REPORTS_TERMINAL_DEFAULT_LIST_WIDTH;
+}
+
+function normalizeReportsTerminalView(view) {
+  return String(view || "").trim().toLowerCase() === "launches" ? "launches" : "transactions";
+}
+
+function reportsTerminalMetaText(view = reportsTerminalState.view) {
+  return normalizeReportsTerminalView(view) === "launches"
+    ? "Latest 25 launches."
+    : "Latest 25 transactions.";
+}
+
+function syncReportsTerminalChrome() {
+  const view = normalizeReportsTerminalView(reportsTerminalState.view);
+  reportsTerminalState.view = view;
+  if (reportsTerminalSection) {
+    reportsTerminalSection.classList.toggle("is-launches-view", view === "launches");
+  }
+  if (reportsTransactionsButton) reportsTransactionsButton.classList.toggle("active", view === "transactions");
+  if (reportsLaunchesButton) reportsLaunchesButton.classList.toggle("active", view === "launches");
+  if (reportsTerminalMeta) reportsTerminalMeta.textContent = reportsTerminalMetaText(view);
+}
+
+function metadataUriToGatewayUrl(uri) {
+  const raw = String(uri || "").trim();
+  if (!raw) return "";
+  if (/^ipfs:\/\//i.test(raw)) {
+    const normalized = raw.replace(/^ipfs:\/\//i, "").replace(/^ipfs\//i, "");
+    return `https://ipfs.io/ipfs/${normalized}`;
+  }
+  return raw;
+}
+
+function parseDevBuyDescription(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "none") return { mode: "sol", amount: "" };
+  const [kind, amount] = raw.split(":");
+  const normalizedKind = String(kind || "").trim().toLowerCase();
+  return {
+    mode: normalizedKind === "tokens" ? "tokens" : "sol",
+    amount: String(amount || "").trim(),
+  };
+}
+
+function launchHistoryTitle(metadata, report) {
+  const symbol = String(metadata && metadata.symbol || "").trim();
+  const name = String(metadata && metadata.name || "").trim();
+  if (name) return name;
+  if (symbol) return symbol;
+  return String(report && report.mint || "Unknown launch");
+}
+
+function launchHistorySymbol(metadata, report) {
+  const symbol = String(metadata && metadata.symbol || "").trim();
+  if (symbol) return symbol;
+  const mode = String(report && report.mode || "").trim();
+  return mode ? mode.toUpperCase() : "LAUNCH";
+}
+
+function launchHistoryImageUrl(metadata) {
+  const raw = String(metadata && metadata.image || "").trim();
+  return metadataUriToGatewayUrl(raw);
+}
+
+async function fetchLaunchMetadataSummary(metadataUriValue) {
+  const metadataUriValueNormalized = String(metadataUriValue || "").trim();
+  if (!metadataUriValueNormalized) return null;
+  if (Object.prototype.hasOwnProperty.call(reportsTerminalState.launchMetadataByUri, metadataUriValueNormalized)) {
+    return reportsTerminalState.launchMetadataByUri[metadataUriValueNormalized];
+  }
+  const url = metadataUriToGatewayUrl(metadataUriValueNormalized);
+  if (!url) {
+    reportsTerminalState.launchMetadataByUri[metadataUriValueNormalized] = null;
+    return null;
+  }
+  try {
+    const response = await fetch(url, { cache: "force-cache" });
+    if (!response.ok) throw new Error("metadata fetch failed");
+    const payload = await response.json();
+    const metadata = payload && typeof payload === "object" ? payload : null;
+    reportsTerminalState.launchMetadataByUri[metadataUriValueNormalized] = metadata;
+    return metadata;
+  } catch (_error) {
+    reportsTerminalState.launchMetadataByUri[metadataUriValueNormalized] = null;
+    return null;
+  }
+}
+
+async function fetchReportBundleForLaunch(id) {
+  const normalizedId = String(id || "").trim();
+  if (!normalizedId) return null;
+  if (reportsTerminalState.launchBundles[normalizedId]) return reportsTerminalState.launchBundles[normalizedId];
+  const response = await fetch(`/api/reports/view?id=${encodeURIComponent(normalizedId)}`);
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to load report.");
+  }
+  reportsTerminalState.launchBundles[normalizedId] = payload;
+  return payload;
+}
+
+function getLaunchHistoryEntry(id) {
+  const normalizedId = String(id || "").trim();
+  if (!normalizedId) return null;
+  return reportsTerminalState.launches.find((entry) => entry.id === normalizedId) || null;
+}
+
+function buildLaunchHistoryEntry(entry, bundle, metadata) {
+  const payload = bundle && bundle.payload && typeof bundle.payload === "object" ? bundle.payload : {};
+  const report = payload.report && typeof payload.report === "object" ? payload.report : {};
+  const execution = report.execution && typeof report.execution === "object" ? report.execution : {};
+  const followDaemon = report.followDaemon && typeof report.followDaemon === "object" ? report.followDaemon : {};
+  const followJob = followDaemon.job && typeof followDaemon.job === "object" ? followDaemon.job : {};
+  const savedFollowLaunch = report.savedFollowLaunch && typeof report.savedFollowLaunch === "object" ? report.savedFollowLaunch : null;
+  const savedBags = report.savedBags && typeof report.savedBags === "object" ? report.savedBags : null;
+  const savedFeeSharingRecipients = Array.isArray(report.savedFeeSharingRecipients) ? report.savedFeeSharingRecipients : [];
+  const savedAgentFeeRecipients = Array.isArray(report.savedAgentFeeRecipients) ? report.savedAgentFeeRecipients : [];
+  const savedCreatorFee = report.savedCreatorFee && typeof report.savedCreatorFee === "object" ? report.savedCreatorFee : null;
+  const followLaunch = savedFollowLaunch || (followJob.followLaunch && typeof followJob.followLaunch === "object" ? followJob.followLaunch : {});
+  const devBuy = parseDevBuyDescription(report.devBuyDescription);
+  return {
+    id: entry.id,
+    entry,
+    payload,
+    report,
+    execution,
+    followJob,
+    followLaunch,
+    selectedWalletKey: String(report.savedSelectedWalletKey || followJob.selectedWalletKey || "").trim(),
+    quoteAsset: String(report.savedQuoteAsset || followJob.quoteAsset || "sol").trim(),
+    metadata: metadata || null,
+    title: launchHistoryTitle(metadata, report),
+    symbol: launchHistorySymbol(metadata, report),
+    imageUrl: launchHistoryImageUrl(metadata),
+    metadataUri: String(report.metadataUri || "").trim(),
+    devBuy,
+    bags: savedBags,
+    feeSharingRecipients: savedFeeSharingRecipients,
+    agentFeeRecipients: savedAgentFeeRecipients,
+    creatorFee: savedCreatorFee,
+  };
+}
+
+async function loadReportsTerminalLaunches() {
+  const sourceEntries = reportsTerminalState.allEntries
+    .filter((entry) => String(entry && entry.action || "").trim().toLowerCase() === "send")
+    .slice(0, REPORTS_TERMINAL_ITEM_LIMIT);
+  const launches = await Promise.all(sourceEntries.map(async (entry) => {
+    try {
+      const bundle = await fetchReportBundleForLaunch(entry.id);
+      const payload = bundle && bundle.payload && typeof bundle.payload === "object" ? bundle.payload : {};
+      const report = payload.report && typeof payload.report === "object" ? payload.report : {};
+      const metadata = await fetchLaunchMetadataSummary(report.metadataUri || "");
+      return buildLaunchHistoryEntry(entry, bundle, metadata);
+    } catch (_error) {
+      return buildLaunchHistoryEntry(entry, null, null);
+    }
+  }));
+  reportsTerminalState.launches = launches;
 }
 
 function describeReportEntry(entry) {
@@ -4197,7 +5455,7 @@ function inferReportErrorCategory(message) {
 function describeFollowActionTrigger(action) {
   if (!action || typeof action !== "object") return "Immediate";
   if (action.requireConfirmation) return "After confirmation";
-  if (action.targetBlockOffset != null) return `Block ${action.targetBlockOffset}`;
+  if (action.targetBlockOffset != null) return `On Confirmed Block + ${action.targetBlockOffset}`;
   if (Number(action.submitDelayMs || 0) > 0) return `Submit + ${action.submitDelayMs}ms`;
   if (Number(action.delayMs || 0) > 0) return `Delay ${action.delayMs}ms`;
   return "Immediate";
@@ -4528,7 +5786,200 @@ function buildReportsRawMarkup() {
   return `<pre class="console reports-console">${escapeHTML(reportsTerminalState.activeText || "Report is empty.")}</pre>`;
 }
 
+function buildLaunchHistorySettingsText(launch) {
+  const settings = [
+    launch.report && launch.report.launchpad ? launch.report.launchpad : "",
+    launch.report && launch.report.mode ? launch.report.mode : "",
+    launch.quoteAsset || "",
+    launch.bags && launch.bags.identityMode === "linked"
+      ? (launch.bags.agentUsername ? `identity @${launch.bags.agentUsername}` : "identity linked")
+      : "",
+    launch.execution && launch.execution.activePresetId ? launch.execution.activePresetId : "",
+    launch.selectedWalletKey ? formatWalletHistoryLabel(launch.selectedWalletKey) : "",
+    launch.execution && launch.execution.provider ? launch.execution.provider : "",
+    launch.execution && launch.execution.buyProvider ? `buy ${launch.execution.buyProvider}` : "",
+    launch.execution && launch.execution.sellProvider ? `sell ${launch.execution.sellProvider}` : "",
+  ].filter(Boolean);
+  return settings.join(" | ");
+}
+
+function parseLaunchBuyWalletLabel(rawLabel) {
+  const label = String(rawLabel || "").trim();
+  const match = label.match(/wallet-(.+)$/i);
+  if (!match) return "";
+  const suffix = String(match[1] || "").trim();
+  if (!suffix || suffix === "primary") return "Wallet #1";
+  if (/^\d+$/.test(suffix)) return `Wallet #${suffix}`;
+  return `Wallet ${suffix}`;
+}
+
+function buildLaunchHistorySnipeText(launch) {
+  const quoteAsset = launch.quoteAsset || "sol";
+  const quoteLabel = getQuoteAssetLabel(quoteAsset);
+  const snipes = launch.followLaunch && Array.isArray(launch.followLaunch.snipes)
+    ? launch.followLaunch.snipes.filter((entry) => entry && entry.enabled !== false)
+    : [];
+  if (!snipes.length) return "";
+  return snipes.map((entry) => {
+    const walletLabel = formatWalletHistoryLabel(entry.walletEnvKey || entry.envKey || "");
+    const amount = entry.buyAmountSol ? `${entry.buyAmountSol} ${quoteLabel}` : `-- ${quoteLabel}`;
+    const trigger = entry.targetBlockOffset != null
+      ? `b${entry.targetBlockOffset}`
+      : (entry.submitWithLaunch ? "same-time" : getSniperTriggerSummary(entry).toLowerCase());
+    const retry = entry.retryOnFailure ? " | retry once" : "";
+    return `${walletLabel || "Wallet"} ${amount} @ ${trigger}${retry}`;
+  }).join(" | ");
+}
+
+function buildLaunchHistoryLaunchBuyFallbackText(launch) {
+  const sent = launch.execution && Array.isArray(launch.execution.sent) ? launch.execution.sent : [];
+  const labels = sent
+    .map((entry) => parseLaunchBuyWalletLabel(entry && entry.label))
+    .filter(Boolean);
+  if (!labels.length) return "";
+  return `launch buys ${labels.join(" | ")}`;
+}
+
+function buildLaunchHistoryAutoSellText(launch) {
+  const devAutoSell = launch.followLaunch && launch.followLaunch.devAutoSell && launch.followLaunch.devAutoSell.enabled;
+  if (!devAutoSell) return "";
+  const percent = launch.followLaunch.devAutoSell.percent != null ? launch.followLaunch.devAutoSell.percent : 100;
+  return `${percent}%`;
+}
+
+function buildLaunchHistoryBuyAmountItems(launch) {
+  const items = [];
+  if (launch.devBuy && launch.devBuy.amount) {
+    items.push({
+      label: "Dev Buy",
+      value: `${launch.devBuy.amount} ${launch.devBuy.mode === "tokens" ? "%" : getDevBuyAssetLabel(launch.launchpad || "pump", launch.quoteAsset || "sol")}`,
+    });
+  }
+  const snipeText = buildLaunchHistorySnipeText(launch);
+  if (snipeText) {
+    items.push({ label: "Auto Snipe", value: snipeText });
+  } else {
+    const fallbackSnipeText = buildLaunchHistoryLaunchBuyFallbackText(launch);
+    if (fallbackSnipeText) items.push({ label: "Launch Buys", value: fallbackSnipeText });
+  }
+  const autoSellText = buildLaunchHistoryAutoSellText(launch);
+  if (autoSellText) {
+    items.push({ label: "Auto Sell", value: autoSellText });
+  }
+  return items;
+}
+
+function buildLaunchHistoryBuyAmountsMarkup(launch) {
+  const items = buildLaunchHistoryBuyAmountItems(launch);
+  if (!items.length) {
+    return '<div class="reports-launch-card-copy">No buy actions recorded.</div>';
+  }
+  return `
+    <div class="reports-launch-card-detail-list">
+      ${items.map((item) => `
+        <div class="reports-launch-card-detail-row">
+          <div class="reports-launch-card-detail-key">${escapeHTML(item.label)}</div>
+          <div class="reports-launch-card-detail-value">${escapeHTML(item.value)}</div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function formatLaunchHistoryDisplayTime(entry) {
+  const writtenAtMs = entry && entry.writtenAtMs != null ? entry.writtenAtMs : 0;
+  const numeric = Number(writtenAtMs);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    try {
+      return new Date(numeric).toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    } catch (_error) {
+      // Fall back below.
+    }
+  }
+  return entry && entry.displayTime ? String(entry.displayTime) : "";
+}
+
+function launchPrimarySignature(launch) {
+  return launch.payload && Array.isArray(launch.payload.signatures) && launch.payload.signatures[0]
+    ? String(launch.payload.signatures[0]).trim()
+    : "";
+}
+
+function launchSolscanUrl(launch) {
+  const signature = launchPrimarySignature(launch);
+  return signature ? `https://solscan.io/tx/${encodeURIComponent(signature)}` : "";
+}
+
+function buildReportsLaunchesMarkup() {
+  if (!reportsTerminalState.launches.length) {
+    return '<div class="reports-terminal-empty">No deployed launches found yet.</div>';
+  }
+  return `
+    <div class="reports-launches-grid">
+      ${reportsTerminalState.launches.map((launch) => {
+        const title = launch.title || "Unknown launch";
+        const symbol = launch.symbol || "LAUNCH";
+        const imageMarkup = launch.imageUrl
+          ? `<img src="${escapeHTML(launch.imageUrl)}" alt="${escapeHTML(title)}" class="reports-launch-card-image">`
+          : `<span class="reports-launch-card-image-fallback">${escapeHTML(symbol.slice(0, 4).toUpperCase())}</span>`;
+        const solscanUrl = launchSolscanUrl(launch);
+        return `
+          <article class="reports-launch-card">
+            <div class="reports-launch-card-head">
+              ${imageMarkup}
+              <div>
+                <strong class="reports-launch-card-title">${escapeHTML(title)}</strong>
+                <span class="reports-launch-card-subtitle">${escapeHTML(symbol)}</span>
+                <span class="reports-launch-card-subtitle">${escapeHTML(formatLaunchHistoryDisplayTime(launch.entry) || "Unknown time")}</span>
+              </div>
+            </div>
+            ${launch.report && launch.report.mint ? `
+              <button
+                type="button"
+                class="reports-launch-card-ca"
+                data-copy-value="${escapeHTML(launch.report.mint)}"
+                title="Copy contract address"
+              >
+                <span class="reports-launch-card-ca-label">CA</span>
+                <span class="reports-launch-card-ca-value">${escapeHTML(launch.report.mint)}</span>
+              </button>
+            ` : ""}
+            <div class="reports-launch-card-chip-row">
+              <span class="reports-launch-card-chip">${escapeHTML(launch.report && launch.report.launchpad ? launch.report.launchpad : "launch")}</span>
+              <span class="reports-launch-card-chip">${escapeHTML(launch.report && launch.report.mode ? launch.report.mode : "regular")}</span>
+              ${launch.followJob && launch.followJob.quoteAsset ? `<span class="reports-launch-card-chip">${escapeHTML(launch.followJob.quoteAsset)}</span>` : ""}
+            </div>
+            <div class="reports-launch-card-section">
+              <div class="reports-launch-card-label">Settings</div>
+              <div class="reports-launch-card-copy">${escapeHTML(buildLaunchHistorySettingsText(launch) || "No settings recorded.")}</div>
+            </div>
+            <div class="reports-launch-card-section">
+              <div class="reports-launch-card-label">Buy Amounts</div>
+              ${buildLaunchHistoryBuyAmountsMarkup(launch)}
+            </div>
+            <div class="reports-launch-card-footer">
+              ${solscanUrl ? `<a class="reports-inline-link" href="${escapeHTML(solscanUrl)}" target="_blank" rel="noreferrer">Open in Solscan</a>` : '<span class="reports-launch-card-copy">No signature recorded.</span>'}
+              <div class="reports-launch-card-actions">
+                <button type="button" class="preset-chip compact reports-terminal-chip" data-report-reuse-id="${escapeHTML(launch.id)}">Reuse</button>
+                <button type="button" class="preset-chip compact reports-terminal-chip active" data-report-relaunch-id="${escapeHTML(launch.id)}">Relaunch</button>
+              </div>
+            </div>
+          </article>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function buildReportsTerminalOutputMarkup() {
+  if (normalizeReportsTerminalView(reportsTerminalState.view) === "launches") {
+    return `<div class="reports-terminal-content">${buildReportsLaunchesMarkup()}</div>`;
+  }
   const payload = currentReportsTerminalPayload();
   const tab = normalizeReportsTerminalTab(reportsTerminalState.activeTab);
   const tabs = [
@@ -4565,6 +6016,7 @@ function buildReportsTerminalOutputMarkup() {
 
 function renderReportsTerminalOutput() {
   if (!reportsTerminalOutput) return;
+  syncReportsTerminalChrome();
   const markup = buildReportsTerminalOutputMarkup();
   if (RenderUtils.setCachedHTML) {
     RenderUtils.setCachedHTML(renderCache, "reportsOutput", reportsTerminalOutput, markup);
@@ -4575,6 +6027,15 @@ function renderReportsTerminalOutput() {
 
 function renderReportsTerminalList() {
   if (!reportsTerminalList) return;
+  syncReportsTerminalChrome();
+  if (normalizeReportsTerminalView(reportsTerminalState.view) === "launches") {
+    if (RenderUtils.setCachedHTML) {
+      RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, "");
+    } else {
+      reportsTerminalList.innerHTML = "";
+    }
+    return;
+  }
   if (!reportsTerminalState.entries.length) {
     const emptyMarkup = '<div class="reports-terminal-empty">No persisted reports found yet.</div>';
     if (RenderUtils.setCachedHTML) {
@@ -4602,8 +6063,9 @@ function renderReportsTerminalList() {
   }
 }
 
-async function loadReportsTerminalEntry(id) {
+async function loadReportsTerminalEntry(id, { syncMainOutput = false } = {}) {
   if (!id || !reportsTerminalOutput) return;
+  if (normalizeReportsTerminalView(reportsTerminalState.view) !== "transactions") return;
   reportsTerminalState.activePayload = null;
   reportsTerminalState.activeText = "Loading report...";
   renderReportsTerminalOutput();
@@ -4621,15 +6083,11 @@ async function loadReportsTerminalEntry(id) {
   reportsTerminalState.activeId = payload.entry && payload.entry.id ? payload.entry.id : id;
   reportsTerminalState.activePayload = payload.payload && typeof payload.payload === "object" ? payload.payload : null;
   reportsTerminalState.activeText = payload.text || "Report is empty.";
-  if (reportsTerminalMeta) {
-    reportsTerminalMeta.textContent = payload.entry
-      ? [
-          payload.entry.displayTime || "Unknown time",
-          payload.entry.action || "unknown",
-          payload.entry.provider || "unknown route",
-          payload.entry.followEnabled && payload.entry.followState ? `follow ${payload.entry.followState}` : "",
-        ].filter(Boolean).join(" | ")
-      : "Report loaded.";
+  if (syncMainOutput) {
+    output.textContent = reportsTerminalState.activeText;
+    if (reportsTerminalState.activePayload && reportsTerminalState.activePayload.report) {
+      metaNode.textContent = buildOutputMetaTextFromReport(reportsTerminalState.activePayload.report);
+    }
   }
   renderReportsTerminalOutput();
   renderReportsTerminalList();
@@ -4637,6 +6095,7 @@ async function loadReportsTerminalEntry(id) {
 
 async function refreshReportsTerminal({ preserveSelection = true, preferId = "" } = {}) {
   if (!reportsTerminalList || !reportsTerminalOutput) return;
+  syncReportsTerminalChrome();
   if (RenderUtils.setCachedHTML) {
     RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, '<div class="reports-terminal-empty">Loading reports...</div>');
   } else {
@@ -4653,7 +6112,10 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
   if (!response.ok || !payload.ok) {
     throw new Error(payload.error || "Failed to list reports.");
   }
-  reportsTerminalState.entries = Array.isArray(payload.reports) ? payload.reports : [];
+  reportsTerminalState.allEntries = Array.isArray(payload.reports) ? payload.reports : [];
+  reportsTerminalState.entries = reportsTerminalState.allEntries
+    .filter((entry) => ["send", "simulate", "build"].includes(String(entry && entry.action || "").trim().toLowerCase()))
+    .slice(0, REPORTS_TERMINAL_ITEM_LIMIT);
   setReportsTerminalSort(payload.sort || reportsTerminalState.sort, { persist: false });
   const availableIds = new Set(reportsTerminalState.entries.map((entry) => entry.id));
   const nextId = preferId && availableIds.has(preferId)
@@ -4664,15 +6126,191 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
         ? reportsTerminalState.entries[0].id
         : "";
   reportsTerminalState.activeId = nextId;
+  if (normalizeReportsTerminalView(reportsTerminalState.view) === "launches") {
+    await loadReportsTerminalLaunches();
+    reportsTerminalState.activePayload = null;
+    reportsTerminalState.activeText = "";
+    renderReportsTerminalList();
+    renderReportsTerminalOutput();
+    return;
+  }
   renderReportsTerminalList();
   if (!nextId) {
     reportsTerminalState.activePayload = null;
     reportsTerminalState.activeText = "Run Build, Simulate, or Deploy to create persisted reports.";
-    if (reportsTerminalMeta) reportsTerminalMeta.textContent = "No persisted reports available yet.";
     renderReportsTerminalOutput();
     return;
   }
   await loadReportsTerminalEntry(nextId);
+}
+
+function applyWalletSelectionFromLaunch(walletKey) {
+  const nextKey = String(walletKey || "").trim();
+  if (!nextKey || !latestWalletStatus || !Array.isArray(latestWalletStatus.wallets)) return;
+  const exists = latestWalletStatus.wallets.some((wallet) => wallet.envKey === nextKey);
+  if (!exists) return;
+  setStoredSelectedWalletKey(nextKey);
+  applySelectedWalletLocally(nextKey);
+  refreshWalletStatus(true).catch(() => {});
+}
+
+function applyProvidersFromLaunch(launch) {
+  const savedExecution = launch.followJob && launch.followJob.execution && typeof launch.followJob.execution === "object"
+    ? launch.followJob.execution
+    : {};
+  if (providerSelect) providerSelect.value = launch.execution && launch.execution.provider ? launch.execution.provider : "helius-sender";
+  if (buyProviderSelect) buyProviderSelect.value = savedExecution.buyProvider || (launch.execution && launch.execution.buyProvider) || "helius-sender";
+  if (sellProviderSelect) sellProviderSelect.value = savedExecution.sellProvider || (launch.execution && launch.execution.sellProvider) || "helius-sender";
+  if (creationPriorityInput) creationPriorityInput.value = savedExecution.priorityFeeSol || "";
+  if (creationTipInput) creationTipInput.value = savedExecution.tipSol || "";
+  if (creationAutoFeeInput) creationAutoFeeInput.checked = Boolean(savedExecution.autoGas);
+  if (creationMaxFeeInput) creationMaxFeeInput.value = savedExecution.maxPriorityFeeSol || savedExecution.maxTipSol || "";
+  if (buyPriorityFeeInput) buyPriorityFeeInput.value = savedExecution.buyPriorityFeeSol || "";
+  if (buyTipInput) buyTipInput.value = savedExecution.buyTipSol || "";
+  if (buySlippageInput) buySlippageInput.value = savedExecution.buySlippagePercent || "";
+  if (buyAutoFeeInput) buyAutoFeeInput.checked = Boolean(savedExecution.buyAutoGas);
+  if (buyMaxFeeInput) buyMaxFeeInput.value = savedExecution.buyMaxPriorityFeeSol || savedExecution.buyMaxTipSol || "";
+  if (sellPriorityFeeInput) sellPriorityFeeInput.value = savedExecution.sellPriorityFeeSol || "";
+  if (sellTipInput) sellTipInput.value = savedExecution.sellTipSol || "";
+  if (sellSlippageInput) sellSlippageInput.value = savedExecution.sellSlippagePercent || "";
+  if (sellAutoFeeInput) sellAutoFeeInput.checked = Boolean(savedExecution.sellAutoGas);
+  if (sellMaxFeeInput) sellMaxFeeInput.value = savedExecution.sellMaxPriorityFeeSol || savedExecution.sellMaxTipSol || "";
+  syncSettingsCapabilities();
+  syncActivePresetFromInputs();
+}
+
+function buildSniperWalletStateFromLaunch(launch) {
+  const snipes = launch.followLaunch && Array.isArray(launch.followLaunch.snipes) ? launch.followLaunch.snipes : [];
+  return snipes.reduce((accumulator, entry) => {
+    if (!entry || !entry.walletEnvKey) return accumulator;
+    accumulator[entry.walletEnvKey] = {
+      selected: entry.enabled !== false,
+      amountSol: entry.buyAmountSol || "",
+      triggerMode: entry.targetBlockOffset != null
+        ? "block-offset"
+        : (entry.submitWithLaunch ? "same-time" : "on-submit"),
+      submitDelayMs: entry.submitDelayMs || 0,
+      targetBlockOffset: entry.targetBlockOffset,
+      retryOnce: Boolean(entry.retryOnFailure),
+    };
+    return accumulator;
+  }, {});
+}
+
+async function applyLaunchHistoryEntryToForm(id) {
+  const launch = getLaunchHistoryEntry(id);
+  if (!launch) return null;
+  const metadata = launch.metadata || await fetchLaunchMetadataSummary(launch.metadataUri);
+  applyWalletSelectionFromLaunch(launch.selectedWalletKey);
+  const nextLaunchpad = launch.report && launch.report.launchpad ? launch.report.launchpad : "pump";
+  applyImportedLaunchContext({
+    launchpad: nextLaunchpad,
+    mode: launch.report && launch.report.mode ? launch.report.mode : defaultLaunchModeForLaunchpad(nextLaunchpad),
+    quoteAsset: launch.quoteAsset || "sol",
+    routes: {
+      feeSharingRecipients: launch.feeSharingRecipients || [],
+      agentFeeRecipients: launch.agentFeeRecipients || [],
+      creatorFee: launch.creatorFee || null,
+    },
+  });
+  if (launch.report && launch.report.launchpad === "bagsapp" && launch.bags) {
+    setBagsIdentityStateInputs({
+      mode: launch.bags.identityMode === "linked" ? "linked" : "wallet-only",
+      agentUsername: launch.bags.agentUsername || "",
+      verifiedWallet: launch.bags.identityVerifiedWallet || "",
+      verified: launch.bags.identityMode === "linked" && Boolean(launch.bags.identityVerifiedWallet),
+    });
+  } else {
+    setBagsIdentityStateInputs({
+      mode: "wallet-only",
+      agentUsername: "",
+      authToken: "",
+      verifiedWallet: "",
+      verified: false,
+    });
+  }
+  syncLaunchpadModeOptions();
+  syncBonkQuoteAssetUI();
+  syncBagsIdentityUI();
+  if (launch.report && launch.report.launchpad === "bagsapp") {
+    refreshBagsIdentityStatus().catch(() => {});
+  }
+
+  if (nameInput) nameInput.value = metadata && metadata.name ? metadata.name : (launch.title || "");
+  if (symbolInput) {
+    syncingTickerFromName = true;
+    symbolInput.value = formatTickerValue(metadata && metadata.symbol ? metadata.symbol : (launch.symbol || ""));
+    syncingTickerFromName = false;
+    tickerManuallyEdited = Boolean(String(metadata && metadata.symbol ? metadata.symbol : "").trim());
+    tickerClearedForManualEntry = false;
+  }
+  if (descriptionInput) {
+    descriptionInput.value = metadata && metadata.description ? metadata.description : "";
+    toggleDescriptionDisclosure(Boolean(descriptionInput.value.trim()));
+    updateDescriptionDisclosure();
+  }
+  if (websiteInput) websiteInput.value = metadata && metadata.website ? metadata.website : "";
+  if (twitterInput) twitterInput.value = metadata && metadata.twitter ? metadata.twitter : "";
+  if (telegramInput) telegramInput.value = metadata && metadata.telegram ? metadata.telegram : "";
+
+  uploadedImage = null;
+  imageLibraryState.activeImageId = "";
+  clearMetadataUploadCache({ clearInput: true });
+  if (metadataUri) metadataUri.value = launch.metadataUri || "";
+  setImagePreview(launch.imageUrl || "");
+  imageStatus.textContent = launch.metadataUri ? "Restored image from saved launch metadata." : "";
+  imagePath.textContent = "";
+
+  const devBuy = launch.devBuy || { mode: "sol", amount: "" };
+  setDevBuyHiddenState(devBuy.mode, devBuy.amount);
+  syncingDevBuyInputs = true;
+  if (devBuySolInput) devBuySolInput.value = devBuy.mode === "sol" ? devBuy.amount : "";
+  if (devBuyPercentInput) {
+    devBuyPercentInput.value = devBuy.mode === "tokens"
+      ? tokenAmountToPercent(devBuy.amount)
+      : "";
+  }
+  syncingDevBuyInputs = false;
+
+  const sniperWallets = buildSniperWalletStateFromLaunch(launch);
+  sniperFeature.setState({
+    enabled: Object.values(sniperWallets).some((entry) => entry && entry.selected),
+    wallets: sniperWallets,
+  });
+  applySniperStateToForm();
+  renderSniperUI();
+
+  const devAutoSell = launch.followLaunch && launch.followLaunch.devAutoSell ? launch.followLaunch.devAutoSell : null;
+  if (autoSellEnabledInput) autoSellEnabledInput.checked = Boolean(devAutoSell && devAutoSell.enabled);
+  setNamedValue("automaticDevSellPercent", String(devAutoSell && devAutoSell.percent != null ? devAutoSell.percent : 100));
+  setNamedValue("automaticDevSellTriggerMode", devAutoSell && devAutoSell.targetBlockOffset != null
+    ? "block-offset"
+    : (devAutoSell && (devAutoSell.delayMs || 0) > 0 ? "submit-delay" : "block-offset"));
+  setNamedValue("automaticDevSellDelayMs", String(devAutoSell && devAutoSell.delayMs != null ? devAutoSell.delayMs : 0));
+  setNamedValue("automaticDevSellBlockOffset", String(devAutoSell && devAutoSell.targetBlockOffset != null ? devAutoSell.targetBlockOffset : 0));
+  syncDevAutoSellUI();
+
+  applyProvidersFromLaunch(launch);
+  updateTokenFieldCounts();
+  clearValidationErrors();
+  Object.keys(fieldValidators).forEach((name) => setFieldError(name, ""));
+  queueQuoteUpdate();
+  return launch;
+}
+
+async function reuseFromHistory(id) {
+  const launch = await applyLaunchHistoryEntryToForm(id);
+  if (!launch) return;
+  setStatusLabel("Launch loaded");
+  metaNode.textContent = `Restored ${launch.title || "saved launch"} into the form.`;
+}
+
+async function relaunchFromHistory(id) {
+  const launch = await applyLaunchHistoryEntryToForm(id);
+  if (!launch) return;
+  setStatusLabel("Relaunching");
+  metaNode.textContent = `Re-launching ${launch.title || "saved launch"} with saved settings.`;
+  await run("deploy");
 }
 
 function extractReportIdFromPath(filePath) {
@@ -4696,7 +6334,8 @@ function setThemeMode(mode, { persist = true } = {}) {
   document.documentElement.classList.toggle("theme-light", normalized === "light");
   document.body.classList.toggle("theme-light", normalized === "light");
   if (themeToggleButton) {
-    themeToggleButton.textContent = normalized === "light" ? "☾" : "☀";
+    if (themeToggleSunIcon) themeToggleSunIcon.hidden = normalized === "light";
+    if (themeToggleMoonIcon) themeToggleMoonIcon.hidden = normalized !== "light";
     themeToggleButton.classList.toggle("active", normalized === "light");
     themeToggleButton.setAttribute("aria-pressed", normalized === "light" ? "true" : "false");
     themeToggleButton.setAttribute("title", normalized === "light" ? "Switch to dark mode" : "Switch to white mode");
@@ -4845,14 +6484,19 @@ form.querySelectorAll('input[name="mode"]').forEach((node) => {
   node.addEventListener("change", () => {
     setStoredLaunchMode(getMode());
     updateModeVisibility();
+    warmDevBuyQuoteCache();
   });
 });
 launchpadInputs.forEach((input) => {
   input.addEventListener("change", () => {
     if (!input.checked) return;
     setStoredLaunchpad(input.value);
+    setLaunchpad(input.value, { resetMode: true, persistMode: true });
     applyLaunchpadTokenMetadata();
-    updateModeVisibility();
+    warmDevBuyQuoteCache();
+    if (input.value === "bagsapp") {
+      refreshBagsIdentityStatus().catch(() => {});
+    }
   });
 });
 if (bonkQuoteAssetToggle) {
@@ -4861,7 +6505,56 @@ if (bonkQuoteAssetToggle) {
     if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = asset;
     setStoredBonkQuoteAsset(asset);
     syncBonkQuoteAssetUI();
+    warmDevBuyQuoteCache();
     queueQuoteUpdate();
+  });
+}
+if (bagsIdentityButton) {
+  bagsIdentityButton.addEventListener("click", async () => {
+    if (getLaunchpad() !== "bagsapp") return;
+    if (getBagsIdentityMode() === "linked") {
+      try {
+        await fetch("/api/bags/identity/clear", { method: "POST" });
+      } catch (_error) {
+        // Ignore backend clear errors and still reset the frontend state.
+      }
+      setBagsIdentityStateInputs({
+        mode: "wallet-only",
+        verified: false,
+        agentUsername: "",
+        authToken: "",
+        verifiedWallet: "",
+      });
+      syncBagsIdentityUI();
+      return;
+    }
+    showBagsIdentityModal();
+  });
+}
+if (bagsIdentityClose) {
+  bagsIdentityClose.addEventListener("click", () => hideBagsIdentityModal());
+}
+if (bagsIdentityCancel) {
+  bagsIdentityCancel.addEventListener("click", () => hideBagsIdentityModal());
+}
+if (bagsIdentityInitButton) {
+  bagsIdentityInitButton.addEventListener("click", async () => {
+    setBagsIdentityError("");
+    try {
+      await initBagsIdentityVerification();
+    } catch (error) {
+      setBagsIdentityError(error.message || "Failed to initialize Bags identity.");
+    }
+  });
+}
+if (bagsIdentityVerifyButton) {
+  bagsIdentityVerifyButton.addEventListener("click", async () => {
+    setBagsIdentityError("");
+    try {
+      await verifyBagsIdentity();
+    } catch (error) {
+      setBagsIdentityError(error.message || "Failed to verify Bags identity.");
+    }
   });
 }
 if (nameInput) {
@@ -4980,8 +6673,8 @@ if (sellProviderSelect) sellProviderSelect.addEventListener("change", () => {
 });
 feeSplitPill.addEventListener("click", () => {
   const mode = getMode();
-  if (mode !== "regular" && mode !== "agent-custom") return;
-  if (!feeSplitEnabled.checked) {
+  if (mode !== "regular" && mode !== "agent-custom" && !mode.startsWith("bags-")) return;
+  if (!mode.startsWith("bags-") && !feeSplitEnabled.checked) {
     feeSplitEnabled.checked = true;
     showFeeSplitModal();
     return;
@@ -5000,6 +6693,9 @@ if (walletRefreshButton) {
     walletRefreshButton.disabled = true;
     try {
       await refreshWalletStatus(true, true);
+      if (getLaunchpad() === "bagsapp") {
+        await refreshBagsIdentityStatus().catch(() => {});
+      }
     } finally {
       walletRefreshButton.disabled = false;
     }
@@ -5016,6 +6712,7 @@ if (walletDropdownList) {
     applySelectedWalletLocally(nextKey);
     setWalletDropdownOpen(false);
     refreshWalletStatus(true);
+    if (getLaunchpad() === "bagsapp") refreshBagsIdentityStatus().catch(() => {});
   });
 }
 walletSelect.addEventListener("change", () => {
@@ -5023,6 +6720,7 @@ walletSelect.addEventListener("change", () => {
   setStoredSelectedWalletKey(nextKey);
   applySelectedWalletLocally(nextKey);
   refreshWalletStatus(true);
+  if (getLaunchpad() === "bagsapp") refreshBagsIdentityStatus().catch(() => {});
 });
 document.addEventListener("click", (event) => {
   if (!walletDropdown || walletDropdown.hidden) return;
@@ -5036,6 +6734,7 @@ feeSplitAdd.addEventListener("click", () => {
   feeSplitList.appendChild(createFeeSplitRow({ type: "wallet", sharePercent: "" }));
   syncFeeSplitTotals();
   setStoredFeeSplitDraft(serializeFeeSplitDraft());
+  setFeeSplitModalError("");
 });
 
 feeSplitReset.addEventListener("click", () => {
@@ -5045,6 +6744,7 @@ feeSplitReset.addEventListener("click", () => {
   });
   syncFeeSplitTotals();
   setStoredFeeSplitDraft(serializeFeeSplitDraft());
+  setFeeSplitModalError("");
 });
 
 feeSplitEven.addEventListener("click", () => {
@@ -5065,6 +6765,7 @@ feeSplitEven.addEventListener("click", () => {
   });
   syncFeeSplitTotals();
   setStoredFeeSplitDraft(serializeFeeSplitDraft());
+  setFeeSplitModalError("");
 });
 
 feeSplitList.addEventListener("click", (event) => {
@@ -5074,25 +6775,35 @@ feeSplitList.addEventListener("click", (event) => {
     setRecipientTargetLocked(row, row.dataset.targetLocked !== "true");
     syncFeeSplitTotals();
     setStoredFeeSplitDraft(serializeFeeSplitDraft());
+    setFeeSplitModalError("");
     return;
   }
   const tab = event.target.closest(".recipient-type-tab");
   if (tab) {
     updateFeeSplitRowType(tab.closest(".fee-split-row"), tab.dataset.type);
     setStoredFeeSplitDraft(serializeFeeSplitDraft());
+    setFeeSplitModalError("");
     return;
   }
   const removeButton = event.target.closest(".recipient-remove");
   if (removeButton) {
     removeButton.closest(".fee-split-row").remove();
+    ensureFeeSplitDefaultRow();
     syncFeeSplitTotals();
     setStoredFeeSplitDraft(serializeFeeSplitDraft());
+    setFeeSplitModalError("");
   }
 });
 
 feeSplitList.addEventListener("input", (event) => {
   const row = event.target.closest(".fee-split-row");
   if (!row) return;
+  if (event.target.classList.contains("recipient-target")) {
+    event.target.setCustomValidity("");
+  }
+  if (event.target.classList.contains("recipient-target") && row.dataset.type === "github") {
+    delete row.dataset.githubUserId;
+  }
   if (event.target.classList.contains("recipient-slider")) {
     row.querySelector(".recipient-share").value = event.target.value;
   }
@@ -5101,6 +6812,7 @@ feeSplitList.addEventListener("input", (event) => {
   }
   syncFeeSplitTotals();
   setStoredFeeSplitDraft(serializeFeeSplitDraft());
+  setFeeSplitModalError("");
 });
 
 agentSplitAdd.addEventListener("click", () => {
@@ -5177,6 +6889,9 @@ agentSplitList.addEventListener("click", (event) => {
 agentSplitList.addEventListener("input", (event) => {
   const row = event.target.closest(".fee-split-row");
   if (!row) return;
+  if (event.target.classList.contains("recipient-target")) {
+    event.target.setCustomValidity("");
+  }
   if (event.target.classList.contains("recipient-slider")) {
     row.querySelector(".recipient-share").value = event.target.value;
   }
@@ -5258,13 +6973,7 @@ modalConfirm.addEventListener("click", () => {
   hideDeployModal();
   run("deploy");
 });
-if (settingsClose) settingsClose.addEventListener("click", hideSettingsModal);
-if (settingsCancel) settingsCancel.addEventListener("click", hideSettingsModal);
-if (settingsModal) {
-  settingsModal.addEventListener("click", (event) => {
-    if (event.target === settingsModal) hideSettingsModal();
-  });
-}
+if (settingsCancel) settingsCancel.addEventListener("click", () => hideSettingsModal("cancel"));
 if (topPresetChipBar) {
   topPresetChipBar.addEventListener("click", (event) => {
     const chip = event.target.closest("[data-preset-id]");
@@ -5285,19 +6994,38 @@ if (presetEditToggle) {
   });
 }
 [
+  [creationAutoFeeButton, creationAutoFeeInput],
+  [buyAutoFeeButton, buyAutoFeeInput],
+  [sellAutoFeeButton, sellAutoFeeInput],
+].forEach(([button, input]) => {
+  if (!button || !input) return;
+  button.addEventListener("click", () => {
+    if (button.disabled) return;
+    input.checked = !input.checked;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+});
+[
   creationTipInput,
   creationPriorityInput,
+  creationAutoFeeInput,
+  creationMaxFeeInput,
   buyPriorityFeeInput,
   buyTipInput,
   buySlippageInput,
+  buyAutoFeeInput,
+  buyMaxFeeInput,
   sellPriorityFeeInput,
   sellTipInput,
   sellSlippageInput,
+  sellAutoFeeInput,
+  sellMaxFeeInput,
 ].forEach((input) => {
   if (!input) return;
   const eventName = input.tagName === "SELECT" || input.type === "checkbox" ? "change" : "input";
   input.addEventListener(eventName, () => {
     syncActivePresetFromInputs();
+    syncSettingsCapabilities();
     if (input.name) validateFieldByName(input.name);
     if (sniperModal && !sniperModal.hidden) {
       renderSniperUI();
@@ -5336,22 +7064,14 @@ if (modeVanityButton) {
     showVanityModal();
   });
 }
-if (feeSplitClose) feeSplitClose.addEventListener("click", hideFeeSplitModal);
-if (feeSplitSave) feeSplitSave.addEventListener("click", () => {
-  setStoredFeeSplitDraft(serializeFeeSplitDraft());
-  hideFeeSplitModal();
-});
+if (feeSplitClose) feeSplitClose.addEventListener("click", attemptCloseFeeSplitModal);
+if (feeSplitSave) feeSplitSave.addEventListener("click", attemptCloseFeeSplitModal);
 if (feeSplitDisable) {
-  feeSplitDisable.addEventListener("click", () => {
-    feeSplitEnabled.checked = false;
-    updateFeeSplitVisibility();
-    setStoredFeeSplitDraft(serializeFeeSplitDraft());
-    hideFeeSplitModal();
-  });
+  feeSplitDisable.addEventListener("click", cancelFeeSplitModal);
 }
 if (feeSplitModal) {
   feeSplitModal.addEventListener("click", (event) => {
-    if (event.target === feeSplitModal) hideFeeSplitModal();
+    if (event.target === feeSplitModal) attemptCloseFeeSplitModal();
   });
 }
 if (agentSplitClose) agentSplitClose.addEventListener("click", attemptCloseAgentSplitModal);
@@ -5397,6 +7117,10 @@ if (vampImport) {
 if (vampClose) vampClose.addEventListener("click", hideVampModal);
 if (vampCancel) vampCancel.addEventListener("click", hideVampModal);
 if (vampContractInput) {
+  vampContractInput.addEventListener("input", () => {
+    if (vampError) vampError.textContent = "";
+    scheduleVampAutoImport();
+  });
   vampContractInput.addEventListener("keydown", async (event) => {
     if (event.key !== "Enter") return;
     event.preventDefault();

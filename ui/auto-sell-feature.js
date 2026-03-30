@@ -18,7 +18,6 @@
       autoSellEnabledInput,
       autoSellToggleState,
       autoSellTriggerValue,
-      autoSellTriggerDescription,
       autoSellDelaySlider,
       autoSellDelayControl,
       autoSellPercentSlider,
@@ -35,10 +34,11 @@
 
     function normalizeTriggerMode(value) {
       const mode = String(value || "").trim().toLowerCase();
-      if (mode === "submit-delay" || mode === "block-offset" || mode === "confirmation") {
+      if (mode === "submit-delay" || mode === "block-offset") {
         return mode;
       }
-      return "confirmation";
+      if (mode === "confirmation") return "block-offset";
+      return "block-offset";
     }
 
     function getTriggerMode() {
@@ -54,13 +54,12 @@
     function getBlockOffset() {
       const numeric = Number(getNamedValue("automaticDevSellBlockOffset") || "0");
       if (!Number.isFinite(numeric)) return 0;
-      return Math.max(0, Math.min(5, Math.round(numeric)));
+      return Math.max(0, Math.min(22, Math.round(numeric)));
     }
 
     function getTriggerLabel(mode = getTriggerMode()) {
       if (mode === "submit-delay") return "On Submit + Delay";
-      if (mode === "block-offset") return "Block Offset";
-      return "Safe Confirmed";
+      return "On Confirmed Block";
     }
 
     function getTriggerDescription(mode = getTriggerMode()) {
@@ -68,9 +67,13 @@
         return `Sell ${getDelayMs()}ms after submit is observed without waiting for confirmation.`;
       }
       if (mode === "block-offset") {
-        return `Send the sell transaction when observed block ${getBlockOffset()} is reached, without waiting for confirmation.`;
+        return `Send the sell transaction on confirmed block + ${getBlockOffset()} from launch confirmation.`;
       }
-      return "Wait for the launch to confirm first, then sell immediately. Safest option.";
+      return `Send the sell transaction on confirmed block + ${getBlockOffset()} from launch confirmation.`;
+    }
+
+    function getBlockOffsetDescription(offset = getBlockOffset()) {
+      return `Send the sell transaction on confirmed block + ${offset} from launch confirmation.`;
     }
 
     function getSummaryText(formValues) {
@@ -80,9 +83,9 @@
         return `${percent} at submit + ${Number(formValues.automaticDevSellDelayMs || 0)}ms`;
       }
       if (mode === "block-offset") {
-        return `${percent} at block ${Number(formValues.automaticDevSellBlockOffset || 0)}`;
+        return `${percent} on confirmed + ${Number(formValues.automaticDevSellBlockOffset || 0)}`;
       }
-      return `${percent} after confirmation`;
+      return `${percent} on confirmed + ${Number(formValues.automaticDevSellBlockOffset || 0)}`;
     }
 
     function togglePanel(forceOpen) {
@@ -116,10 +119,11 @@
       if (autoSellEnabledInput) autoSellEnabledInput.checked = enabled;
       if (autoSellSettings) autoSellSettings.hidden = !enabled;
       if (autoSellTriggerValue) autoSellTriggerValue.textContent = getTriggerLabel(triggerMode);
-      if (autoSellTriggerDescription) autoSellTriggerDescription.textContent = getTriggerDescription(triggerMode);
       autoSellTriggerModeButtons.forEach((button) => {
-        button.classList.toggle("active", button.getAttribute("data-auto-sell-trigger-mode") === triggerMode);
+        const buttonMode = button.getAttribute("data-auto-sell-trigger-mode") || "block-offset";
+        button.classList.toggle("active", buttonMode === triggerMode);
         button.disabled = !enabled;
+        button.title = getTriggerDescription(buttonMode);
       });
       if (autoSellDelaySlider) {
         autoSellDelaySlider.value = delayMs;
@@ -128,15 +132,17 @@
       if (autoSellDelayControl) autoSellDelayControl.hidden = !enabled || triggerMode !== "submit-delay";
       if (autoSellBlockControl) autoSellBlockControl.hidden = !enabled || triggerMode !== "block-offset";
       autoSellBlockOffsetButtons.forEach((button) => {
-        button.classList.toggle("active", button.getAttribute("data-auto-sell-block-offset") === blockOffset);
+        const offsetValue = Number(button.getAttribute("data-auto-sell-block-offset") || "0");
+        button.classList.toggle("active", String(offsetValue) === blockOffset);
         button.disabled = !enabled || triggerMode !== "block-offset";
+        button.title = getBlockOffsetDescription(offsetValue);
       });
       if (autoSellPercentSlider) {
         autoSellPercentSlider.value = percent;
         autoSellPercentSlider.disabled = !enabled;
       }
       if (autoSellDelayValue) autoSellDelayValue.textContent = formatSliderValue(delayMs, "ms", 0);
-      if (autoSellBlockValue) autoSellBlockValue.textContent = `Block ${blockOffset}`;
+      if (autoSellBlockValue) autoSellBlockValue.textContent = blockOffset;
       if (autoSellPercentValue) autoSellPercentValue.textContent = formatSliderValue(percent, "%", 0);
       syncSettingsCapabilities();
     }
@@ -168,7 +174,7 @@
       }
       autoSellTriggerModeButtons.forEach((button) => {
         button.addEventListener("click", () => {
-          setNamedValue("automaticDevSellTriggerMode", button.getAttribute("data-auto-sell-trigger-mode") || "confirmation");
+          setNamedValue("automaticDevSellTriggerMode", button.getAttribute("data-auto-sell-trigger-mode") || "block-offset");
           syncUI();
           syncActivePresetFromInputs();
           validateFieldByName("automaticDevSellDelayMs");

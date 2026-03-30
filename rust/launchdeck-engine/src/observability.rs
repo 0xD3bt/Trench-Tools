@@ -8,7 +8,7 @@ use std::{
 };
 use uuid::Uuid;
 
-use crate::{paths, transport::TransportPlan};
+use crate::{fs_utils::atomic_write, paths, transport::TransportPlan};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceContext {
@@ -83,11 +83,10 @@ pub fn update_persisted_follow_daemon_snapshot(path: &str, snapshot: &Value) -> 
         .and_then(Value::as_object_mut)
         .ok_or_else(|| "Persisted launch report missing report payload.".to_string())?;
     report.insert("followDaemon".to_string(), snapshot.clone());
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?,
+    atomic_write(
+        std::path::Path::new(path),
+        &serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?,
     )
-    .map_err(|error| error.to_string())
 }
 
 fn write_launch_report_file(
@@ -122,11 +121,10 @@ fn write_launch_report_file(
         "transportPlan": transport_plan,
         "report": report,
     });
-    fs::write(
+    atomic_write(
         path,
-        serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?,
+        &serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?,
     )
-    .map_err(|error| error.to_string())
 }
 
 fn current_time_ms() -> u128 {

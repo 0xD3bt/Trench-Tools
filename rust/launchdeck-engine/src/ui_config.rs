@@ -1,6 +1,9 @@
 #![allow(non_snake_case, dead_code)]
 
-use crate::paths;
+use crate::{
+    fs_utils::{atomic_write, quarantine_corrupt_file},
+    paths,
+};
 use serde_json::{Value, json};
 use std::fs;
 
@@ -77,12 +80,16 @@ fn creation_settings(
     provider: &str,
     tip_sol: &str,
     priority_fee_sol: &str,
+    auto_fee: bool,
+    max_fee_sol: &str,
     dev_buy_sol: &str,
 ) -> Value {
     json!({
         "provider": normalize_provider(provider, DEFAULT_PROVIDER),
         "tipSol": normalize_decimal_string(tip_sol, DEFAULT_CREATION_TIP_SOL),
         "priorityFeeSol": normalize_decimal_string(priority_fee_sol, "0.001"),
+        "autoFee": auto_fee,
+        "maxFeeSol": max_fee_sol.trim(),
         "devBuySol": normalize_decimal_string(dev_buy_sol, ""),
     })
 }
@@ -92,17 +99,21 @@ fn trade_settings(
     priority_fee_sol: &str,
     tip_sol: &str,
     slippage_percent: &str,
+    auto_fee: bool,
+    max_fee_sol: &str,
 ) -> Value {
     json!({
         "provider": normalize_provider(provider, DEFAULT_PROVIDER),
         "priorityFeeSol": normalize_decimal_string(priority_fee_sol, DEFAULT_TRADE_PRIORITY_FEE_SOL),
         "tipSol": normalize_decimal_string(tip_sol, DEFAULT_TRADE_TIP_SOL),
         "slippagePercent": normalize_decimal_string(slippage_percent, DEFAULT_TRADE_SLIPPAGE_PERCENT),
+        "autoFee": auto_fee,
+        "maxFeeSol": max_fee_sol.trim(),
     })
 }
 
 fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
-    let mut buy = trade_settings("", "", "", "");
+    let mut buy = trade_settings("", "", "", "", false, "");
     if let Some(object) = buy.as_object_mut() {
         object.insert(
             "snipeBuyAmountSol".to_string(),
@@ -112,9 +123,9 @@ fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
     json!({
         "id": id,
         "label": label,
-        "creationSettings": creation_settings("", "", "", dev_buy_sol),
+        "creationSettings": creation_settings("", "", "", false, "", dev_buy_sol),
         "buySettings": buy,
-        "sellSettings": trade_settings("", "", "", ""),
+        "sellSettings": trade_settings("", "", "", "", false, ""),
         "postLaunchStrategy": "none",
     })
 }
@@ -132,7 +143,7 @@ pub fn create_default_persistent_config() -> Value {
             "automaticDevSell": {
                 "enabled": false,
                 "percent": 100,
-                "triggerMode": "confirmation",
+                "triggerMode": "block-offset",
                 "delayMs": 0,
                 "targetBlockOffset": 0
             }
@@ -219,6 +230,19 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .and_then(Value::as_str)
                     .unwrap_or("0.001"),
             ),
+        bool_value(
+            creation.and_then(|value| value.get("autoFee")),
+            bool_value(fallback_creation.get("autoFee"), false),
+        ),
+        creation
+            .and_then(|value| value.get("maxFeeSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_creation
+                    .get("maxFeeSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
         creation
             .and_then(|value| value.get("devBuySol"))
             .and_then(Value::as_str)
@@ -261,6 +285,18 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .get("slippagePercent")
                     .and_then(Value::as_str)
                     .unwrap_or(DEFAULT_TRADE_SLIPPAGE_PERCENT),
+            ),
+        bool_value(
+            buy.and_then(|value| value.get("autoFee")),
+            bool_value(fallback_buy.get("autoFee"), false),
+        ),
+        buy.and_then(|value| value.get("maxFeeSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_buy
+                    .get("maxFeeSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
             ),
     );
     buy_settings
@@ -312,6 +348,18 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .get("slippagePercent")
                     .and_then(Value::as_str)
                     .unwrap_or(DEFAULT_TRADE_SLIPPAGE_PERCENT),
+            ),
+        bool_value(
+            sell.and_then(|value| value.get("autoFee")),
+            bool_value(fallback_sell.get("autoFee"), false),
+        ),
+        sell.and_then(|value| value.get("maxFeeSol"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_sell
+                    .get("maxFeeSol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
             ),
     );
     let post_launch_strategy = preset_obj
@@ -396,6 +444,15 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
                         string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("tipSol"))),
                     ]),
                     "priorityFeeSol": creation_priority,
+                    "autoFee": bool_value(
+                        launch_execution.get("autoGas"),
+                        bool_value(fallback_preset.get("creationSettings").and_then(|v| v.get("autoFee")), false),
+                    ),
+                    "maxFeeSol": first_non_empty(&[
+                        string_value(launch_execution.get("maxPriorityFeeSol")),
+                        string_value(launch_execution.get("maxTipSol")),
+                        string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("maxFeeSol"))),
+                    ]),
                     "devBuySol": normalize_decimal_string(&string_value(launch_preset.get("buyAmountSol")), &string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("devBuySol")))),
                 },
                 "buySettings": {
@@ -403,6 +460,17 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
                     "priorityFeeSol": buy_priority,
                     "tipSol": buy_tip,
                     "slippagePercent": string_value(fallback_preset.get("buySettings").and_then(|v| v.get("slippagePercent"))),
+                    "autoFee": bool_value(
+                        buy_execution.get("buyAutoGas").or_else(|| buy_execution.get("autoGas")),
+                        bool_value(fallback_preset.get("buySettings").and_then(|v| v.get("autoFee")), false),
+                    ),
+                    "maxFeeSol": first_non_empty(&[
+                        string_value(buy_execution.get("buyMaxPriorityFeeSol")),
+                        string_value(buy_execution.get("buyMaxTipSol")),
+                        string_value(buy_execution.get("maxPriorityFeeSol")),
+                        string_value(buy_execution.get("maxTipSol")),
+                        string_value(fallback_preset.get("buySettings").and_then(|v| v.get("maxFeeSol"))),
+                    ]),
                     "snipeBuyAmountSol": normalize_decimal_string(&string_value(sniper_preset.get("buyAmountSol")), &string_value(fallback_preset.get("buySettings").and_then(|v| v.get("snipeBuyAmountSol")))),
                 },
                 "sellSettings": {
@@ -410,6 +478,21 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
                     "priorityFeeSol": if buy_priority.is_empty() { string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("priorityFeeSol"))) } else { buy_priority.clone() },
                     "tipSol": if buy_tip.is_empty() { string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("tipSol"))) } else { buy_tip.clone() },
                     "slippagePercent": string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("slippagePercent"))),
+                    "autoFee": bool_value(
+                        buy_execution.get("sellAutoGas")
+                            .or_else(|| buy_execution.get("buyAutoGas"))
+                            .or_else(|| buy_execution.get("autoGas")),
+                        bool_value(fallback_preset.get("sellSettings").and_then(|v| v.get("autoFee")), false),
+                    ),
+                    "maxFeeSol": first_non_empty(&[
+                        string_value(buy_execution.get("sellMaxPriorityFeeSol")),
+                        string_value(buy_execution.get("sellMaxTipSol")),
+                        string_value(buy_execution.get("buyMaxPriorityFeeSol")),
+                        string_value(buy_execution.get("buyMaxTipSol")),
+                        string_value(buy_execution.get("maxPriorityFeeSol")),
+                        string_value(buy_execution.get("maxTipSol")),
+                        string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("maxFeeSol"))),
+                    ]),
                 },
                 "postLaunchStrategy": first_non_empty(&[string_value(defaults.get("postLaunchStrategy")), "none".to_string()])
             })), &fallback_preset, index)
@@ -426,10 +509,11 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
             "preset1".to_string()
         }
     };
-    let legacy_auto_sell_trigger_mode = if number_value(legacy_auto_sell.get("delaySeconds"), 0) > 0 {
+    let legacy_auto_sell_trigger_mode = if number_value(legacy_auto_sell.get("delaySeconds"), 0) > 0
+    {
         "submit-delay".to_string()
     } else {
-        "confirmation".to_string()
+        "block-offset".to_string()
     };
     json!({
         "defaults": {
@@ -521,9 +605,13 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
         }
     };
     let automatic_dev_sell_trigger_mode = {
-        let mode = string_value(merged_defaults.get("automaticDevSell").and_then(|value| value.get("triggerMode")));
+        let mode = string_value(
+            merged_defaults
+                .get("automaticDevSell")
+                .and_then(|value| value.get("triggerMode")),
+        );
         if mode.is_empty() {
-            "confirmation".to_string()
+            "block-offset".to_string()
         } else {
             mode
         }
@@ -565,7 +653,10 @@ pub fn read_persistent_config() -> Value {
     }
     serde_json::from_str::<Value>(&raw)
         .map(normalize_persistent_config)
-        .unwrap_or_else(|_| create_default_persistent_config())
+        .unwrap_or_else(|_| {
+            let _ = quarantine_corrupt_file(&path, "persistent config");
+            create_default_persistent_config()
+        })
 }
 
 pub fn write_persistent_config(next_config: Value) -> Result<String, String> {
@@ -574,11 +665,10 @@ pub fn write_persistent_config(next_config: Value) -> Result<String, String> {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let normalized = normalize_persistent_config(next_config);
-    fs::write(
+    atomic_write(
         &path,
-        serde_json::to_vec_pretty(&normalized).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+        &serde_json::to_vec_pretty(&normalized).map_err(|error| error.to_string())?,
+    )?;
     Ok(path.display().to_string())
 }
 
