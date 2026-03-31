@@ -332,6 +332,12 @@ pub struct RawFollowLaunchMarketCapTrigger {
     pub direction: String,
     #[serde(default)]
     pub threshold: String,
+    #[serde(default)]
+    pub scanTimeoutSeconds: Option<Value>,
+    #[serde(default)]
+    pub timeoutAction: String,
+    #[serde(default, rename = "scanTimeoutMinutes", skip_serializing_if = "Option::is_none")]
+    pub legacyScanTimeoutMinutes: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -509,6 +515,25 @@ pub struct NormalizedFeeSharing {
     pub recipients: Vec<NormalizedRecipient>,
 }
 
+pub fn launch_follow_up_label(config: &NormalizedConfig) -> Option<&'static str> {
+    match config.mode.as_str() {
+        "regular" | "cashback"
+            if config.feeSharing.generateLaterSetup && !config.feeSharing.recipients.is_empty() =>
+        {
+            Some("follow-up")
+        }
+        "agent-custom" if config.agent.splitAgentInit && !config.agent.feeRecipients.is_empty() => {
+            Some("agent-setup")
+        }
+        "agent-locked" => Some("agent-setup"),
+        _ => None,
+    }
+}
+
+pub fn has_launch_follow_up(config: &NormalizedConfig) -> bool {
+    launch_follow_up_label(config).is_some()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedCreatorFee {
     pub mode: String,
@@ -623,7 +648,7 @@ pub struct NormalizedFollowLaunchSell {
     pub enabled: bool,
     pub walletEnvKey: String,
     pub percent: u8,
-    pub delayMs: u64,
+    pub delayMs: Option<u64>,
     pub targetBlockOffset: Option<u8>,
     pub marketCap: Option<NormalizedFollowLaunchMarketCapTrigger>,
     pub precheckRequired: bool,
@@ -634,6 +659,8 @@ pub struct NormalizedFollowLaunchSell {
 pub struct NormalizedFollowLaunchMarketCapTrigger {
     pub direction: String,
     pub threshold: String,
+    pub scanTimeoutSeconds: u64,
+    pub timeoutAction: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -723,6 +750,65 @@ fn parse_int(
         )));
     }
     Ok(Some(parsed))
+}
+
+fn parse_market_cap_threshold(value: &str, label: &str) -> Result<String, ConfigError> {
+    let normalized = value.trim().replace(',', "").to_lowercase();
+    if normalized.is_empty() {
+        return Err(ConfigError::Message(format!("{label} is required.")));
+    }
+    let (number_part, multiplier) = match normalized.chars().last() {
+        Some('k') => (&normalized[..normalized.len() - 1], 1_000_f64),
+        Some('m') => (&normalized[..normalized.len() - 1], 1_000_000_f64),
+        Some('b') => (&normalized[..normalized.len() - 1], 1_000_000_000_f64),
+        Some('t') => (&normalized[..normalized.len() - 1], 1_000_000_000_000_f64),
+        _ => (normalized.as_str(), 1_f64),
+    };
+    let parsed = number_part.parse::<f64>().map_err(|_| {
+        ConfigError::Message(format!(
+            "{label} must be a positive number like 100000 or 100k. Got: {value}"
+        ))
+    })?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(ConfigError::Message(format!(
+            "{label} must be a positive number like 100000 or 100k. Got: {value}"
+        )));
+    }
+    let expanded = (parsed * multiplier).round();
+    if !expanded.is_finite() || expanded <= 0.0 || expanded > u64::MAX as f64 {
+        return Err(ConfigError::Message(format!(
+            "{label} is too large. Got: {value}"
+        )));
+    }
+    Ok((expanded as u64).to_string())
+}
+
+fn parse_market_cap_scan_timeout_seconds(
+    raw: &RawFollowLaunchMarketCapTrigger,
+    label_prefix: &str,
+) -> Result<u64, ConfigError> {
+    if raw.scanTimeoutSeconds.is_some() {
+        return Ok(parse_int(
+            &raw.scanTimeoutSeconds,
+            &format!("{label_prefix}.scanTimeoutSeconds"),
+            Some(1),
+            Some(86_400),
+            Some(15),
+        )?
+        .unwrap_or(15) as u64);
+    }
+    if raw.legacyScanTimeoutMinutes.is_some() {
+        let minutes = parse_int(
+            &raw.legacyScanTimeoutMinutes,
+            &format!("{label_prefix}.scanTimeoutMinutes"),
+            Some(1),
+            Some(1_440),
+            Some(15),
+        )?
+        .unwrap_or(15) as u64;
+        return Ok(minutes.saturating_mul(60));
+    }
+    Ok(15)
 }
 
 fn parse_choice(
@@ -1025,26 +1111,33 @@ fn normalize_follow_sell(
         &format!("{fallback_action_id}.delayMs"),
         Some(0),
         None,
-        Some(0),
+        None,
     )?
-    .unwrap_or(0) as u64;
+    .map(|value| value as u64);
     let target_block_offset = parse_int(
         &raw.targetBlockOffset,
         &format!("{fallback_action_id}.targetBlockOffset"),
         Some(0),
-        Some(22),
+        Some(23),
         None,
     )?
     .map(|value| value as u8);
-    let direction = if raw.marketCap.direction.trim().is_empty() {
-        "gte".to_string()
+    let direction = "gte".to_string();
+    let scan_timeout_seconds =
+        parse_market_cap_scan_timeout_seconds(&raw.marketCap, &format!("{fallback_action_id}.marketCap"))?;
+    let timeout_action = parse_choice(
+        &raw.marketCap.timeoutAction,
+        &format!("{fallback_action_id}.marketCap.timeoutAction"),
+        &["stop", "sell"],
+        "stop",
+    )?;
+    let normalized_market_cap_threshold = if market_cap_enabled {
+        Some(parse_market_cap_threshold(
+            &raw.marketCap.threshold,
+            &format!("{fallback_action_id}.marketCap.threshold"),
+        )?)
     } else {
-        parse_choice(
-            &raw.marketCap.direction,
-            &format!("{fallback_action_id}.marketCap.direction"),
-            &["gte", "lte"],
-            "gte",
-        )?
+        None
     };
     Ok(Some(NormalizedFollowLaunchSell {
         actionId: if raw.actionId.trim().is_empty() {
@@ -1052,7 +1145,7 @@ fn normalize_follow_sell(
         } else {
             raw.actionId.trim().to_string()
         },
-        enabled: enabled || percent > 0,
+        enabled,
         walletEnvKey: if raw.walletEnvKey.trim().is_empty() {
             fallback_wallet_env_key.trim().to_string()
         } else {
@@ -1064,7 +1157,9 @@ fn normalize_follow_sell(
         marketCap: if market_cap_enabled {
             Some(NormalizedFollowLaunchMarketCapTrigger {
                 direction,
-                threshold: raw.marketCap.threshold.trim().to_string(),
+                threshold: normalized_market_cap_threshold.unwrap_or_default(),
+                scanTimeoutSeconds: scan_timeout_seconds,
+                timeoutAction: timeout_action,
             })
         } else {
             None
@@ -1127,7 +1222,8 @@ fn legacy_follow_launch(
                 Some(100),
             )?
             .unwrap_or(100) as u8,
-            delayMs: (parse_int(
+            delayMs: Some(
+                (parse_int(
                 &raw.postLaunch.automaticDevSell.delaySeconds,
                 "postLaunch.automaticDevSell.delaySeconds",
                 Some(0),
@@ -1135,7 +1231,8 @@ fn legacy_follow_launch(
                 Some(0),
             )?
             .unwrap_or(0) as u64)
-                * 1000,
+                    * 1000,
+            ),
             targetBlockOffset: None,
             marketCap: None,
             precheckRequired: false,
@@ -1185,7 +1282,7 @@ fn normalize_follow_launch(
             &entry.targetBlockOffset,
             &format!("followLaunch.snipes[{index}].targetBlockOffset"),
             Some(0),
-            Some(22),
+            Some(23),
             None,
         )?
         .map(|value| value as u8);
@@ -1254,12 +1351,15 @@ fn normalize_follow_launch(
         None => None,
     };
     let explicit_enabled = parse_bool(&follow.enabled, false);
-    let has_explicit_payload = explicit_enabled || !snipes.is_empty() || dev_auto_sell.is_some();
+    let has_enabled_snipes = snipes.iter().any(|snipe| snipe.enabled);
+    let has_enabled_dev_auto_sell = dev_auto_sell.as_ref().is_some_and(|sell| sell.enabled);
+    let has_explicit_payload =
+        explicit_enabled || has_enabled_snipes || has_enabled_dev_auto_sell;
     if !has_explicit_payload {
         return legacy_follow_launch(raw, post_launch_strategy);
     }
     Ok(NormalizedFollowLaunch {
-        enabled: explicit_enabled || !snipes.is_empty() || dev_auto_sell.is_some(),
+        enabled: explicit_enabled || has_enabled_snipes || has_enabled_dev_auto_sell,
         source: "followLaunch".to_string(),
         schemaVersion: explicit_schema,
         snipes,
@@ -1868,7 +1968,7 @@ mod tests {
             .expect("dev auto sell should be present");
         assert_eq!(dev_auto_sell.walletEnvKey, "SOLANA_PRIVATE_KEY2");
         assert_eq!(dev_auto_sell.percent, 75);
-        assert_eq!(dev_auto_sell.delayMs, 2000);
+        assert_eq!(dev_auto_sell.delayMs, Some(2000));
     }
 
     #[test]
@@ -1927,5 +2027,103 @@ mod tests {
                 .to_string()
                 .contains("followLaunch.snipes[0].postBuySell is not shipped yet")
         );
+    }
+
+    #[test]
+    fn disabled_follow_launch_entries_do_not_enable_follow_daemon() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": false,
+            "schemaVersion": 1,
+            "snipes": [
+                {
+                    "enabled": false,
+                    "walletEnvKey": "SOLANA_PRIVATE_KEY2",
+                    "buyAmountSol": "0.25",
+                    "submitDelayMs": 30
+                }
+            ],
+            "devAutoSell": {
+                "enabled": false,
+                "percent": 50,
+                "delayMs": 2000
+            }
+        }))
+        .expect("follow launch raw");
+
+        let normalized = normalize_raw_config(raw).expect("disabled follow launch should normalize");
+        assert!(!normalized.followLaunch.enabled);
+        assert!(normalized.followLaunch.snipes.is_empty());
+        assert!(normalized.followLaunch.devAutoSell.is_none());
+    }
+
+    #[test]
+    fn normalizes_market_cap_scan_timeout_for_follow_sell() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": true,
+            "schemaVersion": 1,
+            "devAutoSell": {
+                "enabled": true,
+                "walletEnvKey": "SOLANA_PRIVATE_KEY",
+                "percent": 100,
+                "targetBlockOffset": 1,
+                "marketCap": {
+                    "enabled": true,
+                    "direction": "gte",
+                    "threshold": "250000000",
+                    "scanTimeoutSeconds": 42,
+                    "timeoutAction": "sell"
+                }
+            }
+        }))
+        .expect("follow launch raw");
+
+        let normalized = normalize_raw_config(raw).expect("market-cap follow sell should normalize");
+        let dev_auto_sell = normalized
+            .followLaunch
+            .devAutoSell
+            .expect("dev auto sell should be present");
+        let trigger = dev_auto_sell
+            .marketCap
+            .expect("market-cap trigger should be present");
+        assert_eq!(trigger.direction, "gte");
+        assert_eq!(trigger.threshold, "250000000");
+        assert_eq!(trigger.scanTimeoutSeconds, 42);
+        assert_eq!(trigger.timeoutAction, "sell");
+    }
+
+    #[test]
+    fn normalizes_market_cap_shorthand_threshold_for_follow_sell() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": true,
+            "schemaVersion": 1,
+            "devAutoSell": {
+                "enabled": true,
+                "walletEnvKey": "SOLANA_PRIVATE_KEY",
+                "percent": 100,
+                "targetBlockOffset": 1,
+                "marketCap": {
+                    "enabled": true,
+                    "threshold": "100k",
+                    "scanTimeoutSeconds": 15
+                }
+            }
+        }))
+        .expect("follow launch raw");
+
+        let normalized = normalize_raw_config(raw).expect("market-cap shorthand should normalize");
+        let dev_auto_sell = normalized
+            .followLaunch
+            .devAutoSell
+            .expect("dev auto sell should be present");
+        let trigger = dev_auto_sell
+            .marketCap
+            .expect("market-cap trigger should be present");
+        assert_eq!(trigger.direction, "gte");
+        assert_eq!(trigger.threshold, "100000");
+        assert_eq!(trigger.scanTimeoutSeconds, 15);
+        assert_eq!(trigger.timeoutAction, "stop");
     }
 }

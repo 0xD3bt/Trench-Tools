@@ -2,7 +2,7 @@
 
 This guide walks through a simple VPS deployment flow for LaunchDeck.
 
-You can use any provider. For the best latency, the current recommendation is:
+For most operators, start with Helius-first routing. The current recommendation is:
 
 - US: Newark, Virginia, or New York area
 - EU: Frankfurt or Amsterdam
@@ -73,7 +73,7 @@ In Vultr, add SSH keys here:
 
 When creating the VPS:
 
-- use any provider if you prefer another one
+- prefer Helius-backed routing first; only switch to another provider when you have a specific reason
 - for US, pick Newark, Virginia, or New York area
 - for EU, pick Frankfurt or Amsterdam
 
@@ -150,9 +150,17 @@ At minimum, most operators will want to fill in:
 
 Optional but common:
 
-- `HELIUS_API_KEY`
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier
 - `PINATA_JWT`
 - `BAGS_API_KEY`
+
+Recommended setup:
+
+- use a Helius mainnet RPC URL for `SOLANA_RPC_URL`
+- use the matching Helius websocket URL for `SOLANA_WS_URL`
+- use `Helius Sender` as your provider in LaunchDeck
+
+At the moment, that is the fastest and best-supported operator path in LaunchDeck for most users. If your Helius websocket supports `transactionSubscribe` on dev tier, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` for the upgraded market-watcher path.
 
 Full env reference:
 

@@ -176,9 +176,9 @@ const openPopoutButton = document.getElementById("open-popout-button");
 const toggleOutputButton = document.getElementById("toggle-output-button");
 const toggleReportsButton = document.getElementById("toggle-reports-button");
 const reportsRefreshButton = document.getElementById("reports-refresh-button");
-const reportsSortButton = document.getElementById("reports-sort-button");
 const reportsTransactionsButton = document.getElementById("reports-transactions-button");
 const reportsLaunchesButton = document.getElementById("reports-launches-button");
+const reportsActiveJobsButton = document.getElementById("reports-active-jobs-button");
 const openSettingsButton = document.getElementById("open-settings-button");
 const saveSettingsButton = document.getElementById("save-settings-button");
 const settingsModal = document.getElementById("settings-modal");
@@ -190,7 +190,10 @@ const devAutoSellButton = document.getElementById("dev-auto-sell-button");
 const devAutoSellPanel = document.getElementById("dev-auto-sell-panel");
 const autoSellEnabledInput = document.getElementById("auto-sell-enabled-input");
 const autoSellToggleState = document.getElementById("auto-sell-toggle-state");
+const autoSellTriggerFamilyValue = document.getElementById("auto-sell-trigger-family-value");
 const autoSellTriggerValue = document.getElementById("auto-sell-trigger-value");
+const autoSellTimeSettings = document.getElementById("auto-sell-time-settings");
+const autoSellTriggerFamilyButtons = Array.from(document.querySelectorAll("[data-auto-sell-trigger-family]"));
 const autoSellDelaySlider = document.getElementById("auto-sell-delay-slider");
 const autoSellDelayControl = document.getElementById("auto-sell-delay-control");
 const autoSellPercentSlider = document.getElementById("auto-sell-percent-slider");
@@ -201,6 +204,13 @@ const autoSellPercentValue = document.getElementById("auto-sell-percent-value");
 const autoSellSettings = document.getElementById("auto-sell-settings");
 const autoSellTriggerModeButtons = Array.from(document.querySelectorAll("[data-auto-sell-trigger-mode]"));
 const autoSellBlockOffsetButtons = Array.from(document.querySelectorAll("[data-auto-sell-block-offset]"));
+const autoSellMarketCapEnabledInput = document.getElementById("auto-sell-market-cap-enabled-input");
+const autoSellMarketCapSettings = document.getElementById("auto-sell-market-cap-settings");
+const autoSellMarketCapThresholdInput = document.getElementById("auto-sell-market-cap-threshold-input");
+const autoSellMarketCapThresholdValue = document.getElementById("auto-sell-market-cap-threshold-value");
+const autoSellMarketCapDirectionInput = document.getElementById("auto-sell-market-cap-direction-input");
+const autoSellMarketCapTimeoutInput = document.getElementById("auto-sell-market-cap-timeout-input");
+const autoSellMarketCapTimeoutActionInput = document.getElementById("auto-sell-market-cap-timeout-action-input");
 const sniperModal = document.getElementById("sniper-modal");
 const sniperClose = document.getElementById("sniper-close");
 const sniperCancel = document.getElementById("sniper-cancel");
@@ -231,7 +241,6 @@ let vampAutoImportTimer = null;
 let vampInFlightAddress = "";
 const OUTPUT_SECTION_VISIBILITY_KEY = "launchdeck.outputSectionVisible";
 const REPORTS_TERMINAL_VISIBILITY_KEY = "launchdeck.reportsTerminalVisible";
-const REPORTS_TERMINAL_SORT_KEY = "launchdeck.reportsTerminalSort";
 const REPORTS_TERMINAL_LIST_WIDTH_KEY = "launchdeck.reportsTerminalListWidth";
 const THEME_MODE_STORAGE_KEY = "launchdeck.themeMode";
 const SELECTED_WALLET_STORAGE_KEY = "launchdeck.selectedWalletKey";
@@ -242,6 +251,7 @@ const SELECTED_MODE_STORAGE_KEY = "launchdeck.selectedMode";
 const SELECTED_BONK_QUOTE_ASSET_STORAGE_KEY = "launchdeck.bonkQuoteAsset";
 const FEE_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.feeSplitDraft.v1";
 const AGENT_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.agentSplitDraft.v1";
+const AUTO_SELL_DRAFT_STORAGE_KEY = "launchdeck.autoSellDraft.v1";
 let settingsModalInitialConfig = null;
 const bagsIdentityModeInput = getNamedInput("bagsIdentityMode");
 const bagsAgentUsernameHiddenInput = getNamedInput("bagsAgentUsername");
@@ -322,6 +332,7 @@ const requestStates = {
   bootstrap: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   walletStatus: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   runtimeStatus: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  followJobs: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   reports: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   reportView: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   images: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
@@ -382,9 +393,19 @@ let reportsTerminalState = {
   activeText: "",
   activeTab: "overview",
   view: "transactions",
-  sort: getStoredReportsTerminalSort(),
+  sort: "newest",
 };
 let reportsTerminalResizeState = null;
+let followJobsState = {
+  configured: false,
+  reachable: false,
+  jobs: [],
+  health: null,
+  timingProfiles: [],
+  error: "",
+  loaded: false,
+  refreshTimer: null,
+};
 let outputFollowRefreshState = {
   serial: 0,
   timer: null,
@@ -397,6 +418,8 @@ const REPORTS_TERMINAL_MAX_LIST_WIDTH = 240;
 const REPORTS_TERMINAL_ITEM_LIMIT = 25;
 const OUTPUT_FOLLOW_REFRESH_INTERVAL_MS = 1500;
 const OUTPUT_FOLLOW_REFRESH_TIMEOUT_MS = 90000;
+const FOLLOW_JOBS_REFRESH_INTERVAL_MS = 5000;
+const FOLLOW_JOBS_OFFLINE_RETRY_MS = 15000;
 const SPLIT_COLORS = ["#5b7cff", "#ff5d5d", "#14c38e", "#ffb020", "#7c5cff", "#00b8d9", "#ef5da8", "#8b5cf6"];
 const DEFAULT_QUICK_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
 const DEFAULT_PRESET_ID = "preset1";
@@ -731,6 +754,71 @@ function setStoredAgentSplitDraft(value) {
   }
 }
 
+function normalizeAutoSellDraft(value) {
+  if (!value || typeof value !== "object") return null;
+  const triggerFamily = normalizeAutoSellTriggerFamily(
+    value.triggerFamily || ((Boolean(value.marketCapEnabled) || String(value.marketCapThreshold || "").trim()) ? "market-cap" : "time")
+  );
+  const legacyTimeoutMinutes = Math.max(1, Math.min(1440, Math.round(Number(value.marketCapScanTimeoutMinutes || 15) || 15)));
+  const timeoutSeconds = value.marketCapScanTimeoutSeconds != null && value.marketCapScanTimeoutSeconds !== ""
+    ? Math.max(1, Math.min(86400, Math.round(Number(value.marketCapScanTimeoutSeconds || 15) || 15)))
+    : legacyTimeoutMinutes * 60;
+  return {
+    enabled: Boolean(value.enabled),
+    percent: Math.max(1, Math.min(100, Number(value.percent || 100) || 100)),
+    triggerFamily,
+    triggerMode: normalizeAutoSellTriggerMode(value.triggerMode),
+    delayMs: Math.max(0, Number(value.delayMs || 0) || 0),
+    blockOffset: Math.max(0, Math.min(23, Math.round(Number(value.blockOffset || 0) || 0))),
+    marketCapEnabled: triggerFamily === "market-cap" || Boolean(value.marketCapEnabled),
+    marketCapThreshold: String(value.marketCapThreshold || "").trim(),
+    marketCapDirection: String(value.marketCapDirection || "").trim().toLowerCase() === "lte" ? "lte" : "gte",
+    marketCapScanTimeoutSeconds: timeoutSeconds,
+    marketCapTimeoutAction: String(value.marketCapTimeoutAction || "").trim().toLowerCase() === "sell" ? "sell" : "stop",
+  };
+}
+
+function getStoredAutoSellDraft() {
+  try {
+    const raw = window.localStorage.getItem(AUTO_SELL_DRAFT_STORAGE_KEY);
+    if (!raw) return null;
+    return normalizeAutoSellDraft(JSON.parse(raw));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function setStoredAutoSellDraft(value) {
+  try {
+    const normalized = normalizeAutoSellDraft(value);
+    if (!normalized) {
+      window.localStorage.removeItem(AUTO_SELL_DRAFT_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(AUTO_SELL_DRAFT_STORAGE_KEY, JSON.stringify(normalized));
+  } catch (_error) {
+    // Ignore localStorage write failures.
+  }
+}
+
+function applyAutoSellDraft(value, { persist = false } = {}) {
+  const draft = normalizeAutoSellDraft(value);
+  if (!draft) return;
+  if (autoSellEnabledInput) autoSellEnabledInput.checked = Boolean(draft.enabled);
+  setNamedValue("automaticDevSellTriggerFamily", draft.triggerFamily);
+  setNamedValue("automaticDevSellPercent", String(draft.percent));
+  setNamedValue("automaticDevSellTriggerMode", draft.triggerMode);
+  setNamedValue("automaticDevSellDelayMs", String(draft.delayMs));
+  setNamedValue("automaticDevSellBlockOffset", String(draft.blockOffset));
+  setNamedChecked("automaticDevSellMarketCapEnabled", draft.triggerFamily === "market-cap");
+  setNamedValue("automaticDevSellMarketCapThreshold", draft.marketCapThreshold);
+  setNamedValue("automaticDevSellMarketCapDirection", draft.marketCapDirection);
+  setNamedValue("automaticDevSellMarketCapScanTimeoutSeconds", String(draft.marketCapScanTimeoutSeconds));
+  setNamedValue("automaticDevSellMarketCapTimeoutAction", draft.marketCapTimeoutAction);
+  syncDevAutoSellUI();
+  if (persist) setStoredAutoSellDraft(draft);
+}
+
 function applyAgentSplitDraft(value, { persist = false } = {}) {
   const draft = normalizeAgentSplitDraft(value);
   if (agentSplitList) {
@@ -872,13 +960,12 @@ const reportsFeature = window.ReportsFeature.create({
     toggleOutputButton,
     toggleReportsButton,
     reportsRefreshButton,
-    reportsSortButton,
     reportsTransactionsButton,
     reportsLaunchesButton,
+    reportsActiveJobsButton,
   },
   storage: {
     visibilityKey: REPORTS_TERMINAL_VISIBILITY_KEY,
-    sortKey: REPORTS_TERMINAL_SORT_KEY,
     listWidthKey: REPORTS_TERMINAL_LIST_WIDTH_KEY,
   },
   requestStates,
@@ -913,6 +1000,34 @@ const reportsFeature = window.ReportsFeature.create({
 
 reportsFeature.bindEvents();
 
+if (reportsTerminalOutput) {
+  reportsTerminalOutput.addEventListener("click", async (event) => {
+    const cancelAllButton = event.target.closest("[data-follow-cancel-all]");
+    if (cancelAllButton) {
+      if (cancelAllButton.disabled) return;
+      if (!window.confirm("Cancel all active follow launches?")) return;
+      try {
+        await cancelAllFollowJobs();
+        await refreshReportsTerminal().catch(() => {});
+      } catch (error) {
+        metaNode.textContent = error && error.message ? error.message : "Failed to cancel active follow launches.";
+      }
+      return;
+    }
+    const cancelButton = event.target.closest("[data-follow-cancel-trace-id]");
+    if (!cancelButton) return;
+    const traceId = cancelButton.getAttribute("data-follow-cancel-trace-id") || "";
+    if (!traceId) return;
+    if (!window.confirm("Cancel this follow launch?")) return;
+    try {
+      await cancelFollowJob(traceId, { note: "Cancelled from History launch card" });
+      await refreshReportsTerminal().catch(() => {});
+    } catch (error) {
+      metaNode.textContent = error && error.message ? error.message : "Failed to cancel follow launch.";
+    }
+  });
+}
+
 function getStoredReportsTerminalListWidth() {
   return reportsFeature.getStoredListWidth();
 }
@@ -924,12 +1039,6 @@ function setReportsTerminalListWidth(width, options) {
 function setReportsTerminalVisible(isVisible, options) {
   return reportsFeature.setVisible(isVisible, options);
 }
-
-function setReportsTerminalSort(sort, options) {
-  return reportsFeature.setSort(sort, options);
-}
-
-setReportsTerminalSort(reportsTerminalState.sort, { persist: false });
 setReportsTerminalVisible(
   isPopoutMode && popoutReportsParam != null
     ? popoutReportsParam === "1"
@@ -1100,7 +1209,10 @@ const autoSellFeature = window.AutoSellFeature.create({
     devAutoSellPanel,
     autoSellEnabledInput,
     autoSellToggleState,
+    autoSellTriggerFamilyValue,
     autoSellTriggerValue,
+    autoSellTimeSettings,
+    autoSellTriggerFamilyButtons,
     autoSellDelaySlider,
     autoSellDelayControl,
     autoSellPercentSlider,
@@ -1111,6 +1223,13 @@ const autoSellFeature = window.AutoSellFeature.create({
     autoSellSettings,
     autoSellTriggerModeButtons,
     autoSellBlockOffsetButtons,
+    autoSellMarketCapEnabledInput,
+    autoSellMarketCapSettings,
+    autoSellMarketCapThresholdInput,
+    autoSellMarketCapThresholdValue,
+    autoSellMarketCapDirectionInput,
+    autoSellMarketCapTimeoutInput,
+    autoSellMarketCapTimeoutActionInput,
   },
   getNamedValue,
   setNamedValue,
@@ -1119,7 +1238,23 @@ const autoSellFeature = window.AutoSellFeature.create({
   syncSettingsCapabilities,
   syncActivePresetFromInputs,
   validateFieldByName,
+  setNamedChecked,
   documentNode: document,
+  persistDraft: () => setStoredAutoSellDraft({
+    enabled: isNamedChecked("automaticDevSellEnabled"),
+    percent: getNamedValue("automaticDevSellPercent") || "100",
+    triggerFamily: getNamedValue("automaticDevSellTriggerFamily") || "time",
+    triggerMode: getNamedValue("automaticDevSellTriggerMode") || "block-offset",
+    delayMs: getNamedValue("automaticDevSellDelayMs") || "0",
+    blockOffset: getNamedValue("automaticDevSellBlockOffset") || "0",
+    marketCapEnabled: (getNamedValue("automaticDevSellTriggerFamily") || "time") === "market-cap",
+    marketCapThreshold: getNamedValue("automaticDevSellMarketCapThreshold") || "",
+    marketCapDirection: getNamedValue("automaticDevSellMarketCapDirection") || "gte",
+    marketCapScanTimeoutSeconds: getNamedValue("automaticDevSellMarketCapScanTimeoutSeconds")
+      || getNamedValue("automaticDevSellMarketCapScanTimeoutMinutes")
+      || "15",
+    marketCapTimeoutAction: getNamedValue("automaticDevSellMarketCapTimeoutAction") || "stop",
+  }),
 });
 
 autoSellFeature.bindEvents();
@@ -1128,8 +1263,20 @@ function normalizeAutoSellTriggerMode(value) {
   return autoSellFeature.normalizeTriggerMode(value);
 }
 
+function normalizeAutoSellTriggerFamily(value) {
+  return autoSellFeature.normalizeTriggerFamily(value);
+}
+
+function getAutoSellTriggerFamily() {
+  return autoSellFeature.getTriggerFamily();
+}
+
 function getAutoSellTriggerMode() {
   return autoSellFeature.getTriggerMode();
+}
+
+function parseAutoSellMarketCapThreshold(value) {
+  return autoSellFeature.parseMarketCapThreshold(value);
 }
 
 function getAutoSellDelayMs() {
@@ -1458,9 +1605,15 @@ function createFallbackConfig() {
         automaticDevSell: {
           enabled: false,
           percent: 100,
+          triggerFamily: "time",
           triggerMode: "block-offset",
           delayMs: 0,
           targetBlockOffset: 0,
+          marketCapEnabled: false,
+          marketCapThreshold: "",
+          marketCapDirection: "gte",
+          marketCapScanTimeoutSeconds: 15,
+          marketCapTimeoutAction: "stop",
         },
         postLaunchStrategy: "none",
       })),
@@ -3045,6 +3198,27 @@ function hasMeaningfulFeeSplitConfiguration() {
   return hasMeaningfulFeeSplitRecipients(collectFeeSplitRecipients());
 }
 
+function hasMeaningfulAgentSplitRecipients(recipients) {
+  const entries = Array.isArray(recipients) ? recipients.filter(Boolean) : [];
+  if (entries.length === 0) return false;
+  const positiveAgentShare = entries
+    .filter((entry) => entry.type === "agent")
+    .reduce((sum, entry) => sum + Math.max(0, Number(entry.shareBps || 0)), 0);
+  if (positiveAgentShare > 0) return true;
+  const positiveNonAgentEntries = entries.filter((entry) => entry.type !== "agent" && Number(entry.shareBps || 0) > 0);
+  if (positiveNonAgentEntries.length === 0) return false;
+  if (positiveNonAgentEntries.length !== 1) return true;
+  const [entry] = positiveNonAgentEntries;
+  if (!entry || entry.type !== "wallet") return true;
+  const deployerAddress = getDeployerFeeSplitAddress();
+  if (!deployerAddress) return true;
+  return String(entry.address || "").trim() !== deployerAddress || Number(entry.shareBps || 0) !== 10_000;
+}
+
+function hasMeaningfulAgentSplitConfiguration() {
+  return hasMeaningfulAgentSplitRecipients(collectAgentSplitRecipients());
+}
+
 function finalizeFeeSplitDraftForMode() {
   const draft = normalizeFeeSplitDraft(serializeFeeSplitDraft());
   const mode = getMode();
@@ -3643,33 +3817,39 @@ function applyPersistentDefaults(config) {
   const storedBonkQuoteAsset = getStoredBonkQuoteAsset();
   const storedFeeSplitDraft = getStoredFeeSplitDraft();
   const storedAgentSplitDraft = getStoredAgentSplitDraft();
+  const storedAutoSellDraft = getStoredAutoSellDraft();
   setLaunchpad(storedLaunchpad || defaults.launchpad || "pump");
   if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = normalizeQuoteAsset(storedBonkQuoteAsset || "sol");
   setConfig(config);
   applyPresetToSettingsInputs(getActivePreset(config));
   warmDevBuyQuoteCache();
-  if (defaults.automaticDevSell) {
-    if (autoSellEnabledInput) autoSellEnabledInput.checked = Boolean(defaults.automaticDevSell.enabled);
-    setNamedValue(
-      "automaticDevSellPercent",
-      String(defaults.automaticDevSell.enabled
+  if (storedAutoSellDraft) {
+    applyAutoSellDraft(storedAutoSellDraft, { persist: false });
+  } else if (defaults.automaticDevSell) {
+    applyAutoSellDraft({
+      enabled: defaults.automaticDevSell.enabled,
+      percent: defaults.automaticDevSell.enabled
         ? Math.max(1, Number(defaults.automaticDevSell.percent || 100))
-        : Number(defaults.automaticDevSell.percent || 100)),
-    );
-    setNamedValue(
-      "automaticDevSellTriggerMode",
-      normalizeAutoSellTriggerMode(
-        defaults.automaticDevSell.triggerMode
-          || (Number(defaults.automaticDevSell.delaySeconds || 0) > 0 ? "submit-delay" : "block-offset"),
-      ),
-    );
-    setNamedValue(
-      "automaticDevSellDelayMs",
-      String(defaults.automaticDevSell.delayMs != null
+        : Number(defaults.automaticDevSell.percent || 100),
+      triggerFamily: defaults.automaticDevSell.triggerFamily
+        || ((Boolean(defaults.automaticDevSell.marketCapEnabled) || Boolean(defaults.automaticDevSell.marketCapThreshold))
+          ? "market-cap"
+          : "time"),
+      triggerMode: defaults.automaticDevSell.triggerMode
+        || (Number(defaults.automaticDevSell.delaySeconds || 0) > 0 ? "submit-delay" : "block-offset"),
+      delayMs: defaults.automaticDevSell.delayMs != null
         ? defaults.automaticDevSell.delayMs
-        : Number(defaults.automaticDevSell.delaySeconds || 0) * 1000),
-    );
-    setNamedValue("automaticDevSellBlockOffset", String(defaults.automaticDevSell.targetBlockOffset || 0));
+        : Number(defaults.automaticDevSell.delaySeconds || 0) * 1000,
+      blockOffset: defaults.automaticDevSell.targetBlockOffset || 0,
+      marketCapEnabled: Boolean(defaults.automaticDevSell.marketCapEnabled)
+        || Boolean(defaults.automaticDevSell.marketCapThreshold),
+      marketCapThreshold: defaults.automaticDevSell.marketCapThreshold || "",
+      marketCapDirection: defaults.automaticDevSell.marketCapDirection || "gte",
+      marketCapScanTimeoutSeconds: defaults.automaticDevSell.marketCapScanTimeoutSeconds != null
+        ? defaults.automaticDevSell.marketCapScanTimeoutSeconds
+        : ((defaults.automaticDevSell.marketCapScanTimeoutMinutes || 15) * 60),
+      marketCapTimeoutAction: defaults.automaticDevSell.marketCapTimeoutAction || "stop",
+    }, { persist: false });
   }
   applyFeeSplitDraft(
     storedFeeSplitDraft || (defaults.misc && defaults.misc.feeSplitDraft) || null,
@@ -3688,7 +3868,6 @@ function applyPersistentDefaults(config) {
     });
   }
   setMode(storedMode || defaults.mode || "regular");
-  syncDevAutoSellUI();
   setPresetEditing(Boolean(defaults.presetEditing));
   if (!storedSniperDraft && defaults.misc && defaults.misc.sniperDraft) {
     sniperFeature.setState(normalizeSniperDraftState(defaults.misc.sniperDraft));
@@ -3730,8 +3909,14 @@ function readForm() {
   const devBuyAmount = String(values.devBuyAmount || "").trim();
   const autoSellRequested = isNamedChecked("automaticDevSellEnabled");
   const automaticDevSellEnabled = autoSellRequested && Boolean(devBuyAmount);
-  const agentSplitRecipients = mode === "agent-custom" ? collectAgentSplitRecipients() : [];
-  const agentBuyback = agentSplitRecipients.find((entry) => entry.type === "agent");
+  const rawAgentSplitRecipients = mode === "agent-custom" ? collectAgentSplitRecipients() : [];
+  const agentSplitRecipients = mode === "agent-custom" && hasMeaningfulAgentSplitRecipients(rawAgentSplitRecipients)
+    ? rawAgentSplitRecipients
+    : [];
+  const agentBuyback = rawAgentSplitRecipients.find((entry) => entry.type === "agent");
+  const meaningfulFeeSplitEnabled = mode === "regular"
+    ? Boolean(feeSplitEnabled && feeSplitEnabled.checked && hasMeaningfulFeeSplitConfiguration())
+    : mode.startsWith("bags-");
   let sniperWallets = [];
   try {
     const parsed = JSON.parse(getNamedValue("sniperConfigJson") || "[]");
@@ -3797,9 +3982,9 @@ function readForm() {
     jitoTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
     skipPreflight: getNamedValue("skipPreflight") === "true",
     trackSendBlockHeight: true,
-    feeSplitEnabled: mode === "regular" ? feeSplitEnabled.checked : mode.startsWith("bags-"),
+    feeSplitEnabled: meaningfulFeeSplitEnabled,
     feeSplitRecipients: mode === "regular"
-      ? (feeSplitEnabled.checked ? collectFeeSplitRecipients() : [])
+      ? (meaningfulFeeSplitEnabled ? collectFeeSplitRecipients() : [])
       : (mode.startsWith("bags-") ? collectFeeSplitRecipients() : []),
     creatorFeeMode: importedCreatorFeeState.mode || "",
     creatorFeeAddress: importedCreatorFeeState.address || "",
@@ -3812,9 +3997,17 @@ function readForm() {
     sniperConfigJson: getNamedValue("sniperConfigJson") || "[]",
     automaticDevSellEnabled,
     automaticDevSellPercent: getNamedValue("automaticDevSellPercent") || "0",
+    automaticDevSellTriggerFamily: getAutoSellTriggerFamily(),
     automaticDevSellTriggerMode: getAutoSellTriggerMode(),
     automaticDevSellDelayMs: String(getAutoSellDelayMs()),
     automaticDevSellBlockOffset: String(getAutoSellBlockOffset()),
+    automaticDevSellMarketCapEnabled: getAutoSellTriggerFamily() === "market-cap",
+    automaticDevSellMarketCapThreshold: getNamedValue("automaticDevSellMarketCapThreshold") || "",
+    automaticDevSellMarketCapDirection: getNamedValue("automaticDevSellMarketCapDirection") || "gte",
+    automaticDevSellMarketCapScanTimeoutSeconds: getNamedValue("automaticDevSellMarketCapScanTimeoutSeconds")
+      || getNamedValue("automaticDevSellMarketCapScanTimeoutMinutes")
+      || "15",
+    automaticDevSellMarketCapTimeoutAction: getNamedValue("automaticDevSellMarketCapTimeoutAction") || "stop",
     vanityPrivateKey: getNamedValue("vanityPrivateKey") || "",
     imageFileName: uploadedImage ? uploadedImage.fileName : "",
     metadataUri: metadataUri.value || "",
@@ -4150,6 +4343,220 @@ function applyBootstrapFastPayload(payload) {
 function applyRuntimeStatusPayload(payload) {
   latestRuntimeStatus = payload;
   markBootstrapState({ runtimeLoaded: true });
+  syncFollowStatusChrome();
+  refreshFollowJobs({ silent: true }).catch(() => {});
+}
+
+function runtimeFollowDaemonStatus() {
+  return latestRuntimeStatus && latestRuntimeStatus.followDaemon && typeof latestRuntimeStatus.followDaemon === "object"
+    ? latestRuntimeStatus.followDaemon
+    : null;
+}
+
+function clearFollowJobsRefreshTimer() {
+  if (!followJobsState.refreshTimer) return;
+  window.clearTimeout(followJobsState.refreshTimer);
+  followJobsState.refreshTimer = null;
+}
+
+function countFollowJobStates(jobs = []) {
+  return jobs.reduce((accumulator, job) => {
+    const state = String(job && job.state || "").trim().toLowerCase();
+    if (state === "reserved") accumulator.reserved += 1;
+    else if (state === "armed") accumulator.armed += 1;
+    else if (state === "running") accumulator.running += 1;
+    if (!isTerminalFollowJobState(state)) {
+      accumulator.active += 1;
+      if (job && job.lastError) accumulator.issues += 1;
+    }
+    return accumulator;
+  }, {
+    active: 0,
+    reserved: 0,
+    armed: 0,
+    running: 0,
+    issues: 0,
+  });
+}
+
+function followStatusSnapshot() {
+  const runtimeFollow = runtimeFollowDaemonStatus();
+  const configured = Boolean(runtimeFollow && runtimeFollow.configured);
+  const reachable = Boolean(runtimeFollow && runtimeFollow.reachable);
+  const health = followJobsState.health || (runtimeFollow && runtimeFollow.health) || null;
+  const counts = followJobsState.loaded
+    ? countFollowJobStates(followJobsState.jobs)
+    : {
+        active: Number(health && health.activeJobs || 0),
+        reserved: 0,
+        armed: 0,
+        running: 0,
+        issues: 0,
+      };
+  return {
+    configured,
+    reachable,
+    health,
+    counts,
+    canCancelAll: followJobsState.loaded && counts.active > 0,
+    offline: configured && !reachable,
+  };
+}
+
+function buildFollowJobsSummaryText(snapshot = followStatusSnapshot()) {
+  if (!snapshot.configured) return "Follow disabled";
+  if (snapshot.offline) return "Follow offline";
+  if (snapshot.counts.active > 0) {
+    const parts = [`${snapshot.counts.active} active`];
+    if (snapshot.counts.reserved > 0) parts.push(`${snapshot.counts.reserved} reserved`);
+    if (snapshot.counts.armed > 0) parts.push(`${snapshot.counts.armed} armed`);
+    if (snapshot.counts.running > 0) parts.push(`${snapshot.counts.running} running`);
+    if (snapshot.counts.issues > 0) parts.push(`${snapshot.counts.issues} issue${snapshot.counts.issues === 1 ? "" : "s"}`);
+    return parts.join(" | ");
+  }
+  return "Follow idle";
+}
+
+function syncFollowStatusChrome() {
+  const snapshot = followStatusSnapshot();
+  if (toggleReportsButton) {
+    toggleReportsButton.title = snapshot.offline
+      ? "Dashboard (follow daemon offline)"
+      : snapshot.counts.active > 0
+        ? `Dashboard (${snapshot.counts.active} active follow launch${snapshot.counts.active === 1 ? "" : "es"})`
+        : "Dashboard";
+  }
+}
+
+function scheduleFollowJobsRefresh() {
+  clearFollowJobsRefreshTimer();
+  const snapshot = followStatusSnapshot();
+  const shouldRefresh = snapshot.offline || snapshot.counts.active > 0 || Boolean(reportsTerminalSection && !reportsTerminalSection.hidden);
+  if (!shouldRefresh) return;
+  const delayMs = snapshot.offline ? FOLLOW_JOBS_OFFLINE_RETRY_MS : FOLLOW_JOBS_REFRESH_INTERVAL_MS;
+  followJobsState.refreshTimer = window.setTimeout(() => {
+    refreshFollowJobs({ silent: true }).catch(() => {});
+  }, delayMs);
+}
+
+async function refreshFollowJobs({ silent = false } = {}) {
+  clearFollowJobsRefreshTimer();
+  const runtimeFollow = runtimeFollowDaemonStatus();
+  if (runtimeFollow && runtimeFollow.configured === false) {
+    followJobsState = {
+      ...followJobsState,
+      configured: false,
+      reachable: false,
+      jobs: [],
+      health: null,
+      timingProfiles: [],
+      error: "",
+      loaded: true,
+    };
+    syncFollowStatusChrome();
+    return;
+  }
+  try {
+    const result = RequestUtils.fetchJsonLatest
+      ? await RequestUtils.fetchJsonLatest("follow-jobs", "/api/follow/jobs", {}, requestStates.followJobs)
+      : null;
+    if (result && result.aborted) return;
+    const response = result ? result.response : await fetch("/api/follow/jobs");
+    const payload = result ? result.payload : await response.json();
+    if (result && !result.isLatest) return;
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || "Failed to load follow launch status.");
+    }
+    followJobsState = {
+      ...followJobsState,
+      configured: true,
+      reachable: true,
+      jobs: Array.isArray(payload.jobs) ? payload.jobs : [],
+      health: payload.health && typeof payload.health === "object" ? payload.health : null,
+      timingProfiles: Array.isArray(payload.timingProfiles) ? payload.timingProfiles : [],
+      error: "",
+      loaded: true,
+    };
+  } catch (error) {
+    followJobsState = {
+      ...followJobsState,
+      configured: Boolean(runtimeFollow && runtimeFollow.configured),
+      reachable: false,
+      jobs: [],
+      health: runtimeFollow && runtimeFollow.health && typeof runtimeFollow.health === "object" ? runtimeFollow.health : null,
+      error: error && error.message ? error.message : "Failed to load follow launch status.",
+      loaded: true,
+    };
+    if (!silent && reportsTerminalOutput && ["launches", "active-jobs"].includes(normalizeReportsTerminalView(reportsTerminalState.view))) {
+      reportsTerminalState.activeText = followJobsState.error;
+    }
+  }
+  syncFollowStatusChrome();
+  if (["launches", "active-jobs"].includes(normalizeReportsTerminalView(reportsTerminalState.view)) && reportsTerminalOutput) {
+    renderReportsTerminalOutput();
+  }
+  scheduleFollowJobsRefresh();
+}
+
+async function cancelFollowJob(traceId, { note = "" } = {}) {
+  const response = await fetch("/api/follow/cancel", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      traceId,
+      note,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to cancel follow launch.");
+  }
+  followJobsState = {
+    ...followJobsState,
+    jobs: Array.isArray(payload.jobs) ? payload.jobs : followJobsState.jobs,
+    health: payload.health && typeof payload.health === "object" ? payload.health : followJobsState.health,
+    timingProfiles: Array.isArray(payload.timingProfiles) ? payload.timingProfiles : followJobsState.timingProfiles,
+    reachable: true,
+    configured: true,
+    loaded: true,
+    error: "",
+  };
+  syncFollowStatusChrome();
+  scheduleFollowJobsRefresh();
+}
+
+async function cancelAllFollowJobs() {
+  const response = await fetch("/api/follow/stop-all", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      note: "Cancelled from History panel",
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to cancel active follow launches.");
+  }
+  followJobsState = {
+    ...followJobsState,
+    jobs: Array.isArray(payload.jobs) ? payload.jobs : [],
+    health: payload.health && typeof payload.health === "object" ? payload.health : followJobsState.health,
+    timingProfiles: Array.isArray(payload.timingProfiles) ? payload.timingProfiles : followJobsState.timingProfiles,
+    reachable: true,
+    configured: true,
+    loaded: true,
+    error: "",
+  };
+  syncFollowStatusChrome();
+  scheduleFollowJobsRefresh();
+}
+
+function activeFollowJobForTraceId(traceId) {
+  const normalized = String(traceId || "").trim();
+  if (!normalized) return null;
+  const job = followJobsState.jobs.find((entry) => String(entry && entry.traceId || "").trim() === normalized);
+  if (!job || isTerminalFollowJobState(job.state)) return null;
+  return job;
 }
 
 function applyWalletStatusPayload(payload) {
@@ -4465,15 +4872,32 @@ const fieldValidators = {
     return "";
   },
   automaticDevSellDelayMs(v) {
-    if (!isNamedChecked("automaticDevSellEnabled") || getAutoSellTriggerMode() !== "submit-delay") return "";
+    if (!isNamedChecked("automaticDevSellEnabled")
+      || getAutoSellTriggerFamily() !== "time"
+      || getAutoSellTriggerMode() !== "submit-delay") return "";
     const n = Number(v);
     if (isNaN(n) || n < 0 || n > 1500) return "Must be between 0 and 1500";
     return "";
   },
   automaticDevSellBlockOffset(v) {
-    if (!isNamedChecked("automaticDevSellEnabled") || getAutoSellTriggerMode() !== "block-offset") return "";
+    if (!isNamedChecked("automaticDevSellEnabled")
+      || getAutoSellTriggerFamily() !== "time"
+      || getAutoSellTriggerMode() !== "block-offset") return "";
     const n = Number(v);
-    if (isNaN(n) || n < 0 || n > 22) return "Must be between 0 and 22";
+    if (isNaN(n) || n < 0 || n > 23) return "Must be between 0 and 23";
+    return "";
+  },
+  automaticDevSellMarketCapThreshold(v) {
+    if (!isNamedChecked("automaticDevSellEnabled") || getAutoSellTriggerFamily() !== "market-cap") return "";
+    if (!String(v || "").trim()) return "Market cap is required";
+    const normalized = parseAutoSellMarketCapThreshold(v);
+    if (!Number.isFinite(normalized) || normalized <= 0) return "Use a positive number like 100000 or 100k";
+    return "";
+  },
+  automaticDevSellMarketCapScanTimeoutSeconds(v) {
+    if (!isNamedChecked("automaticDevSellEnabled") || getAutoSellTriggerFamily() !== "market-cap") return "";
+    const n = Number(v);
+    if (isNaN(n) || n < 1 || n > 86400) return "Must be between 1 and 86400";
     return "";
   },
   agentUnlockedBuybackPercent(v) {
@@ -4928,6 +5352,7 @@ async function run(action) {
         }
       });
       if (actualAction === "send" && payload.report && payload.report.followDaemon && payload.report.followDaemon.enabled) {
+        refreshFollowJobs({ silent: true }).catch(() => {});
         startOutputFollowRefresh(reportId);
       }
     }
@@ -4966,9 +5391,18 @@ function buildSavedConfigFromForm() {
     automaticDevSell: {
       enabled: isNamedChecked("automaticDevSellEnabled"),
       percent: Number(f.automaticDevSellPercent || 100),
+      triggerFamily: normalizeAutoSellTriggerFamily(f.automaticDevSellTriggerFamily),
       triggerMode: normalizeAutoSellTriggerMode(f.automaticDevSellTriggerMode),
       delayMs: Number(f.automaticDevSellDelayMs || 0),
       targetBlockOffset: Number(f.automaticDevSellBlockOffset || 0),
+      marketCapEnabled: normalizeAutoSellTriggerFamily(f.automaticDevSellTriggerFamily) === "market-cap",
+      marketCapThreshold: f.automaticDevSellMarketCapThreshold || "",
+      marketCapDirection: f.automaticDevSellMarketCapDirection || "gte",
+      marketCapScanTimeoutSeconds: Number(
+        f.automaticDevSellMarketCapScanTimeoutSeconds
+          || ((Number(f.automaticDevSellMarketCapScanTimeoutMinutes || 15) || 15) * 60)
+      ) || 15,
+      marketCapTimeoutAction: f.automaticDevSellMarketCapTimeoutAction || "stop",
     },
   };
 
@@ -5161,14 +5595,6 @@ function setImageLayoutCompact(isCompact, { persist = true } = {}) {
   schedulePopoutAutosize();
 }
 
-function getStoredReportsTerminalSort() {
-  try {
-    return window.localStorage.getItem(REPORTS_TERMINAL_SORT_KEY) === "oldest" ? "oldest" : "newest";
-  } catch (_error) {
-    return "newest";
-  }
-}
-
 function clampReportsTerminalListWidth(width) {
   const numeric = Number(width);
   if (!Number.isFinite(numeric)) return REPORTS_TERMINAL_DEFAULT_LIST_WIDTH;
@@ -5186,13 +5612,25 @@ function getCurrentReportsTerminalListWidth() {
 }
 
 function normalizeReportsTerminalView(view) {
-  return String(view || "").trim().toLowerCase() === "launches" ? "launches" : "transactions";
+  const normalized = String(view || "").trim().toLowerCase();
+  if (normalized === "launches") return "launches";
+  if (normalized === "active-jobs") return "active-jobs";
+  return "transactions";
 }
 
 function reportsTerminalMetaText(view = reportsTerminalState.view) {
-  return normalizeReportsTerminalView(view) === "launches"
-    ? "Latest 25 launches."
-    : "Latest 25 transactions.";
+  const normalized = normalizeReportsTerminalView(view);
+  if (normalized === "launches") return "Latest 25 launches.";
+  if (normalized === "active-jobs") {
+    const snapshot = followStatusSnapshot();
+    if (snapshot.offline) return "Follow daemon offline.";
+    if (!snapshot.configured) return "Follow daemon disabled.";
+    if (snapshot.counts.active > 0) {
+      return `${snapshot.counts.active} live follow job${snapshot.counts.active === 1 ? "" : "s"}.`;
+    }
+    return "Live follow-daemon jobs.";
+  }
+  return "Latest 25 transactions.";
 }
 
 function syncReportsTerminalChrome() {
@@ -5200,10 +5638,13 @@ function syncReportsTerminalChrome() {
   reportsTerminalState.view = view;
   if (reportsTerminalSection) {
     reportsTerminalSection.classList.toggle("is-launches-view", view === "launches");
+    reportsTerminalSection.classList.toggle("is-active-jobs-view", view === "active-jobs");
   }
   if (reportsTransactionsButton) reportsTransactionsButton.classList.toggle("active", view === "transactions");
   if (reportsLaunchesButton) reportsLaunchesButton.classList.toggle("active", view === "launches");
+  if (reportsActiveJobsButton) reportsActiveJobsButton.classList.toggle("active", view === "active-jobs");
   if (reportsTerminalMeta) reportsTerminalMeta.textContent = reportsTerminalMetaText(view);
+  syncFollowStatusChrome();
 }
 
 function metadataUriToGatewayUrl(uri) {
@@ -5305,6 +5746,7 @@ function buildLaunchHistoryEntry(entry, bundle, metadata) {
   const devBuy = parseDevBuyDescription(report.devBuyDescription);
   return {
     id: entry.id,
+    traceId: String(entry && entry.traceId || followJob.traceId || "").trim(),
     entry,
     payload,
     report,
@@ -5416,6 +5858,96 @@ function formatReportMetric(value, suffix = "", fallback = "--", digits = 0) {
   return `${numeric.toFixed(digits)}${suffix}`;
 }
 
+function parseReportMetricNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function buildTimingMetricItem(label, value, detail = "", { hideZero = false } = {}) {
+  const numeric = parseReportMetricNumber(value);
+  if (numeric == null || (hideZero && numeric === 0)) return null;
+  return {
+    label,
+    value: formatReportMetric(numeric, "ms"),
+    detail,
+  };
+}
+
+function deriveRemainingTiming(totalValue, childValues = []) {
+  const total = parseReportMetricNumber(totalValue);
+  if (total == null) return null;
+  let hasChild = false;
+  const consumed = childValues.reduce((sum, value) => {
+    const numeric = parseReportMetricNumber(value);
+    if (numeric == null) return sum;
+    hasChild = true;
+    return sum + numeric;
+  }, 0);
+  if (!hasChild) return null;
+  return Math.max(0, total - consumed);
+}
+
+function buildBenchmarkTimingSections(timings = {}) {
+  const compileTotal = parseReportMetricNumber(timings.compileTransactionsMs);
+  const compileAltLoad = parseReportMetricNumber(timings.compileAltLoadMs);
+  const compileBlockhash = parseReportMetricNumber(timings.compileBlockhashFetchMs);
+  const compileGlobal = parseReportMetricNumber(timings.compileGlobalFetchMs);
+  const compileFollowUp = parseReportMetricNumber(timings.compileFollowUpPrepMs);
+  const compileSerialize = parseReportMetricNumber(timings.compileTxSerializeMs);
+  const compileOther = deriveRemainingTiming(compileTotal, [
+    compileAltLoad,
+    compileBlockhash,
+    compileGlobal,
+    compileFollowUp,
+    compileSerialize,
+  ]);
+
+  const sendTotal = parseReportMetricNumber(timings.sendMs);
+  const submitTotal = parseReportMetricNumber(timings.sendSubmitMs);
+  const confirmTotal = parseReportMetricNumber(timings.sendConfirmMs);
+  const bagsSetupSubmit = parseReportMetricNumber(timings.bagsSetupSubmitMs);
+  const bagsSetupConfirm = parseReportMetricNumber(timings.bagsSetupConfirmMs);
+  const launchSubmit = bagsSetupSubmit != null ? deriveRemainingTiming(submitTotal, [bagsSetupSubmit]) : null;
+  const launchConfirm = bagsSetupConfirm != null ? deriveRemainingTiming(confirmTotal, [bagsSetupConfirm]) : null;
+  const sendOther = deriveRemainingTiming(sendTotal, [submitTotal, confirmTotal]);
+
+  return {
+    topLevel: [
+      buildTimingMetricItem("End-to-end", timings.totalElapsedMs, "client + backend"),
+      buildTimingMetricItem("Client overhead", timings.clientPreRequestMs, "before engine work starts"),
+      buildTimingMetricItem("Backend total", timings.backendTotalElapsedMs, "all engine work"),
+      buildTimingMetricItem("Compile total", timings.compileTransactionsMs, "inclusive stage total"),
+      buildTimingMetricItem("Send total", timings.sendMs, "inclusive of submit + confirm"),
+      buildTimingMetricItem("Persist report", timings.persistReportMs, "final report write"),
+    ],
+    prep: [
+      buildTimingMetricItem("Form -> Raw", timings.formToRawConfigMs, "UI payload to engine config"),
+      buildTimingMetricItem("Normalize", timings.normalizeConfigMs, "config validation + normalization"),
+      buildTimingMetricItem("Wallet load", timings.walletLoadMs, "wallet/env hydration"),
+      buildTimingMetricItem("Report build", timings.reportBuildMs, "initial report assembly"),
+    ],
+    compile: [
+      buildTimingMetricItem("Compile total", timings.compileTransactionsMs, "inclusive stage total"),
+      buildTimingMetricItem("ALT load", timings.compileAltLoadMs, "lookup table fetch"),
+      buildTimingMetricItem("Blockhash", timings.compileBlockhashFetchMs, "latest blockhash fetch"),
+      buildTimingMetricItem("Global fetch", timings.compileGlobalFetchMs, "shared launch context"),
+      buildTimingMetricItem("Follow-up prep", timings.compileFollowUpPrepMs, "follow action planning"),
+      buildTimingMetricItem("Serialize tx", timings.compileTxSerializeMs, "tx serialization only"),
+      buildTimingMetricItem("Compile other", compileOther, "remaining compile work", { hideZero: true }),
+    ],
+    send: [
+      buildTimingMetricItem("Send total", timings.sendMs, "inclusive stage total"),
+      buildTimingMetricItem("Submit total", timings.sendSubmitMs, "all transaction submissions"),
+      buildTimingMetricItem("Confirm total", timings.sendConfirmMs, "all confirmation waits"),
+      buildTimingMetricItem("Launch submit", launchSubmit, "launch tx only", { hideZero: true }),
+      buildTimingMetricItem("Setup submit", timings.bagsSetupSubmitMs, "setup tx submit", { hideZero: true }),
+      buildTimingMetricItem("Launch confirm", launchConfirm, "launch tx only", { hideZero: true }),
+      buildTimingMetricItem("Setup confirm", timings.bagsSetupConfirmMs, "setup tx confirm", { hideZero: true }),
+      buildTimingMetricItem("Send other", sendOther, "remaining transport overhead", { hideZero: true }),
+    ],
+  };
+}
+
 function formatReportTimestamp(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return "--";
@@ -5454,9 +5986,19 @@ function inferReportErrorCategory(message) {
 
 function describeFollowActionTrigger(action) {
   if (!action || typeof action !== "object") return "Immediate";
+  if (action.marketCap && String(action.marketCap.threshold || "").trim()) {
+    const timeoutSeconds = action.marketCap.scanTimeoutSeconds != null
+      ? Number(action.marketCap.scanTimeoutSeconds)
+      : (action.marketCap.scanTimeoutMinutes != null ? Number(action.marketCap.scanTimeoutMinutes) * 60 : null);
+    const timeoutAction = String(action.marketCap.timeoutAction || "").trim();
+    return `Market Cap ${action.marketCap.threshold}${Number.isFinite(timeoutSeconds) && timeoutSeconds > 0
+      ? ` (${timeoutSeconds}s${timeoutAction ? `, ${timeoutAction}` : ""})`
+      : ""}`;
+  }
   if (action.requireConfirmation) return "After confirmation";
   if (action.targetBlockOffset != null) return `On Confirmed Block + ${action.targetBlockOffset}`;
   if (Number(action.submitDelayMs || 0) > 0) return `Submit + ${action.submitDelayMs}ms`;
+  if (action.submitDelayMs != null) return "On Submit";
   if (Number(action.delayMs || 0) > 0) return `Delay ${action.delayMs}ms`;
   return "Immediate";
 }
@@ -5477,6 +6019,54 @@ function describeFollowActionSize(action) {
 function describeFollowActionWallet(action) {
   if (!action || !action.walletEnvKey) return "--";
   return `Wallet #${walletIndexFromEnvKey(action.walletEnvKey)}`;
+}
+
+function formatProviderLabel(provider) {
+  const normalized = String(provider || "").trim();
+  if (!normalized) return "--";
+  return PROVIDER_LABELS[normalized] || normalized;
+}
+
+function formatLaunchTransactionLabel(label) {
+  const normalized = String(label || "").trim();
+  if (!normalized) return "transaction";
+  if (normalized === "follow-up") return "fee-sharing setup";
+  if (normalized === "agent-setup") return "agent fee setup";
+  return normalized;
+}
+
+function followActionRouteDetails(action, followJob) {
+  const kind = String(action && action.kind || "").trim().toLowerCase();
+  const execution = followJob && followJob.execution && typeof followJob.execution === "object"
+    ? followJob.execution
+    : {};
+  const isBuy = kind === "sniper-buy";
+  const isSell = kind === "dev-auto-sell" || kind === "sniper-sell";
+  return {
+    provider: String(
+      (action && action.provider)
+      || (isBuy ? execution.buyProvider : "")
+      || (isSell ? execution.sellProvider : "")
+      || execution.provider
+      || "",
+    ).trim(),
+    endpointProfile: String(
+      (action && action.endpointProfile)
+      || (isBuy ? execution.buyEndpointProfile : "")
+      || (isSell ? execution.sellEndpointProfile : "")
+      || execution.endpointProfile
+      || "",
+    ).trim(),
+    transportType: String(action && action.transportType || "").trim(),
+  };
+}
+
+function describeFollowActionRoute(action, followJob) {
+  const route = followActionRouteDetails(action, followJob);
+  const parts = [];
+  if (route.provider) parts.push(formatProviderLabel(route.provider));
+  if (route.transportType && route.transportType !== route.provider) parts.push(route.transportType);
+  return parts.join(" | ");
 }
 
 function shortenReportEndpoint(endpoint) {
@@ -5518,7 +6108,11 @@ function renderCopyableHash(value, label = "Copy hash") {
 
 function buildFollowActionMetricItems(action, followJob) {
   const isBuy = String(action && action.kind || "").toLowerCase() === "sniper-buy";
+  const route = followActionRouteDetails(action, followJob);
   const metrics = [
+    { label: "Provider", value: formatProviderLabel(route.provider) },
+    { label: "Transport", value: route.transportType || "--" },
+    { label: "Endpoint Profile", value: route.endpointProfile || "--" },
     { label: "Wallet", value: describeFollowActionWallet(action) },
     { label: "Trigger", value: describeFollowActionTrigger(action) },
     {
@@ -5562,6 +6156,7 @@ function renderReportMetricGrid(items = []) {
         <div class="reports-metric-card">
           <span class="reports-metric-label">${escapeHTML(item.label || "")}</span>
           <strong class="reports-metric-value">${escapeHTML(String(item.value))}</strong>
+          ${item.detail ? `<span class="reports-metric-note">${escapeHTML(String(item.detail))}</span>` : ""}
         </div>
       `).join("")}
     </div>
@@ -5575,24 +6170,27 @@ function buildReportsOverviewMarkup() {
   const execution = currentReportsTerminalExecution() || {};
   const benchmark = currentReportsTerminalBenchmark() || {};
   const timings = benchmark.timings || execution.timings || {};
+  const benchmarkSections = buildBenchmarkTimingSections(timings);
   const health = report && report.followDaemon && report.followDaemon.health ? report.followDaemon.health : null;
   const job = currentReportsTerminalFollowJob();
   const actions = currentReportsTerminalFollowActions();
+  const providerCardLabel = job ? "Launch Provider" : "Provider";
+  const transportCardLabel = job ? "Launch Transport" : "Transport";
   const problemCount = actions.filter((action) => ["failed", "cancelled", "expired"].includes(String(action.state || "").toLowerCase())).length;
   const runningCount = actions.filter((action) => ["running", "eligible", "armed", "queued", "sent"].includes(String(action.state || "").toLowerCase())).length;
   const overviewCards = [
     { label: "Action", value: entry && entry.action ? entry.action : payload && payload.action ? payload.action : "--" },
     { label: "Mint", value: entry && entry.mint ? shortenAddress(entry.mint, 6) : report && report.mint ? shortenAddress(report.mint, 6) : "--" },
-    { label: "Provider", value: execution.resolvedProvider || execution.provider || "--" },
-    { label: "Transport", value: execution.transportType || (entry && entry.transportType) || "--" },
+    { label: providerCardLabel, value: execution.resolvedProvider || execution.provider || "--" },
+    { label: transportCardLabel, value: execution.transportType || (entry && entry.transportType) || "--" },
     { label: "Signatures", value: entry ? String(entry.signatureCount || 0) : String(Array.isArray(payload && payload.signatures) ? payload.signatures.length : 0) },
     { label: "Follow", value: job ? (job.state || "armed") : "Off" },
     { label: "Selected Wallet", value: job && job.selectedWalletKey ? `Wallet #${walletIndexFromEnvKey(job.selectedWalletKey)}` : "--" },
     { label: "Follow Actions", value: actions.length ? `${actions.length} total` : "0" },
     { label: "Problems", value: String(problemCount) },
     { label: "Running", value: String(runningCount) },
-    { label: "Submit", value: formatReportMetric(timings.sendSubmitMs, "ms") },
-    { label: "Confirm", value: formatReportMetric(timings.sendConfirmMs, "ms") },
+    buildTimingMetricItem("Submit total", timings.sendSubmitMs, "child of send total"),
+    buildTimingMetricItem("Confirm total", timings.sendConfirmMs, "child of send total"),
   ];
   const watcherCards = health
     ? [
@@ -5611,15 +6209,9 @@ function buildReportsOverviewMarkup() {
         ${renderReportMetricGrid(overviewCards)}
       </section>
       <section class="reports-panel-section">
-        <div class="reports-panel-title">Primary Benchmarks</div>
-        ${renderReportMetricGrid([
-          { label: "Total", value: formatReportMetric(timings.totalElapsedMs, "ms") },
-          { label: "Backend", value: formatReportMetric(timings.backendTotalElapsedMs, "ms") },
-          { label: "Compile", value: formatReportMetric(timings.compileTransactionsMs, "ms") },
-          { label: "Serialize", value: formatReportMetric(timings.compileTxSerializeMs, "ms") },
-          { label: "Send", value: formatReportMetric(timings.sendMs, "ms") },
-          { label: "Persist", value: formatReportMetric(timings.persistReportMs, "ms") },
-        ])}
+        <div class="reports-panel-title">Stage Totals</div>
+        <div class="reports-panel-note">Totals are inclusive. Child timings are broken out on the Benchmarks tab.</div>
+        ${renderReportMetricGrid(benchmarkSections.topLevel)}
       </section>
       ${watcherCards.length ? `
         <section class="reports-panel-section">
@@ -5650,7 +6242,7 @@ function buildReportsActionsMarkup() {
               <article class="reports-action-card">
                 <div class="reports-action-head">
                   <div>
-                    <strong>${escapeHTML(sent.label || "launch")}</strong>
+                    <strong>${escapeHTML(formatLaunchTransactionLabel(sent.label || "launch"))}</strong>
                     <div class="reports-action-subtitle">${escapeHTML(execution.resolvedProvider || execution.provider || execution.transportType || "--")}</div>
                   </div>
                   <span class="reports-state-badge ${reportStateClass(sent.confirmationStatus)}">${escapeHTML(sent.confirmationStatus || "sent")}</span>
@@ -5674,12 +6266,18 @@ function buildReportsActionsMarkup() {
           <div class="reports-action-list">
             ${actions.map((action) => {
               const errorCategory = inferReportErrorCategory(action.lastError);
+              const subtitleParts = [
+                describeFollowActionRoute(action, followJob),
+                describeFollowActionWallet(action),
+                describeFollowActionTrigger(action),
+                describeFollowActionSize({ ...action, parentQuoteAsset: followJob && followJob.quoteAsset }),
+              ].filter((part) => part && part !== "--");
               return `
                 <article class="reports-action-card">
                   <div class="reports-action-head">
                     <div>
                       <strong>${escapeHTML(action.kind || action.actionId || "action")}</strong>
-                      <div class="reports-action-subtitle">${escapeHTML(`${describeFollowActionWallet(action)} | ${describeFollowActionTrigger(action)} | ${describeFollowActionSize({ ...action, parentQuoteAsset: followJob && followJob.quoteAsset })}`)}</div>
+                      <div class="reports-action-subtitle">${escapeHTML(subtitleParts.join(" | "))}</div>
                     </div>
                     <span class="reports-state-badge ${reportStateClass(action.state)}">${escapeHTML(action.state || "--")}</span>
                   </div>
@@ -5700,28 +6298,27 @@ function buildReportsBenchmarksMarkup() {
   const benchmark = currentReportsTerminalBenchmark() || {};
   const execution = currentReportsTerminalExecution() || {};
   const timings = benchmark.timings || execution.timings || {};
+  const benchmarkSections = buildBenchmarkTimingSections(timings);
   const sent = Array.isArray(benchmark.sent) && benchmark.sent.length ? benchmark.sent : (Array.isArray(execution.sent) ? execution.sent : []);
   const timingProfiles = currentReportsTerminalTimingProfiles();
   return `
     <div class="reports-panel-stack">
       <section class="reports-panel-section">
-        <div class="reports-panel-title">Timing Breakdown</div>
-        ${renderReportMetricGrid([
-          { label: "Total", value: formatReportMetric(timings.totalElapsedMs, "ms") },
-          { label: "Backend", value: formatReportMetric(timings.backendTotalElapsedMs, "ms") },
-          { label: "Pre-request", value: formatReportMetric(timings.clientPreRequestMs, "ms") },
-          { label: "Form", value: formatReportMetric(timings.formToRawConfigMs, "ms") },
-          { label: "Normalize", value: formatReportMetric(timings.normalizeConfigMs, "ms") },
-          { label: "Wallet Load", value: formatReportMetric(timings.walletLoadMs, "ms") },
-          { label: "Compile", value: formatReportMetric(timings.compileTransactionsMs, "ms") },
-          { label: "ALT Load", value: formatReportMetric(timings.compileAltLoadMs, "ms") },
-          { label: "Blockhash", value: formatReportMetric(timings.compileBlockhashFetchMs, "ms") },
-          { label: "Serialize", value: formatReportMetric(timings.compileTxSerializeMs, "ms") },
-          { label: "Send", value: formatReportMetric(timings.sendMs, "ms") },
-          { label: "Submit", value: formatReportMetric(timings.sendSubmitMs, "ms") },
-          { label: "Confirm", value: formatReportMetric(timings.sendConfirmMs, "ms") },
-          { label: "Persist", value: formatReportMetric(timings.persistReportMs, "ms") },
-        ])}
+        <div class="reports-panel-title">Top-Level Timings</div>
+        <div class="reports-panel-note">Inclusive totals are shown separately from the nested work they contain.</div>
+        ${renderReportMetricGrid(benchmarkSections.topLevel)}
+      </section>
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">Preparation</div>
+        ${renderReportMetricGrid(benchmarkSections.prep)}
+      </section>
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">Compile Breakdown</div>
+        ${renderReportMetricGrid(benchmarkSections.compile)}
+      </section>
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">Send Breakdown</div>
+        ${renderReportMetricGrid(benchmarkSections.send)}
       </section>
       <section class="reports-panel-section">
         <div class="reports-panel-title">Chain Benchmark</div>
@@ -5843,8 +6440,27 @@ function buildLaunchHistoryLaunchBuyFallbackText(launch) {
 function buildLaunchHistoryAutoSellText(launch) {
   const devAutoSell = launch.followLaunch && launch.followLaunch.devAutoSell && launch.followLaunch.devAutoSell.enabled;
   if (!devAutoSell) return "";
-  const percent = launch.followLaunch.devAutoSell.percent != null ? launch.followLaunch.devAutoSell.percent : 100;
-  return `${percent}%`;
+  const autoSell = launch.followLaunch.devAutoSell;
+  const percent = autoSell.percent != null ? autoSell.percent : 100;
+  const parts = [`${percent}%`];
+  if (autoSell.marketCap && autoSell.marketCap.threshold) {
+    const trigger = autoSell.marketCap;
+    parts.push(
+      `market ${trigger.threshold}${
+        (trigger.scanTimeoutSeconds != null || trigger.scanTimeoutMinutes != null)
+          ? ` (${trigger.scanTimeoutSeconds != null ? trigger.scanTimeoutSeconds : trigger.scanTimeoutMinutes * 60}s${trigger.timeoutAction ? `, ${trigger.timeoutAction}` : ""})`
+          : ""
+      }`
+    );
+  } else if (autoSell.targetBlockOffset != null) {
+    parts.push(`confirmed + ${autoSell.targetBlockOffset}`);
+  } else if (autoSell.requireConfirmation) {
+    parts.push("after confirmation");
+  } else {
+    const delayMs = autoSell.delayMs != null ? autoSell.delayMs : 0;
+    parts.push(delayMs > 0 ? `submit + ${delayMs}ms` : "on submit");
+  }
+  return parts.join(" | ");
 }
 
 function buildLaunchHistoryBuyAmountItems(launch) {
@@ -5915,6 +6531,264 @@ function launchSolscanUrl(launch) {
   return signature ? `https://solscan.io/tx/${encodeURIComponent(signature)}` : "";
 }
 
+function formatFollowStateLabel(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "Unknown";
+  return normalized
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function followStateBadgeTone(state) {
+  const normalized = String(state || "").trim().toLowerCase();
+  if (["running", "sent", "confirmed", "completed"].includes(normalized)) return "is-good";
+  if (["failed", "cancelled", "completed-with-failures", "expired"].includes(normalized)) return "is-bad";
+  if (["armed", "eligible", "reserved"].includes(normalized)) return "is-warn";
+  return "";
+}
+
+function formatCompactDateTime(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "";
+  try {
+    return new Date(numeric).toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  } catch (_error) {
+    return "";
+  }
+}
+
+function summarizeFollowJobProgress(job) {
+  const actions = Array.isArray(job && job.actions) ? job.actions : [];
+  if (!actions.length) {
+    return job && job.cancelRequested
+      ? "Cancel requested."
+      : "Waiting for follow actions.";
+  }
+  const counts = actions.reduce((accumulator, action) => {
+    const state = String(action && action.state || "").trim().toLowerCase();
+    if (state) {
+      accumulator[state] = (accumulator[state] || 0) + 1;
+    }
+    return accumulator;
+  }, {});
+  const doneCount = (counts.confirmed || 0) + (counts.sent || 0);
+  const activeCount = (counts.running || 0) + (counts.eligible || 0);
+  const queuedCount = (counts.queued || 0) + (counts.armed || 0);
+  const failedCount = counts.failed || 0;
+  const cancelledCount = counts.cancelled || 0;
+  const expiredCount = counts.expired || 0;
+  const parts = [`${doneCount}/${actions.length} done`];
+  if (activeCount > 0) parts.push(`${activeCount} active`);
+  if (queuedCount > 0) parts.push(`${queuedCount} queued`);
+  if (failedCount > 0) parts.push(`${failedCount} failed`);
+  if (cancelledCount > 0) parts.push(`${cancelledCount} cancelled`);
+  if (expiredCount > 0) parts.push(`${expiredCount} expired`);
+  if (job && job.cancelRequested) parts.push("cancel requested");
+  return parts.join(" | ");
+}
+
+function buildFollowActionSubtitle(action) {
+  const parts = [];
+  if (action && action.walletEnvKey) parts.push(`W${walletIndexFromEnvKey(action.walletEnvKey)}`);
+  if (action && action.buyAmountSol) parts.push(`${action.buyAmountSol} SOL`);
+  if (action && action.sellPercent != null) parts.push(`${action.sellPercent}% sell`);
+  if (action && action.targetBlockOffset != null) parts.push(`+${action.targetBlockOffset} blocks`);
+  if (action && action.submitDelayMs != null && Number(action.submitDelayMs) > 0) parts.push(`${action.submitDelayMs}ms delay`);
+  if (action && action.signature) parts.push(shortAddress(action.signature));
+  return parts.join(" | ");
+}
+
+function buildActiveJobActionRouteMarkup(action, followJob) {
+  const route = followActionRouteDetails(action, followJob);
+  const rows = [
+    { label: "Provider", value: formatProviderLabel(route.provider) },
+    { label: "Transport", value: route.transportType || "--" },
+    { label: "Profile", value: route.endpointProfile || "--" },
+  ];
+  return `
+    <div class="reports-active-job-action-meta">
+      ${rows.map((row) => `
+        <span class="reports-active-job-action-meta-pill">
+          <strong>${escapeHTML(row.label)}</strong>
+          <span>${escapeHTML(row.value)}</span>
+        </span>
+      `).join("")}
+    </div>
+  `;
+}
+
+function buildActiveJobLaunchRouteMarkup(job) {
+  const plan = job && job.transportPlan && typeof job.transportPlan === "object"
+    ? job.transportPlan
+    : {};
+  const execution = job && job.execution && typeof job.execution === "object"
+    ? job.execution
+    : {};
+  const rows = [
+    { label: "Launch Provider", value: formatProviderLabel(plan.resolvedProvider || execution.provider || "") },
+    { label: "Launch Transport", value: String(plan.transportType || "--").trim() || "--" },
+    { label: "Launch Profile", value: String(plan.resolvedEndpointProfile || execution.endpointProfile || "--").trim() || "--" },
+  ];
+  return `
+    <div class="reports-active-job-route-meta">
+      ${rows.map((row) => `
+        <span class="reports-active-job-action-meta-pill">
+          <strong>${escapeHTML(row.label)}</strong>
+          <span>${escapeHTML(row.value)}</span>
+        </span>
+      `).join("")}
+    </div>
+  `;
+}
+
+function buildReportsActiveJobsMarkup() {
+  const snapshot = followStatusSnapshot();
+  const activeJobs = followJobsState.jobs.filter((job) => !isTerminalFollowJobState(job && job.state));
+  const summaryClassNames = [
+    "reports-follow-summary",
+    snapshot.offline ? "is-offline" : "",
+    snapshot.counts.active > 0 ? "is-active" : "",
+    snapshot.counts.issues > 0 ? "is-issues" : "",
+  ].filter(Boolean).join(" ");
+  if (snapshot.offline) {
+    return `
+      <div class="reports-panel-stack">
+        <div class="reports-active-jobs-header">
+          <div class="reports-active-jobs-heading">
+            <strong>Active Jobs</strong>
+            <span class="${summaryClassNames}">${escapeHTML(buildFollowJobsSummaryText(snapshot))}</span>
+          </div>
+          <button
+            type="button"
+            class="preset-chip compact reports-terminal-chip reports-terminal-chip-danger"
+            data-follow-cancel-all="1"
+            disabled
+          >Cancel all</button>
+        </div>
+        <div class="reports-callout is-bad">${escapeHTML(followJobsState.error || "Follow daemon is offline. Live active jobs are temporarily unavailable.")}</div>
+      </div>
+    `;
+  }
+  if (!snapshot.configured) {
+    return `
+      <div class="reports-panel-stack">
+        <div class="reports-active-jobs-header">
+          <div class="reports-active-jobs-heading">
+            <strong>Active Jobs</strong>
+            <span class="${summaryClassNames}">${escapeHTML(buildFollowJobsSummaryText(snapshot))}</span>
+          </div>
+        </div>
+        <div class="reports-terminal-empty">Follow daemon is not enabled for this workspace.</div>
+      </div>
+    `;
+  }
+  if (!activeJobs.length) {
+    return `
+      <div class="reports-panel-stack">
+        <div class="reports-active-jobs-header">
+          <div class="reports-active-jobs-heading">
+            <strong>Active Jobs</strong>
+            <span class="${summaryClassNames}">${escapeHTML(buildFollowJobsSummaryText(snapshot))}</span>
+          </div>
+        </div>
+        <div class="reports-terminal-empty">No active follow jobs right now.</div>
+      </div>
+    `;
+  }
+  return `
+    <div class="reports-panel-stack">
+      <div class="reports-active-jobs-header">
+        <div class="reports-active-jobs-heading">
+          <strong>Active Jobs</strong>
+          <span class="${summaryClassNames}">${escapeHTML(buildFollowJobsSummaryText(snapshot))}</span>
+        </div>
+        <button
+          type="button"
+          class="preset-chip compact reports-terminal-chip reports-terminal-chip-danger"
+          data-follow-cancel-all="1"
+          ${snapshot.canCancelAll && !snapshot.offline ? "" : "disabled"}
+        >Cancel all</button>
+      </div>
+      <div class="reports-active-jobs-grid">
+        ${activeJobs.map((job) => {
+          const createdLabel = formatCompactDateTime(job.createdAtMs || job.updatedAtMs);
+          const launchUrl = job.launchSignature ? `https://solscan.io/tx/${encodeURIComponent(job.launchSignature)}` : "";
+          return `
+            <article class="reports-launch-card reports-active-job-card">
+              <div class="reports-action-head">
+                <div>
+                  <strong class="reports-launch-card-title">${escapeHTML(`${job.launchpad || "launch"} follow job`)}</strong>
+                  <div class="reports-launch-card-subtitle">${escapeHTML(createdLabel ? `Created ${createdLabel}` : `Trace ${shortAddress(job.traceId || "")}`)}</div>
+                </div>
+                <span class="reports-state-badge ${followStateBadgeTone(job.state)}">${escapeHTML(formatFollowStateLabel(job.state))}</span>
+              </div>
+              <div class="reports-launch-card-chip-row">
+                <span class="reports-launch-card-chip">${escapeHTML(job.launchpad || "launch")}</span>
+                <span class="reports-launch-card-chip">${escapeHTML(job.quoteAsset || "sol")}</span>
+                ${job.cancelRequested ? '<span class="reports-launch-card-chip">cancel requested</span>' : ""}
+              </div>
+              ${buildActiveJobLaunchRouteMarkup(job)}
+              <div class="reports-active-job-meta-grid">
+                <div class="reports-launch-card-detail-row">
+                  <span class="reports-launch-card-detail-key">Wallet</span>
+                  <span class="reports-launch-card-detail-value">${escapeHTML(job.selectedWalletKey || "-")}</span>
+                </div>
+                <div class="reports-launch-card-detail-row">
+                  <span class="reports-launch-card-detail-key">Mint</span>
+                  <span class="reports-launch-card-detail-value">${escapeHTML(job.mint || "-")}</span>
+                </div>
+                <div class="reports-launch-card-detail-row">
+                  <span class="reports-launch-card-detail-key">Trace</span>
+                  <span class="reports-launch-card-detail-value">${escapeHTML(job.traceId || "-")}</span>
+                </div>
+                <div class="reports-launch-card-detail-row">
+                  <span class="reports-launch-card-detail-key">Launch</span>
+                  <span class="reports-launch-card-detail-value">${escapeHTML(job.launchSignature || "-")}</span>
+                </div>
+              </div>
+              <div class="reports-launch-card-section">
+                <div class="reports-launch-card-label">Progress</div>
+                <div class="reports-launch-card-copy">${escapeHTML(summarizeFollowJobProgress(job))}</div>
+                <div class="reports-active-job-action-list">
+                  ${(Array.isArray(job.actions) ? job.actions : []).map((action) => `
+                    <div class="reports-active-job-action">
+                      <div class="reports-active-job-action-copy">
+                        <strong>${escapeHTML(formatFollowStateLabel(action.kind || "action"))}</strong>
+                        <span>${escapeHTML(buildFollowActionSubtitle(action) || "No extra details.")}</span>
+                        ${buildActiveJobActionRouteMarkup(action, job)}
+                      </div>
+                      <span class="reports-state-badge ${followStateBadgeTone(action.state)}">${escapeHTML(formatFollowStateLabel(action.state))}</span>
+                    </div>
+                  `).join("")}
+                </div>
+              </div>
+              ${job.lastError ? `<div class="reports-callout is-bad">${escapeHTML(job.lastError)}</div>` : ""}
+              <div class="reports-launch-card-footer">
+                ${launchUrl ? `<a class="reports-inline-link" href="${escapeHTML(launchUrl)}" target="_blank" rel="noreferrer">Open launch tx</a>` : '<span class="reports-launch-card-copy">Launch signature not available yet.</span>'}
+                <div class="reports-launch-card-actions">
+                  <button
+                    type="button"
+                    class="preset-chip compact reports-terminal-chip reports-terminal-chip-danger"
+                    data-follow-cancel-trace-id="${escapeHTML(job.traceId || "")}"
+                    ${job.cancelRequested || snapshot.offline ? "disabled" : ""}
+                  >Cancel</button>
+                </div>
+              </div>
+            </article>
+          `;
+        }).join("")}
+      </div>
+    </div>
+  `;
+}
+
 function buildReportsLaunchesMarkup() {
   if (!reportsTerminalState.launches.length) {
     return '<div class="reports-terminal-empty">No deployed launches found yet.</div>';
@@ -5924,6 +6798,10 @@ function buildReportsLaunchesMarkup() {
       ${reportsTerminalState.launches.map((launch) => {
         const title = launch.title || "Unknown launch";
         const symbol = launch.symbol || "LAUNCH";
+        const activeFollowJob = activeFollowJobForTraceId(launch.traceId);
+        const followState = activeFollowJob && activeFollowJob.state
+          ? String(activeFollowJob.state)
+          : String(launch.followJob && launch.followJob.state || "").trim();
         const imageMarkup = launch.imageUrl
           ? `<img src="${escapeHTML(launch.imageUrl)}" alt="${escapeHTML(title)}" class="reports-launch-card-image">`
           : `<span class="reports-launch-card-image-fallback">${escapeHTML(symbol.slice(0, 4).toUpperCase())}</span>`;
@@ -5953,6 +6831,7 @@ function buildReportsLaunchesMarkup() {
               <span class="reports-launch-card-chip">${escapeHTML(launch.report && launch.report.launchpad ? launch.report.launchpad : "launch")}</span>
               <span class="reports-launch-card-chip">${escapeHTML(launch.report && launch.report.mode ? launch.report.mode : "regular")}</span>
               ${launch.followJob && launch.followJob.quoteAsset ? `<span class="reports-launch-card-chip">${escapeHTML(launch.followJob.quoteAsset)}</span>` : ""}
+              ${followState ? `<span class="reports-launch-card-chip">${escapeHTML(`follow ${followState}`)}</span>` : ""}
             </div>
             <div class="reports-launch-card-section">
               <div class="reports-launch-card-label">Settings</div>
@@ -5965,6 +6844,7 @@ function buildReportsLaunchesMarkup() {
             <div class="reports-launch-card-footer">
               ${solscanUrl ? `<a class="reports-inline-link" href="${escapeHTML(solscanUrl)}" target="_blank" rel="noreferrer">Open in Solscan</a>` : '<span class="reports-launch-card-copy">No signature recorded.</span>'}
               <div class="reports-launch-card-actions">
+                ${activeFollowJob ? `<button type="button" class="preset-chip compact reports-terminal-chip reports-terminal-chip-danger" data-follow-cancel-trace-id="${escapeHTML(launch.traceId)}">Cancel</button>` : ""}
                 <button type="button" class="preset-chip compact reports-terminal-chip" data-report-reuse-id="${escapeHTML(launch.id)}">Reuse</button>
                 <button type="button" class="preset-chip compact reports-terminal-chip active" data-report-relaunch-id="${escapeHTML(launch.id)}">Relaunch</button>
               </div>
@@ -5979,6 +6859,9 @@ function buildReportsLaunchesMarkup() {
 function buildReportsTerminalOutputMarkup() {
   if (normalizeReportsTerminalView(reportsTerminalState.view) === "launches") {
     return `<div class="reports-terminal-content">${buildReportsLaunchesMarkup()}</div>`;
+  }
+  if (normalizeReportsTerminalView(reportsTerminalState.view) === "active-jobs") {
+    return `<div class="reports-terminal-content">${buildReportsActiveJobsMarkup()}</div>`;
   }
   const payload = currentReportsTerminalPayload();
   const tab = normalizeReportsTerminalTab(reportsTerminalState.activeTab);
@@ -6028,7 +6911,7 @@ function renderReportsTerminalOutput() {
 function renderReportsTerminalList() {
   if (!reportsTerminalList) return;
   syncReportsTerminalChrome();
-  if (normalizeReportsTerminalView(reportsTerminalState.view) === "launches") {
+  if (["launches", "active-jobs"].includes(normalizeReportsTerminalView(reportsTerminalState.view))) {
     if (RenderUtils.setCachedHTML) {
       RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, "");
     } else {
@@ -6101,7 +6984,7 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
   } else {
     reportsTerminalList.innerHTML = '<div class="reports-terminal-empty">Loading reports...</div>';
   }
-  const url = `/api/reports?sort=${encodeURIComponent(reportsTerminalState.sort)}`;
+  const url = "/api/reports?sort=newest";
   const result = RequestUtils.fetchJsonLatest
     ? await RequestUtils.fetchJsonLatest("reports", url, {}, requestStates.reports)
     : null;
@@ -6116,7 +6999,8 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
   reportsTerminalState.entries = reportsTerminalState.allEntries
     .filter((entry) => ["send", "simulate", "build"].includes(String(entry && entry.action || "").trim().toLowerCase()))
     .slice(0, REPORTS_TERMINAL_ITEM_LIMIT);
-  setReportsTerminalSort(payload.sort || reportsTerminalState.sort, { persist: false });
+  reportsTerminalState.sort = "newest";
+  await refreshFollowJobs({ silent: true }).catch(() => {});
   const availableIds = new Set(reportsTerminalState.entries.map((entry) => entry.id));
   const nextId = preferId && availableIds.has(preferId)
     ? preferId
@@ -6128,6 +7012,13 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
   reportsTerminalState.activeId = nextId;
   if (normalizeReportsTerminalView(reportsTerminalState.view) === "launches") {
     await loadReportsTerminalLaunches();
+    reportsTerminalState.activePayload = null;
+    reportsTerminalState.activeText = "";
+    renderReportsTerminalList();
+    renderReportsTerminalOutput();
+    return;
+  }
+  if (normalizeReportsTerminalView(reportsTerminalState.view) === "active-jobs") {
     reportsTerminalState.activePayload = null;
     reportsTerminalState.activeText = "";
     renderReportsTerminalList();
@@ -6282,12 +7173,44 @@ async function applyLaunchHistoryEntryToForm(id) {
 
   const devAutoSell = launch.followLaunch && launch.followLaunch.devAutoSell ? launch.followLaunch.devAutoSell : null;
   if (autoSellEnabledInput) autoSellEnabledInput.checked = Boolean(devAutoSell && devAutoSell.enabled);
+  setNamedValue(
+    "automaticDevSellTriggerFamily",
+    devAutoSell && devAutoSell.marketCap && devAutoSell.marketCap.threshold ? "market-cap" : "time"
+  );
   setNamedValue("automaticDevSellPercent", String(devAutoSell && devAutoSell.percent != null ? devAutoSell.percent : 100));
   setNamedValue("automaticDevSellTriggerMode", devAutoSell && devAutoSell.targetBlockOffset != null
     ? "block-offset"
     : (devAutoSell && (devAutoSell.delayMs || 0) > 0 ? "submit-delay" : "block-offset"));
   setNamedValue("automaticDevSellDelayMs", String(devAutoSell && devAutoSell.delayMs != null ? devAutoSell.delayMs : 0));
   setNamedValue("automaticDevSellBlockOffset", String(devAutoSell && devAutoSell.targetBlockOffset != null ? devAutoSell.targetBlockOffset : 0));
+  setNamedChecked(
+    "automaticDevSellMarketCapEnabled",
+    Boolean(devAutoSell && devAutoSell.marketCap && devAutoSell.marketCap.threshold)
+  );
+  setNamedValue(
+    "automaticDevSellMarketCapThreshold",
+    String(devAutoSell && devAutoSell.marketCap && devAutoSell.marketCap.threshold ? devAutoSell.marketCap.threshold : "")
+  );
+  setNamedValue(
+    "automaticDevSellMarketCapDirection",
+    String(devAutoSell && devAutoSell.marketCap && devAutoSell.marketCap.direction ? devAutoSell.marketCap.direction : "gte")
+  );
+  setNamedValue(
+    "automaticDevSellMarketCapScanTimeoutSeconds",
+    String(
+      devAutoSell
+        && devAutoSell.marketCap
+        && (devAutoSell.marketCap.scanTimeoutSeconds != null || devAutoSell.marketCap.scanTimeoutMinutes != null)
+        ? (devAutoSell.marketCap.scanTimeoutSeconds != null
+          ? devAutoSell.marketCap.scanTimeoutSeconds
+          : devAutoSell.marketCap.scanTimeoutMinutes * 60)
+        : 15
+    )
+  );
+  setNamedValue(
+    "automaticDevSellMarketCapTimeoutAction",
+    String(devAutoSell && devAutoSell.marketCap && devAutoSell.marketCap.timeoutAction ? devAutoSell.marketCap.timeoutAction : "stop")
+  );
   syncDevAutoSellUI();
 
   applyProvidersFromLaunch(launch);

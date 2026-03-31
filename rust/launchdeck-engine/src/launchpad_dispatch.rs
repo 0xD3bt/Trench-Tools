@@ -80,6 +80,7 @@ pub async fn try_compile_native_launchpad(
     built_at: String,
     creator_public_key: String,
     config_path: Option<String>,
+    allow_ata_creation: bool,
 ) -> Result<Option<NativeLaunchArtifacts>, String> {
     match config.launchpad.as_str() {
         "pump" => try_compile_native_pump(
@@ -101,6 +102,7 @@ pub async fn try_compile_native_launchpad(
             built_at,
             creator_public_key,
             config_path,
+            allow_ata_creation,
         )
         .await
         .map(|result| result.map(Into::into)),
@@ -147,6 +149,7 @@ pub async fn compile_atomic_follow_buy_for_launchpad(
     mint: &str,
     launch_creator: &str,
     buy_amount_sol: &str,
+    allow_ata_creation: bool,
 ) -> Result<CompiledTransaction, String> {
     match launchpad {
         "pump" => {
@@ -174,6 +177,7 @@ pub async fn compile_atomic_follow_buy_for_launchpad(
                 mint,
                 launch_creator,
                 buy_amount_sol,
+                allow_ata_creation,
             )
             .await
         }

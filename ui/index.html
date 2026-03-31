@@ -58,7 +58,9 @@
                   </div>
                   <button id="open-vamp-button" type="button" class="preset-chip compact wallet-chip-button">Vamp</button>
                   <button id="toggle-output-button" type="button" class="preset-chip compact wallet-chip-button">Output</button>
-                  <button id="toggle-reports-button" type="button" class="preset-chip compact wallet-chip-button">History</button>
+                  <button id="toggle-reports-button" type="button" class="preset-chip compact wallet-chip-button">
+                    <span>Dashboard</span>
+                  </button>
                   <button id="toggle-theme-button" type="button" class="preset-chip compact wallet-chip-button icon-chip-button" title="Switch to white mode" aria-label="Switch to white mode">
                     <span class="icon-chip-glyph theme-icon theme-icon-sun" aria-hidden="true">
                       <svg viewBox="0 0 24 24" focusable="false">
@@ -363,8 +365,24 @@
                   <div id="auto-sell-settings" class="auto-sell-settings" hidden>
                     <div class="auto-sell-trigger-block">
                       <div class="auto-sell-slider-head">
-                        <span>Trigger</span>
-                        <strong id="auto-sell-trigger-value">Safe</strong>
+                        <span>Trigger Type</span>
+                        <strong id="auto-sell-trigger-family-value">Time</strong>
+                      </div>
+                      <div class="auto-sell-segmented-control">
+                        <button type="button" class="preset-chip compact wallet-chip-button auto-sell-segmented-button" data-auto-sell-trigger-family="time">
+                          <span class="mode-title">Time</span>
+                        </button>
+                        <button type="button" class="preset-chip compact wallet-chip-button auto-sell-segmented-button" data-auto-sell-trigger-family="market-cap">
+                          <span class="mode-title">Mcap</span>
+                        </button>
+                      </div>
+                      <input name="automaticDevSellTriggerFamily" type="hidden" value="time">
+                      <input id="auto-sell-market-cap-enabled-input" name="automaticDevSellMarketCapEnabled" type="checkbox" hidden>
+                    </div>
+                    <div id="auto-sell-time-settings" class="auto-sell-trigger-block">
+                      <div class="auto-sell-slider-head">
+                        <span>Time Trigger</span>
+                        <strong id="auto-sell-trigger-value">On Confirmed Block</strong>
                       </div>
                       <div class="auto-sell-trigger-grid">
                         <button type="button" class="auto-sell-trigger-chip" data-auto-sell-trigger-mode="submit-delay">On Submit + Delay</button>
@@ -410,9 +428,66 @@
                         <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="20">20</button>
                         <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="21">21</button>
                         <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="22">22</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="23">23</button>
                       </div>
                       <input name="automaticDevSellBlockOffset" type="hidden" value="0">
                       <div class="field-error" data-error-for="automaticDevSellBlockOffset"></div>
+                    </div>
+                    <div id="auto-sell-market-cap-settings" class="auto-sell-market-cap-settings" hidden>
+                      <div class="auto-sell-slider-block">
+                        <div class="auto-sell-slider-head">
+                          <span class="auto-sell-market-cap-title">
+                            <span>Market Cap Trigger</span>
+                            <span
+                              class="tooltip-dot inline auto-sell-tooltip-dot"
+                              title="Stops scanning once the token market cap crosses this threshold."
+                              aria-label="Stops scanning once the token market cap crosses this threshold."
+                            >i</span>
+                          </span>
+                          <strong id="auto-sell-market-cap-threshold-value">Disabled</strong>
+                        </div>
+                        <input
+                          id="auto-sell-market-cap-threshold-input"
+                          class="auto-sell-market-cap-input"
+                          name="automaticDevSellMarketCapThreshold"
+                          type="text"
+                          inputmode="text"
+                          autocomplete="off"
+                          placeholder="e.g. 100000 or 100k"
+                        >
+                        <div class="field-error" data-error-for="automaticDevSellMarketCapThreshold"></div>
+                      </div>
+                      <div class="auto-sell-market-cap-grid">
+                        <input id="auto-sell-market-cap-direction-input" name="automaticDevSellMarketCapDirection" type="hidden" value="gte">
+                        <label class="auto-sell-market-cap-field">
+                          <span>Scan Timeout</span>
+                          <div class="auto-sell-market-cap-timeout-row">
+                            <input
+                              id="auto-sell-market-cap-timeout-input"
+                              class="auto-sell-market-cap-input"
+                              name="automaticDevSellMarketCapScanTimeoutSeconds"
+                              type="number"
+                              min="1"
+                              max="86400"
+                              step="1"
+                              value="15"
+                            >
+                            <span class="auto-sell-market-cap-suffix">sec</span>
+                          </div>
+                          <div class="field-error" data-error-for="automaticDevSellMarketCapScanTimeoutSeconds"></div>
+                        </label>
+                        <label class="auto-sell-market-cap-field">
+                          <span>On Timeout</span>
+                          <select
+                            id="auto-sell-market-cap-timeout-action-input"
+                            class="auto-sell-market-cap-select"
+                            name="automaticDevSellMarketCapTimeoutAction"
+                          >
+                            <option value="stop">Stop</option>
+                            <option value="sell">Sell</option>
+                          </select>
+                        </label>
+                      </div>
                     </div>
                     <div class="auto-sell-slider-block">
                       <div class="auto-sell-slider-head">
@@ -503,15 +578,15 @@
       <aside id="reports-terminal-section" class="card reports-terminal" hidden>
         <div class="reports-terminal-head">
           <div>
-            <h2>History</h2>
+            <h2>Dashboard</h2>
             <div id="reports-terminal-meta" class="meta muted">Latest 25 transactions.</div>
           </div>
           <div class="reports-terminal-actions">
             <div class="reports-terminal-button-group">
               <button id="reports-transactions-button" type="button" class="preset-chip compact reports-terminal-chip active">Transactions</button>
               <button id="reports-launches-button" type="button" class="preset-chip compact reports-terminal-chip">Launches</button>
+              <button id="reports-active-jobs-button" type="button" class="preset-chip compact reports-terminal-chip">Active Jobs</button>
             </div>
-            <button id="reports-sort-button" type="button" class="preset-chip compact reports-terminal-chip">Newest</button>
             <button id="reports-refresh-button" type="button" class="preset-chip compact reports-terminal-chip">Refresh</button>
           </div>
         </div>

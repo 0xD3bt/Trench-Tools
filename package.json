@@ -11,6 +11,8 @@
     "engine:check": "cargo check --manifest-path ./rust/launchdeck-engine/Cargo.toml",
     "engine:test": "cargo test --manifest-path ./rust/launchdeck-engine/Cargo.toml",
     "engine:bench": "node ./scripts/engine-benchmark.js",
+    "browser-matrix": "node ./scripts/browser-matrix/run.js",
+    "browser-matrix:fast": "node ./scripts/browser-matrix/run-fast.js",
     "ui": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml",
     "start": "node ./scripts/runtime-control.js start",
     "stop": "node ./scripts/runtime-control.js stop",
@@ -26,5 +28,8 @@
     "@solana/web3.js": "^1.98.4",
     "bs58": "^6.0.0",
     "dotenv": "^17.3.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.58.2"
   }
 }

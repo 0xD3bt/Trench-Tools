@@ -65,6 +65,13 @@ If you set explicit endpoint overrides, profile-based routing is bypassed. Use e
 
 `Helius Sender` is the default, fastest, and most reliable starting point in the current runtime for most operators.
 
+Recommended operator stack:
+
+- use Helius for `SOLANA_RPC_URL`
+- use Helius for `SOLANA_WS_URL`
+- use `helius-sender` for creation, buy, and sell provider routing
+- if you have Helius dev tier and websocket support for it, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
+
 Use it when you want:
 
 - the main supported low-latency path
@@ -96,6 +103,20 @@ Practical note:
 
 - if `SOLANA_RPC_URL` is not configured, LaunchDeck can still use the default Sender endpoint, but you should set a dedicated confirmation RPC for real operation
 - in normal average-latency setups this is the provider we recommend first
+- pairing Helius Sender with Helius RPC + Helius WS is currently the strongest overall default setup in LaunchDeck
+
+### Helius Enhanced Market Watchers
+
+When all of these are true:
+
+- provider routing resolves to `helius-sender`
+- `SOLANA_WS_URL` points at a Helius websocket endpoint
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
+- your Helius tier actually supports `transactionSubscribe`
+
+the follow daemon upgrades market-cap watchers to use Helius `transactionSubscribe` instead of standard websocket subscriptions.
+
+If any of those conditions are not met, LaunchDeck falls back to the standard websocket watcher path automatically.
 
 ## Standard RPC
 

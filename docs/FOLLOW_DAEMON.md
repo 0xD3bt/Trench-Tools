@@ -115,6 +115,13 @@ Sell-side follow actions can also wait on:
 - market-cap triggers
 - confirmation requirements
 
+Current dev auto-sell behavior:
+
+- the UI exposes mutually exclusive `Time` and `Market Cap` trigger families
+- market-cap mode is exclusive and does not silently carry a hidden time delay
+- market-cap scan timeout is configured in seconds
+- timeout behavior can either `Stop` or proceed to `Sell`
+
 ## Watchers
 
 The daemon uses dedicated watchers for realtime trading behavior.
@@ -131,6 +138,21 @@ Operational notes:
 - watcher health is persisted
 - reconnect and backoff behavior are explicit
 - if websocket connectivity is poor, follow timing quality can degrade
+
+Current watcher modes:
+
+- slot watcher: standard websocket
+- signature watcher: standard websocket
+- market watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and supported
+
+For the best current setup:
+
+- use Helius for `SOLANA_RPC_URL`
+- use Helius for `SOLANA_WS_URL`
+- use `helius-sender` as the provider
+- enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and your websocket supports it
+
+The daemon now persists both watcher health and watcher mode so reports and follow-job state show whether a market-cap action used the enhanced Helius path or the standard websocket fallback.
 
 ## Delayed-Buy Hot Path
 

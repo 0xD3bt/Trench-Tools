@@ -25,6 +25,7 @@ pub const FOLLOW_JOB_SCHEMA_VERSION: u32 = 1;
 pub const FOLLOW_TELEMETRY_SCHEMA_VERSION: u32 = 1;
 pub const FOLLOW_RESPONSE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LOCAL_AUTH_TOKEN: &str = "4815927603149027";
+const RESTART_STALE_JOB_MAX_AGE_MS: u128 = 5 * 60 * 1000;
 
 fn follow_job_schema_version() -> u32 {
     FOLLOW_JOB_SCHEMA_VERSION
@@ -36,6 +37,11 @@ fn follow_telemetry_schema_version() -> u32 {
 
 fn follow_response_schema_version() -> u32 {
     FOLLOW_RESPONSE_SCHEMA_VERSION
+}
+
+fn should_prune_job_on_restart(job: &FollowJobRecord, now: u128) -> bool {
+    let freshest_ms = job.updatedAtMs.max(job.createdAtMs);
+    now.saturating_sub(freshest_ms) > RESTART_STALE_JOB_MAX_AGE_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +90,8 @@ pub enum FollowWatcherHealth {
 pub struct FollowMarketCapTrigger {
     pub direction: String,
     pub threshold: String,
+    pub scanTimeoutSeconds: u64,
+    pub timeoutAction: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +117,16 @@ pub struct FollowActionRecord {
     pub submitStartedAtMs: Option<u128>,
     pub submittedAtMs: Option<u128>,
     pub confirmedAtMs: Option<u128>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub endpointProfile: Option<String>,
+    #[serde(default)]
+    pub transportType: Option<String>,
+    #[serde(default)]
+    pub watcherMode: Option<String>,
+    #[serde(default)]
+    pub watcherFallbackReason: Option<String>,
     #[serde(default)]
     pub sendObservedBlockHeight: Option<u64>,
     #[serde(default)]
@@ -172,8 +190,14 @@ pub struct FollowDaemonHealth {
     pub availableCompileSlots: usize,
     pub availableSendSlots: usize,
     pub slotWatcher: FollowWatcherHealth,
+    #[serde(default)]
+    pub slotWatcherMode: Option<String>,
     pub signatureWatcher: FollowWatcherHealth,
+    #[serde(default)]
+    pub signatureWatcherMode: Option<String>,
     pub marketWatcher: FollowWatcherHealth,
+    #[serde(default)]
+    pub marketWatcherMode: Option<String>,
     pub lastError: Option<String>,
     pub watchEndpoint: Option<String>,
 }
@@ -392,6 +416,7 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
     let mut actions = follow
         .snipes
         .iter()
+        .filter(|snipe| snipe.enabled)
         .map(|snipe| FollowActionRecord {
             actionId: snipe.actionId.clone(),
             kind: FollowActionKind::SniperBuy,
@@ -413,6 +438,11 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
             submitStartedAtMs: None,
             submittedAtMs: None,
             confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
             sendObservedBlockHeight: None,
             confirmedObservedBlockHeight: None,
             blocksToConfirm: None,
@@ -423,7 +453,9 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
             lastError: None,
         })
         .collect::<Vec<_>>();
-    if let Some(dev_auto_sell) = &follow.devAutoSell {
+    if let Some(dev_auto_sell) = &follow.devAutoSell
+        && dev_auto_sell.enabled
+    {
         actions.push(FollowActionRecord {
             actionId: dev_auto_sell.actionId.clone(),
             kind: FollowActionKind::DevAutoSell,
@@ -433,13 +465,15 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
             sellPercent: Some(dev_auto_sell.percent),
             submitDelayMs: None,
             targetBlockOffset: dev_auto_sell.targetBlockOffset,
-            delayMs: Some(dev_auto_sell.delayMs),
+            delayMs: dev_auto_sell.delayMs,
             marketCap: dev_auto_sell
                 .marketCap
                 .as_ref()
                 .map(|trigger| FollowMarketCapTrigger {
                     direction: trigger.direction.clone(),
                     threshold: trigger.threshold.clone(),
+                    scanTimeoutSeconds: trigger.scanTimeoutSeconds,
+                    timeoutAction: trigger.timeoutAction.clone(),
                 }),
             jitterMs: None,
             feeJitterBps: None,
@@ -451,6 +485,11 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
             submitStartedAtMs: None,
             submittedAtMs: None,
             confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
             sendObservedBlockHeight: None,
             confirmedObservedBlockHeight: None,
             blocksToConfirm: None,
@@ -462,7 +501,12 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
         });
     }
     for snipe in &follow.snipes {
-        if let Some(sell) = &snipe.postBuySell {
+        if !snipe.enabled {
+            continue;
+        }
+        if let Some(sell) = &snipe.postBuySell
+            && sell.enabled
+        {
             actions.push(FollowActionRecord {
                 actionId: sell.actionId.clone(),
                 kind: FollowActionKind::SniperSell,
@@ -472,13 +516,15 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
                 sellPercent: Some(sell.percent),
                 submitDelayMs: None,
                 targetBlockOffset: sell.targetBlockOffset,
-                delayMs: Some(sell.delayMs),
+                delayMs: sell.delayMs,
                 marketCap: sell
                     .marketCap
                     .as_ref()
                     .map(|trigger| FollowMarketCapTrigger {
                         direction: trigger.direction.clone(),
                         threshold: trigger.threshold.clone(),
+                        scanTimeoutSeconds: trigger.scanTimeoutSeconds,
+                        timeoutAction: trigger.timeoutAction.clone(),
                     }),
                 jitterMs: None,
                 feeJitterBps: None,
@@ -490,6 +536,11 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
                 submitStartedAtMs: None,
                 submittedAtMs: None,
                 confirmedAtMs: None,
+                provider: None,
+                endpointProfile: None,
+                transportType: None,
+                watcherMode: None,
+                watcherFallbackReason: None,
                 sendObservedBlockHeight: None,
                 confirmedObservedBlockHeight: None,
                 blocksToConfirm: None,
@@ -540,8 +591,11 @@ impl FollowDaemonStore {
                 availableCompileSlots: 0,
                 availableSendSlots: 0,
                 slotWatcher: FollowWatcherHealth::Healthy,
+                slotWatcherMode: None,
                 signatureWatcher: FollowWatcherHealth::Healthy,
+                signatureWatcherMode: None,
                 marketWatcher: FollowWatcherHealth::Healthy,
+                marketWatcherMode: None,
                 lastError: None,
                 watchEndpoint: None,
             },
@@ -562,9 +616,25 @@ impl FollowDaemonStore {
             .count()
     }
 
+    fn has_live_watcher_work(jobs: &[FollowJobRecord]) -> bool {
+        jobs.iter()
+            .any(|job| matches!(job.state, FollowJobState::Armed | FollowJobState::Running))
+    }
+
+    fn normalize_idle_health(state: &mut FollowDaemonStateFile) {
+        if Self::has_live_watcher_work(&state.jobs) {
+            return;
+        }
+        state.health.slotWatcher = FollowWatcherHealth::Healthy;
+        state.health.signatureWatcher = FollowWatcherHealth::Healthy;
+        state.health.marketWatcher = FollowWatcherHealth::Healthy;
+        state.health.lastError = None;
+    }
+
     fn refresh_counts(state: &mut FollowDaemonStateFile) {
         state.health.queueDepth = state.jobs.len();
         state.health.activeJobs = Self::active_job_count(&state.jobs);
+        Self::normalize_idle_health(state);
     }
 
     pub async fn persist(&self) -> Result<(), String> {
@@ -870,16 +940,22 @@ impl FollowDaemonStore {
         &self,
         watch_endpoint: Option<String>,
         slot_watcher: FollowWatcherHealth,
+        slot_watcher_mode: Option<String>,
         signature_watcher: FollowWatcherHealth,
+        signature_watcher_mode: Option<String>,
         market_watcher: FollowWatcherHealth,
+        market_watcher_mode: Option<String>,
         last_error: Option<String>,
     ) -> Result<(), String> {
         let mut state = self.inner.write().await;
         state.health.updatedAtMs = now_ms();
         state.health.watchEndpoint = watch_endpoint;
         state.health.slotWatcher = slot_watcher;
+        state.health.slotWatcherMode = slot_watcher_mode;
         state.health.signatureWatcher = signature_watcher;
+        state.health.signatureWatcherMode = signature_watcher_mode;
         state.health.marketWatcher = market_watcher;
+        state.health.marketWatcherMode = market_watcher_mode;
         state.health.lastError = last_error;
         drop(state);
         self.persist().await
@@ -916,6 +992,7 @@ impl FollowDaemonStore {
     pub async fn recover_jobs_for_restart(&self) -> Result<Vec<FollowJobRecord>, String> {
         let mut state = self.inner.write().await;
         let now = now_ms();
+        state.jobs.retain(|job| !should_prune_job_on_restart(job, now));
         let mut recovered = Vec::new();
         for job in &mut state.jobs {
             if matches!(job.state, FollowJobState::Running) {

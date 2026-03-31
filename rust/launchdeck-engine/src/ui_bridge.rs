@@ -212,11 +212,25 @@ pub struct UiForm {
     #[serde(default)]
     pub automaticDevSellPercent: String,
     #[serde(default)]
+    pub automaticDevSellTriggerFamily: String,
+    #[serde(default)]
     pub automaticDevSellTriggerMode: String,
     #[serde(default)]
     pub automaticDevSellDelayMs: String,
     #[serde(default)]
     pub automaticDevSellBlockOffset: String,
+    #[serde(default)]
+    pub automaticDevSellMarketCapEnabled: bool,
+    #[serde(default)]
+    pub automaticDevSellMarketCapThreshold: String,
+    #[serde(default)]
+    pub automaticDevSellMarketCapDirection: String,
+    #[serde(default)]
+    pub automaticDevSellMarketCapScanTimeoutSeconds: String,
+    #[serde(default)]
+    pub automaticDevSellMarketCapTimeoutAction: String,
+    #[serde(default)]
+    pub automaticDevSellMarketCapScanTimeoutMinutes: String,
     #[serde(default)]
     pub imageFileName: String,
     #[serde(default)]
@@ -288,6 +302,8 @@ pub struct UiFollowLaunchSell {
     #[serde(default)]
     pub percent: String,
     #[serde(default)]
+    pub triggerFamily: String,
+    #[serde(default)]
     pub triggerMode: String,
     #[serde(default)]
     pub delayMs: String,
@@ -297,6 +313,12 @@ pub struct UiFollowLaunchSell {
     pub marketCapThreshold: String,
     #[serde(default)]
     pub marketCapDirection: String,
+    #[serde(default)]
+    pub marketCapScanTimeoutSeconds: String,
+    #[serde(default)]
+    pub marketCapTimeoutAction: String,
+    #[serde(default)]
+    pub marketCapScanTimeoutMinutes: String,
 }
 
 fn uploads_dir() -> std::path::PathBuf {
@@ -947,6 +969,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     };
     resolve_recipient_github_ids(&mut fee_sharing_recipients).await?;
     resolve_recipient_github_ids(&mut agent_fee_recipients).await?;
+    let enable_agent_split_init = is_agent_locked || (is_agent_custom && !agent_fee_recipients.is_empty());
 
     let image_file_name = Path::new(form.imageFileName.trim())
         .file_name()
@@ -960,13 +983,15 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         form.sniperWallets.clone()
     };
+    let snipes_enabled = form.followLaunch.enabled || form.sniperEnabled;
+    let dev_auto_sell_enabled = form.followLaunch.devAutoSell.enabled || form.automaticDevSellEnabled;
     let follow_launch_snipes = follow_snipes
         .iter()
         .enumerate()
         .filter(|(_, entry)| !entry.envKey.trim().is_empty() && !entry.amountSol.trim().is_empty())
         .map(|(index, entry)| RawFollowLaunchSnipe {
             actionId: format!("snipe-{}-buy", index + 1),
-            enabled: Some(json!(true)),
+            enabled: Some(json!(snipes_enabled)),
             walletEnvKey: entry.envKey.trim().to_string(),
             buyAmountSol: entry.amountSol.trim().to_string(),
             submitWithLaunch: Some(json!(
@@ -999,7 +1024,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             {
                 Some(RawFollowLaunchSell {
                     actionId: format!("snipe-{}-sell", index + 1),
-                    enabled: Some(json!(true)),
+                    enabled: Some(json!(snipes_enabled)),
                     walletEnvKey: entry.envKey.trim().to_string(),
                     percent: entry.sellPercent.map(|value| json!(value.max(0))),
                     delayMs: entry.sellDelayMs.map(|value| json!(value.max(0))),
@@ -1012,6 +1037,9 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                             entry.sellMarketCapDirection.trim().to_string()
                         },
                         threshold: entry.sellMarketCapThreshold.trim().to_string(),
+                        scanTimeoutSeconds: None,
+                        timeoutAction: "stop".to_string(),
+                        legacyScanTimeoutMinutes: None,
                     },
                     precheckRequired: Some(json!(false)),
                     requireConfirmation: Some(json!(true)),
@@ -1026,6 +1054,19 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         form.automaticDevSellPercent.trim().to_string()
     };
+    let dev_auto_sell_trigger_family =
+        if !form.followLaunch.devAutoSell.triggerFamily.trim().is_empty() {
+            form.followLaunch.devAutoSell.triggerFamily.trim().to_lowercase()
+        } else if !form.automaticDevSellTriggerFamily.trim().is_empty() {
+            form.automaticDevSellTriggerFamily.trim().to_lowercase()
+        } else if form.automaticDevSellMarketCapEnabled
+            || !form.followLaunch.devAutoSell.marketCapThreshold.trim().is_empty()
+            || !form.automaticDevSellMarketCapThreshold.trim().is_empty()
+        {
+            "market-cap".to_string()
+        } else {
+            "time".to_string()
+        };
     let dev_auto_sell_trigger_mode = if !form.followLaunch.devAutoSell.triggerMode.trim().is_empty()
     {
         form.followLaunch.devAutoSell.triggerMode.trim().to_string()
@@ -1039,6 +1080,102 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         form.automaticDevSellDelayMs.trim().to_string()
     };
+    let dev_auto_sell_market_cap_threshold =
+        if !form.followLaunch.devAutoSell.marketCapThreshold.trim().is_empty() {
+            form.followLaunch
+                .devAutoSell
+                .marketCapThreshold
+                .trim()
+                .to_string()
+        } else {
+            form.automaticDevSellMarketCapThreshold.trim().to_string()
+        };
+    let dev_auto_sell_market_cap_enabled = dev_auto_sell_trigger_family == "market-cap"
+        && !dev_auto_sell_market_cap_threshold.trim().is_empty();
+    let dev_auto_sell_market_cap_direction =
+        if !form.followLaunch.devAutoSell.marketCapDirection.trim().is_empty() {
+            form.followLaunch
+                .devAutoSell
+                .marketCapDirection
+                .trim()
+                .to_string()
+        } else if !form.automaticDevSellMarketCapDirection.trim().is_empty() {
+            form.automaticDevSellMarketCapDirection.trim().to_string()
+        } else {
+            "gte".to_string()
+        };
+    let dev_auto_sell_market_cap_scan_timeout_seconds =
+        if !form
+            .followLaunch
+            .devAutoSell
+            .marketCapScanTimeoutSeconds
+            .trim()
+            .is_empty()
+        {
+            form.followLaunch
+                .devAutoSell
+                .marketCapScanTimeoutSeconds
+                .trim()
+                .to_string()
+        } else if !form
+            .automaticDevSellMarketCapScanTimeoutSeconds
+            .trim()
+            .is_empty()
+        {
+            form.automaticDevSellMarketCapScanTimeoutSeconds
+                .trim()
+                .to_string()
+        } else if !form
+            .followLaunch
+            .devAutoSell
+            .marketCapScanTimeoutMinutes
+            .trim()
+            .is_empty()
+        {
+            form.followLaunch
+                .devAutoSell
+                .marketCapScanTimeoutMinutes
+                .trim()
+                .parse::<u64>()
+                .map(|value| value.saturating_mul(60).to_string())
+                .unwrap_or_else(|_| "15".to_string())
+        } else if !form
+            .automaticDevSellMarketCapScanTimeoutMinutes
+            .trim()
+            .is_empty()
+        {
+            form.automaticDevSellMarketCapScanTimeoutMinutes
+                .trim()
+                .parse::<u64>()
+                .map(|value| value.saturating_mul(60).to_string())
+                .unwrap_or_else(|_| "15".to_string())
+        } else {
+            "15".to_string()
+        };
+    let dev_auto_sell_market_cap_timeout_action =
+        if !form
+            .followLaunch
+            .devAutoSell
+            .marketCapTimeoutAction
+            .trim()
+            .is_empty()
+        {
+            form.followLaunch
+                .devAutoSell
+                .marketCapTimeoutAction
+                .trim()
+                .to_string()
+        } else if !form
+            .automaticDevSellMarketCapTimeoutAction
+            .trim()
+            .is_empty()
+        {
+            form.automaticDevSellMarketCapTimeoutAction
+                .trim()
+                .to_string()
+        } else {
+            "stop".to_string()
+        };
     let dev_auto_sell_block_offset = if !form
         .followLaunch
         .devAutoSell
@@ -1054,22 +1191,21 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         form.automaticDevSellBlockOffset.trim().to_string()
     };
-    let dev_auto_sell_require_confirmation = dev_auto_sell_trigger_mode == "confirmation";
-    let dev_auto_sell_target_block_offset = if dev_auto_sell_trigger_mode == "block-offset" {
+    let dev_auto_sell_require_confirmation =
+        dev_auto_sell_trigger_family == "time" && dev_auto_sell_trigger_mode == "confirmation";
+    let dev_auto_sell_target_block_offset =
+        if dev_auto_sell_trigger_family == "time" && dev_auto_sell_trigger_mode == "block-offset" {
         dev_auto_sell_block_offset.clone()
     } else {
         String::new()
     };
-    let dev_auto_sell_delay_ms = if dev_auto_sell_trigger_mode == "submit-delay" {
-        dev_auto_sell_delay_ms
-    } else {
-        String::new()
-    };
-    let follow_launch_enabled = form.followLaunch.enabled
-        || form.sniperEnabled
-        || !follow_launch_snipes.is_empty()
-        || form.automaticDevSellEnabled
-        || form.followLaunch.devAutoSell.enabled;
+    let dev_auto_sell_delay_ms =
+        if dev_auto_sell_trigger_family == "time" && dev_auto_sell_trigger_mode == "submit-delay" {
+            dev_auto_sell_delay_ms
+        } else {
+            String::new()
+        };
+    let follow_launch_enabled = snipes_enabled || dev_auto_sell_enabled;
     let creator_fee_mode = if mode == "cashback" {
         "cashback".to_string()
     } else if is_agent_locked {
@@ -1123,7 +1259,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                 String::new()
             },
             buybackBps: buyback_bps.map(|value| json!(value)),
-            splitAgentInit: Some(json!(is_agent_custom || is_agent_locked)),
+            splitAgentInit: Some(json!(enable_agent_split_init)),
             feeReceiver: String::new(),
             feeRecipients: if !has_agent_mode || is_agent_locked || is_agent_unlocked {
                 vec![]
@@ -1278,10 +1414,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             enabled: Some(json!(follow_launch_enabled)),
             schemaVersion: Some(json!(1)),
             snipes: follow_launch_snipes,
-            devAutoSell: if form.followLaunch.devAutoSell.enabled
-                || form.automaticDevSellEnabled
-                || !dev_auto_sell_percent.trim().is_empty()
-            {
+            devAutoSell: if dev_auto_sell_enabled {
                 Some(RawFollowLaunchSell {
                     actionId: "dev-auto-sell".to_string(),
                     enabled: Some(json!(true)),
@@ -1290,35 +1423,12 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                     delayMs: Some(json!(dev_auto_sell_delay_ms)),
                     targetBlockOffset: Some(json!(dev_auto_sell_target_block_offset)),
                     marketCap: RawFollowLaunchMarketCapTrigger {
-                        enabled: Some(json!(
-                            !form
-                                .followLaunch
-                                .devAutoSell
-                                .marketCapThreshold
-                                .trim()
-                                .is_empty()
-                        )),
-                        direction: if form
-                            .followLaunch
-                            .devAutoSell
-                            .marketCapDirection
-                            .trim()
-                            .is_empty()
-                        {
-                            "gte".to_string()
-                        } else {
-                            form.followLaunch
-                                .devAutoSell
-                                .marketCapDirection
-                                .trim()
-                                .to_string()
-                        },
-                        threshold: form
-                            .followLaunch
-                            .devAutoSell
-                            .marketCapThreshold
-                            .trim()
-                            .to_string(),
+                        enabled: Some(json!(dev_auto_sell_market_cap_enabled)),
+                        direction: dev_auto_sell_market_cap_direction,
+                        threshold: dev_auto_sell_market_cap_threshold,
+                        scanTimeoutSeconds: Some(json!(dev_auto_sell_market_cap_scan_timeout_seconds)),
+                        timeoutAction: dev_auto_sell_market_cap_timeout_action,
+                        legacyScanTimeoutMinutes: None,
                     },
                     precheckRequired: Some(json!(false)),
                     requireConfirmation: Some(json!(dev_auto_sell_require_confirmation)),
@@ -1466,6 +1576,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_custom_without_meaningful_split_disables_agent_init() {
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                mode: "agent-custom".to_string(),
+                buybackPercent: "0".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("agent-custom config should build");
+
+        assert_eq!(raw.agent.splitAgentInit, Some(json!(false)));
+        assert!(raw.agent.feeRecipients.is_empty());
+    }
+
+    #[tokio::test]
     async fn preserves_vanity_private_key_from_ui_form() {
         let raw = build_raw_config_from_ui_form(
             "send",
@@ -1535,5 +1662,35 @@ mod tests {
         assert_eq!(dev_auto_sell.walletEnvKey, "SOLANA_PRIVATE_KEY");
         assert_eq!(dev_auto_sell.percent, Some(json!("50")));
         assert_eq!(dev_auto_sell.delayMs, Some(json!("2000")));
+    }
+
+    #[tokio::test]
+    async fn disabled_follow_toggles_do_not_arm_snipers_or_dev_auto_sell() {
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                selectedWalletKey: "SOLANA_PRIVATE_KEY".to_string(),
+                sniperEnabled: false,
+                sniperWallets: vec![UiSniperWalletInput {
+                    envKey: "SOLANA_PRIVATE_KEY2".to_string(),
+                    amountSol: "0.25".to_string(),
+                    triggerMode: "submit-delay".to_string(),
+                    submitDelayMs: Some(25),
+                    ..UiSniperWalletInput::default()
+                }],
+                automaticDevSellEnabled: false,
+                automaticDevSellPercent: "50".to_string(),
+                automaticDevSellTriggerMode: "submit-delay".to_string(),
+                automaticDevSellDelayMs: "2000".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("disabled follow config should build");
+
+        assert_eq!(raw.followLaunch.enabled, Some(json!(false)));
+        assert_eq!(raw.followLaunch.snipes.len(), 1);
+        assert_eq!(raw.followLaunch.snipes[0].enabled, Some(json!(false)));
+        assert!(raw.followLaunch.devAutoSell.is_none());
     }
 }

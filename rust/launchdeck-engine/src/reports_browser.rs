@@ -509,24 +509,26 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
                     parts.push(format!("{label}={value}ms"));
                 }
             };
-            push_timing(&mut timing_parts, "totalElapsedMs", "total");
+            push_timing(&mut timing_parts, "totalElapsedMs", "endToEnd");
             push_timing(&mut timing_parts, "backendTotalElapsedMs", "backendTotal");
-            push_timing(&mut timing_parts, "clientPreRequestMs", "preRequest");
-            push_timing(&mut timing_parts, "formToRawConfigMs", "form");
+            push_timing(&mut timing_parts, "clientPreRequestMs", "clientOverhead");
+            push_timing(&mut timing_parts, "formToRawConfigMs", "formToRaw");
             push_timing(&mut timing_parts, "normalizeConfigMs", "normalize");
             push_timing(&mut timing_parts, "walletLoadMs", "wallet");
-            push_timing(&mut timing_parts, "reportBuildMs", "report");
-            push_timing(&mut timing_parts, "compileTransactionsMs", "compile");
+            push_timing(&mut timing_parts, "reportBuildMs", "reportBuild");
+            push_timing(&mut timing_parts, "compileTransactionsMs", "compileTotal");
             push_timing(&mut timing_parts, "compileAltLoadMs", "altLoad");
             push_timing(&mut timing_parts, "compileBlockhashFetchMs", "blockhash");
             push_timing(&mut timing_parts, "compileGlobalFetchMs", "global");
             push_timing(&mut timing_parts, "compileFollowUpPrepMs", "followUpPrep");
-            push_timing(&mut timing_parts, "compileTxSerializeMs", "serialize");
+            push_timing(&mut timing_parts, "compileTxSerializeMs", "serializeTx");
             push_timing(&mut timing_parts, "simulateMs", "simulate");
-            push_timing(&mut timing_parts, "sendMs", "send");
-            push_timing(&mut timing_parts, "sendSubmitMs", "submit");
-            push_timing(&mut timing_parts, "sendConfirmMs", "confirm");
-            push_timing(&mut timing_parts, "persistReportMs", "persist");
+            push_timing(&mut timing_parts, "sendMs", "sendTotal");
+            push_timing(&mut timing_parts, "sendSubmitMs", "submitTotal");
+            push_timing(&mut timing_parts, "sendConfirmMs", "confirmTotal");
+            push_timing(&mut timing_parts, "bagsSetupSubmitMs", "setupSubmit");
+            push_timing(&mut timing_parts, "bagsSetupConfirmMs", "setupConfirm");
+            push_timing(&mut timing_parts, "persistReportMs", "persistReport");
             if !timing_parts.is_empty() {
                 lines.push(format!("  Timings: {}", timing_parts.join(" | ")));
             }

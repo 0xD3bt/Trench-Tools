@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    config::{NormalizedConfig, NormalizedCreatorFee, NormalizedFollowLaunch, NormalizedRecipient},
+    config::{
+        NormalizedConfig, NormalizedCreatorFee, NormalizedFollowLaunch, NormalizedRecipient,
+        has_launch_follow_up, launch_follow_up_label,
+    },
     transport::TransportPlan,
     wallet::list_solana_env_wallets,
 };
@@ -100,6 +103,8 @@ pub struct ExecutionTimings {
     pub sendMs: Option<u128>,
     pub sendSubmitMs: Option<u128>,
     pub sendConfirmMs: Option<u128>,
+    pub bagsSetupSubmitMs: Option<u128>,
+    pub bagsSetupConfirmMs: Option<u128>,
     pub persistReportMs: Option<u128>,
 }
 
@@ -315,19 +320,33 @@ fn render_follow_action_summary(action: &Value) -> Option<String> {
         parts.push(format!("block+{}", block_offset));
     }
     if let Some(market_cap) = action.get("marketCap").and_then(Value::as_object) {
-        let direction = market_cap
-            .get("direction")
-            .and_then(Value::as_str)
-            .unwrap_or("gte");
         let threshold = market_cap
             .get("threshold")
             .and_then(Value::as_str)
             .unwrap_or("");
         if !threshold.trim().is_empty() {
-            parts.push(format!("market {} {}", direction, threshold.trim()));
+            parts.push(format!("market {}", threshold.trim()));
+        }
+        if let Some(timeout_seconds) = market_cap
+            .get("scanTimeoutSeconds")
+            .and_then(Value::as_u64)
+        {
+            parts.push(format!("scan={}s", timeout_seconds));
+        }
+        if let Some(timeout_action) = market_cap
+            .get("timeoutAction")
+            .and_then(Value::as_str)
+            && !timeout_action.trim().is_empty()
+        {
+            parts.push(format!("timeout={}", timeout_action.trim()));
         }
     }
     parts.push(format!("status={state}"));
+    if let Some(mode) = action.get("watcherMode").and_then(Value::as_str)
+        && !mode.trim().is_empty()
+    {
+        parts.push(format!("watcher={}", mode.trim()));
+    }
     if let Some(signature) = action.get("signature").and_then(Value::as_str)
         && !signature.trim().is_empty()
     {
@@ -340,6 +359,11 @@ fn render_follow_action_summary(action: &Value) -> Option<String> {
         && !error.trim().is_empty()
     {
         parts.push(format!("error={}", error.trim()));
+    }
+    if let Some(reason) = action.get("watcherFallbackReason").and_then(Value::as_str)
+        && !reason.trim().is_empty()
+    {
+        parts.push(format!("watcher-note={}", reason.trim()));
     }
     Some(parts.join(" | "))
 }
@@ -367,6 +391,15 @@ fn parse_lookup_table_addresses(config: &NormalizedConfig) -> Vec<String> {
         }
     }
     deduped
+}
+
+fn display_transaction_label(label: &str) -> String {
+    match label.trim() {
+        "follow-up" => "fee-sharing setup".to_string(),
+        "agent-setup" => "agent fee setup".to_string(),
+        other if other.is_empty() => "transaction".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn planned_transactions(
@@ -406,14 +439,10 @@ fn planned_transactions(
         warnings: vec![],
     }];
 
-    let follow_up = match config.mode.as_str() {
-        "regular" | "cashback" if config.feeSharing.generateLaterSetup => Some("follow-up"),
-        "agent-custom" | "agent-locked" => Some("agent-setup"),
-        _ => None,
-    };
+    let follow_up = launch_follow_up_label(config);
     if let Some(label) = follow_up {
         transactions.push(TransactionSummary {
-            label: label.to_string(),
+            label: display_transaction_label(label),
             instructionSummary: vec![],
             legacyLength: None,
             v0Length: None,
@@ -521,11 +550,9 @@ pub fn build_report(
     let creator_fee_receiver = match config.mode.as_str() {
         "cashback" => "cashback to traders".to_string(),
         "agent-locked" => "agent buyback escrow (locked after launch)".to_string(),
-        "agent-custom" => summarize_recipients(
-            &config.agent.feeRecipients,
-            &creator,
-            config.agent.buybackBps,
-        ),
+        "agent-custom" if has_launch_follow_up(config) => {
+            summarize_recipients(&config.agent.feeRecipients, &creator, config.agent.buybackBps)
+        }
         _ if config.creatorFee.mode == "github" && !config.creatorFee.githubUsername.is_empty() => {
             format!("GitHub @{}", config.creatorFee.githubUsername)
         }
@@ -538,10 +565,13 @@ pub fn build_report(
         _ => creator.clone(),
     };
     let fee_sharing_status = match config.mode.as_str() {
-        "agent-custom" => "agent custom split bundled post-launch (final)".to_string(),
+        "agent-custom" if has_launch_follow_up(config) => {
+            "agent custom split bundled post-launch (final)".to_string()
+        }
+        "agent-custom" => "untouched on launch (configure later manually)".to_string(),
         "agent-unlocked" => "untouched on launch (configure later once)".to_string(),
         "agent-locked" => "locked to agent escrow".to_string(),
-        _ if config.feeSharing.generateLaterSetup => "deferred one-time setup artifact".to_string(),
+        _ if has_launch_follow_up(config) => "deferred one-time setup artifact".to_string(),
         _ => "untouched".to_string(),
     };
     let notes = vec![
@@ -844,16 +874,16 @@ pub fn render_report(report: &LaunchReport) -> String {
         let timings = &benchmark.timings;
         let mut timing_parts = Vec::new();
         if let Some(value) = timings.totalElapsedMs {
-            timing_parts.push(format!("total={value}ms"));
+            timing_parts.push(format!("endToEnd={value}ms"));
         }
         if let Some(value) = timings.backendTotalElapsedMs {
             timing_parts.push(format!("backendTotal={value}ms"));
         }
         if let Some(value) = timings.clientPreRequestMs {
-            timing_parts.push(format!("preRequest={value}ms"));
+            timing_parts.push(format!("clientOverhead={value}ms"));
         }
         if let Some(value) = timings.formToRawConfigMs {
-            timing_parts.push(format!("form={value}ms"));
+            timing_parts.push(format!("formToRaw={value}ms"));
         }
         if let Some(value) = timings.normalizeConfigMs {
             timing_parts.push(format!("normalize={value}ms"));
@@ -862,10 +892,10 @@ pub fn render_report(report: &LaunchReport) -> String {
             timing_parts.push(format!("wallet={value}ms"));
         }
         if let Some(value) = timings.reportBuildMs {
-            timing_parts.push(format!("report={value}ms"));
+            timing_parts.push(format!("reportBuild={value}ms"));
         }
         if let Some(value) = timings.compileTransactionsMs {
-            timing_parts.push(format!("compile={value}ms"));
+            timing_parts.push(format!("compileTotal={value}ms"));
         }
         if let Some(value) = timings.compileAltLoadMs {
             timing_parts.push(format!("altLoad={value}ms"));
@@ -880,22 +910,28 @@ pub fn render_report(report: &LaunchReport) -> String {
             timing_parts.push(format!("followUpPrep={value}ms"));
         }
         if let Some(value) = timings.compileTxSerializeMs {
-            timing_parts.push(format!("serialize={value}ms"));
+            timing_parts.push(format!("serializeTx={value}ms"));
         }
         if let Some(value) = timings.simulateMs {
             timing_parts.push(format!("simulate={value}ms"));
         }
         if let Some(value) = timings.sendMs {
-            timing_parts.push(format!("send={value}ms"));
+            timing_parts.push(format!("sendTotal={value}ms"));
         }
         if let Some(value) = timings.sendSubmitMs {
-            timing_parts.push(format!("submit={value}ms"));
+            timing_parts.push(format!("submitTotal={value}ms"));
         }
         if let Some(value) = timings.sendConfirmMs {
-            timing_parts.push(format!("confirm={value}ms"));
+            timing_parts.push(format!("confirmTotal={value}ms"));
+        }
+        if let Some(value) = timings.bagsSetupSubmitMs {
+            timing_parts.push(format!("setupSubmit={value}ms"));
+        }
+        if let Some(value) = timings.bagsSetupConfirmMs {
+            timing_parts.push(format!("setupConfirm={value}ms"));
         }
         if let Some(value) = timings.persistReportMs {
-            timing_parts.push(format!("persist={value}ms"));
+            timing_parts.push(format!("persistReport={value}ms"));
         }
         if !timing_parts.is_empty() {
             lines.push(format!("  Timings: {}", timing_parts.join(" | ")));
@@ -915,7 +951,11 @@ pub fn render_report(report: &LaunchReport) -> String {
                 sent_parts.push(format!("confirmed slot={value}"));
             }
             if !sent_parts.is_empty() {
-                lines.push(format!("  {}: {}", sent.label, sent_parts.join(" | ")));
+                lines.push(format!(
+                    "  {}: {}",
+                    display_transaction_label(&sent.label),
+                    sent_parts.join(" | ")
+                ));
             }
         }
     }
@@ -924,7 +964,7 @@ pub fn render_report(report: &LaunchReport) -> String {
     for tx in &report.transactions {
         lines.push(format!(
             "- {}: {} instructions | legacy={} | v0={} | v0+alt={}",
-            tx.label,
+            display_transaction_label(&tx.label),
             tx.instructionSummary.len(),
             tx.legacyLength
                 .map(|value| format!("{value} bytes"))
@@ -952,7 +992,7 @@ pub fn render_report(report: &LaunchReport) -> String {
         for sent in &report.execution.sent {
             let mut summary = format!(
                 "- {}: signature={} | status={}",
-                sent.label,
+                display_transaction_label(&sent.label),
                 sent.signature.as_deref().unwrap_or("(missing)"),
                 sent.confirmationStatus.as_deref().unwrap_or("(pending)")
             );

@@ -22,7 +22,10 @@ use std::{
 use tokio::{join, task::JoinSet, time::sleep};
 
 use crate::{
-    config::{NormalizedConfig, NormalizedExecution, NormalizedRecipient},
+    config::{
+        NormalizedConfig, NormalizedExecution, NormalizedRecipient, has_launch_follow_up,
+        launch_follow_up_label,
+    },
     paths,
     report::{LaunchReport, build_report, render_report},
     rpc::{
@@ -163,7 +166,7 @@ pub async fn try_compile_native_pump(
     let mint = mint_keypair.pubkey();
     let separate_tip_transaction =
         transport_plan.separateTipTransaction && config.tx.jitoTipLamports > 0;
-    let has_follow_up_transaction = native_follow_up_label(config).is_some();
+    let has_follow_up_transaction = has_launch_follow_up(config);
     let launch_creator_future = async {
         let started = Instant::now();
         let resolved =
@@ -2095,12 +2098,7 @@ fn resolve_agent_fee_recipients(
 }
 
 fn native_follow_up_label(config: &NormalizedConfig) -> Option<&'static str> {
-    match config.mode.as_str() {
-        "regular" | "cashback" if config.feeSharing.generateLaterSetup => Some("follow-up"),
-        "agent-custom" => Some("agent-setup"),
-        "agent-locked" => Some("agent-setup"),
-        _ => None,
-    }
+    launch_follow_up_label(config)
 }
 
 async fn build_native_follow_up_instructions(
@@ -2713,6 +2711,8 @@ fn compile_transaction_candidate(
         )
     };
     let serialized_len = serialized.len();
+    let serialized_base64 = BASE64.encode(serialized);
+    let signature = crate::rpc::precompute_transaction_signature(&serialized_base64);
     Ok(CompiledTxCandidate {
         serialized_len,
         compiled: CompiledTransaction {
@@ -2720,7 +2720,8 @@ fn compile_transaction_candidate(
             format,
             blockhash: blockhash.to_string(),
             lastValidBlockHeight: last_valid_block_height,
-            serializedBase64: BASE64.encode(serialized),
+            serializedBase64: serialized_base64,
+            signature,
             lookupTablesUsed: lookup_tables_used,
             computeUnitLimit: Some(u64::from(FIXED_COMPUTE_UNIT_LIMIT)),
             computeUnitPriceMicroLamports: if tx_config.compute_unit_price_micro_lamports > 0 {
@@ -3011,6 +3012,7 @@ mod tests {
                 blockhash: "blockhash".to_string(),
                 lastValidBlockHeight: 123,
                 serializedBase64: String::new(),
+                signature: None,
                 lookupTablesUsed: vec![],
                 computeUnitLimit: Some(u64::from(FIXED_COMPUTE_UNIT_LIMIT)),
                 computeUnitPriceMicroLamports: None,
@@ -3537,6 +3539,17 @@ mod tests {
         let mut config = regular_config();
         config.mode = "agent-unlocked".to_string();
         config.agent.buybackBps = Some(2_500);
+
+        assert_eq!(native_follow_up_label(&config), None);
+    }
+
+    #[test]
+    fn agent_custom_without_init_has_no_follow_up_transaction() {
+        let mut config = regular_config();
+        config.mode = "agent-custom".to_string();
+        config.agent.buybackBps = Some(0);
+        config.agent.splitAgentInit = false;
+        config.agent.feeRecipients = vec![];
 
         assert_eq!(native_follow_up_label(&config), None);
     }

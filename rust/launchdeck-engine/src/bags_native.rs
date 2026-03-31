@@ -428,12 +428,14 @@ fn decode_secret_base64(secret: &[u8]) -> String {
 }
 
 fn convert_compiled_transaction(source: HelperCompiledTransaction) -> CompiledTransaction {
+    let signature = crate::rpc::precompute_transaction_signature(&source.serializedBase64);
     CompiledTransaction {
         label: source.label,
         format: source.format,
         blockhash: source.blockhash,
         lastValidBlockHeight: source.lastValidBlockHeight,
         serializedBase64: source.serializedBase64,
+        signature,
         lookupTablesUsed: source.lookupTablesUsed,
         computeUnitLimit: source.computeUnitLimit,
         computeUnitPriceMicroLamports: source.computeUnitPriceMicroLamports,

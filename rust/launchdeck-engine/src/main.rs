@@ -29,7 +29,7 @@ use crate::{
     config::{NormalizedConfig, NormalizedFollowLaunch, RawConfig, normalize_raw_config},
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
-        FollowJobResponse, FollowReadyRequest, FollowReserveRequest,
+        FollowJobResponse, FollowReadyRequest, FollowReserveRequest, FollowStopAllRequest,
     },
     fs_utils::atomic_write,
     image_library::{
@@ -87,10 +87,11 @@ use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     net::SocketAddr,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone)]
@@ -132,6 +133,20 @@ struct RunRequest {
     #[serde(default)]
     #[serde(rename = "clientPreRequestMs")]
     client_pre_request_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct FollowCancelApiRequest {
+    #[serde(rename = "traceId")]
+    trace_id: String,
+    #[serde(rename = "actionId")]
+    action_id: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct FollowStopAllApiRequest {
+    note: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -635,6 +650,9 @@ fn split_same_time_snipes(
         .snipes
         .iter()
         .filter_map(|snipe| {
+            if !snipe.enabled {
+                return None;
+            }
             if snipe.submitWithLaunch {
                 same_time.push(snipe.clone());
                 if snipe.retryOnFailure {
@@ -652,7 +670,8 @@ fn split_same_time_snipes(
             }
         })
         .collect::<Vec<_>>();
-    deferred.enabled = !deferred.snipes.is_empty() || deferred.devAutoSell.is_some();
+    deferred.enabled = !deferred.snipes.is_empty()
+        || deferred.devAutoSell.as_ref().is_some_and(|sell| sell.enabled);
     (same_time, deferred)
 }
 
@@ -750,6 +769,67 @@ struct FeeMarketSnapshot {
     jito_tip_p99_lamports: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedFeeMarketSnapshot {
+    snapshot: FeeMarketSnapshot,
+    fetched_at: Instant,
+}
+
+const FEE_MARKET_CACHE_TTL: Duration = Duration::from_secs(3);
+
+fn fee_market_cache() -> &'static Mutex<HashMap<String, CachedFeeMarketSnapshot>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedFeeMarketSnapshot>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fee_market_cache_key(rpc_url: &str, helius_priority_level: &str, jito_tip_percentile: &str) -> String {
+    format!("{rpc_url}|{helius_priority_level}|{jito_tip_percentile}")
+}
+
+fn get_cached_fee_market_snapshot(
+    rpc_url: &str,
+    helius_priority_level: &str,
+    jito_tip_percentile: &str,
+) -> Option<FeeMarketSnapshot> {
+    let cache = fee_market_cache().lock().ok()?;
+    let entry = cache.get(&fee_market_cache_key(
+        rpc_url,
+        helius_priority_level,
+        jito_tip_percentile,
+    ))?;
+    if entry.fetched_at.elapsed() > FEE_MARKET_CACHE_TTL {
+        return None;
+    }
+    Some(entry.snapshot.clone())
+}
+
+fn cache_fee_market_snapshot(
+    rpc_url: &str,
+    helius_priority_level: &str,
+    jito_tip_percentile: &str,
+    snapshot: &FeeMarketSnapshot,
+) {
+    if let Ok(mut cache) = fee_market_cache().lock() {
+        cache.insert(
+            fee_market_cache_key(rpc_url, helius_priority_level, jito_tip_percentile),
+            CachedFeeMarketSnapshot {
+                snapshot: snapshot.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+}
+
+fn shared_fee_market_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("shared fee market client")
+    })
+}
+
 fn auto_fee_helius_priority_level() -> String {
     let value = std::env::var("LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL")
         .unwrap_or_else(|_| DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL.to_string());
@@ -828,10 +908,12 @@ fn cap_auto_fee_lamports(estimate_lamports: u64, cap_lamports: Option<u64>) -> u
 async fn fetch_fee_market_snapshot(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
     let helius_priority_level = auto_fee_helius_priority_level();
     let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|error| error.to_string())?;
+    if let Some(snapshot) =
+        get_cached_fee_market_snapshot(rpc_url, &helius_priority_level, &jito_tip_percentile)
+    {
+        return Ok(snapshot);
+    }
+    let client = shared_fee_market_http_client();
     let helius_options = if helius_priority_level == "recommended" {
         json!({
             "recommended": true
@@ -939,10 +1021,17 @@ async fn fetch_fee_market_snapshot(rpc_url: &str) -> Result<FeeMarketSnapshot, S
         Err(error) => return Err(format!("Jito tip floor request failed: {error}")),
     };
 
-    Ok(FeeMarketSnapshot {
+    let snapshot = FeeMarketSnapshot {
         helius_priority_lamports,
         jito_tip_p99_lamports,
-    })
+    };
+    cache_fee_market_snapshot(
+        rpc_url,
+        &helius_priority_level,
+        &jito_tip_percentile,
+        &snapshot,
+    );
+    Ok(snapshot)
 }
 
 async fn resolve_auto_execution_fees(
@@ -1223,6 +1312,7 @@ async fn compile_same_time_snipes(
     mint: &str,
     launch_creator: &str,
     snipes: &[crate::config::NormalizedFollowLaunchSnipe],
+    allow_ata_creation: bool,
 ) -> Result<Vec<CompiledTransaction>, String> {
     let tasks = snipes.iter().enumerate().map(|(index, snipe)| async move {
         let wallet_secret = load_solana_wallet_by_env_key(&snipe.walletEnvKey)?;
@@ -1238,6 +1328,7 @@ async fn compile_same_time_snipes(
             mint,
             launch_creator,
             &snipe.buyAmountSol,
+            allow_ata_creation,
         )
         .await?;
         tx.label = format!(
@@ -1795,6 +1886,7 @@ async fn execute_engine_action_payload(
             now_timestamp_string(),
             creator_public_key.clone(),
             Some("Rust native compile".to_string()),
+            action == "send",
         )
         .await
         .map_err(|error| {
@@ -2239,6 +2331,7 @@ async fn execute_engine_action_payload(
                 &compiled_mint,
                 &compiled_launch_creator,
                 &same_time_snipes,
+                action == "send",
             )
             .await
             .map_err(|error| {
@@ -2416,6 +2509,7 @@ async fn execute_engine_action_payload(
                 &compiled_mint,
                 &compiled_launch_creator,
                 &same_time_snipes,
+                true,
             )
             .await
             {
@@ -3482,6 +3576,119 @@ async fn api_runtime_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     ))
 }
 
+fn follow_daemon_browser_client() -> Result<FollowDaemonClient, String> {
+    configured_follow_daemon_transport().map(|_| ())?;
+    Ok(FollowDaemonClient::new(&configured_follow_daemon_base_url()))
+}
+
+fn follow_jobs_payload(response: FollowJobResponse, started_at_ms: u128) -> Json<Value> {
+    let FollowJobResponse {
+        schemaVersion,
+        ok,
+        job,
+        jobs,
+        health,
+        timingProfiles,
+    } = response;
+    Json(attach_timing(
+        json!({
+            "ok": ok,
+            "schemaVersion": schemaVersion,
+            "job": job,
+            "jobs": jobs,
+            "health": health,
+            "timingProfiles": timingProfiles,
+        }),
+        started_at_ms,
+    ))
+}
+
+async fn api_follow_jobs() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let client = follow_daemon_browser_client().map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+    })?;
+    client
+        .list()
+        .await
+        .map(|response| follow_jobs_payload(response, started_at_ms))
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })
+}
+
+async fn api_follow_cancel(
+    Json(payload): Json<FollowCancelApiRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let client = follow_daemon_browser_client().map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+    })?;
+    client
+        .cancel(&FollowCancelRequest {
+            traceId: payload.trace_id,
+            actionId: payload.action_id,
+            note: payload.note,
+        })
+        .await
+        .map(|response| follow_jobs_payload(response, started_at_ms))
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })
+}
+
+async fn api_follow_stop_all(
+    Json(payload): Json<FollowStopAllApiRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let client = follow_daemon_browser_client().map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+    })?;
+    client
+        .stop_all(&FollowStopAllRequest { note: payload.note })
+        .await
+        .map(|response| follow_jobs_payload(response, started_at_ms))
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })
+}
+
 async fn api_status(
     State(state): State<Arc<AppState>>,
     Query(query): Query<StatusQuery>,
@@ -4194,6 +4401,9 @@ async fn main() {
         .route("/api/pump-global/warm", post(api_pump_global_warm))
         .route("/api/wallet-status", get(api_wallet_status))
         .route("/api/runtime-status", get(api_runtime_status))
+        .route("/api/follow/jobs", get(api_follow_jobs))
+        .route("/api/follow/cancel", post(api_follow_cancel))
+        .route("/api/follow/stop-all", post(api_follow_stop_all))
         .route("/api/status", get(api_status))
         .route("/api/run", post(api_run))
         .route("/api/engine/health", get(api_engine_health))

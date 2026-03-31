@@ -5,12 +5,30 @@ LaunchDeck is a self-hosted Solana launch and snipe tool built under the broader
 [![Website](https://img.shields.io/badge/Website-trench.tools-2563eb?style=flat-square&logo=googlechrome&logoColor=white)](https://trench.tools/)
 [![Trench.tools on X](https://img.shields.io/badge/X-@TrenchDotTools-111111?style=flat-square&logo=x&logoColor=white)](https://x.com/TrenchDotTools)
 [![0xd3bt on X](https://img.shields.io/badge/X-@0xd3bt-111111?style=flat-square&logo=x&logoColor=white)](https://x.com/0xd3bt)
+[![Trench.tools Community](https://img.shields.io/badge/X-Community-111111?style=flat-square&logo=x&logoColor=white)](https://x.com/i/communities/2038790841418838419)
+
+> ### Contract Address
+> `L73w5odyo5ZdJ1fPp319nfjqaFfHDdKifRmM8Kxpump`
 
 Instead of paying fees to third-party launch platforms, LaunchDeck lets you run the launcher locally, use your own wallets and provider keys, and customize how launches are built, simulated, and sent. The basic version can be run with a free-tier Helius key, so getting started does not require paid infrastructure.
 
 This repo is under active development. The README reflects the features we consider usable today.
 
 LaunchDeck is open-source tooling provided as-is. Running it, configuring it, modifying it, deploying it, or using it in any way is entirely the user's own responsibility. By using this software, you accept full responsibility for your environment, infrastructure, wallets, keys, dependencies, third-party packages, and any outcomes that result from its use. Trench.tools is not responsible for losses, damages, exploits, malicious code, compromised packages, misconfiguration, misuse, downtime, failed transactions, or any other direct or indirect consequences related to the software or its dependencies.
+
+## Current Recommendation
+
+For most operators today, the best-supported and fastest setup is:
+
+- `Helius` for `SOLANA_RPC_URL`
+- `Helius` for `SOLANA_WS_URL`
+- `Helius Sender` as the creation, buy, and sell provider
+
+If you have a Helius dev-tier plan and your websocket endpoint supports it, also enable:
+
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
+
+That unlocks the enhanced `transactionSubscribe` market-watcher path for follow-daemon market-cap triggers while still falling back safely when unsupported.
 
 ## What It Does
 
@@ -119,6 +137,7 @@ Optional but common:
 - `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata` ([Pinata](https://pinata.cloud/))
 - `PINATA_JWT`
 - `BAGS_API_KEY`
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and want the enhanced market-watcher path
 
 Full configuration reference: `docs/CONFIG.md`
 
@@ -136,7 +155,7 @@ Primary commands:
 - Linux: `start.sh`
 - Windows: `start.ps1`
 
-It stops old LaunchDeck processes, starts the main host and follow daemon, waits for health, and opens the UI when supported.
+It stops old LaunchDeck processes, starts the main host and follow daemon together, waits for both health checks, and opens the UI when supported.
 
 ### 4. Open The UI
 
@@ -192,7 +211,8 @@ Current follow behavior includes:
 - same-time sniper buys
 - delayed sniper buys with `On Submit + Delay`
 - confirmed-block sniper buys with `On Confirmed Block`
-- automatic dev sell
+- automatic dev sell with exclusive `Time` or `Market Cap` trigger families
+- market-cap sell triggers with timeout in seconds and selectable timeout behavior (`Stop` or `Sell`)
 - snipe sells
 - same-time retry for eligible sniper buys
 

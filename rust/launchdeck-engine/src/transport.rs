@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 
 use crate::{
-    config::{NormalizedConfig, NormalizedExecution},
+    config::{NormalizedConfig, NormalizedExecution, has_launch_follow_up},
     providers::get_provider_meta,
 };
 
@@ -215,6 +215,21 @@ pub fn configured_watch_endpoints_for_provider(
         return vec![explicit_ws.trim().to_string()];
     }
     vec![]
+}
+
+pub fn supports_helius_transaction_subscribe(
+    provider: &str,
+    endpoint_profile: &str,
+    watch_endpoint: Option<&str>,
+) -> bool {
+    let normalized_provider = normalize_provider(provider);
+    let _ = normalize_endpoint_profile(provider, endpoint_profile);
+    if normalized_provider != "helius-sender" {
+        return false;
+    }
+    watch_endpoint
+        .map(|endpoint| endpoint.trim().to_ascii_lowercase().contains("helius"))
+        .unwrap_or(false)
 }
 
 pub fn resolved_provider(execution: &NormalizedExecution, transaction_count: usize) -> String {
@@ -428,10 +443,7 @@ pub fn build_transport_plan(
 
 pub fn estimate_transaction_count(config: &NormalizedConfig) -> usize {
     let mut transaction_count = 1usize;
-    if matches!(config.mode.as_str(), "agent-custom" | "agent-locked")
-        || (matches!(config.mode.as_str(), "regular" | "cashback")
-            && config.feeSharing.generateLaterSetup)
-    {
+    if has_launch_follow_up(config) {
         transaction_count += 1;
     }
     if normalize_provider(&config.execution.provider) == "jito-bundle"
@@ -567,5 +579,24 @@ mod tests {
             resolve_default_endpoint_profile_for_provider("standard-rpc", "eu", "us"),
             ""
         );
+    }
+
+    #[test]
+    fn helius_transaction_subscribe_requires_helius_sender_and_helius_ws() {
+        assert!(supports_helius_transaction_subscribe(
+            "helius-sender",
+            "global",
+            Some("wss://mainnet.helius-rpc.com/?api-key=test")
+        ));
+        assert!(!supports_helius_transaction_subscribe(
+            "standard-rpc",
+            "global",
+            Some("wss://mainnet.helius-rpc.com/?api-key=test")
+        ));
+        assert!(!supports_helius_transaction_subscribe(
+            "helius-sender",
+            "global",
+            Some("wss://example-rpc.com/ws")
+        ));
     }
 }

@@ -36,7 +36,10 @@ use launchdeck_engine::{
         confirm_submitted_transactions_for_transport, fetch_current_block_height,
         spawn_blockhash_refresh_task, submit_transactions_for_transport,
     },
-    transport::configured_watch_endpoints_for_provider,
+    transport::{
+        TransportPlan, build_transport_plan, configured_watch_endpoints_for_provider,
+        supports_helius_transaction_subscribe,
+    },
     wallet::{
         fetch_balance_lamports, fetch_token_balance, load_solana_wallet_by_env_key,
         public_key_from_secret, selected_wallet_key_or_default,
@@ -251,6 +254,7 @@ async fn set_watcher_health(
     state: &Arc<AppState>,
     kind: WatcherKind,
     status: FollowWatcherHealth,
+    mode: Option<String>,
     endpoint: Option<String>,
     last_error: Option<String>,
 ) {
@@ -259,21 +263,36 @@ async fn set_watcher_health(
         WatcherKind::Slot => status.clone(),
         _ => current.slotWatcher.clone(),
     };
+    let slot_mode = match kind {
+        WatcherKind::Slot => mode.clone(),
+        _ => current.slotWatcherMode.clone(),
+    };
     let signature = match kind {
         WatcherKind::Signature => status.clone(),
         _ => current.signatureWatcher.clone(),
     };
+    let signature_mode = match kind {
+        WatcherKind::Signature => mode.clone(),
+        _ => current.signatureWatcherMode.clone(),
+    };
     let market = match kind {
         WatcherKind::Market => status,
         _ => current.marketWatcher.clone(),
+    };
+    let market_mode = match kind {
+        WatcherKind::Market => mode,
+        _ => current.marketWatcherMode.clone(),
     };
     let _ = state
         .store
         .update_health(
             endpoint.or(current.watchEndpoint),
             slot,
+            slot_mode,
             signature,
+            signature_mode,
             market,
+            market_mode,
             last_error,
         )
         .await;
@@ -621,6 +640,11 @@ async fn run_launch_gate_prechecks(
             submitStartedAtMs: None,
             submittedAtMs: None,
             confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
             sendObservedBlockHeight: None,
             confirmedObservedBlockHeight: None,
             blocksToConfirm: None,
@@ -661,9 +685,21 @@ fn requires_realtime_watchers(request: &FollowReadyRequest) -> bool {
     request.followLaunch.snipes.iter().any(|snipe| {
         snipe.enabled
             && (snipe.targetBlockOffset.is_some()
-                || snipe.submitDelayMs > 0
-                || snipe.postBuySell.is_some())
-    }) || request.followLaunch.devAutoSell.is_some()
+                || snipe
+                    .postBuySell
+                    .as_ref()
+                    .is_some_and(sell_requires_realtime_watchers))
+    }) || request
+        .followLaunch
+        .devAutoSell
+        .as_ref()
+        .is_some_and(sell_requires_realtime_watchers)
+}
+
+fn sell_requires_realtime_watchers(
+    sell: &launchdeck_engine::config::NormalizedFollowLaunchSell,
+) -> bool {
+    sell.requireConfirmation || sell.targetBlockOffset.is_some() || sell.marketCap.is_some()
 }
 
 fn phase_two_follow_actions_enabled(
@@ -684,6 +720,20 @@ fn resolve_watch_endpoint(request: &FollowReadyRequest) -> Option<String> {
         .into_iter()
         .next()
     })
+}
+
+fn selected_market_watcher_mode(
+    provider: &str,
+    endpoint_profile: &str,
+    watch_endpoint: Option<&str>,
+) -> String {
+    if configured_enable_helius_transaction_subscribe()
+        && supports_helius_transaction_subscribe(provider, endpoint_profile, watch_endpoint)
+    {
+        "helius-transaction-subscribe".to_string()
+    } else {
+        "standard-ws".to_string()
+    }
 }
 
 async fn validate_watch_endpoint(endpoint: &str) -> Result<(), String> {
@@ -764,8 +814,11 @@ async fn daemon_ready(
                 .update_health(
                     None,
                     FollowWatcherHealth::Failed,
+                    None,
                     FollowWatcherHealth::Failed,
+                    None,
                     FollowWatcherHealth::Failed,
+                    None,
                     Some("No websocket watch endpoint configured for follow daemon. Set SOLANA_WS_URL.".to_string()),
                 )
                 .await;
@@ -784,8 +837,11 @@ async fn daemon_ready(
                 .update_health(
                     Some(endpoint.clone()),
                     FollowWatcherHealth::Failed,
+                    None,
                     FollowWatcherHealth::Failed,
+                    None,
                     FollowWatcherHealth::Failed,
+                    None,
                     Some(error.clone()),
                 )
                 .await;
@@ -803,8 +859,15 @@ async fn daemon_ready(
             .update_health(
                 Some(endpoint.clone()),
                 FollowWatcherHealth::Healthy,
+                Some("standard-ws".to_string()),
                 FollowWatcherHealth::Healthy,
+                Some("standard-ws".to_string()),
                 FollowWatcherHealth::Healthy,
+                Some(selected_market_watcher_mode(
+                    &payload.execution.provider,
+                    &payload.execution.endpointProfile,
+                    Some(endpoint.as_str()),
+                )),
                 None,
             )
             .await;
@@ -1128,6 +1191,10 @@ async fn run_action_task(
             return Ok(());
         }
         if let Err(error) = execute_action(state.clone(), &current_job, &action).await {
+            if is_expired_action_error(&error) {
+                record_action_expired(&state, &current_job, &action, &error).await;
+                return Ok(());
+            }
             let Some(latest_job) = get_job(&state, &trace_id).await else {
                 return Err(error);
             };
@@ -1176,37 +1243,52 @@ async fn record_action_failure(
         })
         .await;
     sync_follow_job_report(state, &job.traceId).await;
-    if let Some(transport_plan) = job.transportPlan.as_ref() {
-        let attempt_count = action.attemptCount.saturating_add(1);
-        let _ = state
-            .store
-            .record_sample(FollowTelemetrySample {
-                schemaVersion: FOLLOW_TELEMETRY_SCHEMA_VERSION,
-                traceId: job.traceId.clone(),
-                actionId: action.actionId.clone(),
-                actionType: action_type_name(&action.kind).to_string(),
-                phase: "follow".to_string(),
-                provider: job.execution.provider.clone(),
-                endpointProfile: job.execution.endpointProfile.clone(),
-                transportType: transport_plan.transportType.clone(),
-                attemptCount: attempt_count,
-                triggerType: action_trigger_type(action),
-                delaySettingMs: action.submitDelayMs.or(action.delayMs),
-                jitterMs: action.jitterMs,
-                feeJitterBps: action.feeJitterBps,
-                submitLatencyMs: None,
-                confirmLatencyMs: None,
-                launchToActionMs: None,
-                launchToActionBlocks: None,
-                scheduleSlipMs: None,
-                outcome: classify_action_failure(error).to_string(),
-                qualityLabel: "failed".to_string(),
-                qualityWeight: 0,
-                detail: Some(error.to_string()),
-                writtenAtMs: now_ms(),
-            })
-            .await;
-    }
+    let transport_plan = follow_action_transport_plan(job, action);
+    let attempt_count = action.attemptCount.saturating_add(1);
+    let _ = state
+        .store
+        .record_sample(FollowTelemetrySample {
+            schemaVersion: FOLLOW_TELEMETRY_SCHEMA_VERSION,
+            traceId: job.traceId.clone(),
+            actionId: action.actionId.clone(),
+            actionType: action_type_name(&action.kind).to_string(),
+            phase: "follow".to_string(),
+            provider: transport_plan.resolvedProvider.clone(),
+            endpointProfile: transport_plan.resolvedEndpointProfile.clone(),
+            transportType: transport_plan.transportType.clone(),
+            attemptCount: attempt_count,
+            triggerType: action_trigger_type(action),
+            delaySettingMs: action.submitDelayMs.or(action.delayMs),
+            jitterMs: action.jitterMs,
+            feeJitterBps: action.feeJitterBps,
+            submitLatencyMs: None,
+            confirmLatencyMs: None,
+            launchToActionMs: None,
+            launchToActionBlocks: None,
+            scheduleSlipMs: None,
+            outcome: classify_action_failure(error).to_string(),
+            qualityLabel: "failed".to_string(),
+            qualityWeight: 0,
+            detail: Some(error.to_string()),
+            writtenAtMs: now_ms(),
+        })
+        .await;
+}
+
+async fn record_action_expired(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+    reason: &str,
+) {
+    let _ = state
+        .store
+        .update_action(&job.traceId, &action.actionId, |record| {
+            record.state = FollowActionState::Expired;
+            record.lastError = Some(reason.to_string());
+        })
+        .await;
+    sync_follow_job_report(state, &job.traceId).await;
 }
 
 async fn record_creation_sample(state: &Arc<AppState>, job: &FollowJobRecord) {
@@ -1261,6 +1343,9 @@ fn should_retry_action(job: &FollowJobRecord, action: &FollowActionRecord, error
     if action.attemptCount > job.followLaunch.constraints.retryBudget {
         return false;
     }
+    if is_expired_action_error(error) {
+        return false;
+    }
     if matches!(
         action.state,
         FollowActionState::Sent
@@ -1308,12 +1393,23 @@ fn action_retry_backoff_ms(attempt_count: u32) -> u64 {
     (150u64.saturating_mul(multiplier)).min(5_000)
 }
 
+fn market_cap_scan_expired_error(action_id: &str, scan_timeout_seconds: u64) -> String {
+    format!(
+        "__expired__ market-cap scan window elapsed for {action_id} after {scan_timeout_seconds} second(s)."
+    )
+}
+
+fn is_expired_action_error(error: &str) -> bool {
+    error.trim().starts_with("__expired__")
+}
+
 async fn execute_action(
     state: Arc<AppState>,
     job: &FollowJobRecord,
     action: &FollowActionRecord,
 ) -> Result<(), String> {
     let trace_id = job.traceId.clone();
+    let transport_plan = follow_action_transport_plan(job, action);
     ensure_action_not_cancelled(&state, &trace_id, &action.actionId).await?;
     state
         .store
@@ -1330,6 +1426,9 @@ async fn execute_action(
         .store
         .update_action(&trace_id, &action.actionId, |record| {
             record.state = FollowActionState::Eligible;
+            record.provider = Some(transport_plan.resolvedProvider.clone());
+            record.endpointProfile = Some(transport_plan.resolvedEndpointProfile.clone());
+            record.transportType = Some(transport_plan.transportType.clone());
         })
         .await?;
     sync_follow_job_report(&state, &trace_id).await;
@@ -1362,10 +1461,6 @@ async fn execute_action(
         .launchCreator
         .as_deref()
         .ok_or_else(|| "Follow job missing launch creator.".to_string())?;
-    let transport_plan = job
-        .transportPlan
-        .as_ref()
-        .ok_or_else(|| "Follow job missing transport plan.".to_string())?;
     let _compile_permit = acquire_capacity_slot(
         state.compile_slots.clone(),
         state.capacity_wait_ms,
@@ -1417,6 +1512,7 @@ async fn execute_action(
                         mint,
                         launch_creator,
                         amount,
+                        true,
                     )
                     .await?,
                 )
@@ -1513,7 +1609,7 @@ async fn execute_action(
         let topup_input = vec![topup.clone()];
         let (mut topup_submitted, topup_warnings, _) = submit_transactions_for_transport(
             &state.rpc_url,
-            transport_plan,
+            &transport_plan,
             &topup_input,
             &job.execution.commitment,
             job.execution.skipPreflight,
@@ -1526,7 +1622,7 @@ async fn execute_action(
         let mut topup_confirm_input = vec![topup_sent.clone()];
         let _ = confirm_submitted_transactions_for_transport(
             &state.rpc_url,
-            transport_plan,
+            &transport_plan,
             &mut topup_confirm_input,
             &job.execution.commitment,
             job.execution.trackSendBlockHeight,
@@ -1550,7 +1646,7 @@ async fn execute_action(
         let started = Instant::now();
         match submit_transactions_for_transport(
             &state.rpc_url,
-            transport_plan,
+            &transport_plan,
             &[compiled.clone()],
             &job.execution.commitment,
             job.execution.skipPreflight,
@@ -1625,7 +1721,7 @@ async fn execute_action(
     let mut confirm_input = vec![sent.clone()];
     let (_, confirm_ms) = confirm_submitted_transactions_for_transport(
         &state.rpc_url,
-        transport_plan,
+        &transport_plan,
         &mut confirm_input,
         &job.execution.commitment,
         job.execution.trackSendBlockHeight,
@@ -1684,8 +1780,8 @@ async fn execute_action(
             actionId: action.actionId.clone(),
             actionType: action_type_name(&action.kind).to_string(),
             phase: "follow".to_string(),
-            provider: job.execution.provider.clone(),
-            endpointProfile: job.execution.endpointProfile.clone(),
+            provider: transport_plan.resolvedProvider.clone(),
+            endpointProfile: transport_plan.resolvedEndpointProfile.clone(),
             transportType: transport_plan.transportType.clone(),
             attemptCount: attempt_count,
             triggerType: action_trigger_type(action),
@@ -1714,6 +1810,25 @@ fn action_type_name(kind: &FollowActionKind) -> &'static str {
         FollowActionKind::DevAutoSell => "dev-auto-sell",
         FollowActionKind::SniperSell => "sniper-sell",
     }
+}
+
+fn follow_action_execution(job: &FollowJobRecord, action: &FollowActionRecord) -> launchdeck_engine::config::NormalizedExecution {
+    let mut execution = job.execution.clone();
+    match action.kind {
+        FollowActionKind::SniperBuy => {
+            execution.provider = job.execution.buyProvider.clone();
+            execution.endpointProfile = job.execution.buyEndpointProfile.clone();
+        }
+        FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
+            execution.provider = job.execution.sellProvider.clone();
+            execution.endpointProfile = job.execution.sellEndpointProfile.clone();
+        }
+    }
+    execution
+}
+
+fn follow_action_transport_plan(job: &FollowJobRecord, action: &FollowActionRecord) -> TransportPlan {
+    build_transport_plan(&follow_action_execution(job, action), 1)
 }
 
 fn action_trigger_type(action: &FollowActionRecord) -> String {
@@ -2012,11 +2127,18 @@ async fn handle_watcher_retry(
     error: String,
 ) -> Result<(), String> {
     ensure_job_not_cancelled(state, trace_id).await?;
+    let current = state.store.health().await;
+    let current_mode = match kind {
+        WatcherKind::Slot => current.slotWatcherMode.clone(),
+        WatcherKind::Signature => current.signatureWatcherMode.clone(),
+        WatcherKind::Market => current.marketWatcherMode.clone(),
+    };
     if attempt >= WATCHER_MAX_RECONNECT_ATTEMPTS {
         set_watcher_health(
             state,
             kind,
             FollowWatcherHealth::Failed,
+            current_mode.clone(),
             Some(endpoint.to_string()),
             Some(error.clone()),
         )
@@ -2027,6 +2149,7 @@ async fn handle_watcher_retry(
         state,
         kind,
         FollowWatcherHealth::Degraded,
+        current_mode,
         Some(endpoint.to_string()),
         Some(error),
     )
@@ -2092,6 +2215,267 @@ async fn ensure_market_watcher(
     hub.market_tx.subscribe()
 }
 
+fn configured_enable_helius_transaction_subscribe() -> bool {
+    matches!(
+        env::var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+async fn capture_action_watcher_metadata(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    action_id: &str,
+    kind: WatcherKind,
+) {
+    let health = state.store.health().await;
+    let inferred_endpoint = resolve_job_watch_endpoint(job).ok();
+    let inferred_mode = match kind {
+        WatcherKind::Slot | WatcherKind::Signature => Some("standard-ws".to_string()),
+        WatcherKind::Market => Some(selected_market_watcher_mode(
+            &job.execution.provider,
+            &job.execution.endpointProfile,
+            inferred_endpoint.as_deref(),
+        )),
+    };
+    let (mode, fallback_reason) = match kind {
+        WatcherKind::Slot => (
+            health.slotWatcherMode.clone().or_else(|| inferred_mode.clone()),
+            health.lastError.clone(),
+        ),
+        WatcherKind::Signature => (
+            health
+                .signatureWatcherMode
+                .clone()
+                .or_else(|| inferred_mode.clone()),
+            health.lastError.clone(),
+        ),
+        WatcherKind::Market => (
+            health
+                .marketWatcherMode
+                .clone()
+                .or_else(|| inferred_mode.clone()),
+            health.lastError.clone(),
+        ),
+    };
+    let _ = state
+        .store
+        .update_action(&job.traceId, action_id, |record| {
+            record.watcherMode = mode;
+            record.watcherFallbackReason = fallback_reason;
+        })
+        .await;
+}
+
+async fn run_slot_watcher_ws_session(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    tx: &watch::Sender<Option<Result<u64, String>>>,
+    endpoint: &str,
+) -> Result<(), String> {
+    let mut ws = open_subscription_socket(endpoint).await?;
+    subscribe(&mut ws, "slotSubscribe", json!([])).await?;
+    loop {
+        ensure_job_not_cancelled(state, &job.traceId).await?;
+        let message = next_json_message(&mut ws).await?;
+        if message.get("params").is_none() {
+            continue;
+        }
+        let block_height = fetch_current_block_height(&state.rpc_url, "confirmed").await?;
+        let _ = tx.send(Some(Ok(block_height)));
+        set_watcher_health(
+            state,
+            WatcherKind::Slot,
+            FollowWatcherHealth::Healthy,
+            Some("standard-ws".to_string()),
+            Some(endpoint.to_string()),
+            None,
+        )
+        .await;
+    }
+}
+
+async fn run_slot_watcher_polling_session(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    tx: &watch::Sender<Option<Result<u64, String>>>,
+    note: Option<String>,
+) -> Result<(), String> {
+    loop {
+        ensure_job_not_cancelled(state, &job.traceId).await?;
+        let block_height = fetch_current_block_height(&state.rpc_url, "confirmed").await?;
+        let _ = tx.send(Some(Ok(block_height)));
+        set_watcher_health(
+            state,
+            WatcherKind::Slot,
+            FollowWatcherHealth::Healthy,
+            Some("rpc-polling".to_string()),
+            Some(state.rpc_url.clone()),
+            note.clone(),
+        )
+        .await;
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn recompute_market_cap_for_job(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    mint: &str,
+) -> Result<u64, String> {
+    if job.launchpad == "bonk" {
+        let snapshot = fetch_bonk_market_snapshot(&state.rpc_url, mint, &job.quoteAsset).await?;
+        return snapshot
+            .marketCapLamports
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid Bonk market cap payload: {error}"));
+    }
+    if job.launchpad == "bagsapp" {
+        let snapshot = fetch_bags_market_snapshot(&state.rpc_url, mint).await?;
+        return snapshot
+            .marketCapLamports
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid Bags market cap payload: {error}"));
+    }
+    let snapshot = fetch_pump_market_snapshot(&state.rpc_url, mint).await?;
+    Ok(snapshot.marketCapLamports)
+}
+
+fn market_watch_account(job: &FollowJobRecord, mint: &str) -> Result<String, String> {
+    if job.launchpad == "pump" {
+        return pump_bonding_curve_address(mint);
+    }
+    Ok(mint.to_string())
+}
+
+async fn run_standard_market_watcher_session(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    tx: &watch::Sender<Option<Result<u64, String>>>,
+    endpoint: &str,
+    mint: &str,
+    note: Option<String>,
+) -> Result<(), String> {
+    if job.launchpad == "pump" {
+        let bonding_curve = market_watch_account(job, mint)?;
+        let mut ws = open_subscription_socket(endpoint).await?;
+        subscribe(
+            &mut ws,
+            "accountSubscribe",
+            json!([
+                bonding_curve,
+                {
+                    "encoding": "base64",
+                    "commitment": "processed"
+                }
+            ]),
+        )
+        .await?;
+        loop {
+            ensure_job_not_cancelled(state, &job.traceId).await?;
+            let message = next_json_message(&mut ws).await?;
+            if message.get("params").is_none() {
+                continue;
+            }
+            let market_cap = recompute_market_cap_for_job(state, job, mint).await?;
+            let _ = tx.send(Some(Ok(market_cap)));
+            set_watcher_health(
+                state,
+                WatcherKind::Market,
+                FollowWatcherHealth::Healthy,
+                Some("standard-ws".to_string()),
+                Some(endpoint.to_string()),
+                note.clone(),
+            )
+            .await;
+        }
+    }
+    let mut ws = open_subscription_socket(endpoint).await?;
+    subscribe(
+        &mut ws,
+        "logsSubscribe",
+        json!([
+            {
+                "mentions": [mint]
+            },
+            {
+                "commitment": "processed"
+            }
+        ]),
+    )
+    .await?;
+    loop {
+        ensure_job_not_cancelled(state, &job.traceId).await?;
+        let message = next_json_message(&mut ws).await?;
+        if message.get("params").is_none() {
+            continue;
+        }
+        let market_cap = recompute_market_cap_for_job(state, job, mint).await?;
+        let _ = tx.send(Some(Ok(market_cap)));
+        set_watcher_health(
+            state,
+            WatcherKind::Market,
+            FollowWatcherHealth::Healthy,
+            Some("standard-ws".to_string()),
+            Some(endpoint.to_string()),
+            note.clone(),
+        )
+        .await;
+    }
+}
+
+async fn run_helius_transaction_market_watcher_session(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    tx: &watch::Sender<Option<Result<u64, String>>>,
+    endpoint: &str,
+    mint: &str,
+) -> Result<(), String> {
+    let watch_account = market_watch_account(job, mint)?;
+    let mut ws = open_subscription_socket(endpoint).await?;
+    subscribe(
+        &mut ws,
+        "transactionSubscribe",
+        json!([
+            {
+                "accountInclude": [watch_account],
+                "failed": false,
+                "vote": false
+            },
+            {
+                "commitment": "processed",
+                "encoding": "jsonParsed",
+                "transactionDetails": "none",
+                "showRewards": false,
+                "maxSupportedTransactionVersion": 0
+            }
+        ]),
+    )
+    .await?;
+    loop {
+        ensure_job_not_cancelled(state, &job.traceId).await?;
+        let message = next_json_message(&mut ws).await?;
+        if message.get("params").is_none() {
+            continue;
+        }
+        let market_cap = recompute_market_cap_for_job(state, job, mint).await?;
+        let _ = tx.send(Some(Ok(market_cap)));
+        set_watcher_health(
+            state,
+            WatcherKind::Market,
+            FollowWatcherHealth::Healthy,
+            Some("helius-transaction-subscribe".to_string()),
+            Some(endpoint.to_string()),
+            None,
+        )
+        .await;
+    }
+}
+
 async fn run_signature_watcher(
     state: Arc<AppState>,
     job: FollowJobRecord,
@@ -2153,6 +2537,7 @@ async fn run_signature_watcher(
                     &state,
                     WatcherKind::Signature,
                     FollowWatcherHealth::Healthy,
+                    Some("standard-ws".to_string()),
                     Some(endpoint.clone()),
                     None,
                 )
@@ -2185,24 +2570,27 @@ async fn run_slot_watcher(
     tx: watch::Sender<Option<Result<u64, String>>>,
 ) {
     let mut attempt: u32 = 0;
+    let watch_endpoint = resolve_job_watch_endpoint(&job).ok();
     loop {
-        let session: Result<(), String> = async {
-            loop {
-                ensure_job_not_cancelled(&state, &job.traceId).await?;
-                let block_height = fetch_current_block_height(&state.rpc_url, "confirmed").await?;
-                let _ = tx.send(Some(Ok(block_height)));
-                set_watcher_health(
-                    &state,
-                    WatcherKind::Slot,
-                    FollowWatcherHealth::Healthy,
-                    Some(state.rpc_url.clone()),
-                    None,
-                )
-                .await;
-                sleep(Duration::from_millis(200)).await;
+        let session = if let Some(endpoint) = watch_endpoint.as_deref() {
+            match run_slot_watcher_ws_session(&state, &job, &tx, endpoint).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let fallback_note = format!(
+                        "Standard websocket slot watcher failed: {error}. Falling back to RPC polling."
+                    );
+                    run_slot_watcher_polling_session(&state, &job, &tx, Some(fallback_note)).await
+                }
             }
-        }
-        .await;
+        } else {
+            run_slot_watcher_polling_session(
+                &state,
+                &job,
+                &tx,
+                Some("No websocket watch endpoint configured for slot watcher. Falling back to RPC polling.".to_string()),
+            )
+            .await
+        };
         match session {
             Ok(()) => return,
             Err(error) => {
@@ -2212,7 +2600,7 @@ async fn run_slot_watcher(
                     &state,
                     &job.traceId,
                     WatcherKind::Slot,
-                    &state.rpc_url,
+                    watch_endpoint.as_deref().unwrap_or(&state.rpc_url),
                     attempt,
                     error,
                 )
@@ -2242,115 +2630,64 @@ async fn run_market_watcher(
         )));
         return;
     };
-    if job.launchpad == "bonk" {
-        let mut attempt: u32 = 0;
-        loop {
-            let session: Result<(), String> = async {
-                loop {
-                    ensure_job_not_cancelled(&state, &job.traceId).await?;
-                    let snapshot =
-                        fetch_bonk_market_snapshot(&state.rpc_url, &mint, &job.quoteAsset).await?;
-                    let market_cap = snapshot
-                        .marketCapLamports
-                        .parse::<u64>()
-                        .map_err(|error| format!("Invalid Bonk market cap payload: {error}"))?;
-                    let _ = tx.send(Some(Ok(market_cap)));
-                    sleep(Duration::from_millis(750)).await;
-                }
-            }
-            .await;
-            match session {
-                Ok(()) => return,
-                Err(error) => {
-                    attempt = attempt.saturating_add(1);
-                    let terminal_error = error.clone();
-                    if handle_watcher_retry(
-                        &state,
-                        &job.traceId,
-                        WatcherKind::Market,
-                        &endpoint,
-                        attempt,
-                        error,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        let _ = tx.send(Some(Err(terminal_error)));
-                        return;
-                    }
-                }
-            }
-        }
-    }
-    if job.launchpad == "bagsapp" {
-        let mut attempt: u32 = 0;
-        loop {
-            let session: Result<(), String> = async {
-                loop {
-                    ensure_job_not_cancelled(&state, &job.traceId).await?;
-                    let snapshot = fetch_bags_market_snapshot(&state.rpc_url, &mint).await?;
-                    let market_cap = snapshot
-                        .marketCapLamports
-                        .parse::<u64>()
-                        .map_err(|error| format!("Invalid Bags market cap payload: {error}"))?;
-                    let _ = tx.send(Some(Ok(market_cap)));
-                    sleep(Duration::from_millis(1000)).await;
-                }
-            }
-            .await;
-            match session {
-                Ok(()) => return,
-                Err(error) => {
-                    attempt = attempt.saturating_add(1);
-                    let terminal_error = error.clone();
-                    if handle_watcher_retry(
-                        &state,
-                        &job.traceId,
-                        WatcherKind::Market,
-                        &endpoint,
-                        attempt,
-                        error,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        let _ = tx.send(Some(Err(terminal_error)));
-                        return;
-                    }
-                }
-            }
-        }
-    }
-    let Ok(bonding_curve) = pump_bonding_curve_address(&mint) else {
-        let _ = tx.send(Some(Err(
-            "Failed to derive Pump bonding curve address.".to_string()
-        )));
-        return;
-    };
     let mut attempt: u32 = 0;
+    let prefers_helius_transaction_subscribe = configured_enable_helius_transaction_subscribe()
+        && supports_helius_transaction_subscribe(
+            &job.execution.provider,
+            &job.execution.endpointProfile,
+            Some(&endpoint),
+        );
     loop {
-        let session: Result<(), String> = async {
-            let mut ws = open_subscription_socket(&endpoint).await?;
-            subscribe(
-                &mut ws,
-                "accountSubscribe",
-                json!([
-                    bonding_curve,
-                    {
-                        "encoding": "base64",
-                        "commitment": "processed"
-                    }
-                ]),
+        let session = if prefers_helius_transaction_subscribe {
+            set_watcher_health(
+                &state,
+                WatcherKind::Market,
+                FollowWatcherHealth::Healthy,
+                Some("helius-transaction-subscribe".to_string()),
+                Some(endpoint.clone()),
+                None,
             )
-            .await?;
-            loop {
-                ensure_job_not_cancelled(&state, &job.traceId).await?;
-                let _ = next_json_message(&mut ws).await?;
-                let snapshot = fetch_pump_market_snapshot(&state.rpc_url, &mint).await?;
-                let _ = tx.send(Some(Ok(snapshot.marketCapLamports)));
+            .await;
+            match run_helius_transaction_market_watcher_session(&state, &job, &tx, &endpoint, &mint)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let fallback_note = format!(
+                        "Helius transactionSubscribe market watcher failed: {error}. Falling back to standard websocket."
+                    );
+                    set_watcher_health(
+                        &state,
+                        WatcherKind::Market,
+                        FollowWatcherHealth::Healthy,
+                        Some("standard-ws".to_string()),
+                        Some(endpoint.clone()),
+                        Some(fallback_note.clone()),
+                    )
+                    .await;
+                    run_standard_market_watcher_session(
+                        &state,
+                        &job,
+                        &tx,
+                        &endpoint,
+                        &mint,
+                        Some(fallback_note),
+                    )
+                    .await
+                }
             }
-        }
-        .await;
+        } else {
+            set_watcher_health(
+                &state,
+                WatcherKind::Market,
+                FollowWatcherHealth::Healthy,
+                Some("standard-ws".to_string()),
+                Some(endpoint.clone()),
+                None,
+            )
+            .await;
+            run_standard_market_watcher_session(&state, &job, &tx, &endpoint, &mint, None).await
+        };
         match session {
             Ok(()) => return,
             Err(error) => {
@@ -2385,7 +2722,11 @@ async fn wait_for_signature_confirmation(
         ensure_action_not_cancelled(&state, &job.traceId, action_id).await?;
         let current = rx.borrow().clone();
         match current {
-            Some(Ok(confirmed_block_height)) => return Ok(confirmed_block_height),
+            Some(Ok(confirmed_block_height)) => {
+                capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Signature)
+                    .await;
+                return Ok(confirmed_block_height);
+            }
             Some(Err(error)) => return Err(error),
             None => {
                 rx.changed()
@@ -2417,6 +2758,8 @@ async fn wait_for_slot_offset(
             match result {
                 Ok(block_height) => {
                     if block_height >= base_block_height.saturating_add(target_offset) {
+                        capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Slot)
+                            .await;
                         return Ok(());
                     }
                 }
@@ -2445,9 +2788,22 @@ async fn wait_for_market_cap_trigger(
             trigger.threshold
         )
     })?;
+    let timeout_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(trigger.scanTimeoutSeconds);
     let mut rx = ensure_market_watcher(state.clone(), job).await;
     loop {
         ensure_action_not_cancelled(&state, &job.traceId, action_id).await?;
+        if tokio::time::Instant::now() >= timeout_deadline {
+            if trigger.timeoutAction == "sell" {
+                capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Market).await;
+                return Ok(());
+            }
+            capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Market).await;
+            return Err(market_cap_scan_expired_error(
+                action_id,
+                trigger.scanTimeoutSeconds,
+            ));
+        }
         let current_market_cap = rx.borrow().clone();
         if let Some(result) = current_market_cap {
             match result {
@@ -2457,25 +2813,46 @@ async fn wait_for_market_cap_trigger(
                         _ => market_cap >= threshold,
                     };
                     if matches {
+                        let current_health = state.store.health().await;
                         set_watcher_health(
                             &state,
                             WatcherKind::Market,
                             FollowWatcherHealth::Healthy,
+                            current_health.marketWatcherMode.clone(),
                             job.transportPlan
                                 .as_ref()
                                 .and_then(|plan| plan.watchEndpoint.clone()),
-                            None,
+                            current_health.lastError.clone(),
                         )
                         .await;
+                        capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Market)
+                            .await;
                         return Ok(());
                     }
                 }
                 Err(error) => return Err(error),
             }
         }
-        rx.changed()
-            .await
-            .map_err(|_| "Shared market watcher stopped unexpectedly.".to_string())?;
+        let wait_for_change = timeout_deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default();
+        match timeout(wait_for_change, rx.changed()).await {
+            Ok(result) => {
+                result.map_err(|_| "Shared market watcher stopped unexpectedly.".to_string())?;
+            }
+            Err(_) => {
+                if trigger.timeoutAction == "sell" {
+                    capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Market)
+                        .await;
+                    return Ok(());
+                }
+                capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Market).await;
+                return Err(market_cap_scan_expired_error(
+                    action_id,
+                    trigger.scanTimeoutSeconds,
+                ));
+            }
+        }
     }
 }
 
@@ -2637,4 +3014,250 @@ async fn main() {
         })
         .await
         .expect("LaunchDeck follow daemon server failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use launchdeck_engine::config::{
+        NormalizedExecution, NormalizedFollowLaunch, NormalizedFollowLaunchConstraints,
+        NormalizedFollowLaunchMarketCapTrigger, NormalizedFollowLaunchSell,
+        NormalizedFollowLaunchSnipe,
+    };
+    use serde_json::json;
+
+    fn sample_execution() -> NormalizedExecution {
+        serde_json::from_value(json!({
+            "simulate": false,
+            "send": true,
+            "txFormat": "base64",
+            "commitment": "confirmed",
+            "skipPreflight": false,
+            "trackSendBlockHeight": true,
+            "provider": "helius-sender",
+            "endpointProfile": "us",
+            "autoGas": false,
+            "autoMode": "off",
+            "priorityFeeSol": "0.001",
+            "tipSol": "0.01",
+            "maxPriorityFeeSol": "",
+            "maxTipSol": "",
+            "buyProvider": "standard-rpc",
+            "buyEndpointProfile": "",
+            "buyAutoGas": false,
+            "buyAutoMode": "off",
+            "buyPriorityFeeSol": "0.001",
+            "buyTipSol": "",
+            "buySlippagePercent": "90",
+            "buyMaxPriorityFeeSol": "",
+            "buyMaxTipSol": "",
+            "sellAutoGas": false,
+            "sellAutoMode": "off",
+            "sellProvider": "jito-bundle",
+            "sellEndpointProfile": "eu",
+            "sellPriorityFeeSol": "0.001",
+            "sellTipSol": "0.01",
+            "sellSlippagePercent": "90",
+            "sellMaxPriorityFeeSol": "",
+            "sellMaxTipSol": ""
+        }))
+        .expect("sample execution should deserialize")
+    }
+
+    fn sample_job() -> FollowJobRecord {
+        FollowJobRecord {
+            schemaVersion: 1,
+            traceId: "trace".to_string(),
+            jobId: "job".to_string(),
+            state: FollowJobState::Armed,
+            createdAtMs: 0,
+            updatedAtMs: 0,
+            launchpad: "pump".to_string(),
+            quoteAsset: "sol".to_string(),
+            selectedWalletKey: "SOLANA_PRIVATE_KEY".to_string(),
+            execution: sample_execution(),
+            tokenMayhemMode: false,
+            jitoTipAccount: "tip".to_string(),
+            preferPostSetupCreatorVaultForSell: false,
+            mint: None,
+            launchCreator: None,
+            launchSignature: None,
+            submitAtMs: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            reportPath: None,
+            transportPlan: None,
+            followLaunch: NormalizedFollowLaunch {
+                enabled: true,
+                source: "test".to_string(),
+                schemaVersion: 1,
+                snipes: vec![],
+                devAutoSell: None,
+                constraints: NormalizedFollowLaunchConstraints {
+                    pumpOnly: false,
+                    retryBudget: 0,
+                    requireDaemonReadiness: false,
+                    blockOnRequiredPrechecks: false,
+                },
+            },
+            actions: vec![],
+            cancelRequested: false,
+            lastError: None,
+        }
+    }
+
+    fn sample_follow_launch() -> NormalizedFollowLaunch {
+        sample_job().followLaunch
+    }
+
+    #[test]
+    fn follow_buy_transport_plan_uses_buy_provider() {
+        let job = sample_job();
+        let action = FollowActionRecord {
+            actionId: "buy".to_string(),
+            kind: FollowActionKind::SniperBuy,
+            walletEnvKey: "SOLANA_PRIVATE_KEY2".to_string(),
+            state: FollowActionState::Armed,
+            buyAmountSol: Some("1".to_string()),
+            sellPercent: None,
+            submitDelayMs: Some(0),
+            targetBlockOffset: None,
+            delayMs: None,
+            marketCap: None,
+            jitterMs: Some(0),
+            feeJitterBps: Some(0),
+            precheckRequired: false,
+            requireConfirmation: false,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+        };
+        let plan = follow_action_transport_plan(&job, &action);
+        assert_eq!(plan.resolvedProvider, "standard-rpc");
+        assert_eq!(plan.transportType, "standard-rpc-sequential");
+    }
+
+    #[test]
+    fn follow_sell_transport_plan_uses_sell_provider() {
+        let job = sample_job();
+        let action = FollowActionRecord {
+            actionId: "sell".to_string(),
+            kind: FollowActionKind::DevAutoSell,
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            state: FollowActionState::Armed,
+            buyAmountSol: None,
+            sellPercent: Some(100),
+            submitDelayMs: None,
+            targetBlockOffset: Some(1),
+            delayMs: Some(0),
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: true,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+        };
+        let plan = follow_action_transport_plan(&job, &action);
+        assert_eq!(plan.resolvedProvider, "jito-bundle");
+        assert_eq!(plan.transportType, "jito-bundle");
+    }
+
+    #[test]
+    fn realtime_watchers_not_required_for_delay_only_follow_actions() {
+        let mut follow = sample_follow_launch();
+        follow.snipes.push(NormalizedFollowLaunchSnipe {
+            actionId: "snipe-1".to_string(),
+            enabled: true,
+            walletEnvKey: "SOLANA_PRIVATE_KEY2".to_string(),
+            buyAmountSol: "0.1".to_string(),
+            submitWithLaunch: false,
+            retryOnFailure: false,
+            submitDelayMs: 250,
+            targetBlockOffset: None,
+            jitterMs: 0,
+            feeJitterBps: 0,
+            skipIfTokenBalancePositive: false,
+            postBuySell: None,
+        });
+        follow.devAutoSell = Some(NormalizedFollowLaunchSell {
+            actionId: "dev-auto-sell".to_string(),
+            enabled: true,
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            percent: 100,
+            delayMs: Some(500),
+            targetBlockOffset: None,
+            marketCap: None,
+            precheckRequired: false,
+            requireConfirmation: false,
+        });
+        let request = FollowReadyRequest {
+            followLaunch: follow,
+            quoteAsset: "sol".to_string(),
+            execution: sample_execution(),
+            watchEndpoint: Some("wss://example.invalid".to_string()),
+        };
+        assert!(!requires_realtime_watchers(&request));
+    }
+
+    #[test]
+    fn realtime_watchers_required_for_market_cap_follow_sell() {
+        let mut follow = sample_follow_launch();
+        follow.devAutoSell = Some(NormalizedFollowLaunchSell {
+            actionId: "dev-auto-sell".to_string(),
+            enabled: true,
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            percent: 100,
+            delayMs: None,
+            targetBlockOffset: None,
+            marketCap: Some(NormalizedFollowLaunchMarketCapTrigger {
+                direction: "gte".to_string(),
+                threshold: "100000".to_string(),
+                scanTimeoutSeconds: 15,
+                timeoutAction: "stop".to_string(),
+            }),
+            precheckRequired: false,
+            requireConfirmation: false,
+        });
+        let request = FollowReadyRequest {
+            followLaunch: follow,
+            quoteAsset: "sol".to_string(),
+            execution: sample_execution(),
+            watchEndpoint: Some("wss://example.invalid".to_string()),
+        };
+        assert!(requires_realtime_watchers(&request));
+    }
 }

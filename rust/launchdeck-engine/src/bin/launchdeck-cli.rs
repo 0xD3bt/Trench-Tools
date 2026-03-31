@@ -184,6 +184,7 @@ async fn run_cli() -> Result<(), String> {
         now_timestamp_string(),
         creator_public_key,
         Some(format!("Rust CLI {}", args.config.display())),
+        false,
     )
     .await?
     .ok_or_else(|| {

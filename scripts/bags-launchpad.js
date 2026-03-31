@@ -527,12 +527,17 @@ function imageInputFromPath(filePath) {
   if (!absolutePath || !fs.existsSync(absolutePath)) {
     throw new Error("Bags launch requires a readable local image file.");
   }
+  if (!fs.statSync(absolutePath).isFile()) {
+    throw new Error("Bags launch requires a readable local image file.");
+  }
   const buffer = fs.readFileSync(absolutePath);
   const extension = path.extname(absolutePath).toLowerCase();
   const contentType = extension === ".jpg" || extension === ".jpeg"
     ? "image/jpeg"
     : extension === ".gif"
       ? "image/gif"
+      : extension === ".svg"
+        ? "image/svg+xml"
       : extension === ".webp"
         ? "image/webp"
         : "image/png";

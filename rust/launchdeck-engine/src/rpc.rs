@@ -23,6 +23,8 @@ pub struct CompiledTransaction {
     pub lastValidBlockHeight: u64,
     pub serializedBase64: String,
     #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(default)]
     pub lookupTablesUsed: Vec<String>,
     #[serde(default)]
     pub computeUnitLimit: Option<u64>,
@@ -125,8 +127,7 @@ fn cache_blockhash(
 }
 
 async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value, String> {
-    let client = Client::new();
-    let response = client
+    let response = shared_http_client()
         .post(rpc_url)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -372,6 +373,15 @@ fn signature_from_serialized_base64(serialized_base64: &str) -> Option<String> {
         .map(|signature| signature.to_string())
 }
 
+pub(crate) fn precompute_transaction_signature(serialized_base64: &str) -> Option<String> {
+    signature_from_serialized_base64(serialized_base64)
+}
+
+fn shared_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(Client::new)
+}
+
 async fn wait_for_confirmation(
     rpc_url: &str,
     signature: &str,
@@ -597,58 +607,83 @@ pub async fn confirm_transactions_with_websocket_fallback(
     poll_interval_ms: u64,
 ) -> Result<(Vec<String>, u128), String> {
     let confirm_started = std::time::Instant::now();
-    let mut warnings = Vec::new();
-    for result in submitted {
-        let signature = result.signature.clone().ok_or_else(|| {
-            format!(
-                "Submitted transaction {} is missing a signature.",
-                result.label
-            )
-        })?;
-        let confirmation = if let Some(endpoint) = watch_endpoint {
-            match wait_for_confirmation_websocket(
-                endpoint,
-                rpc_url,
-                &signature,
-                commitment,
-                track_send_block_height,
-            )
-            .await
-            {
-                Ok(confirmation) => confirmation,
-                Err(error) => {
-                    warnings.push(format!(
-                        "Websocket confirmation failed for {}: {}. Falling back to RPC polling.",
-                        result.label, error
-                    ));
+    let jobs = submitted
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let label = result.label.clone();
+            let signature = result.signature.clone().ok_or_else(|| {
+                format!(
+                    "Submitted transaction {} is missing a signature.",
+                    result.label
+                )
+            });
+            async move {
+                let signature = signature?;
+                let mut warnings = Vec::new();
+                let confirmation = if let Some(endpoint) = watch_endpoint {
+                    match wait_for_confirmation_websocket(
+                        endpoint,
+                        rpc_url,
+                        &signature,
+                        commitment,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(confirmation) => confirmation,
+                        Err(error) => {
+                            warnings.push(format!(
+                                "Websocket confirmation failed for {}: {}. Falling back to RPC polling.",
+                                label, error
+                            ));
+                            wait_for_confirmation_polling(
+                                rpc_url,
+                                &signature,
+                                commitment,
+                                poll_max_attempts,
+                                poll_interval_ms,
+                                false,
+                            )
+                            .await?
+                        }
+                    }
+                } else {
                     wait_for_confirmation_polling(
                         rpc_url,
                         &signature,
                         commitment,
                         poll_max_attempts,
                         poll_interval_ms,
-                        track_send_block_height,
+                        false,
                     )
                     .await?
-                }
+                };
+                Ok::<(usize, ConfirmationDetails, Vec<String>), String>((index, confirmation, warnings))
             }
-        } else {
-            wait_for_confirmation_polling(
-                rpc_url,
-                &signature,
-                commitment,
-                poll_max_attempts,
-                poll_interval_ms,
-                track_send_block_height,
-            )
-            .await?
-        };
+        })
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    let mut confirmations = Vec::with_capacity(submitted.len());
+    for result in join_all(jobs).await {
+        let (index, confirmation, entry_warnings) = result?;
+        warnings.extend(entry_warnings);
+        confirmations.push((index, confirmation));
+    }
+    let confirmed_observed_block_height = if track_send_block_height {
+        fetch_current_block_height(rpc_url, commitment).await.ok()
+    } else {
+        None
+    };
+    for (index, confirmation) in confirmations {
+        let result = &mut submitted[index];
         result.confirmationStatus = confirmation
             .status
             .get("confirmationStatus")
             .and_then(Value::as_str)
             .map(str::to_string);
-        result.confirmedObservedBlockHeight = confirmation.confirmed_observed_block_height;
+        result.confirmedObservedBlockHeight =
+            confirmed_observed_block_height.or(confirmation.confirmed_observed_block_height);
         result.confirmedSlot = confirmation.confirmed_slot;
     }
     Ok((warnings, confirm_started.elapsed().as_millis()))
@@ -682,6 +717,7 @@ pub async fn submit_transactions_sequential(
         .await?
         .as_str()
         .map(str::to_string)
+        .or_else(|| transaction.signature.clone())
         .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
         .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
         let send_observed_block_height = if track_send_block_height {
@@ -738,6 +774,7 @@ async fn submit_single_transaction_rpc(
     .await?
     .as_str()
     .map(str::to_string)
+    .or_else(|| transaction.signature.clone())
     .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
     .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
     let send_observed_block_height = if track_send_block_height {
@@ -855,93 +892,23 @@ pub async fn submit_transactions_helius_sender(
     }
     let submit_started = std::time::Instant::now();
     for transaction in transactions {
-        validate_helius_sender_transaction(transaction)?;
-        let mut successful_endpoints = Vec::new();
-        let mut returned_signatures = Vec::new();
-        let mut errors = Vec::new();
-        let local_signature = signature_from_serialized_base64(&transaction.serializedBase64);
-        for endpoint in endpoints {
-            match rpc_request(
-                endpoint,
-                "sendTransaction",
-                json!([
-                    transaction.serializedBase64,
-                    {
-                        "encoding": "base64",
-                        "skipPreflight": true,
-                        "maxRetries": 0,
-                    }
-                ]),
-            )
-            .await
-            {
-                Ok(result) => {
-                    if let Some(signature) = result.as_str() {
-                        returned_signatures.push(signature.to_string());
-                    }
-                    successful_endpoints.push(endpoint.clone());
-                }
-                Err(error) => errors.push(format!("{endpoint}: {error}")),
-            }
+        let (entry, entry_warnings) =
+            submit_single_transaction_helius_sender(endpoints, transaction).await?;
+        results.push(entry);
+        warnings.extend(entry_warnings);
+    }
+    if track_send_block_height {
+        let send_observed_block_height = fetch_current_block_height(rpc_url, commitment).await.ok();
+        for result in &mut results {
+            result.sendObservedBlockHeight = send_observed_block_height;
         }
-        if successful_endpoints.is_empty() {
-            return Err(format!(
-                "Helius Sender failed for transaction {} on all attempted endpoints: {}",
-                transaction.label,
-                errors.join(" | ")
-            ));
-        }
-        if !errors.is_empty() {
-            warnings.push(format!(
-                "Helius Sender fanout had partial failures for {}: {}",
-                transaction.label,
-                errors.join(" | ")
-            ));
-        }
-        let signature = local_signature
-            .or_else(|| returned_signatures.first().cloned())
-            .ok_or_else(|| {
-                format!(
-                    "Helius Sender did not return a signature for {}.",
-                    transaction.label
-                )
-            })?;
-        let send_observed_block_height = if track_send_block_height {
-            fetch_current_block_height(rpc_url, commitment).await.ok()
-        } else {
-            None
-        };
-        results.push(SentResult {
-            label: transaction.label.clone(),
-            format: transaction.format.clone(),
-            signature: Some(signature.clone()),
-            explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
-            transportType: "helius-sender".to_string(),
-            endpoint: successful_endpoints.first().cloned(),
-            attemptedEndpoints: endpoints.to_vec(),
-            skipPreflight: true,
-            maxRetries: 0,
-            confirmationStatus: None,
-            sendObservedBlockHeight: send_observed_block_height,
-            confirmedObservedBlockHeight: None,
-            confirmedSlot: None,
-            computeUnitLimit: transaction.computeUnitLimit,
-            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
-            inlineTipLamports: transaction.inlineTipLamports,
-            inlineTipAccount: transaction.inlineTipAccount.clone(),
-            bundleId: None,
-            attemptedBundleIds: vec![],
-        });
     }
     Ok((results, warnings, submit_started.elapsed().as_millis()))
 }
 
 async fn submit_single_transaction_helius_sender(
-    rpc_url: &str,
     endpoints: &[String],
     transaction: &CompiledTransaction,
-    commitment: &str,
-    track_send_block_height: bool,
 ) -> Result<(SentResult, Vec<String>), String> {
     validate_helius_sender_transaction(transaction)?;
     let endpoint_results = join_all(endpoints.iter().map(|endpoint| async move {
@@ -992,7 +959,10 @@ async fn submit_single_transaction_helius_sender(
             errors.join(" | ")
         ));
     }
-    let local_signature = signature_from_serialized_base64(&transaction.serializedBase64);
+    let local_signature = transaction
+        .signature
+        .clone()
+        .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64));
     let signature = local_signature
         .or_else(|| returned_signatures.first().cloned())
         .ok_or_else(|| {
@@ -1001,11 +971,6 @@ async fn submit_single_transaction_helius_sender(
                 transaction.label
             )
         })?;
-    let send_observed_block_height = if track_send_block_height {
-        fetch_current_block_height(rpc_url, commitment).await.ok()
-    } else {
-        None
-    };
     Ok((
         SentResult {
             label: transaction.label.clone(),
@@ -1018,7 +983,7 @@ async fn submit_single_transaction_helius_sender(
             skipPreflight: true,
             maxRetries: 0,
             confirmationStatus: None,
-            sendObservedBlockHeight: send_observed_block_height,
+            sendObservedBlockHeight: None,
             confirmedObservedBlockHeight: None,
             confirmedSlot: None,
             computeUnitLimit: transaction.computeUnitLimit,
@@ -1044,13 +1009,7 @@ pub async fn submit_transactions_helius_sender_parallel(
     }
     let submit_started = std::time::Instant::now();
     let results = join_all(transactions.iter().map(|transaction| {
-        submit_single_transaction_helius_sender(
-            rpc_url,
-            endpoints,
-            transaction,
-            commitment,
-            track_send_block_height,
-        )
+        submit_single_transaction_helius_sender(endpoints, transaction)
     }))
     .await;
     let mut sent = Vec::with_capacity(results.len());
@@ -1059,6 +1018,12 @@ pub async fn submit_transactions_helius_sender_parallel(
         let (entry, entry_warnings) = result?;
         sent.push(entry);
         warnings.extend(entry_warnings);
+    }
+    if track_send_block_height {
+        let send_observed_block_height = fetch_current_block_height(rpc_url, commitment).await.ok();
+        for result in &mut sent {
+            result.sendObservedBlockHeight = send_observed_block_height;
+        }
     }
     Ok((sent, warnings, submit_started.elapsed().as_millis()))
 }
@@ -1088,7 +1053,12 @@ pub async fn submit_transactions_bundle(
         .collect();
     let local_signatures = transactions
         .iter()
-        .map(|transaction| signature_from_serialized_base64(&transaction.serializedBase64))
+        .map(|transaction| {
+            transaction
+                .signature
+                .clone()
+                .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
+        })
         .collect::<Vec<_>>();
     let mut attempts = Vec::new();
     let mut send_errors = Vec::new();
@@ -1390,14 +1360,12 @@ pub async fn send_transactions_helius_sender(
         let mut confirm_ms = 0u128;
         for transaction in transactions {
             let submit_started = std::time::Instant::now();
-            let (sent, entry_warnings) = submit_single_transaction_helius_sender(
-                rpc_url,
-                endpoints,
-                transaction,
-                commitment,
-                track_send_block_height,
-            )
-            .await?;
+            let (mut sent, entry_warnings) =
+                submit_single_transaction_helius_sender(endpoints, transaction).await?;
+            if track_send_block_height {
+                sent.sendObservedBlockHeight =
+                    fetch_current_block_height(rpc_url, commitment).await.ok();
+            }
             submit_ms += submit_started.elapsed().as_millis();
             warnings.extend(entry_warnings);
             let mut submitted = vec![sent];
@@ -1451,8 +1419,7 @@ pub async fn send_transactions_helius_sender(
 }
 
 async fn jito_request(endpoint: &str, method: &str, params: Value) -> Result<Value, String> {
-    let client = Client::new();
-    let response = client
+    let response = shared_http_client()
         .post(endpoint)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -1540,14 +1507,33 @@ pub async fn send_transactions_for_transport(
             .await
         }
         "helius-sender" => {
-            send_transactions_helius_sender(
+            let (mut results, mut warnings, submit_ms) = submit_transactions_helius_sender(
                 rpc_url,
                 &transport_plan.heliusSenderEndpoints,
                 transactions,
                 commitment,
                 track_send_block_height,
             )
-            .await
+            .await?;
+            let (confirm_warnings, confirm_ms) = confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                transport_watch_endpoint(transport_plan),
+                &mut results,
+                commitment,
+                track_send_block_height,
+                75,
+                400,
+            )
+            .await?;
+            warnings.extend(confirm_warnings);
+            Ok((
+                results,
+                warnings,
+                SendTimingBreakdown {
+                    submit_ms,
+                    confirm_ms,
+                },
+            ))
         }
         _ => {
             send_transactions_sequential(
@@ -1706,6 +1692,7 @@ mod tests {
             blockhash: "test-blockhash".to_string(),
             lastValidBlockHeight: 123,
             serializedBase64: "AQID".to_string(),
+            signature: None,
             lookupTablesUsed: vec![],
             computeUnitLimit: Some(1_000_000),
             computeUnitPriceMicroLamports: Some(1),

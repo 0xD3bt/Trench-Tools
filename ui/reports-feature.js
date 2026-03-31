@@ -34,14 +34,13 @@
       toggleOutputButton,
       toggleReportsButton,
       reportsRefreshButton,
-      reportsSortButton,
       reportsTransactionsButton,
       reportsLaunchesButton,
+      reportsActiveJobsButton,
     } = elements;
 
     const {
       visibilityKey,
-      sortKey,
       listWidthKey,
     } = storage;
 
@@ -121,19 +120,6 @@
         }
       }
       schedulePopoutAutosize();
-    }
-
-    function setSort(sort, { persist = true } = {}) {
-      state.sort = sort === "oldest" ? "oldest" : "newest";
-      if (reportsSortButton) {
-        reportsSortButton.textContent = state.sort === "oldest" ? "Oldest" : "Newest";
-      }
-      if (!persist) return;
-      try {
-        window.localStorage.setItem(sortKey, state.sort);
-      } catch (_error) {
-        // Ignore storage failures and keep the UI functional.
-      }
     }
 
     function startResize(event) {
@@ -231,20 +217,6 @@
           }
         });
       }
-      if (reportsSortButton) {
-        reportsSortButton.addEventListener("click", async () => {
-          setSort(state.sort === "newest" ? "oldest" : "newest");
-          try {
-            await refreshReports({ preserveSelection: false });
-          } catch (error) {
-            if (reportsTerminalOutput) {
-              state.activePayload = null;
-              state.activeText = error.message || "Failed to sort reports.";
-              renderOutput();
-            }
-          }
-        });
-      }
       if (reportsTransactionsButton) {
         reportsTransactionsButton.addEventListener("click", async () => {
           if (getView() === "transactions") return;
@@ -270,6 +242,21 @@
             if (reportsTerminalOutput) {
               state.activePayload = null;
               state.activeText = error.message || "Failed to load launches.";
+              renderOutput();
+            }
+          }
+        });
+      }
+      if (reportsActiveJobsButton) {
+        reportsActiveJobsButton.addEventListener("click", async () => {
+          if (getView() === "active-jobs") return;
+          setView("active-jobs");
+          try {
+            await refreshReports({ preserveSelection: false });
+          } catch (error) {
+            if (reportsTerminalOutput) {
+              state.activePayload = null;
+              state.activeText = error.message || "Failed to load active jobs.";
               renderOutput();
             }
           }
@@ -354,7 +341,6 @@
       getStoredListWidth,
       setListWidth,
       setVisible,
-      setSort,
     };
   }
 

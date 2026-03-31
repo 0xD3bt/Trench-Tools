@@ -33,15 +33,6 @@ pub struct ProviderAvailability {
 pub fn provider_registry() -> Vec<ProviderMeta> {
     vec![
         ProviderMeta {
-            id: "standard-rpc",
-            label: "Standard RPC",
-            verified: true,
-            supportsSingle: true,
-            supportsSequential: true,
-            supportsBundle: false,
-            supportsEndpointProfiles: false,
-        },
-        ProviderMeta {
             id: "helius-sender",
             label: "Helius Sender",
             verified: true,
@@ -58,6 +49,15 @@ pub fn provider_registry() -> Vec<ProviderMeta> {
             supportsSequential: false,
             supportsBundle: true,
             supportsEndpointProfiles: true,
+        },
+        ProviderMeta {
+            id: "standard-rpc",
+            label: "Standard RPC",
+            verified: true,
+            supportsSingle: true,
+            supportsSequential: true,
+            supportsBundle: false,
+            supportsEndpointProfiles: false,
         },
     ]
 }

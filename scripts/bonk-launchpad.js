@@ -15,7 +15,12 @@ const {
   TransactionMessage,
   VersionedTransaction,
 } = require("@solana/web3.js");
-const { NATIVE_MINT, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } = require("@solana/spl-token");
+const {
+  NATIVE_MINT,
+  TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountIdempotentInstruction,
+  getAssociatedTokenAddressSync,
+} = require("@solana/spl-token");
 const {
   Curve,
   LaunchpadConfig,
@@ -179,6 +184,114 @@ function normalizeTransactions(result, { labelPrefix, computeUnitLimit, computeU
       serializedLength: Buffer.from(serializeTransaction(transaction), "base64").length,
     };
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForWalletTokenAccountVisibility(raydium, owner, mint, ata, commitment) {
+  if (!raydium || !raydium.account || typeof raydium.account.fetchWalletTokenAccounts !== "function") {
+    return false;
+  }
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const refreshed = await raydium.account.fetchWalletTokenAccounts({ forceUpdate: true, commitment });
+    const visible = (refreshed.tokenAccountRawInfos || []).some((entry) => (
+      entry.pubkey.equals(ata) || entry.accountInfo.mint.equals(mint)
+    ));
+    if (visible) {
+      return true;
+    }
+    if (attempt < 5) {
+      await sleep(400 * (attempt + 1));
+    }
+  }
+  return false;
+}
+
+async function ensureAssociatedTokenAccountExists(connection, owner, mint, request, raydium) {
+  const commitment = request.commitment || "confirmed";
+  const mintInfo = await connection.getAccountInfo(mint, commitment);
+  if (!mintInfo) {
+    throw new Error(`Token mint account not found: ${mint.toBase58()}`);
+  }
+  const tokenProgramId = mintInfo.owner;
+  const ata = getAssociatedTokenAddressSync(mint, owner.publicKey, false, tokenProgramId);
+  const existingAta = await connection.getAccountInfo(ata, commitment);
+  if (existingAta) {
+    const visible = await waitForWalletTokenAccountVisibility(
+      raydium,
+      owner.publicKey,
+      mint,
+      ata,
+      commitment,
+    );
+    if (!visible) {
+      throw new Error(`Associated token account exists on-chain but is not yet visible to Raydium: ${ata.toBase58()}`);
+    }
+    return ata;
+  }
+  const transaction = new Transaction();
+  transaction.feePayer = owner.publicKey;
+  if (request.txConfig && request.txConfig.computeUnitPriceMicroLamports) {
+    transaction.add(
+      ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: Number(request.txConfig.computeUnitPriceMicroLamports),
+      }),
+    );
+  }
+  if (request.txConfig && request.txConfig.computeUnitLimit) {
+    transaction.add(
+      ComputeBudgetProgram.setComputeUnitLimit({
+        units: Number(request.txConfig.computeUnitLimit),
+      }),
+    );
+  }
+  transaction.add(
+    createAssociatedTokenAccountIdempotentInstruction(
+      owner.publicKey,
+      ata,
+      owner.publicKey,
+      mint,
+      tokenProgramId,
+    ),
+  );
+  const tipInstruction = buildInlineTipInstruction(
+    owner.publicKey,
+    request.txConfig && request.txConfig.tipAccount,
+    request.txConfig && request.txConfig.tipLamports,
+  );
+  if (tipInstruction) {
+    transaction.add(tipInstruction);
+  }
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(commitment);
+  transaction.recentBlockhash = blockhash;
+  transaction.sign(owner);
+  const signature = await connection.sendRawTransaction(transaction.serialize(), {
+    preflightCommitment: commitment,
+  });
+  const confirmation = await connection.confirmTransaction(
+    { signature, blockhash, lastValidBlockHeight },
+    commitment,
+  );
+  if (confirmation && confirmation.value && confirmation.value.err) {
+    throw new Error(`USD1 ATA creation failed: ${JSON.stringify(confirmation.value.err)}`);
+  }
+  const visible = await waitForWalletTokenAccountVisibility(
+    raydium,
+    owner.publicKey,
+    mint,
+    ata,
+    commitment,
+  );
+  if (!visible) {
+    throw new Error(`Created associated token account is not yet visible to Raydium: ${ata.toBase58()}`);
+  }
+  return ata;
+}
+
+function allowAtaCreation(request) {
+  return Boolean(request && request.allowAtaCreation);
 }
 
 async function resolveLookupTableAccounts(connection, transaction) {
@@ -1024,6 +1137,9 @@ async function buildLaunch(request) {
       );
     }
   }
+  if (allowAtaCreation(request) && !createOnly && defaults.quoteAsset !== "sol") {
+    await ensureAssociatedTokenAccountExists(connection, owner, defaults.quoteMint, request, raydium);
+  }
   const usd1Topup = !createOnly && defaults.quoteAsset === "usd1" && buyAmount
     ? await prepareUsd1Topup(
       raydium,
@@ -1054,6 +1170,8 @@ async function buildLaunch(request) {
     extraSigners: [mintKeypair],
     computeBudgetConfig: buildComputeBudgetConfig(request.txConfig),
     txTipConfig: buildTipConfig(request.txConfig),
+    associatedOnly: false,
+    checkCreateATAOwner: true,
   });
   const launchTransactions = extractTransactions(buildResult);
   let atomicFallbackReason = null;
@@ -1129,6 +1247,9 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
   });
   const mint = new PublicKey(request.mint);
   const quote = resolveQuoteAssetConfig(request.quoteAsset);
+  if (allowAtaCreation(request) && quote.asset !== "sol") {
+    await ensureAssociatedTokenAccountExists(connection, owner, quote.mint, request, raydium);
+  }
   const buyAmount = parseDecimalToBn(request.buyAmountSol, quote.decimals, `follow buy amount ${quote.label}`);
   const options = {
     programId: LAUNCHPAD_PROGRAM,
@@ -1167,6 +1288,8 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
   }
   const buildResult = await raydium.launchpad.buyToken({
     ...options,
+    associatedOnly: false,
+    checkCreateATAOwner: true,
   });
   if (atomic && quote.asset === "usd1") {
     const usd1Topup = await prepareUsd1Topup(
@@ -1254,6 +1377,8 @@ async function compileFollowSell(request) {
     txVersion: txVersionFromFormat(request.txFormat),
     computeBudgetConfig: buildComputeBudgetConfig(request.txConfig),
     txTipConfig: buildTipConfig(request.txConfig),
+    associatedOnly: false,
+    checkCreateATAOwner: true,
   });
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
   return {

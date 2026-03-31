@@ -538,6 +538,12 @@ h2 {
   letter-spacing: 0.04em;
 }
 
+#toggle-reports-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .wallet-inline-controls .wallet-chip-button:not(.icon-chip-button) {
   padding-left: 7px;
   padding-right: 7px;
@@ -2025,10 +2031,11 @@ textarea.input-error {
 
 .auto-sell-popover-panel {
   position: absolute;
-  top: calc(100% + 8px);
+  top: auto;
+  bottom: calc(100% + 8px);
   right: 0;
   z-index: 30;
-  width: 260px;
+  width: 248px;
   padding: 12px;
   border: 1px solid var(--accent-border);
   border-radius: 10px;
@@ -2182,11 +2189,190 @@ textarea.input-error {
   gap: 8px;
 }
 
+.auto-sell-segmented-control {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, max-content));
+  gap: 4px;
+  justify-content: center;
+  align-items: center;
+  justify-self: center;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+}
+
+.auto-sell-segmented-button {
+  width: auto;
+  min-width: 58px;
+  min-height: 22px;
+  padding: 4px 11px;
+  border-radius: 4px;
+}
+
+.auto-sell-segmented-button.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(25, 199, 163, 0.05);
+}
+
+.auto-sell-segmented-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.auto-sell-segmented-button .mode-title {
+  letter-spacing: 0.05em;
+}
+
+#auto-sell-time-settings,
+.auto-sell-market-cap-settings {
+  width: min(100%, 238px);
+  justify-self: center;
+}
+
+#auto-sell-time-settings {
+  display: grid;
+}
+
+.auto-sell-market-cap-settings {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.auto-sell-market-cap-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  align-items: end;
+}
+
+.auto-sell-market-cap-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.auto-sell-market-cap-field span {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.auto-sell-market-cap-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.auto-sell-tooltip-dot {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
+  font-size: 6px;
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.auto-sell-market-cap-input {
+  width: 100%;
+  min-height: 28px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(180deg, rgba(18, 24, 33, 0.94), rgba(12, 17, 24, 0.98));
+  color: var(--text);
+  font: 500 10px/1.35 var(--font-body);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+  outline: none;
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+.auto-sell-market-cap-select {
+  width: 100%;
+  min-height: 28px;
+  padding: 5px 26px 5px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background:
+    linear-gradient(180deg, rgba(18, 24, 33, 0.94), rgba(12, 17, 24, 0.98)),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%238d9caf' d='M1.1.6 5 4.4 8.9.6 10 1.7 5 6 .1 1.7z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat, no-repeat;
+  background-position: 0 0, right 9px center;
+  background-size: auto, 10px 6px;
+  color: var(--text);
+  font: 500 10px/1.35 var(--font-body);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  color-scheme: dark;
+}
+
+.auto-sell-market-cap-input::placeholder {
+  color: var(--text-muted);
+}
+
+.auto-sell-market-cap-input:hover,
+.auto-sell-market-cap-select:hover {
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.auto-sell-market-cap-input:focus,
+.auto-sell-market-cap-select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim), inset 0 1px 0 rgba(255, 255, 255, 0.025);
+}
+
+.auto-sell-market-cap-input:disabled,
+.auto-sell-market-cap-select:disabled {
+  opacity: 0.5;
+}
+
+.auto-sell-market-cap-select option {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.auto-sell-market-cap-input::-webkit-outer-spin-button,
+.auto-sell-market-cap-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.auto-sell-market-cap-timeout-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.auto-sell-market-cap-suffix {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.auto-sell-helper-text {
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
 .auto-sell-trigger-chip {
   min-width: 0;
   width: 100%;
   min-height: 32px;
-  padding: 7px 10px;
+  padding: 7px 12px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.03);
@@ -2215,14 +2401,16 @@ textarea.input-error {
 .auto-sell-block-grid {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 3px;
 }
 
 .auto-sell-block-grid .auto-sell-trigger-chip {
   width: auto;
-  min-width: 24px;
-  min-height: 20px;
-  padding: 3px 6px;
+  min-width: 22px;
+  min-height: 18px;
+  padding: 2px 5px;
+  font-size: 9px;
+  line-height: 1.1;
 }
 
 .auto-sell-help-text {
@@ -3221,6 +3409,43 @@ button {
   cursor: pointer;
 }
 
+.reports-terminal-chip-danger {
+  border-color: rgba(255, 93, 93, 0.24);
+  color: #ff8b8b;
+}
+
+.reports-terminal-chip-danger:hover,
+.reports-terminal-chip-danger:focus-visible {
+  border-color: rgba(255, 93, 93, 0.38);
+}
+
+.reports-follow-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.reports-follow-summary.is-offline {
+  border-color: rgba(255, 176, 32, 0.24);
+  color: var(--text-primary);
+}
+
+.reports-follow-summary.is-active {
+  color: var(--text-primary);
+}
+
+.reports-follow-summary.is-issues {
+  border-color: rgba(255, 93, 93, 0.22);
+}
+
 .reports-terminal-body {
   --reports-terminal-list-width: 152px;
   display: grid;
@@ -3238,8 +3463,14 @@ button {
   grid-template-columns: minmax(0, 1fr);
 }
 
+.reports-terminal.is-active-jobs-view .reports-terminal-body {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .reports-terminal.is-launches-view .reports-terminal-list,
-.reports-terminal.is-launches-view .reports-terminal-resize-handle {
+.reports-terminal.is-launches-view .reports-terminal-resize-handle,
+.reports-terminal.is-active-jobs-view .reports-terminal-list,
+.reports-terminal.is-active-jobs-view .reports-terminal-resize-handle {
   display: none;
 }
 
@@ -3385,6 +3616,34 @@ button {
 .reports-launches-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.reports-active-jobs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.reports-active-jobs-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.reports-active-jobs-heading strong {
+  font: 700 11px/1.4 var(--font-display);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.reports-active-jobs-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
   gap: 10px;
 }
 
@@ -3556,6 +3815,85 @@ button {
   padding-top: 2px;
 }
 
+.reports-active-job-card {
+  gap: 10px;
+}
+
+.reports-active-job-meta-grid {
+  display: grid;
+  gap: 6px;
+}
+
+.reports-active-job-route-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.reports-active-job-action-list {
+  display: grid;
+  gap: 6px;
+}
+
+.reports-active-job-action {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.reports-active-job-action-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.reports-active-job-action-copy strong {
+  font: 600 11px/1.35 var(--font-body);
+  color: var(--text);
+}
+
+.reports-active-job-action-copy span {
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.reports-active-job-action-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.reports-active-job-action-meta-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  min-width: 0;
+}
+
+.reports-active-job-action-meta-pill strong {
+  font: 600 9px/1.2 var(--font-body);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.reports-active-job-action-meta-pill span {
+  font: 600 10px/1.25 var(--font-mono);
+  color: var(--text);
+}
+
 .reports-panel-stack {
   display: grid;
   gap: 10px;
@@ -3600,6 +3938,19 @@ button {
   font: 600 12px/1.3 var(--font-mono);
   color: var(--text);
   overflow-wrap: anywhere;
+}
+
+.reports-metric-note {
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
+.reports-panel-note {
+  margin: 0 0 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
 }
 
 .reports-action-list {

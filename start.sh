@@ -126,6 +126,7 @@ wait_for_health_endpoint() {
 
 start_launchdeck_processes() {
   local ports engine_port follow_daemon_port daemon_stdout_path daemon_stderr_path stdout_path stderr_path
+  local daemon_wait_pid engine_wait_pid
   mapfile -t ports < <(stop_old_launchdeck_runtime)
   engine_port="${ports[0]}"
   follow_daemon_port="${ports[1]}"
@@ -139,13 +140,6 @@ start_launchdeck_processes() {
     nohup cargo run --manifest-path "rust/launchdeck-engine/Cargo.toml" --bin launchdeck-follow-daemon \
       >"$daemon_stdout_path" 2>"$daemon_stderr_path" </dev/null &
   )
-
-  if wait_for_health_endpoint "http://127.0.0.1:$follow_daemon_port/health" "LaunchDeck follow daemon" 40 0.5; then
-    echo "LaunchDeck follow daemon ready on port $follow_daemon_port."
-  else
-    echo "Warning: Check .local/launchdeck/follow-daemon-error.log if the follow daemon failed to start." >&2
-  fi
-
   stdout_path="$launchdeck_log_dir/engine.log"
   stderr_path="$launchdeck_log_dir/engine-error.log"
   (
@@ -154,15 +148,30 @@ start_launchdeck_processes() {
       >"$stdout_path" 2>"$stderr_path" </dev/null &
   )
 
-  if wait_for_health_endpoint "http://127.0.0.1:$engine_port/health" "LaunchDeck Rust host" 60 0.5; then
-    echo "LaunchDeck Rust host ready on port $engine_port."
-    if command -v xdg-open >/dev/null 2>&1; then
-      xdg-open "http://127.0.0.1:$engine_port" >/dev/null 2>&1 || true
+  (
+    if wait_for_health_endpoint "http://127.0.0.1:$follow_daemon_port/health" "LaunchDeck follow daemon" 40 0.5; then
+      echo "LaunchDeck follow daemon ready on port $follow_daemon_port."
+    else
+      echo "Warning: Check .local/launchdeck/follow-daemon-error.log if the follow daemon failed to start." >&2
     fi
-  else
-    echo "Warning: LaunchDeck Rust host did not report healthy startup before timeout at http://127.0.0.1:$engine_port/health. It may still be compiling." >&2
-    echo "Warning: Check .local/launchdeck/engine-error.log if the Rust host actually failed to start." >&2
-  fi
+  ) &
+  daemon_wait_pid=$!
+
+  (
+    if wait_for_health_endpoint "http://127.0.0.1:$engine_port/health" "LaunchDeck Rust host" 60 0.5; then
+      echo "LaunchDeck Rust host ready on port $engine_port."
+      if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "http://127.0.0.1:$engine_port" >/dev/null 2>&1 || true
+      fi
+    else
+      echo "Warning: LaunchDeck Rust host did not report healthy startup before timeout at http://127.0.0.1:$engine_port/health. It may still be compiling." >&2
+      echo "Warning: Check .local/launchdeck/engine-error.log if the Rust host actually failed to start." >&2
+    fi
+  ) &
+  engine_wait_pid=$!
+
+  wait "$daemon_wait_pid"
+  wait "$engine_wait_pid"
 }
 
 cd "$project_root"

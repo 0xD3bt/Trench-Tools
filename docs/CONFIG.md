@@ -35,8 +35,12 @@ Recommended practice:
 - set `USER_REGION` to your nearest region instead of pinning one sender or bundle endpoint
 - region fanout is usually faster and more reliable because LaunchDeck can send across that region's endpoint group instead of depending on a single host
 - use provider-specific region overrides only when one provider needs a different region than your shared default
+- for most operators, use Helius for both `SOLANA_RPC_URL` and `SOLANA_WS_URL` because it is currently the fastest and best-supported overall setup in LaunchDeck
 
 If you omit `SOLANA_WS_URL`, LaunchDeck cannot do its best realtime follow behavior.
+
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE`
+  Enables the enhanced Helius `transactionSubscribe` market-watcher path when your Helius websocket supports it. Recommended only for Helius dev-tier users; otherwise leave it `false` and LaunchDeck will stay on the standard websocket watcher path.
 
 ### Wallet Import
 
@@ -257,6 +261,8 @@ For all providers:
 - `followLaunch.snipes[].postBuySell` is not supported yet and is rejected
 - `submitWithLaunch` cannot be combined with `submitDelayMs` or `targetBlockOffset`
 - follow constraints and retry budgets are validated
+- dev auto-sell supports an exclusive `time` or `market-cap` trigger family
+- market-cap timeout is stored in seconds and supports `timeoutAction=stop|sell`
 
 ## Provider Defaults And Preset Defaults
 

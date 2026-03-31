@@ -330,12 +330,14 @@ fn decode_secret_base64(secret: &[u8]) -> String {
 }
 
 fn convert_compiled_transaction(source: HelperCompiledTransaction) -> CompiledTransaction {
+    let signature = crate::rpc::precompute_transaction_signature(&source.serializedBase64);
     CompiledTransaction {
         label: source.label,
         format: source.format,
         blockhash: source.blockhash,
         lastValidBlockHeight: source.lastValidBlockHeight,
         serializedBase64: source.serializedBase64,
+        signature,
         lookupTablesUsed: source.lookupTablesUsed,
         computeUnitLimit: source.computeUnitLimit,
         computeUnitPriceMicroLamports: source.computeUnitPriceMicroLamports,
@@ -467,6 +469,7 @@ pub async fn try_compile_native_bonk(
     built_at: String,
     creator_public_key: String,
     config_path: Option<String>,
+    allow_ata_creation: bool,
 ) -> Result<Option<NativeBonkArtifacts>, String> {
     if config.launchpad != "bonk" {
         return Ok(None);
@@ -480,6 +483,7 @@ pub async fn try_compile_native_bonk(
         "rpcUrl": rpc_url,
         "commitment": config.execution.commitment,
         "ownerSecret": decode_secret_base64(wallet_secret),
+        "allowAtaCreation": allow_ata_creation,
         "vanitySecret": config.vanityPrivateKey,
         "txFormat": config.execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
@@ -553,6 +557,7 @@ pub async fn compile_follow_buy_transaction(
     mint: &str,
     _launch_creator: &str,
     buy_amount_sol: &str,
+    allow_ata_creation: bool,
 ) -> Result<CompiledTransaction, String> {
     let tip_lamports = parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?;
     let response: HelperFollowBuyResponse = run_helper(&json!({
@@ -561,6 +566,7 @@ pub async fn compile_follow_buy_transaction(
         "quoteAsset": quote_asset,
         "commitment": execution.commitment,
         "ownerSecret": decode_secret_base64(wallet_secret),
+        "allowAtaCreation": allow_ata_creation,
         "mint": mint,
         "buyAmountSol": buy_amount_sol,
         "txFormat": execution.txFormat,
@@ -587,6 +593,7 @@ pub async fn compile_atomic_follow_buy_transaction(
     mint: &str,
     launch_creator: &str,
     buy_amount_sol: &str,
+    allow_ata_creation: bool,
 ) -> Result<CompiledTransaction, String> {
     let tip_lamports = parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?;
     let response: HelperFollowBuyResponse = run_helper(&json!({
@@ -596,6 +603,7 @@ pub async fn compile_atomic_follow_buy_transaction(
         "quoteAsset": quote_asset,
         "commitment": execution.commitment,
         "ownerSecret": decode_secret_base64(wallet_secret),
+        "allowAtaCreation": allow_ata_creation,
         "mint": mint,
         "launchCreator": launch_creator,
         "buyAmountSol": buy_amount_sol,
