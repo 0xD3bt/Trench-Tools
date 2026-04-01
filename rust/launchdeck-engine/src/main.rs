@@ -227,6 +227,7 @@ struct ReportViewQuery {
     id: Option<String>,
 }
 
+#[allow(non_snake_case)]
 #[derive(Deserialize, Default)]
 struct QuoteQuery {
     launchpad: Option<String>,
@@ -623,9 +624,6 @@ fn attach_follow_daemon_report(
         job_record.followLaunch = original_follow_launch.clone();
     }
     let health = latest_response.map(|response| response.health.clone());
-    let timing_profiles = latest_response
-        .map(|response| response.timingProfiles.clone())
-        .unwrap_or_default();
     report["followDaemon"] = json!({
         "schemaVersion": FOLLOW_RESPONSE_SCHEMA_VERSION,
         "enabled": reserved.is_some() || armed.is_some(),
@@ -634,7 +632,6 @@ fn attach_follow_daemon_report(
         "armed": armed,
         "job": job,
         "health": health,
-        "timingProfiles": timing_profiles,
     });
 }
 
@@ -3588,7 +3585,6 @@ fn follow_jobs_payload(response: FollowJobResponse, started_at_ms: u128) -> Json
         job,
         jobs,
         health,
-        timingProfiles,
     } = response;
     Json(attach_timing(
         json!({
@@ -3597,7 +3593,6 @@ fn follow_jobs_payload(response: FollowJobResponse, started_at_ms: u128) -> Json
             "job": job,
             "jobs": jobs,
             "health": health,
-            "timingProfiles": timingProfiles,
         }),
         started_at_ms,
     ))

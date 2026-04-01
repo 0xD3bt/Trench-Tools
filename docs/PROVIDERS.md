@@ -105,7 +105,7 @@ Practical note:
 - in normal average-latency setups this is the provider we recommend first
 - pairing Helius Sender with Helius RPC + Helius WS is currently the strongest overall default setup in LaunchDeck
 
-### Helius Enhanced Market Watchers
+### Helius Enhanced Realtime Watchers
 
 When all of these are true:
 
@@ -114,7 +114,7 @@ When all of these are true:
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
 - your Helius tier actually supports `transactionSubscribe`
 
-the follow daemon upgrades market-cap watchers to use Helius `transactionSubscribe` instead of standard websocket subscriptions.
+the follow daemon upgrades slot, signature, and market watchers to use Helius `transactionSubscribe` instead of standard websocket subscriptions.
 
 If any of those conditions are not met, LaunchDeck falls back to the standard websocket watcher path automatically.
 

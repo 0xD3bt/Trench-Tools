@@ -19,11 +19,11 @@ use launchdeck_engine::{
         compile_sol_to_usd1_topup_transaction, fetch_bonk_market_snapshot,
     },
     follow::{
-        FOLLOW_RESPONSE_SCHEMA_VERSION, FOLLOW_TELEMETRY_SCHEMA_VERSION, FollowActionKind,
-        FollowActionRecord, FollowActionState, FollowArmRequest, FollowCancelRequest,
-        FollowDaemonHealth, FollowDaemonStore, FollowJobRecord, FollowJobResponse, FollowJobState,
-        FollowReadyRequest, FollowReadyResponse, FollowReserveRequest, FollowStopAllRequest,
-        FollowTelemetrySample, FollowWatcherHealth, follow_job_response, follow_ready_response,
+        FOLLOW_RESPONSE_SCHEMA_VERSION, FollowActionKind, FollowActionRecord, FollowActionState,
+        FollowArmRequest, FollowCancelRequest, FollowDaemonHealth, FollowDaemonStore,
+        FollowJobRecord, FollowJobResponse, FollowJobState, FollowReadyRequest,
+        FollowReadyResponse, FollowReserveRequest, FollowStopAllRequest, FollowWatcherHealth,
+        follow_job_response, follow_ready_response,
     },
     observability::update_persisted_follow_daemon_snapshot,
     paths,
@@ -722,7 +722,7 @@ fn resolve_watch_endpoint(request: &FollowReadyRequest) -> Option<String> {
     })
 }
 
-fn selected_market_watcher_mode(
+fn selected_realtime_watcher_mode(
     provider: &str,
     endpoint_profile: &str,
     watch_endpoint: Option<&str>,
@@ -734,6 +734,14 @@ fn selected_market_watcher_mode(
     } else {
         "standard-ws".to_string()
     }
+}
+
+fn selected_market_watcher_mode(
+    provider: &str,
+    endpoint_profile: &str,
+    watch_endpoint: Option<&str>,
+) -> String {
+    selected_realtime_watcher_mode(provider, endpoint_profile, watch_endpoint)
 }
 
 async fn validate_watch_endpoint(endpoint: &str) -> Result<(), String> {
@@ -859,9 +867,17 @@ async fn daemon_ready(
             .update_health(
                 Some(endpoint.clone()),
                 FollowWatcherHealth::Healthy,
-                Some("standard-ws".to_string()),
+                Some(selected_realtime_watcher_mode(
+                    &payload.execution.provider,
+                    &payload.execution.endpointProfile,
+                    Some(endpoint.as_str()),
+                )),
                 FollowWatcherHealth::Healthy,
-                Some("standard-ws".to_string()),
+                Some(selected_realtime_watcher_mode(
+                    &payload.execution.provider,
+                    &payload.execution.endpointProfile,
+                    Some(endpoint.as_str()),
+                )),
                 FollowWatcherHealth::Healthy,
                 Some(selected_market_watcher_mode(
                     &payload.execution.provider,
@@ -921,16 +937,8 @@ async fn arm_job(
 ) -> Result<Json<FollowJobResponse>, (StatusCode, Json<Value>)> {
     authorize(&headers, &state)?;
     let trace_id = payload.traceId.clone();
-    let already_armed = get_job(&state, &trace_id)
-        .await
-        .and_then(|job| job.launchSignature)
-        .is_some();
     let job = state.store.arm_job(payload).await.map_err(internal_error)?;
     sync_follow_job_report(&state, &trace_id).await;
-    if !already_armed {
-        record_creation_sample(&state, &job).await;
-        sync_follow_job_report(&state, &trace_id).await;
-    }
     prepare_follow_job_buy_caches(state.clone(), &job).await;
     spawn_job_if_needed(state.clone(), trace_id).await;
     Ok(Json(job_response(&state, Some(job)).await))
@@ -1016,8 +1024,7 @@ async fn get_job(state: &Arc<AppState>, trace_id: &str) -> Option<FollowJobRecor
 async fn job_response(state: &Arc<AppState>, job: Option<FollowJobRecord>) -> FollowJobResponse {
     let health = build_health(state).await;
     let jobs = state.store.list_jobs().await;
-    let timing_profiles = state.store.inner.read().await.timingProfiles.clone();
-    follow_job_response(health, job, jobs, timing_profiles)
+    follow_job_response(health, job, jobs)
 }
 
 async fn sync_follow_job_report(state: &Arc<AppState>, trace_id: &str) {
@@ -1028,13 +1035,11 @@ async fn sync_follow_job_report(state: &Arc<AppState>, trace_id: &str) {
         return;
     };
     let health = build_health(state).await;
-    let timing_profiles = state.store.inner.read().await.timingProfiles.clone();
     let snapshot = json!({
         "schemaVersion": FOLLOW_RESPONSE_SCHEMA_VERSION,
         "transport": health.controlTransport,
         "job": job,
         "health": health,
-        "timingProfiles": timing_profiles,
     });
     let _report_guard = state.report_write_lock.lock().await;
     let _ = update_persisted_follow_daemon_snapshot(&report_path, &snapshot);
@@ -1243,36 +1248,6 @@ async fn record_action_failure(
         })
         .await;
     sync_follow_job_report(state, &job.traceId).await;
-    let transport_plan = follow_action_transport_plan(job, action);
-    let attempt_count = action.attemptCount.saturating_add(1);
-    let _ = state
-        .store
-        .record_sample(FollowTelemetrySample {
-            schemaVersion: FOLLOW_TELEMETRY_SCHEMA_VERSION,
-            traceId: job.traceId.clone(),
-            actionId: action.actionId.clone(),
-            actionType: action_type_name(&action.kind).to_string(),
-            phase: "follow".to_string(),
-            provider: transport_plan.resolvedProvider.clone(),
-            endpointProfile: transport_plan.resolvedEndpointProfile.clone(),
-            transportType: transport_plan.transportType.clone(),
-            attemptCount: attempt_count,
-            triggerType: action_trigger_type(action),
-            delaySettingMs: action.submitDelayMs.or(action.delayMs),
-            jitterMs: action.jitterMs,
-            feeJitterBps: action.feeJitterBps,
-            submitLatencyMs: None,
-            confirmLatencyMs: None,
-            launchToActionMs: None,
-            launchToActionBlocks: None,
-            scheduleSlipMs: None,
-            outcome: classify_action_failure(error).to_string(),
-            qualityLabel: "failed".to_string(),
-            qualityWeight: 0,
-            detail: Some(error.to_string()),
-            writtenAtMs: now_ms(),
-        })
-        .await;
 }
 
 async fn record_action_expired(
@@ -1289,54 +1264,6 @@ async fn record_action_expired(
         })
         .await;
     sync_follow_job_report(state, &job.traceId).await;
-}
-
-async fn record_creation_sample(state: &Arc<AppState>, job: &FollowJobRecord) {
-    let Some(transport_plan) = job.transportPlan.as_ref() else {
-        return;
-    };
-    let mut detail_parts = Vec::new();
-    if let Some(signature) = job.launchSignature.as_deref() {
-        detail_parts.push(format!("signature={signature}"));
-    }
-    if let Some(block_height) = job.sendObservedBlockHeight {
-        detail_parts.push(format!("sendObservedBlockHeight={block_height}"));
-    }
-    if let Some(block_height) = job.confirmedObservedBlockHeight {
-        detail_parts.push(format!("confirmedObservedBlockHeight={block_height}"));
-    }
-    let _ = state
-        .store
-        .record_sample(FollowTelemetrySample {
-            schemaVersion: FOLLOW_TELEMETRY_SCHEMA_VERSION,
-            traceId: job.traceId.clone(),
-            actionId: "launch-create".to_string(),
-            actionType: "launch-create".to_string(),
-            phase: "creation".to_string(),
-            provider: job.execution.provider.clone(),
-            endpointProfile: job.execution.endpointProfile.clone(),
-            transportType: transport_plan.transportType.clone(),
-            attemptCount: 1,
-            triggerType: "submit-observed".to_string(),
-            delaySettingMs: None,
-            jitterMs: None,
-            feeJitterBps: None,
-            submitLatencyMs: None,
-            confirmLatencyMs: None,
-            launchToActionMs: Some(0),
-            launchToActionBlocks: Some(0),
-            scheduleSlipMs: None,
-            outcome: "success".to_string(),
-            qualityLabel: "creation-observed".to_string(),
-            qualityWeight: 100,
-            detail: if detail_parts.is_empty() {
-                None
-            } else {
-                Some(detail_parts.join(" | "))
-            },
-            writtenAtMs: now_ms(),
-        })
-        .await;
 }
 
 fn should_retry_action(job: &FollowJobRecord, action: &FollowActionRecord, error: &str) -> bool {
@@ -1642,7 +1569,7 @@ async fn execute_action(
         pre_send_notes.push(note);
     }
     let mut retried_creator_vault = false;
-    let (mut submitted, mut warnings, submit_ms, submit_latency) = loop {
+    let (mut submitted, mut warnings, _submit_ms, _submit_latency) = loop {
         let started = Instant::now();
         match submit_transactions_for_transport(
             &state.rpc_url,
@@ -1717,9 +1644,8 @@ async fn execute_action(
         })
         .await?;
     sync_follow_job_report(&state, &trace_id).await;
-    let action_send_block_height = sent.sendObservedBlockHeight;
     let mut confirm_input = vec![sent.clone()];
-    let (_, confirm_ms) = confirm_submitted_transactions_for_transport(
+    let (_, _confirm_ms) = confirm_submitted_transactions_for_transport(
         &state.rpc_url,
         &transport_plan,
         &mut confirm_input,
@@ -1758,58 +1684,8 @@ async fn execute_action(
         })
         .await?;
     sync_follow_job_report(&state, &trace_id).await;
-    let attempt_count = action.attemptCount.saturating_add(1);
-    let submitted_at_ms = now_ms();
-    let launch_to_action_ms_value = launch_to_action_ms(job, submitted_at_ms);
-    let launch_to_action_blocks_value = launch_to_action_blocks(job, action_send_block_height);
-    let schedule_slip_ms_value = schedule_slip_ms(action, submitted_at_ms);
-    let (outcome, quality_label, quality_weight, detail) = classify_success_quality(
-        job,
-        action,
-        attempt_count,
-        &warnings,
-        confirm_ms,
-        submitted_at_ms,
-        action_send_block_height,
-    );
-    state
-        .store
-        .record_sample(FollowTelemetrySample {
-            schemaVersion: FOLLOW_TELEMETRY_SCHEMA_VERSION,
-            traceId: trace_id.clone(),
-            actionId: action.actionId.clone(),
-            actionType: action_type_name(&action.kind).to_string(),
-            phase: "follow".to_string(),
-            provider: transport_plan.resolvedProvider.clone(),
-            endpointProfile: transport_plan.resolvedEndpointProfile.clone(),
-            transportType: transport_plan.transportType.clone(),
-            attemptCount: attempt_count,
-            triggerType: action_trigger_type(action),
-            delaySettingMs: action.submitDelayMs.or(action.delayMs),
-            jitterMs: action.jitterMs,
-            feeJitterBps: action.feeJitterBps,
-            submitLatencyMs: Some(submit_latency.max(submit_ms)),
-            confirmLatencyMs: Some(confirm_ms),
-            launchToActionMs: launch_to_action_ms_value,
-            launchToActionBlocks: launch_to_action_blocks_value,
-            scheduleSlipMs: schedule_slip_ms_value,
-            outcome,
-            qualityLabel: quality_label,
-            qualityWeight: quality_weight,
-            detail,
-            writtenAtMs: submitted_at_ms,
-        })
-        .await?;
     sync_follow_job_report(&state, &trace_id).await;
     Ok(())
-}
-
-fn action_type_name(kind: &FollowActionKind) -> &'static str {
-    match kind {
-        FollowActionKind::SniperBuy => "sniper-buy",
-        FollowActionKind::DevAutoSell => "dev-auto-sell",
-        FollowActionKind::SniperSell => "sniper-sell",
-    }
 }
 
 fn follow_action_execution(job: &FollowJobRecord, action: &FollowActionRecord) -> launchdeck_engine::config::NormalizedExecution {
@@ -1831,146 +1707,11 @@ fn follow_action_transport_plan(job: &FollowJobRecord, action: &FollowActionReco
     build_transport_plan(&follow_action_execution(job, action), 1)
 }
 
-fn action_trigger_type(action: &FollowActionRecord) -> String {
-    let mut triggers = Vec::new();
-    if action.submitDelayMs.is_some() {
-        triggers.push("submit-time");
-    }
-    if action.targetBlockOffset.is_some() {
-        triggers.push("block");
-    }
-    if action.delayMs.is_some() {
-        triggers.push("time");
-    }
-    if action.marketCap.is_some() {
-        triggers.push("market-cap");
-    }
-    if triggers.is_empty() {
-        "immediate".to_string()
-    } else {
-        triggers.join("+")
-    }
-}
-
-fn classify_action_failure(error: &str) -> &'static str {
-    let normalized = error.to_ascii_lowercase();
-    if normalized.contains("insufficient funds") {
-        "insufficient-funds"
-    } else if normalized.contains("cancel") {
-        "cancelled"
-    } else if normalized.contains("provider") || normalized.contains("rpc") {
-        "provider-rejected"
-    } else {
-        "reverted"
-    }
-}
-
 fn is_creator_vault_seed_mismatch(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     normalized.contains("creator_vault")
         && (normalized.contains("constraintseeds")
             || normalized.contains("seeds constraint was violated"))
-}
-
-fn launch_to_action_ms(job: &FollowJobRecord, submitted_at_ms: u128) -> Option<u128> {
-    job.submitAtMs
-        .map(|submit_at_ms| submitted_at_ms.saturating_sub(submit_at_ms))
-}
-
-fn launch_to_action_blocks(
-    job: &FollowJobRecord,
-    action_send_block_height: Option<u64>,
-) -> Option<u64> {
-    match (job.sendObservedBlockHeight, action_send_block_height) {
-        (Some(job_block_height), Some(action_block_height)) => {
-            Some(action_block_height.saturating_sub(job_block_height))
-        }
-        _ => None,
-    }
-}
-
-fn schedule_slip_ms(action: &FollowActionRecord, submitted_at_ms: u128) -> Option<u64> {
-    action
-        .scheduledForMs
-        .map(|scheduled_for_ms| submitted_at_ms.saturating_sub(scheduled_for_ms) as u64)
-}
-
-fn classify_success_quality(
-    job: &FollowJobRecord,
-    action: &FollowActionRecord,
-    attempt_count: u32,
-    warnings: &[String],
-    confirm_ms: u128,
-    submitted_at_ms: u128,
-    action_send_block_height: Option<u64>,
-) -> (String, String, u8, Option<String>) {
-    let launch_to_ms = launch_to_action_ms(job, submitted_at_ms);
-    let launch_to_blocks = launch_to_action_blocks(job, action_send_block_height);
-    let schedule_slip = schedule_slip_ms(action, submitted_at_ms);
-    let mut quality_weight: u8 = 100;
-    let mut detail_parts = Vec::new();
-    if attempt_count > 1 {
-        quality_weight = quality_weight.saturating_sub(((attempt_count - 1) * 12).min(36) as u8);
-        detail_parts.push(format!("attempts={attempt_count}"));
-    }
-    if !warnings.is_empty() {
-        quality_weight = quality_weight.saturating_sub(10);
-        detail_parts.push(format!("warnings={}", warnings.join(" | ")));
-    }
-    if let Some(slip_ms) = schedule_slip {
-        if slip_ms > 100 {
-            quality_weight = quality_weight.saturating_sub(10);
-        }
-        if slip_ms > 500 {
-            quality_weight = quality_weight.saturating_sub(15);
-        }
-        detail_parts.push(format!("scheduleSlipMs={slip_ms}"));
-    }
-    if let Some(blocks) = launch_to_blocks {
-        if blocks > 2 {
-            quality_weight = quality_weight.saturating_sub(20);
-        }
-        detail_parts.push(format!("launchToActionBlocks={blocks}"));
-    }
-    if let Some(latency_ms) = launch_to_ms {
-        detail_parts.push(format!("launchToActionMs={latency_ms}"));
-    }
-    if confirm_ms > 4_000 {
-        quality_weight = quality_weight.saturating_sub(10);
-    }
-    if confirm_ms > 8_000 {
-        quality_weight = quality_weight.saturating_sub(15);
-    }
-    detail_parts.push(format!("confirmLatencyMs={confirm_ms}"));
-    let missed_window = matches!(action.kind, FollowActionKind::SniperBuy)
-        && action.targetBlockOffset.zip(launch_to_blocks).is_some_and(
-            |(target_offset, observed_offset)| {
-                observed_offset > u64::from(target_offset).saturating_add(1)
-            },
-        );
-    let late = !missed_window
-        && (schedule_slip.unwrap_or_default() > 750
-            || confirm_ms > 8_000
-            || launch_to_blocks.is_some_and(|blocks| blocks > 2));
-    let degraded = !late && (attempt_count > 1 || !warnings.is_empty() || confirm_ms > 4_000);
-    let (outcome, quality_label) = if missed_window {
-        quality_weight = quality_weight.min(25);
-        ("missed-window".to_string(), "missed-window".to_string())
-    } else if late {
-        quality_weight = quality_weight.min(55);
-        ("late".to_string(), "late".to_string())
-    } else if degraded {
-        quality_weight = quality_weight.min(80);
-        ("degraded-success".to_string(), "degraded".to_string())
-    } else {
-        ("success".to_string(), "clean".to_string())
-    };
-    let detail = if detail_parts.is_empty() {
-        None
-    } else {
-        Some(detail_parts.join(" | "))
-    };
-    (outcome, quality_label, quality_weight.max(5), detail)
 }
 
 async fn wallet_lock(state: &Arc<AppState>, wallet_key: &str) -> Arc<Mutex<()>> {
@@ -2235,7 +1976,11 @@ async fn capture_action_watcher_metadata(
     let health = state.store.health().await;
     let inferred_endpoint = resolve_job_watch_endpoint(job).ok();
     let inferred_mode = match kind {
-        WatcherKind::Slot | WatcherKind::Signature => Some("standard-ws".to_string()),
+        WatcherKind::Slot | WatcherKind::Signature => Some(selected_realtime_watcher_mode(
+            &job.execution.provider,
+            &job.execution.endpointProfile,
+            inferred_endpoint.as_deref(),
+        )),
         WatcherKind::Market => Some(selected_market_watcher_mode(
             &job.execution.provider,
             &job.execution.endpointProfile,
@@ -2292,6 +2037,51 @@ async fn run_slot_watcher_ws_session(
             WatcherKind::Slot,
             FollowWatcherHealth::Healthy,
             Some("standard-ws".to_string()),
+            Some(endpoint.to_string()),
+            None,
+        )
+        .await;
+    }
+}
+
+async fn run_helius_transaction_slot_watcher_session(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    tx: &watch::Sender<Option<Result<u64, String>>>,
+    endpoint: &str,
+) -> Result<(), String> {
+    let mut ws = open_subscription_socket(endpoint).await?;
+    subscribe(
+        &mut ws,
+        "transactionSubscribe",
+        json!([
+            {
+                "failed": false,
+                "vote": false
+            },
+            {
+                "commitment": "processed",
+                "encoding": "jsonParsed",
+                "transactionDetails": "none",
+                "showRewards": false,
+                "maxSupportedTransactionVersion": 0
+            }
+        ]),
+    )
+    .await?;
+    loop {
+        ensure_job_not_cancelled(state, &job.traceId).await?;
+        let message = next_json_message(&mut ws).await?;
+        if message.get("params").is_none() {
+            continue;
+        }
+        let block_height = fetch_current_block_height(&state.rpc_url, "confirmed").await?;
+        let _ = tx.send(Some(Ok(block_height)));
+        set_watcher_health(
+            state,
+            WatcherKind::Slot,
+            FollowWatcherHealth::Healthy,
+            Some("helius-transaction-subscribe".to_string()),
             Some(endpoint.to_string()),
             None,
         )
@@ -2476,6 +2266,80 @@ async fn run_helius_transaction_market_watcher_session(
     }
 }
 
+fn extract_transaction_notification_signature(message: &Value) -> Option<String> {
+    [
+        message.pointer("/params/result/signature"),
+        message.pointer("/params/result/transaction/signature"),
+        message.pointer("/params/result/transaction/signatures/0"),
+        message.pointer("/params/result/transaction/transaction/signatures/0"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| value.as_str().map(str::to_string))
+}
+
+async fn run_helius_transaction_signature_watcher_session(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    tx: &watch::Sender<Option<Result<u64, String>>>,
+    endpoint: &str,
+    signature: &str,
+) -> Result<u64, String> {
+    let filter = if let Some(creator) = job.launchCreator.as_ref() {
+        json!({
+            "accountInclude": [creator],
+            "failed": false,
+            "vote": false
+        })
+    } else {
+        json!({
+            "failed": false,
+            "vote": false
+        })
+    };
+    let mut ws = open_subscription_socket(endpoint).await?;
+    subscribe(
+        &mut ws,
+        "transactionSubscribe",
+        json!([
+            filter,
+            {
+                "commitment": "confirmed",
+                "encoding": "jsonParsed",
+                "transactionDetails": "full",
+                "showRewards": false,
+                "maxSupportedTransactionVersion": 0
+            }
+        ]),
+    )
+    .await?;
+    loop {
+        ensure_job_not_cancelled(state, &job.traceId).await?;
+        let message = next_json_message(&mut ws).await?;
+        if message.get("params").is_none() {
+            continue;
+        }
+        let Some(observed_signature) = extract_transaction_notification_signature(&message) else {
+            continue;
+        };
+        if observed_signature != signature {
+            continue;
+        }
+        let confirmed_block_height = fetch_current_block_height(&state.rpc_url, "confirmed").await?;
+        let _ = tx.send(Some(Ok(confirmed_block_height)));
+        set_watcher_health(
+            state,
+            WatcherKind::Signature,
+            FollowWatcherHealth::Healthy,
+            Some("helius-transaction-subscribe".to_string()),
+            Some(endpoint.to_string()),
+            None,
+        )
+        .await;
+        return Ok(confirmed_block_height);
+    }
+}
+
 async fn run_signature_watcher(
     state: Arc<AppState>,
     job: FollowJobRecord,
@@ -2494,8 +2358,41 @@ async fn run_signature_watcher(
         return;
     };
     let mut attempt: u32 = 0;
+    let prefers_helius_transaction_subscribe = configured_enable_helius_transaction_subscribe()
+        && supports_helius_transaction_subscribe(
+            &job.execution.provider,
+            &job.execution.endpointProfile,
+            Some(&endpoint),
+        );
     loop {
         let session: Result<u64, String> = async {
+            if prefers_helius_transaction_subscribe {
+                match run_helius_transaction_signature_watcher_session(
+                    &state,
+                    &job,
+                    &tx,
+                    &endpoint,
+                    &signature,
+                )
+                .await
+                {
+                    Ok(confirmed_block_height) => return Ok(confirmed_block_height),
+                    Err(error) => {
+                        let fallback_note = format!(
+                            "Helius transactionSubscribe signature watcher failed: {error}. Falling back to standard websocket."
+                        );
+                        set_watcher_health(
+                            &state,
+                            WatcherKind::Signature,
+                            FollowWatcherHealth::Healthy,
+                            Some("standard-ws".to_string()),
+                            Some(endpoint.clone()),
+                            Some(fallback_note),
+                        )
+                        .await;
+                    }
+                }
+            }
             let mut ws = open_subscription_socket(&endpoint).await?;
             subscribe(
                 &mut ws,
@@ -2571,15 +2468,59 @@ async fn run_slot_watcher(
 ) {
     let mut attempt: u32 = 0;
     let watch_endpoint = resolve_job_watch_endpoint(&job).ok();
+    let prefers_helius_transaction_subscribe = watch_endpoint.as_deref().is_some_and(|endpoint| {
+        configured_enable_helius_transaction_subscribe()
+            && supports_helius_transaction_subscribe(
+                &job.execution.provider,
+                &job.execution.endpointProfile,
+                Some(endpoint),
+            )
+    });
     loop {
         let session = if let Some(endpoint) = watch_endpoint.as_deref() {
-            match run_slot_watcher_ws_session(&state, &job, &tx, endpoint).await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let fallback_note = format!(
-                        "Standard websocket slot watcher failed: {error}. Falling back to RPC polling."
-                    );
-                    run_slot_watcher_polling_session(&state, &job, &tx, Some(fallback_note)).await
+            if prefers_helius_transaction_subscribe {
+                match run_helius_transaction_slot_watcher_session(&state, &job, &tx, endpoint).await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let fallback_note = format!(
+                            "Helius transactionSubscribe slot watcher failed: {error}. Falling back to standard websocket."
+                        );
+                        set_watcher_health(
+                            &state,
+                            WatcherKind::Slot,
+                            FollowWatcherHealth::Healthy,
+                            Some("standard-ws".to_string()),
+                            Some(endpoint.to_string()),
+                            Some(fallback_note.clone()),
+                        )
+                        .await;
+                        match run_slot_watcher_ws_session(&state, &job, &tx, endpoint).await {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                let fallback_note = format!(
+                                    "{fallback_note} Standard websocket slot watcher failed: {error}. Falling back to RPC polling."
+                                );
+                                run_slot_watcher_polling_session(
+                                    &state,
+                                    &job,
+                                    &tx,
+                                    Some(fallback_note),
+                                )
+                                .await
+                            }
+                        }
+                    }
+                }
+            } else {
+                match run_slot_watcher_ws_session(&state, &job, &tx, endpoint).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let fallback_note = format!(
+                            "Standard websocket slot watcher failed: {error}. Falling back to RPC polling."
+                        );
+                        run_slot_watcher_polling_session(&state, &job, &tx, Some(fallback_note)).await
+                    }
                 }
             }
         } else {
@@ -3259,5 +3200,23 @@ mod tests {
             watchEndpoint: Some("wss://example.invalid".to_string()),
         };
         assert!(requires_realtime_watchers(&request));
+    }
+
+    #[test]
+    fn selected_realtime_watcher_mode_prefers_helius_transaction_subscribe() {
+        unsafe {
+            env::set_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE", "true");
+        }
+        assert_eq!(
+            selected_realtime_watcher_mode(
+                "helius-sender",
+                "us",
+                Some("wss://mainnet.helius-rpc.com/?api-key=test"),
+            ),
+            "helius-transaction-subscribe"
+        );
+        unsafe {
+            env::remove_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE");
+        }
     }
 }

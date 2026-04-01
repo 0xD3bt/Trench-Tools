@@ -9,7 +9,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -22,17 +21,12 @@ use tokio::{
 
 pub const FOLLOW_SCHEMA_VERSION: u32 = 1;
 pub const FOLLOW_JOB_SCHEMA_VERSION: u32 = 1;
-pub const FOLLOW_TELEMETRY_SCHEMA_VERSION: u32 = 1;
 pub const FOLLOW_RESPONSE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LOCAL_AUTH_TOKEN: &str = "4815927603149027";
 const RESTART_STALE_JOB_MAX_AGE_MS: u128 = 5 * 60 * 1000;
 
 fn follow_job_schema_version() -> u32 {
     FOLLOW_JOB_SCHEMA_VERSION
-}
-
-fn follow_telemetry_schema_version() -> u32 {
-    FOLLOW_TELEMETRY_SCHEMA_VERSION
 }
 
 fn follow_response_schema_version() -> u32 {
@@ -203,70 +197,10 @@ pub struct FollowDaemonHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FollowTelemetrySample {
-    #[serde(default = "follow_telemetry_schema_version")]
-    pub schemaVersion: u32,
-    pub traceId: String,
-    pub actionId: String,
-    pub actionType: String,
-    #[serde(default)]
-    pub phase: String,
-    pub provider: String,
-    pub endpointProfile: String,
-    pub transportType: String,
-    #[serde(default)]
-    pub attemptCount: u32,
-    #[serde(default)]
-    pub triggerType: String,
-    pub delaySettingMs: Option<u64>,
-    pub jitterMs: Option<u64>,
-    pub feeJitterBps: Option<u16>,
-    pub submitLatencyMs: Option<u128>,
-    pub confirmLatencyMs: Option<u128>,
-    pub launchToActionMs: Option<u128>,
-    pub launchToActionBlocks: Option<u64>,
-    pub scheduleSlipMs: Option<u64>,
-    pub outcome: String,
-    #[serde(default)]
-    pub qualityLabel: String,
-    pub qualityWeight: u8,
-    pub detail: Option<String>,
-    pub writtenAtMs: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FollowTimingRecommendation {
-    pub suggestedSubmitDelayMs: Option<u64>,
-    pub suggestedJitterMs: Option<u64>,
-    pub confidence: String,
-    pub successRate: f64,
-    pub weightedQualityScore: f64,
-    pub sampleCount: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FollowTimingProfile {
-    #[serde(default = "follow_telemetry_schema_version")]
-    pub schemaVersion: u32,
-    pub provider: String,
-    pub endpointProfile: String,
-    pub actionType: String,
-    pub sampleCount: usize,
-    pub successCount: usize,
-    pub weightedQualityScore: f64,
-    pub p50SubmitMs: Option<u64>,
-    pub p75SubmitMs: Option<u64>,
-    pub p90SubmitMs: Option<u64>,
-    pub recommendation: FollowTimingRecommendation,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowDaemonStateFile {
     pub schemaVersion: u32,
     pub health: FollowDaemonHealth,
     pub jobs: Vec<FollowJobRecord>,
-    pub telemetrySamples: Vec<FollowTelemetrySample>,
-    pub timingProfiles: Vec<FollowTimingProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,7 +269,6 @@ pub struct FollowJobResponse {
     pub job: Option<FollowJobRecord>,
     pub jobs: Vec<FollowJobRecord>,
     pub health: FollowDaemonHealth,
-    pub timingProfiles: Vec<FollowTimingProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -377,38 +310,6 @@ fn configured_follow_daemon_auth_token() -> Option<String> {
         Some(DEFAULT_LOCAL_AUTH_TOKEN.to_string())
     } else {
         Some(trimmed.to_string())
-    }
-}
-
-fn percentile(sorted: &[u128], percentile: f64) -> Option<u64> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let rank = ((sorted.len() - 1) as f64 * percentile).round() as usize;
-    sorted
-        .get(rank)
-        .and_then(|value| u64::try_from(*value).ok())
-}
-
-fn outcome_success_weight(outcome: &str) -> (bool, f64) {
-    match outcome {
-        "success" => (true, 1.0),
-        "degraded-success" => (true, 0.8),
-        "late" => (true, 0.5),
-        "missed-window" => (false, 0.2),
-        "reverted" | "provider-rejected" | "insufficient-funds" => (false, 0.0),
-        "cancelled" => (false, 0.0),
-        _ => (false, 0.1),
-    }
-}
-
-fn recommendation_confidence(sample_count: usize, success_rate: f64) -> String {
-    if sample_count >= 25 && success_rate >= 0.75 {
-        "high".to_string()
-    } else if sample_count >= 10 && success_rate >= 0.5 {
-        "medium".to_string()
-    } else {
-        "low".to_string()
     }
 }
 
@@ -600,8 +501,6 @@ impl FollowDaemonStore {
                 watchEndpoint: None,
             },
             jobs: vec![],
-            telemetrySamples: vec![],
-            timingProfiles: vec![],
         }
     }
 
@@ -1024,87 +923,6 @@ impl FollowDaemonStore {
         Ok(recovered)
     }
 
-    pub async fn record_sample(&self, sample: FollowTelemetrySample) -> Result<(), String> {
-        let mut state = self.inner.write().await;
-        state.telemetrySamples.push(sample);
-        let mut grouped: HashMap<(String, String, String), Vec<&FollowTelemetrySample>> =
-            HashMap::new();
-        for sample in &state.telemetrySamples {
-            grouped
-                .entry((
-                    sample.provider.clone(),
-                    sample.endpointProfile.clone(),
-                    sample.actionType.clone(),
-                ))
-                .or_default()
-                .push(sample);
-        }
-        state.timingProfiles = grouped
-            .into_iter()
-            .map(|((provider, endpoint_profile, action_type), samples)| {
-                let mut submit_latencies = samples
-                    .iter()
-                    .filter(|sample| outcome_success_weight(&sample.outcome).0)
-                    .filter_map(|sample| sample.submitLatencyMs)
-                    .collect::<Vec<_>>();
-                submit_latencies.sort_unstable();
-                let success_count = samples
-                    .iter()
-                    .filter(|sample| outcome_success_weight(&sample.outcome).0)
-                    .count();
-                let success_rate = if samples.is_empty() {
-                    0.0
-                } else {
-                    success_count as f64 / samples.len() as f64
-                };
-                let weighted_quality_score = if samples.is_empty() {
-                    0.0
-                } else {
-                    samples
-                        .iter()
-                        .map(|sample| {
-                            let (_, outcome_weight) = outcome_success_weight(&sample.outcome);
-                            outcome_weight * f64::from(sample.qualityWeight)
-                        })
-                        .sum::<f64>()
-                        / samples.len() as f64
-                };
-                let p50_submit_ms = percentile(&submit_latencies, 0.50);
-                let recommended_delay = if weighted_quality_score >= 80.0 {
-                    p50_submit_ms
-                } else if weighted_quality_score >= 60.0 {
-                    percentile(&submit_latencies, 0.75)
-                } else {
-                    percentile(&submit_latencies, 0.90)
-                };
-                let suggested_jitter_ms = recommended_delay.map(|value| (value / 10).max(5));
-                let recommendation = FollowTimingRecommendation {
-                    suggestedSubmitDelayMs: recommended_delay,
-                    suggestedJitterMs: suggested_jitter_ms,
-                    confidence: recommendation_confidence(samples.len(), success_rate),
-                    successRate: success_rate,
-                    weightedQualityScore: weighted_quality_score,
-                    sampleCount: samples.len(),
-                };
-                FollowTimingProfile {
-                    schemaVersion: FOLLOW_TELEMETRY_SCHEMA_VERSION,
-                    provider,
-                    endpointProfile: endpoint_profile,
-                    actionType: action_type,
-                    sampleCount: samples.len(),
-                    successCount: success_count,
-                    weightedQualityScore: weighted_quality_score,
-                    p50SubmitMs: p50_submit_ms,
-                    p75SubmitMs: percentile(&submit_latencies, 0.75),
-                    p90SubmitMs: percentile(&submit_latencies, 0.90),
-                    recommendation,
-                }
-            })
-            .collect();
-        drop(state);
-        self.persist().await
-    }
-
     pub async fn update_action(
         &self,
         trace_id: &str,
@@ -1255,7 +1073,6 @@ pub fn follow_job_response(
     health: FollowDaemonHealth,
     job: Option<FollowJobRecord>,
     jobs: Vec<FollowJobRecord>,
-    timing_profiles: Vec<FollowTimingProfile>,
 ) -> FollowJobResponse {
     FollowJobResponse {
         schemaVersion: FOLLOW_RESPONSE_SCHEMA_VERSION,
@@ -1263,7 +1080,6 @@ pub fn follow_job_response(
         job,
         jobs,
         health,
-        timingProfiles: timing_profiles,
     }
 }
 

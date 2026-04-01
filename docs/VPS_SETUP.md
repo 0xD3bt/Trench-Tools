@@ -160,7 +160,7 @@ Recommended setup:
 - use the matching Helius websocket URL for `SOLANA_WS_URL`
 - use `Helius Sender` as your provider in LaunchDeck
 
-At the moment, that is the fastest and best-supported operator path in LaunchDeck for most users. If your Helius websocket supports `transactionSubscribe` on dev tier, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` for the upgraded market-watcher path.
+At the moment, that is the fastest and best-supported operator path in LaunchDeck for most users. If your Helius websocket supports `transactionSubscribe` on dev tier, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` for the upgraded slot, signature, and market watcher path.
 
 Full env reference:
 

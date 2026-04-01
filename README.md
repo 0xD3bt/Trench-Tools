@@ -20,6 +20,7 @@ LaunchDeck is open-source tooling provided as-is. Running it, configuring it, mo
 
 For most operators today, the best-supported and fastest setup is:
 
+- [Helius](https://www.helius.dev/) for the full infrastructure stack
 - `Helius` for `SOLANA_RPC_URL`
 - `Helius` for `SOLANA_WS_URL`
 - `Helius Sender` as the creation, buy, and sell provider
@@ -28,7 +29,7 @@ If you have a Helius dev-tier plan and your websocket endpoint supports it, also
 
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
 
-That unlocks the enhanced `transactionSubscribe` market-watcher path for follow-daemon market-cap triggers while still falling back safely when unsupported.
+That unlocks the enhanced `transactionSubscribe` path for follow-daemon slot, signature, and market watchers while still falling back safely when unsupported.
 
 ## What It Does
 
@@ -137,7 +138,7 @@ Optional but common:
 - `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata` ([Pinata](https://pinata.cloud/))
 - `PINATA_JWT`
 - `BAGS_API_KEY`
-- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and want the enhanced market-watcher path
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and want the enhanced `transactionSubscribe` watcher path
 
 Full configuration reference: `docs/CONFIG.md`
 

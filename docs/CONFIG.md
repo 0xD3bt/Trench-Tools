@@ -40,7 +40,7 @@ Recommended practice:
 If you omit `SOLANA_WS_URL`, LaunchDeck cannot do its best realtime follow behavior.
 
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE`
-  Enables the enhanced Helius `transactionSubscribe` market-watcher path when your Helius websocket supports it. Recommended only for Helius dev-tier users; otherwise leave it `false` and LaunchDeck will stay on the standard websocket watcher path.
+  Enables the enhanced Helius `transactionSubscribe` path for slot, signature, and market watchers when your Helius websocket supports it. Recommended only for Helius dev-tier users; otherwise leave it `false` and LaunchDeck will stay on the standard websocket watcher path.
 
 ### Wallet Import
 

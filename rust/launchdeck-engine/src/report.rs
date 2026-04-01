@@ -815,58 +815,6 @@ pub fn render_report(report: &LaunchReport) -> String {
                     }
                 }
             }
-            if let Some(profiles) = follow.get("timingProfiles").and_then(Value::as_array)
-                && !profiles.is_empty()
-            {
-                lines.push("  Timing advice:".to_string());
-                for profile in profiles {
-                    let action_type = profile
-                        .get("actionType")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let sample_count = profile
-                        .get("sampleCount")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let weighted_quality_score = profile
-                        .get("weightedQualityScore")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let recommendation = profile
-                        .get("recommendation")
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    let confidence = recommendation
-                        .get("confidence")
-                        .and_then(Value::as_str)
-                        .unwrap_or("low");
-                    let success_rate = recommendation
-                        .get("successRate")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let suggested_delay = recommendation
-                        .get("suggestedSubmitDelayMs")
-                        .and_then(Value::as_u64);
-                    let suggested_jitter = recommendation
-                        .get("suggestedJitterMs")
-                        .and_then(Value::as_u64);
-                    let mut summary = format!(
-                        "  - {}: samples={} | confidence={} | success={:.0}% | quality={:.1}",
-                        action_type,
-                        sample_count,
-                        confidence,
-                        success_rate * 100.0,
-                        weighted_quality_score
-                    );
-                    if let Some(delay) = suggested_delay {
-                        summary.push_str(&format!(" | suggest delay={}ms", delay));
-                    }
-                    if let Some(jitter) = suggested_jitter {
-                        summary.push_str(&format!(" | suggest jitter={}ms", jitter));
-                    }
-                    lines.push(summary);
-                }
-            }
         }
     }
     if let Some(benchmark) = &report.benchmark {

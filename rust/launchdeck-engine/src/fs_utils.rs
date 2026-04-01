@@ -31,6 +31,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
+#[allow(dead_code)]
 pub fn quarantine_corrupt_file(path: &Path, label: &str) -> Result<PathBuf, String> {
     let corrupt_path = path.with_extension(format!(
         "{}.corrupt-{}",

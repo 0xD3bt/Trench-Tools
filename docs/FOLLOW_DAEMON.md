@@ -141,8 +141,8 @@ Operational notes:
 
 Current watcher modes:
 
-- slot watcher: standard websocket
-- signature watcher: standard websocket
+- slot watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and supported
+- signature watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and supported
 - market watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and supported
 
 For the best current setup:

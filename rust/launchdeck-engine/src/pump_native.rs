@@ -1,3 +1,5 @@
+#![allow(dead_code, non_snake_case)]
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

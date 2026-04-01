@@ -401,7 +401,6 @@ let followJobsState = {
   reachable: false,
   jobs: [],
   health: null,
-  timingProfiles: [],
   error: "",
   loaded: false,
   refreshTimer: null,
@@ -4449,7 +4448,6 @@ async function refreshFollowJobs({ silent = false } = {}) {
       reachable: false,
       jobs: [],
       health: null,
-      timingProfiles: [],
       error: "",
       loaded: true,
     };
@@ -4473,7 +4471,6 @@ async function refreshFollowJobs({ silent = false } = {}) {
       reachable: true,
       jobs: Array.isArray(payload.jobs) ? payload.jobs : [],
       health: payload.health && typeof payload.health === "object" ? payload.health : null,
-      timingProfiles: Array.isArray(payload.timingProfiles) ? payload.timingProfiles : [],
       error: "",
       loaded: true,
     };
@@ -4515,7 +4512,6 @@ async function cancelFollowJob(traceId, { note = "" } = {}) {
     ...followJobsState,
     jobs: Array.isArray(payload.jobs) ? payload.jobs : followJobsState.jobs,
     health: payload.health && typeof payload.health === "object" ? payload.health : followJobsState.health,
-    timingProfiles: Array.isArray(payload.timingProfiles) ? payload.timingProfiles : followJobsState.timingProfiles,
     reachable: true,
     configured: true,
     loaded: true,
@@ -4541,7 +4537,6 @@ async function cancelAllFollowJobs() {
     ...followJobsState,
     jobs: Array.isArray(payload.jobs) ? payload.jobs : [],
     health: payload.health && typeof payload.health === "object" ? payload.health : followJobsState.health,
-    timingProfiles: Array.isArray(payload.timingProfiles) ? payload.timingProfiles : followJobsState.timingProfiles,
     reachable: true,
     configured: true,
     loaded: true,
@@ -5843,15 +5838,6 @@ function currentReportsTerminalExecution() {
   return report && report.execution && typeof report.execution === "object" ? report.execution : null;
 }
 
-function currentReportsTerminalTimingProfiles() {
-  const report = currentReportsTerminalReport();
-  return report
-    && report.followDaemon
-    && Array.isArray(report.followDaemon.timingProfiles)
-    ? report.followDaemon.timingProfiles
-    : [];
-}
-
 function formatReportMetric(value, suffix = "", fallback = "--", digits = 0) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -6091,6 +6077,24 @@ function shortenReportEndpoint(endpoint) {
   }
 }
 
+function formatWatcherModeLabel(mode) {
+  const normalized = String(mode || "").trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized === "helius-transaction-subscribe") return "Helius transactionSubscribe";
+  if (normalized === "standard-ws") return "Standard websocket";
+  if (normalized === "rpc-polling") return "RPC polling";
+  return String(mode || "").trim();
+}
+
+function buildWatcherDetail(mode, fallbackReason) {
+  const parts = [];
+  const modeLabel = formatWatcherModeLabel(mode);
+  if (modeLabel) parts.push(`Mode: ${modeLabel}`);
+  const note = String(fallbackReason || "").trim();
+  if (note) parts.push(note);
+  return parts.join(" | ");
+}
+
 function renderCopyableHash(value, label = "Copy hash") {
   const raw = String(value || "").trim();
   if (!raw) return "--";
@@ -6113,6 +6117,7 @@ function buildFollowActionMetricItems(action, followJob) {
     { label: "Provider", value: formatProviderLabel(route.provider) },
     { label: "Transport", value: route.transportType || "--" },
     { label: "Endpoint Profile", value: route.endpointProfile || "--" },
+    { label: "Watcher", value: formatWatcherModeLabel(action && action.watcherMode) || "--", detail: action && action.watcherFallbackReason ? String(action.watcherFallbackReason) : "" },
     { label: "Wallet", value: describeFollowActionWallet(action) },
     { label: "Trigger", value: describeFollowActionTrigger(action) },
     {
@@ -6122,9 +6127,9 @@ function buildFollowActionMetricItems(action, followJob) {
         parentQuoteAsset: followJob && followJob.quoteAsset,
       }),
     },
-    { label: "Start Block", value: action && action.sendObservedBlockHeight != null ? String(action.sendObservedBlockHeight) : isBuy && followJob && followJob.sendObservedBlockHeight != null ? `launch ${followJob.sendObservedBlockHeight}` : "--" },
-    { label: "Confirm Block", value: action && action.confirmedObservedBlockHeight != null ? String(action.confirmedObservedBlockHeight) : "--" },
-    { label: "Blocks", value: action && action.blocksToConfirm != null ? String(action.blocksToConfirm) : "--" },
+    { label: "Send Block Height", value: action && action.sendObservedBlockHeight != null ? String(action.sendObservedBlockHeight) : isBuy && followJob && followJob.sendObservedBlockHeight != null ? `launch ${followJob.sendObservedBlockHeight}` : "--" },
+    { label: "Confirm Block Height", value: action && action.confirmedObservedBlockHeight != null ? String(action.confirmedObservedBlockHeight) : "--" },
+    { label: "Blocks To Confirm", value: action && action.blocksToConfirm != null ? String(action.blocksToConfirm) : "--" },
     { label: "Endpoint", value: shortenReportEndpoint(action && action.endpoint) },
     { label: "Attempts", value: String(action && action.attemptCount != null ? action.attemptCount : 0) },
   ];
@@ -6194,9 +6199,9 @@ function buildReportsOverviewMarkup() {
   ];
   const watcherCards = health
     ? [
-      { label: "Slot Watcher", value: health.slotWatcher || "--" },
-      { label: "Signature Watcher", value: health.signatureWatcher || "--" },
-      { label: "Market Watcher", value: health.marketWatcher || "--" },
+      { label: "Slot Watcher", value: health.slotWatcher || "--", detail: buildWatcherDetail(health.slotWatcherMode) },
+      { label: "Signature Watcher", value: health.signatureWatcher || "--", detail: buildWatcherDetail(health.signatureWatcherMode) },
+      { label: "Market Watcher", value: health.marketWatcher || "--", detail: buildWatcherDetail(health.marketWatcherMode) },
       { label: "Queue Depth", value: String(health.queueDepth != null ? health.queueDepth : "--") },
       { label: "Compile Slots", value: String(health.availableCompileSlots != null ? health.availableCompileSlots : "--") },
       { label: "Send Slots", value: String(health.availableSendSlots != null ? health.availableSendSlots : "--") },
@@ -6249,9 +6254,9 @@ function buildReportsActionsMarkup() {
                 </div>
                 ${renderReportMetricGrid([
                   { label: "Endpoint", value: shortenReportEndpoint(sent.endpoint) },
-                  { label: "Send Block", value: sent.sendObservedBlockHeight != null ? String(sent.sendObservedBlockHeight) : "--" },
-                  { label: "Confirm Block", value: sent.confirmedObservedBlockHeight != null ? String(sent.confirmedObservedBlockHeight) : "--" },
-                  { label: "Blocks", value: sent.confirmedObservedBlockHeight != null && sent.sendObservedBlockHeight != null ? String(sent.confirmedObservedBlockHeight - sent.sendObservedBlockHeight) : "--" },
+                  { label: "Send Block Height", value: sent.sendObservedBlockHeight != null ? String(sent.sendObservedBlockHeight) : "--" },
+                  { label: "Confirm Block Height", value: sent.confirmedObservedBlockHeight != null ? String(sent.confirmedObservedBlockHeight) : "--" },
+                  { label: "Blocks To Confirm", value: sent.confirmedObservedBlockHeight != null && sent.sendObservedBlockHeight != null ? String(sent.confirmedObservedBlockHeight - sent.sendObservedBlockHeight) : "--" },
                   { label: "Format", value: sent.format || "--" },
                 ])}
                 ${sent.signature ? `<div class="reports-action-links">${renderCopyableHash(sent.signature, "Copy signature")} ${sent.explorerUrl ? `<a class="reports-inline-link" href="${escapeHTML(sent.explorerUrl)}" target="_blank" rel="noreferrer">Open explorer</a>` : ""}</div>` : ""}
@@ -6300,7 +6305,6 @@ function buildReportsBenchmarksMarkup() {
   const timings = benchmark.timings || execution.timings || {};
   const benchmarkSections = buildBenchmarkTimingSections(timings);
   const sent = Array.isArray(benchmark.sent) && benchmark.sent.length ? benchmark.sent : (Array.isArray(execution.sent) ? execution.sent : []);
-  const timingProfiles = currentReportsTerminalTimingProfiles();
   return `
     <div class="reports-panel-stack">
       <section class="reports-panel-section">
@@ -6334,8 +6338,8 @@ function buildReportsBenchmarksMarkup() {
                   <span class="reports-state-badge ${reportStateClass(item.confirmationStatus)}">${escapeHTML(item.confirmationStatus || "--")}</span>
                 </div>
                 ${renderReportMetricGrid([
-                  { label: "Send Block", value: item.sendBlockHeight != null ? String(item.sendBlockHeight) : item.sendObservedBlockHeight != null ? String(item.sendObservedBlockHeight) : "--" },
-                  { label: "Confirm Block", value: item.confirmedBlockHeight != null ? String(item.confirmedBlockHeight) : item.confirmedObservedBlockHeight != null ? String(item.confirmedObservedBlockHeight) : "--" },
+                  { label: "Send Block Height", value: item.sendBlockHeight != null ? String(item.sendBlockHeight) : item.sendObservedBlockHeight != null ? String(item.sendObservedBlockHeight) : "--" },
+                  { label: "Confirm Block Height", value: item.confirmedBlockHeight != null ? String(item.confirmedBlockHeight) : item.confirmedObservedBlockHeight != null ? String(item.confirmedObservedBlockHeight) : "--" },
                   { label: "Blocks To Confirm", value: item.blocksToConfirm != null ? String(item.blocksToConfirm) : "--" },
                   { label: "Confirmed Slot", value: item.confirmedSlot != null ? String(item.confirmedSlot) : "--" },
                 ])}
@@ -6343,37 +6347,6 @@ function buildReportsBenchmarksMarkup() {
             `).join("")}
           </div>
         ` : '<div class="reports-terminal-empty">No chain benchmark entries recorded.</div>'}
-      </section>
-      <section class="reports-panel-section">
-        <div class="reports-panel-title">Timing Profiles</div>
-        ${timingProfiles.length ? `
-          <div class="reports-action-list">
-            ${timingProfiles.map((profile) => {
-              const rec = profile.recommendation || {};
-              return `
-                <article class="reports-action-card">
-                  <div class="reports-action-head">
-                    <div>
-                      <strong>${escapeHTML(profile.actionType || "unknown")}</strong>
-                      <div class="reports-action-subtitle">${escapeHTML(`${profile.provider || "--"} | confidence ${rec.confidence || "low"}`)}</div>
-                    </div>
-                    <span class="reports-state-badge ${Number(rec.successRate || 0) >= 0.75 ? "is-good" : Number(rec.successRate || 0) >= 0.4 ? "is-warn" : "is-bad"}">${escapeHTML(formatReportMetric(Number(rec.successRate || 0) * 100, "%", "--", 0))}</span>
-                  </div>
-                  ${renderReportMetricGrid([
-                    { label: "Samples", value: String(profile.sampleCount != null ? profile.sampleCount : rec.sampleCount || 0) },
-                    { label: "Success", value: formatReportMetric(Number(rec.successRate || 0) * 100, "%", "--", 0) },
-                    { label: "Quality", value: formatReportMetric(rec.weightedQualityScore, "", "--", 1) },
-                    { label: "P50 Submit", value: formatReportMetric(profile.p50SubmitMs, "ms") },
-                    { label: "P75 Submit", value: formatReportMetric(profile.p75SubmitMs, "ms") },
-                    { label: "P90 Submit", value: formatReportMetric(profile.p90SubmitMs, "ms") },
-                    { label: "Suggest Delay", value: formatReportMetric(rec.suggestedSubmitDelayMs, "ms") },
-                    { label: "Suggest Jitter", value: formatReportMetric(rec.suggestedJitterMs, "ms") },
-                  ])}
-                </article>
-              `;
-            }).join("")}
-          </div>
-        ` : '<div class="reports-terminal-empty">No timing profiles recorded yet.</div>'}
       </section>
     </div>
   `;
@@ -6601,6 +6574,7 @@ function buildFollowActionSubtitle(action) {
   if (action && action.sellPercent != null) parts.push(`${action.sellPercent}% sell`);
   if (action && action.targetBlockOffset != null) parts.push(`+${action.targetBlockOffset} blocks`);
   if (action && action.submitDelayMs != null && Number(action.submitDelayMs) > 0) parts.push(`${action.submitDelayMs}ms delay`);
+  if (action && action.watcherMode) parts.push(formatWatcherModeLabel(action.watcherMode));
   if (action && action.signature) parts.push(shortAddress(action.signature));
   return parts.join(" | ");
 }
@@ -6612,6 +6586,9 @@ function buildActiveJobActionRouteMarkup(action, followJob) {
     { label: "Transport", value: route.transportType || "--" },
     { label: "Profile", value: route.endpointProfile || "--" },
   ];
+  if (action && action.watcherMode) {
+    rows.push({ label: "Watcher", value: formatWatcherModeLabel(action.watcherMode) });
+  }
   return `
     <div class="reports-active-job-action-meta">
       ${rows.map((row) => `
@@ -6762,6 +6739,7 @@ function buildReportsActiveJobsMarkup() {
                       <div class="reports-active-job-action-copy">
                         <strong>${escapeHTML(formatFollowStateLabel(action.kind || "action"))}</strong>
                         <span>${escapeHTML(buildFollowActionSubtitle(action) || "No extra details.")}</span>
+                        ${action && action.watcherFallbackReason ? `<span>${escapeHTML(String(action.watcherFallbackReason))}</span>` : ""}
                         ${buildActiveJobActionRouteMarkup(action, job)}
                       </div>
                       <span class="reports-state-badge ${followStateBadgeTone(action.state)}">${escapeHTML(formatFollowStateLabel(action.state))}</span>
