@@ -1094,6 +1094,7 @@ select[disabled],
 .tag,
 .section-tag {
   display: inline-flex;
+  align-items: center;
   font-size: 7px;
   font-weight: 600;
   letter-spacing: 0.03em;
@@ -1103,6 +1104,8 @@ select[disabled],
   vertical-align: middle;
   margin-left: 3px;
   line-height: 1.4;
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .section-tag {
@@ -1890,6 +1893,7 @@ textarea.input-error {
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
+  transition-delay: 0.24s;
 }
 
 .tooltip-button .tooltip-panel {
@@ -2624,6 +2628,26 @@ textarea.input-error {
   color: var(--accent);
 }
 
+.auto-sell-trigger.has-warning,
+.button.subtle.auto-sell-trigger.has-warning {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border));
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface));
+  color: var(--danger);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.auto-sell-trigger.has-warning:hover,
+.button.subtle.auto-sell-trigger.has-warning:hover {
+  border-color: color-mix(in srgb, var(--danger) 58%, var(--border));
+  background: color-mix(in srgb, var(--danger) 18%, var(--surface));
+  color: var(--danger);
+}
+
+.auto-sell-trigger.has-warning .mode-title,
+.button.subtle.auto-sell-trigger.has-warning .mode-title {
+  color: inherit;
+}
+
 .auto-sell-popover-panel {
   position: absolute;
   top: auto;
@@ -2944,6 +2968,15 @@ textarea.input-error {
 .auto-sell-market-cap-select option {
   background: var(--surface);
   color: var(--text);
+}
+
+.auto-sell-inline-warning {
+  margin-top: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 10px;
+  line-height: 1.25;
+  text-align: left;
 }
 
 .auto-sell-market-cap-input::-webkit-outer-spin-button,
@@ -5289,6 +5322,24 @@ button {
   pointer-events: none;
 }
 
+.settings-modal:not(.settings-loading) label.is-disabled,
+.settings-modal:not(.settings-loading) .settings-inline-toggle.is-disabled {
+  opacity: 0.9;
+}
+
+.settings-modal:not(.settings-loading) .button[disabled] {
+  opacity: 0.82;
+  cursor: default;
+}
+
+.settings-modal:not(.settings-loading) input[disabled],
+.settings-modal:not(.settings-loading) textarea[disabled],
+.settings-modal:not(.settings-loading) select[disabled] {
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
+  border-color: var(--border-subtle);
+}
+
 .settings-main-panel-toolbar {
   border-color: rgba(255, 255, 255, 0.06);
   background:
@@ -5438,7 +5489,7 @@ button {
 
 .settings-route-grid label {
   display: grid;
-  grid-template-rows: minmax(12px, auto) 24px minmax(11px, 1fr);
+  grid-template-rows: minmax(12px, auto) 26px minmax(11px, 1fr);
   gap: 4px;
   min-width: 0;
   align-content: start;
@@ -5476,7 +5527,7 @@ button {
   align-items: center;
   gap: 4px;
   min-height: 12px;
-  font-size: 8px;
+  font-size: 9px;
   line-height: 1.2;
   color: var(--text-secondary);
 }
@@ -5485,9 +5536,9 @@ button {
 .settings-route-grid select {
   width: 100%;
   min-width: 0;
-  min-height: 24px;
-  padding: 4px 5px;
-  font-size: 9px;
+  min-height: 26px;
+  padding: 5px 6px;
+  font-size: 10px;
   background: rgba(5, 7, 10, 0.88);
   border-color: rgba(255, 255, 255, 0.06);
   border-radius: 8px;
@@ -5495,23 +5546,23 @@ button {
 
 .settings-grid-creation-compact {
   grid-template-columns:
-    minmax(88px, 1.12fr)
-    minmax(56px, 0.44fr)
-    minmax(62px, 0.68fr)
-    minmax(62px, 0.68fr)
+    minmax(88px, 1.08fr)
+    minmax(72px, 0.5fr)
+    minmax(64px, 0.68fr)
+    minmax(64px, 0.68fr)
     auto
-    minmax(64px, 0.68fr);
+    minmax(68px, 0.68fr);
 }
 
 .settings-grid-trade-compact {
   grid-template-columns:
-    minmax(84px, 1.04fr)
-    minmax(56px, 0.42fr)
-    minmax(52px, 0.52fr)
-    minmax(60px, 0.62fr)
-    minmax(60px, 0.62fr)
+    minmax(84px, 0.96fr)
+    minmax(72px, 0.48fr)
+    minmax(56px, 0.52fr)
+    minmax(64px, 0.62fr)
+    minmax(64px, 0.62fr)
     auto
-    minmax(62px, 0.66fr);
+    minmax(68px, 0.68fr);
 }
 
 .settings-fee-input-wrap input {
@@ -5623,8 +5674,8 @@ button {
 .settings-mev-mode-field {
   display: grid;
   grid-template-columns: auto auto;
-  grid-template-rows: minmax(12px, auto) 24px minmax(11px, 1fr);
-  column-gap: 2px;
+  grid-template-rows: minmax(12px, auto) 26px minmax(11px, 1fr);
+  column-gap: 3px;
   gap: 4px;
   min-width: 0;
   position: relative;
@@ -5632,7 +5683,8 @@ button {
 }
 
 .settings-mev-mode-field-compact {
-  max-width: 62px;
+  min-width: 72px;
+  max-width: none;
 }
 
 .settings-mev-mode-field:hover,
@@ -5640,24 +5692,53 @@ button {
   z-index: 140;
 }
 
-.settings-mev-mode-field span {
-  display: block;
+.settings-mev-label {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  justify-self: start;
+  width: max-content;
+  min-width: 0;
+  color: var(--text-secondary);
+  cursor: help;
+}
+
+.settings-mev-label-text {
+  display: inline-flex;
+  align-items: center;
   line-height: 1.1;
 }
 
-.settings-mev-mode-field > span:first-child {
-  grid-column: 1;
-  grid-row: 1;
-  justify-self: start;
-  width: auto;
+.settings-mev-tooltip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, var(--text-muted) 28%);
+  background: color-mix(in srgb, var(--surface-soft) 88%, transparent);
+  color: var(--text-muted);
+  font: 700 8px/1 var(--font-display);
+  flex: 0 0 auto;
 }
 
-.settings-mev-tooltip {
-  grid-column: 2;
-  grid-row: 1;
-  align-self: center;
-  justify-self: start;
-  flex: 0 0 auto;
+.settings-mev-label .tooltip-panel {
+  left: 0;
+  right: auto;
+  transform: none;
+}
+
+.settings-mev-label:hover .settings-mev-tooltip-icon,
+.settings-mev-label:focus-visible .settings-mev-tooltip-icon,
+.settings-mev-label:focus-within .settings-mev-tooltip-icon {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  color: var(--text);
+}
+
+.settings-mev-tooltip-panel {
   position: relative;
   z-index: 141;
 }
@@ -5665,7 +5746,7 @@ button {
 .settings-mev-tooltip-panel {
   display: block;
   position: absolute;
-  width: min(320px, calc(100vw - 36px));
+  width: min(420px, calc(100vw - 36px));
   overflow: hidden;
   border: 1px solid #262b31;
   background: #0b0b0c !important;
@@ -5692,6 +5773,8 @@ button {
   color: var(--text-secondary);
   position: relative;
   z-index: 1;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .settings-mev-tooltip-panel .tooltip-panel-head strong,
@@ -5700,6 +5783,15 @@ button {
   color: var(--text);
   position: relative;
   z-index: 1;
+}
+
+.settings-mev-tooltip-panel .tooltip-panel-head strong {
+  font-size: 12px;
+}
+
+.settings-mev-tooltip-panel .tooltip-panel-badge {
+  font-size: 9px;
+  padding: 3px 7px;
 }
 
 .theme-light .settings-mev-tooltip-panel {
@@ -5714,19 +5806,24 @@ button {
   background: #ffffff;
 }
 
+.theme-light .settings-mev-tooltip-icon {
+  background: rgba(255, 255, 255, 0.92);
+  border-color: rgba(148, 163, 184, 0.42);
+}
+
 .settings-mev-mode-field select {
   grid-column: 1 / -1;
   grid-row: 2;
   width: 100%;
-  padding-left: 5px;
-  padding-right: 12px;
-  font-size: 9px;
+  padding-left: 6px;
+  padding-right: 20px;
+  font-size: 10px;
   appearance: none;
   -webkit-appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='7' height='4' viewBox='0 0 7 4'%3E%3Cpath fill='%238d9caf' d='M0.8 0.6 3.5 3.2 6.2 0.6 7 1.4 3.5 4 0 1.4z'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath fill='%238d9caf' d='M0.9 0.8 4 3.8 7.1 0.8 8 1.7 4 5 0 1.7z'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
-  background-position: right 5px center;
-  background-size: 7px 4px;
+  background-position: right 7px center;
+  background-size: 8px 5px;
 }
 
 .settings-auto-fee-button {
@@ -5902,18 +5999,19 @@ label.is-disabled textarea {
 .modal-footer .button { font-size: 12px; }
 
 .settings-modal-footer {
-  grid-template-columns: 1fr auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: center;
   justify-content: space-between;
   justify-items: stretch;
+  gap: 8px;
   padding: 10px 12px 12px;
   background:
     linear-gradient(180deg, rgba(13, 17, 24, 0.92), rgba(10, 14, 20, 0.98));
 }
 
 .settings-modal-footer .button {
-  min-width: 84px;
-  width: auto;
+  min-width: 0;
+  width: 100%;
   font-size: 11px;
   padding: 7px 11px;
 }

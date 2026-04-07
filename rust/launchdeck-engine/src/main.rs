@@ -1020,6 +1020,10 @@ fn warm_succeeded_recently(warm: &WarmControlState, now_ms: u128) -> bool {
             })
 }
 
+fn warm_targets_need_resume_pass(warm: &WarmControlState) -> bool {
+    !warm.warm_targets.is_empty() && warm.warm_targets.values().all(|target| !target.active)
+}
+
 fn mark_operator_activity(state: &Arc<AppState>, routes: Vec<WarmRouteSelection>) -> bool {
     let now = current_time_ms();
     let mut warm = state
@@ -1029,6 +1033,8 @@ fn mark_operator_activity(state: &Arc<AppState>, routes: Vec<WarmRouteSelection>
     let route_matches_current = routes.is_empty() || routes == warm.selected_routes;
     let warm_is_active = warm_gate_state(&warm, now, 0).0;
     let should_trigger_immediate_rewarm = if !route_matches_current {
+        true
+    } else if !warm_is_active && warm_targets_need_resume_pass(&warm) {
         true
     } else {
         !warm_is_active && !warm_succeeded_recently(&warm, now)
@@ -7609,6 +7615,54 @@ mod tests {
                 hellomoon_mev_mode: String::new(),
             }]
         );
+    }
+
+    #[test]
+    fn operator_activity_requests_immediate_rewarm_after_idle_suspend_with_inactive_targets() {
+        let idle_ms = u128::from(configured_idle_warm_timeout_ms()) + 5_000;
+        let now_ms = current_time_ms();
+        let mut warm_targets = HashMap::new();
+        warm_targets.insert(
+            "endpoint:hellomoon:https://example.invalid".to_string(),
+            WarmTargetStatus {
+                id: "endpoint:hellomoon:https://example.invalid".to_string(),
+                category: "endpoint".to_string(),
+                provider: Some("hellomoon".to_string()),
+                label: "Hello Moon QUIC".to_string(),
+                target: "https://example.invalid".to_string(),
+                active: false,
+                last_attempt_at_ms: Some((now_ms.saturating_sub(1_000)).min(u128::from(u64::MAX)) as u64),
+                status: WarmTargetHealth::Healthy,
+                last_success_at_ms: Some((now_ms.saturating_sub(1_000)).min(u128::from(u64::MAX)) as u64),
+                last_rate_limited_at_ms: None,
+                last_rate_limit_message: None,
+                last_error: None,
+                consecutive_failures: 0,
+            },
+        );
+        let routes = vec![WarmRouteSelection {
+            provider: "hellomoon".to_string(),
+            endpoint_profile: "ams".to_string(),
+            hellomoon_mev_mode: String::new(),
+        }];
+        let state = test_state(WarmControlState {
+            last_activity_at_ms: now_ms.saturating_sub(idle_ms),
+            last_warm_success_at_ms: Some(now_ms.saturating_sub(1_000)),
+            current_reason: "suspended-idle".to_string(),
+            selected_routes: routes.clone(),
+            warm_targets,
+            ..WarmControlState::default()
+        });
+
+        let immediate = mark_operator_activity(&state, routes.clone());
+        let warm = state
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert!(immediate);
+        assert_eq!(warm.current_reason, "active-operator-activity");
+        assert_eq!(warm.selected_routes, routes);
     }
 
     #[test]

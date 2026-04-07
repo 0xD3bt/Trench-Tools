@@ -42,6 +42,7 @@
     } = elements;
 
     let eventsBound = false;
+    let autoSellWarningPill = null;
 
     function normalizeTriggerMode(value) {
       const mode = String(value || "").trim().toLowerCase();
@@ -108,6 +109,11 @@
       return expanded;
     }
 
+    function getMarketCapDirection() {
+      const value = String(getNamedValue("automaticDevSellMarketCapDirection") || "").trim().toLowerCase();
+      return value === "lte" ? "lte" : "gte";
+    }
+
     function getMarketCapTimeoutSeconds() {
       const explicitSeconds = getNamedValue("automaticDevSellMarketCapScanTimeoutSeconds");
       if (String(explicitSeconds || "").trim()) {
@@ -157,6 +163,9 @@
       );
       const mode = normalizeTriggerMode(formValues.automaticDevSellTriggerMode);
       const marketCapThreshold = String(formValues.automaticDevSellMarketCapThreshold || "").trim();
+      const marketCapDirection = String(formValues.automaticDevSellMarketCapDirection || "").trim().toLowerCase() === "lte"
+        ? "lte"
+        : "gte";
       const explicitTimeoutSeconds = String(formValues.automaticDevSellMarketCapScanTimeoutSeconds || "").trim();
       const legacyTimeoutMinutes = String(formValues.automaticDevSellMarketCapScanTimeoutMinutes || "").trim();
       const marketCapTimeout = explicitTimeoutSeconds
@@ -169,7 +178,8 @@
         : "stop";
       if (triggerFamily === "market-cap") {
         const thresholdLabel = marketCapThreshold ? `$${marketCapThreshold}` : "USD market cap";
-        return `${percent} on ${thresholdLabel} (${marketCapTimeout}s, ${marketCapTimeoutAction})`;
+        const directionLabel = marketCapDirection === "lte" ? "<=" : ">=";
+        return `${percent} on ${directionLabel} ${thresholdLabel} (${marketCapTimeout}s, ${marketCapTimeoutAction})`;
       }
       if (mode === "submit-delay") {
         return `${percent} at submit + ${Number(formValues.automaticDevSellDelayMs || 0)}ms`;
@@ -180,10 +190,54 @@
       return `${percent} on confirmed + ${Number(formValues.automaticDevSellBlockOffset || 0)}`;
     }
 
+    function shouldShowClosedPanelWarning() {
+      return Boolean(
+        devAutoSellPanel
+        && devAutoSellPanel.hidden
+        && isNamedChecked("automaticDevSellEnabled")
+        && getTriggerFamily() === "market-cap"
+        && !getMarketCapThreshold()
+      );
+    }
+
+    function ensureWarningPill() {
+      if (autoSellWarningPill || !devAutoSellButton) return autoSellWarningPill;
+      const actionRow = devAutoSellButton.closest(".mode-action-row");
+      if (!actionRow) return null;
+      autoSellWarningPill = document.createElement("div");
+      autoSellWarningPill.id = "dev-auto-sell-warning";
+      autoSellWarningPill.className = "modal-warning settings-provider-warning auto-sell-inline-warning";
+      autoSellWarningPill.hidden = true;
+      actionRow.insertAdjacentElement("afterend", autoSellWarningPill);
+      return autoSellWarningPill;
+    }
+
+    function renderClosedPanelWarning() {
+      const warningPill = ensureWarningPill();
+      if (!warningPill) return;
+      if (!shouldShowClosedPanelWarning()) {
+        warningPill.hidden = true;
+        warningPill.textContent = "";
+        if (devAutoSellButton) {
+          devAutoSellButton.classList.remove("has-warning");
+          devAutoSellButton.removeAttribute("title");
+        }
+        return;
+      }
+      const warningText = "Market cap auto-sell is selected, but the USD threshold is not set yet.";
+      warningPill.hidden = false;
+      warningPill.textContent = warningText;
+      if (devAutoSellButton) {
+        devAutoSellButton.classList.add("has-warning");
+        devAutoSellButton.title = warningText;
+      }
+    }
+
     function togglePanel(forceOpen) {
       if (!devAutoSellPanel) return;
       const shouldOpen = typeof forceOpen === "boolean" ? forceOpen : devAutoSellPanel.hidden;
       devAutoSellPanel.hidden = !shouldOpen;
+      renderClosedPanelWarning();
     }
 
     function syncUI() {
@@ -271,7 +325,7 @@
       if (autoSellMarketCapThresholdValue) {
         autoSellMarketCapThresholdValue.textContent = triggerFamily === "market-cap" && marketCapThreshold
           ? marketCapThreshold
-          : (triggerFamily === "market-cap" ? "Pending" : "Disabled");
+          : (triggerFamily === "market-cap" ? "Required" : "Disabled");
       }
       if (autoSellMarketCapTimeoutInput) {
         autoSellMarketCapTimeoutInput.value = marketCapTimeoutSeconds;
@@ -281,6 +335,7 @@
         autoSellMarketCapTimeoutActionInput.value = marketCapTimeoutAction;
         autoSellMarketCapTimeoutActionInput.disabled = !enabled || triggerFamily !== "market-cap";
       }
+      renderClosedPanelWarning();
       syncSettingsCapabilities();
     }
 
@@ -314,13 +369,14 @@
       }
       autoSellTriggerFamilyButtons.forEach((button) => {
         button.addEventListener("click", () => {
+          const nextTriggerFamily = normalizeTriggerFamily(button.getAttribute("data-auto-sell-trigger-family"));
           setNamedValue(
             "automaticDevSellTriggerFamily",
-            normalizeTriggerFamily(button.getAttribute("data-auto-sell-trigger-family"))
+            nextTriggerFamily
           );
           setNamedChecked(
             "automaticDevSellMarketCapEnabled",
-            normalizeTriggerFamily(button.getAttribute("data-auto-sell-trigger-family")) === "market-cap"
+            nextTriggerFamily === "market-cap"
           );
           if (!getMarketCapTimeoutSeconds()) {
             setNamedValue("automaticDevSellMarketCapScanTimeoutSeconds", "30");
@@ -332,6 +388,12 @@
           validateFieldByName("automaticDevSellBlockOffset");
           validateFieldByName("automaticDevSellMarketCapThreshold");
           validateFieldByName("automaticDevSellMarketCapScanTimeoutSeconds");
+          if (nextTriggerFamily === "market-cap" && !String(getMarketCapThreshold() || "").trim() && autoSellMarketCapThresholdInput) {
+            autoSellMarketCapThresholdInput.focus();
+            if (typeof autoSellMarketCapThresholdInput.select === "function") {
+              autoSellMarketCapThresholdInput.select();
+            }
+          }
         });
       });
       autoSellTriggerModeButtons.forEach((button) => {

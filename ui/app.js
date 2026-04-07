@@ -2651,13 +2651,16 @@ function buildPlatformRuntimeIndicatorState() {
       };
     } else {
       const warmReasonText = describeWarmReason(warmReason);
+      const autoPaused = isWarmAutoPausedReason(warmReason);
       stateWarm = {
-        tone: isWarmAutoPausedReason(warmReason) ? "blue" : "yellow",
+        tone: autoPaused ? "blue" : "yellow",
         title: stateTargets.length > 0
-          ? `State Warm: auto-paused. ${warmReasonText}. Last success ${lastWarmSuccess}.`
+          ? (autoPaused
+            ? `State Warm: auto-paused. ${warmReasonText}. Last success ${lastWarmSuccess}.`
+            : `State Warm: waiting. ${warmReasonText}. Last success ${lastWarmSuccess}.`)
           : startupWarmInProgress
             ? "State Warm: starting."
-            : isWarmAutoPausedReason(warmReason)
+            : autoPaused
               ? `State Warm: auto-paused. ${warmReasonText}.`
               : `State Warm: waiting. ${warmReasonText}.`,
       };
@@ -2736,13 +2739,16 @@ function buildPlatformRuntimeIndicatorState() {
       };
     } else if (warmProviders.length > 0) {
       const warmReasonText = describeWarmReason(warmReason);
+      const autoPaused = isWarmAutoPausedReason(warmReason);
       endpointPrewarm = {
-        tone: isWarmAutoPausedReason(warmReason) ? "blue" : "yellow",
+        tone: autoPaused ? "blue" : "yellow",
         title: endpointTargets.length > 0
-          ? `${endpointWarmLabel}: auto-paused. ${warmReasonText}. Selected providers: ${formatWarmProviders(warmProviders)}.`
+          ? (autoPaused
+            ? `${endpointWarmLabel}: auto-paused. ${warmReasonText}. Selected providers: ${formatWarmProviders(warmProviders)}.`
+            : `${endpointWarmLabel}: waiting for telemetry. ${warmReasonText}. Selected providers: ${formatWarmProviders(warmProviders)}.`)
           : startupWarmInProgress
             ? `${endpointWarmLabel}: starting. Selected providers: ${formatWarmProviders(warmProviders)}.`
-            : isWarmAutoPausedReason(warmReason)
+            : autoPaused
               ? `${endpointWarmLabel}: auto-paused. ${warmReasonText}. Selected providers: ${formatWarmProviders(warmProviders)}.`
               : `${endpointWarmLabel}: waiting for telemetry. ${warmReasonText}. Selected providers: ${formatWarmProviders(warmProviders)}.`,
       };
@@ -2827,13 +2833,16 @@ function buildPlatformRuntimeIndicatorState() {
       };
     } else {
       const warmReasonText = describeWarmReason(warmReason);
+      const autoPaused = isWarmAutoPausedReason(warmReason);
       watchPrewarm = {
-        tone: isWarmAutoPausedReason(warmReason) ? "blue" : "yellow",
+        tone: autoPaused ? "blue" : "yellow",
         title: watchTargets.length > 0
-          ? `Watcher WS warm: auto-paused. ${warmReasonText}.`
+          ? (autoPaused
+            ? `Watcher WS warm: auto-paused. ${warmReasonText}.`
+            : `Watcher WS warm: waiting. ${warmReasonText}.`)
           : startupWarmInProgress
             ? "Watcher WS warm: starting."
-            : isWarmAutoPausedReason(warmReason)
+            : autoPaused
               ? `Watcher WS warm: auto-paused. ${warmReasonText}.`
               : `Watcher WS warm: waiting. ${warmReasonText}.`,
       };
