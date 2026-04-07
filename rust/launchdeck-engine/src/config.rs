@@ -969,9 +969,9 @@ fn parse_market_cap_scan_timeout_seconds(
             &format!("{label_prefix}.scanTimeoutSeconds"),
             Some(1),
             Some(86_400),
-            Some(15),
+            Some(30),
         )?
-        .unwrap_or(15) as u64);
+        .unwrap_or(30) as u64);
     }
     if raw.legacyScanTimeoutMinutes.is_some() {
         let minutes = parse_int(
@@ -979,12 +979,12 @@ fn parse_market_cap_scan_timeout_seconds(
             &format!("{label_prefix}.scanTimeoutMinutes"),
             Some(1),
             Some(1_440),
-            Some(15),
+            Some(30),
         )?
-        .unwrap_or(15) as u64;
+        .unwrap_or(30) as u64;
         return Ok(minutes.saturating_mul(60));
     }
-    Ok(15)
+    Ok(30)
 }
 
 fn parse_choice(
@@ -2651,6 +2651,37 @@ mod tests {
         assert_eq!(trigger.direction, "gte");
         assert_eq!(trigger.threshold, "100000000000");
         assert_eq!(trigger.scanTimeoutSeconds, 15);
+        assert_eq!(trigger.timeoutAction, "stop");
+    }
+
+    #[test]
+    fn defaults_market_cap_follow_sell_timeout_to_thirty_seconds() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": true,
+            "schemaVersion": 1,
+            "devAutoSell": {
+                "enabled": true,
+                "walletEnvKey": "SOLANA_PRIVATE_KEY",
+                "percent": 100,
+                "targetBlockOffset": 1,
+                "marketCap": {
+                    "enabled": true,
+                    "threshold": "100k"
+                }
+            }
+        }))
+        .expect("follow launch raw");
+
+        let normalized = normalize_raw_config(raw).expect("market-cap default timeout should normalize");
+        let dev_auto_sell = normalized
+            .followLaunch
+            .devAutoSell
+            .expect("dev auto sell should be present");
+        let trigger = dev_auto_sell
+            .marketCap
+            .expect("market-cap trigger should be present");
+        assert_eq!(trigger.scanTimeoutSeconds, 30);
         assert_eq!(trigger.timeoutAction, "stop");
     }
 

@@ -1615,6 +1615,51 @@ function parseAutoSellMarketCapThreshold(value) {
   return autoSellFeature.parseMarketCapThreshold(value);
 }
 
+function formatSavedMarketCapThresholdForUi(value) {
+  const trimmed = String(value || "").trim();
+  if (!/^\d+$/.test(trimmed)) return trimmed;
+  try {
+    const micros = BigInt(trimmed);
+    if (micros < 1000000n) return trimmed;
+    const wholeUsd = micros / 1000000n;
+    const fractionalMicros = micros % 1000000n;
+    const formatWithSuffix = (suffixValue, suffixLabel) => {
+      const whole = wholeUsd / suffixValue;
+      const remainder = wholeUsd % suffixValue;
+      if (whole >= 100n || remainder === 0n) return `${whole.toString()}${suffixLabel}`;
+      const decimal = (remainder * 10n) / suffixValue;
+      if (decimal === 0n) return `${whole.toString()}${suffixLabel}`;
+      return `${whole.toString()}.${decimal.toString()}${suffixLabel}`;
+    };
+    if (fractionalMicros === 0n) {
+      if (wholeUsd >= 1000000000000n) return formatWithSuffix(1000000000000n, "t");
+      if (wholeUsd >= 1000000000n) return formatWithSuffix(1000000000n, "b");
+      if (wholeUsd >= 1000000n) return formatWithSuffix(1000000n, "m");
+      if (wholeUsd >= 1000n) return formatWithSuffix(1000n, "k");
+      return wholeUsd.toString();
+    }
+    const fractionalText = fractionalMicros.toString().padStart(6, "0").replace(/0+$/, "");
+    return fractionalText ? `${wholeUsd.toString()}.${fractionalText}` : wholeUsd.toString();
+  } catch (_error) {
+    return trimmed;
+  }
+}
+
+function normalizeSavedFollowLaunchForUi(value) {
+  if (!value || typeof value !== "object") return {};
+  const followLaunch = { ...value };
+  if (followLaunch.devAutoSell && typeof followLaunch.devAutoSell === "object") {
+    followLaunch.devAutoSell = { ...followLaunch.devAutoSell };
+    if (followLaunch.devAutoSell.marketCap && typeof followLaunch.devAutoSell.marketCap === "object") {
+      followLaunch.devAutoSell.marketCap = {
+        ...followLaunch.devAutoSell.marketCap,
+        threshold: formatSavedMarketCapThresholdForUi(followLaunch.devAutoSell.marketCap.threshold),
+      };
+    }
+  }
+  return followLaunch;
+}
+
 function getAutoSellDelayMs() {
   return autoSellFeature.getDelayMs();
 }
@@ -2322,6 +2367,8 @@ function describeWarmReason(reason) {
       return "waiting for activity before warming";
     case "active-in-flight-request":
       return "active because requests are in flight";
+    case "active-follow-jobs":
+      return "active because follow jobs are running";
     case "active-operator-activity":
       return "active because the app is in use";
     default:
@@ -2552,13 +2599,13 @@ function buildPlatformRuntimeIndicatorState() {
   const failingStateTargets = stateTargets.filter((target) => String(target && target.lastError || "").trim());
   const failingEndpointTargets = endpointTargets.filter((target) => String(target && target.lastError || "").trim());
   const failingWatchTargets = watchTargets.filter((target) => String(target && target.lastError || "").trim());
-  const endpointTargetProviders = uniqueWarmTargetProviders(activeEndpointTargets.length ? activeEndpointTargets : endpointTargets);
-  const senderConnectionWarm = (endpointTargetProviders.length === 1 && endpointTargetProviders[0] === "helius-sender")
-    || (!endpointTargetProviders.length && startupWarm.endpointTargets.length > 0);
-  const endpointWarmLabel = senderConnectionWarm ? "Sender connection warm" : "Endpoint prewarm";
   const warmProviders = warm && Array.isArray(warm.selectedProviders)
     ? warm.selectedProviders.map((value) => String(value || "").trim()).filter(Boolean)
     : [];
+  const endpointTargetProviders = uniqueWarmTargetProviders(activeEndpointTargets.length ? activeEndpointTargets : endpointTargets);
+  const endpointLabelProviders = endpointTargetProviders.length ? endpointTargetProviders : warmProviders;
+  const senderConnectionWarm = endpointLabelProviders.length === 1 && endpointLabelProviders[0] === "helius-sender";
+  const endpointWarmLabel = senderConnectionWarm ? "Sender connection warm" : "Endpoint prewarm";
   const lastWarmSuccess = warm ? formatWarmTimestamp(warm.lastWarmSuccessAtMs) : "--";
   const warmReason = warm && warm.reason ? String(warm.reason).trim() : "";
   const warmError = warm && warm.lastError ? String(warm.lastError).trim() : "";
@@ -3787,18 +3834,13 @@ function beginStartupWarmup() {
   if (startupWarmState.started) {
     return startupWarmState.promise || Promise.resolve();
   }
+  startupWarmState.started = true;
   const cachedWarm = readStoredStartupWarmCache();
   if (cachedWarm) {
-    startupWarmState.started = true;
-    startupWarmState.ready = true;
     startupWarmState.backendLoaded = true;
     startupWarmState.backendPayload = cachedWarm.payload;
     startupWarmState.backendError = "";
-    startupWarmState.promise = Promise.resolve(cachedWarm.payload);
-    renderPlatformRuntimeIndicators();
-    return startupWarmState.promise;
   }
-  startupWarmState.started = true;
   renderPlatformRuntimeIndicators();
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   const timeoutId = setTimeout(() => {
@@ -8112,12 +8154,17 @@ function buildLaunchHistoryEntry(entry, bundle, metadata) {
   const execution = report.execution && typeof report.execution === "object" ? report.execution : {};
   const followDaemon = report.followDaemon && typeof report.followDaemon === "object" ? report.followDaemon : {};
   const followJob = followDaemon.job && typeof followDaemon.job === "object" ? followDaemon.job : {};
-  const savedFollowLaunch = report.savedFollowLaunch && typeof report.savedFollowLaunch === "object" ? report.savedFollowLaunch : null;
+  const savedFollowLaunch = report.savedFollowLaunch && typeof report.savedFollowLaunch === "object"
+    ? normalizeSavedFollowLaunchForUi(report.savedFollowLaunch)
+    : null;
   const savedBags = report.savedBags && typeof report.savedBags === "object" ? report.savedBags : null;
   const savedFeeSharingRecipients = Array.isArray(report.savedFeeSharingRecipients) ? report.savedFeeSharingRecipients : [];
   const savedAgentFeeRecipients = Array.isArray(report.savedAgentFeeRecipients) ? report.savedAgentFeeRecipients : [];
   const savedCreatorFee = report.savedCreatorFee && typeof report.savedCreatorFee === "object" ? report.savedCreatorFee : null;
-  const followLaunch = savedFollowLaunch || (followJob.followLaunch && typeof followJob.followLaunch === "object" ? followJob.followLaunch : {});
+  const followLaunch = savedFollowLaunch
+    || (followJob.followLaunch && typeof followJob.followLaunch === "object"
+      ? normalizeSavedFollowLaunchForUi(followJob.followLaunch)
+      : {});
   const devBuy = parseDevBuyDescription(report.devBuyDescription);
   return {
     id: entry.id,

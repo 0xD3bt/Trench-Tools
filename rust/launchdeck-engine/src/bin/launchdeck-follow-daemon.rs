@@ -396,6 +396,7 @@ const FOLLOW_READY_WATCH_REFRESH_MS: u64 = 5_000;
 const FOLLOW_READY_WATCH_TTL_MS: u128 = 10_000;
 const FOLLOW_READY_PRECHECK_TTL_MS: u128 = 5_000;
 const FOLLOW_READY_PRECHECK_REFRESH_MS: u64 = 3_000;
+const FOLLOW_WATCHER_RPC_POLL_INTERVAL_MS: u64 = 400;
 const DEFAULT_FOLLOW_OFFSET_POLL_INTERVAL_MS: u64 = 400;
 const OFFSET_SAME_BLOCK_REPOLL_DELAY_MS: u64 = 25;
 const OFFSET_SAME_BLOCK_REPOLL_LIMIT: usize = 3;
@@ -3951,7 +3952,7 @@ async fn run_slot_watcher_polling_session(
             note.clone(),
         )
         .await;
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(FOLLOW_WATCHER_RPC_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -4158,7 +4159,7 @@ async fn run_market_watcher_polling_session(
             note.clone(),
         )
         .await;
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(FOLLOW_WATCHER_RPC_POLL_INTERVAL_MS)).await;
     }
 }
 

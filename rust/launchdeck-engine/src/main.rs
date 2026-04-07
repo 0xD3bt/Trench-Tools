@@ -39,7 +39,8 @@ use crate::{
     config::{NormalizedConfig, NormalizedFollowLaunch, RawConfig, normalize_raw_config},
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
-        FollowJobResponse, FollowReserveRequest, FollowStopAllRequest, build_action_records,
+        FollowJobRecord, FollowJobResponse, FollowJobState, FollowReserveRequest,
+        FollowStopAllRequest, build_action_records,
         should_use_post_setup_creator_vault_for_buy, should_use_post_setup_creator_vault_for_sell,
     },
     fs_utils::atomic_write,
@@ -144,8 +145,10 @@ struct WarmControlState {
     current_reason: String,
     last_error: Option<String>,
     selected_routes: Vec<WarmRouteSelection>,
+    follow_job_routes: Vec<WarmRouteSelection>,
     browser_active: bool,
     continuous_active: bool,
+    follow_jobs_active: bool,
     in_flight_requests: usize,
     warm_pass_in_flight: bool,
     warm_targets: HashMap<String, WarmTargetStatus>,
@@ -407,6 +410,31 @@ fn apply_warm_target_attempts(
         }
     }
     prune_stale_warm_targets_after_attempt(warm, &active_ids, attempt_at_ms);
+}
+
+fn record_startup_warm_attempts(
+    warm: &mut WarmControlState,
+    attempts: &[WarmTargetAttempt],
+    attempt_at_ms: u64,
+) {
+    apply_warm_target_attempts(warm, attempts, attempt_at_ms);
+    warm.last_warm_attempt_at_ms = Some(u128::from(attempt_at_ms));
+    if attempts.iter().any(|attempt| {
+        matches!(
+            attempt.result,
+            WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)
+        )
+    }) {
+        let attempt_at_ms_u128 = u128::from(attempt_at_ms);
+        warm.last_warm_success_at_ms = Some(attempt_at_ms_u128);
+        warm.last_activity_at_ms = attempt_at_ms_u128;
+        warm.browser_active = true;
+        warm.continuous_active = true;
+        warm.current_reason = "active-operator-activity".to_string();
+        warm.last_error = None;
+    } else {
+        warm.last_error = Some("startup warm failed".to_string());
+    }
 }
 
 fn collect_warm_targets(warm: &WarmControlState, category: &str) -> Vec<WarmTargetStatus> {
@@ -778,6 +806,14 @@ fn configured_continuous_warm_interval_ms() -> u64 {
         .unwrap_or(50_000)
 }
 
+fn configured_continuous_warm_pass_timeout_ms() -> u64 {
+    std::env::var("LAUNCHDECK_CONTINUOUS_WARM_PASS_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= 10_000)
+        .unwrap_or(120_000)
+}
+
 fn configured_idle_warm_timeout_ms() -> u64 {
     std::env::var("LAUNCHDECK_IDLE_WARM_TIMEOUT_MS")
         .ok()
@@ -910,6 +946,91 @@ fn merged_warm_routes(selected: &[WarmRouteSelection]) -> Vec<WarmRouteSelection
     routes
 }
 
+fn warm_routes_for_execution(execution: &crate::config::NormalizedExecution) -> Vec<WarmRouteSelection> {
+    let mut routes = Vec::new();
+    for (provider, endpoint_profile, mev_mode) in [
+        (
+            execution.provider.as_str(),
+            execution.endpointProfile.as_str(),
+            execution.mevMode.as_str(),
+        ),
+        (
+            execution.buyProvider.as_str(),
+            execution.buyEndpointProfile.as_str(),
+            execution.buyMevMode.as_str(),
+        ),
+        (
+            execution.sellProvider.as_str(),
+            execution.sellEndpointProfile.as_str(),
+            execution.sellMevMode.as_str(),
+        ),
+    ] {
+        push_unique_warm_route(&mut routes, provider, endpoint_profile, mev_mode);
+    }
+    routes
+}
+
+fn warm_routes_from_normalized_config_value(value: &Value) -> Vec<WarmRouteSelection> {
+    let execution = value.get("execution");
+    let mut routes = Vec::new();
+    for (provider_key, endpoint_profile_key, mev_mode_key) in [
+        ("provider", "endpointProfile", "mevMode"),
+        ("buyProvider", "buyEndpointProfile", "buyMevMode"),
+        ("sellProvider", "sellEndpointProfile", "sellMevMode"),
+    ] {
+        let provider = execution
+            .and_then(|entry| entry.get(provider_key))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let endpoint_profile = execution
+            .and_then(|entry| entry.get(endpoint_profile_key))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mev_mode = execution
+            .and_then(|entry| entry.get(mev_mode_key))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        push_unique_warm_route(&mut routes, provider, endpoint_profile, mev_mode);
+    }
+    routes
+}
+
+fn sync_follow_job_warm_state(
+    warm: &mut WarmControlState,
+    active_jobs: usize,
+    jobs: &[FollowJobRecord],
+) {
+    warm.follow_jobs_active = active_jobs > 0;
+    let mut routes = Vec::new();
+    for job in jobs
+        .iter()
+        .filter(|job| matches!(job.state, FollowJobState::Armed | FollowJobState::Running))
+    {
+        for route in warm_routes_for_execution(&job.execution) {
+            push_unique_warm_route(
+                &mut routes,
+                &route.provider,
+                &route.endpoint_profile,
+                &route.hellomoon_mev_mode,
+            );
+        }
+    }
+    warm.follow_job_routes = routes;
+}
+
+fn effective_warm_routes(warm: &WarmControlState) -> Vec<WarmRouteSelection> {
+    let mut routes = merged_warm_routes(&warm.selected_routes);
+    for route in &warm.follow_job_routes {
+        push_unique_warm_route(
+            &mut routes,
+            &route.provider,
+            &route.endpoint_profile,
+            &route.hellomoon_mev_mode,
+        );
+    }
+    routes
+}
+
 fn warm_route_providers(routes: &[WarmRouteSelection]) -> Vec<String> {
     let mut providers = Vec::new();
     for route in routes {
@@ -1024,6 +1145,14 @@ fn warm_targets_need_resume_pass(warm: &WarmControlState) -> bool {
     !warm.warm_targets.is_empty() && warm.warm_targets.values().all(|target| !target.active)
 }
 
+fn warm_pass_in_flight_is_stale(warm: &WarmControlState, now_ms: u128) -> bool {
+    warm.warm_pass_in_flight
+        && warm.last_warm_attempt_at_ms.is_some_and(|started_at_ms| {
+            now_ms.saturating_sub(started_at_ms)
+                > u128::from(configured_continuous_warm_pass_timeout_ms())
+        })
+}
+
 fn mark_operator_activity(state: &Arc<AppState>, routes: Vec<WarmRouteSelection>) -> bool {
     let now = current_time_ms();
     let mut warm = state
@@ -1100,6 +1229,7 @@ fn warm_gate_state(
 }
 
 const IDLE_BACKGROUND_REQUEST_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const FOLLOW_JOB_ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const ENGINE_BLOCKHASH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 fn background_request_gate_active(warm: &WarmControlState, now_ms: u128) -> bool {
@@ -1107,6 +1237,9 @@ fn background_request_gate_active(warm: &WarmControlState, now_ms: u128) -> bool
         return true;
     }
     if warm.in_flight_requests > 0 {
+        return true;
+    }
+    if warm.follow_jobs_active {
         return true;
     }
     if warm.last_activity_at_ms == 0 {
@@ -1141,7 +1274,7 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (active, browser_active, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
-    let selected_routes = merged_warm_routes(&warm.selected_routes);
+    let selected_routes = effective_warm_routes(&warm);
     let selected_providers = warm_route_providers(&selected_routes);
     let state_targets = payload_warm_targets(&warm, "state", active);
     let endpoint_targets = payload_warm_targets(&warm, "endpoint", active);
@@ -1181,6 +1314,26 @@ async fn follow_active_jobs_count() -> u64 {
         .unwrap_or(0)
 }
 
+fn update_follow_job_warm_state(
+    state: &Arc<AppState>,
+    active_jobs: usize,
+    jobs: &[FollowJobRecord],
+) {
+    let mut warm = state
+        .warm
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sync_follow_job_warm_state(&mut warm, active_jobs, jobs);
+}
+
+async fn refresh_follow_job_warm_state_from_daemon(state: &Arc<AppState>) {
+    let client = FollowDaemonClient::new(&configured_follow_daemon_base_url());
+    match client.list().await {
+        Ok(response) => update_follow_job_warm_state(state, response.health.activeJobs, &response.jobs),
+        Err(_error) => update_follow_job_warm_state(state, 0, &[]),
+    }
+}
+
 async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     let follow_active_jobs = follow_active_jobs_count().await;
     let (routes, attempt_started_at_ms) = {
@@ -1189,7 +1342,8 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
             .warm
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let routes = merged_warm_routes(&warm.selected_routes);
+        warm.follow_jobs_active = follow_active_jobs > 0;
+        let routes = effective_warm_routes(&warm);
         let (should_warm, browser_active, reason) =
             warm_gate_state(&warm, now_ms, follow_active_jobs);
         if should_warm != warm.continuous_active {
@@ -1207,7 +1361,15 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
             return;
         }
         if warm.warm_pass_in_flight {
-            return;
+            if warm_pass_in_flight_is_stale(&warm, now_ms) {
+                warm.warm_pass_in_flight = false;
+                warm.last_error = Some(format!(
+                    "Continuous warm pass exceeded {}ms. Resetting stale in-flight state.",
+                    configured_continuous_warm_pass_timeout_ms()
+                ));
+            } else {
+                return;
+            }
         }
         warm.warm_pass_in_flight = true;
         warm.last_warm_attempt_at_ms = Some(now_ms);
@@ -1438,11 +1600,40 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
 fn spawn_continuous_warm_task(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            execute_continuous_warm_pass(&state).await;
+            let pass_timeout_ms = configured_continuous_warm_pass_timeout_ms();
+            if tokio::time::timeout(
+                Duration::from_millis(pass_timeout_ms),
+                execute_continuous_warm_pass(&state),
+            )
+            .await
+            .is_err()
+            {
+                let mut warm = state
+                    .warm
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                warm.warm_pass_in_flight = false;
+                warm.last_error = Some(format!(
+                    "Continuous warm pass timed out after {}ms and was reset.",
+                    pass_timeout_ms
+                ));
+                if warm.continuous_active {
+                    set_all_warm_targets_inactive(&mut warm);
+                }
+            }
             tokio::time::sleep(Duration::from_millis(
                 configured_continuous_warm_interval_ms(),
             ))
             .await;
+        }
+    });
+}
+
+fn spawn_follow_job_activity_refresh_task(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            refresh_follow_job_warm_state_from_daemon(&state).await;
+            tokio::time::sleep(FOLLOW_JOB_ACTIVITY_REFRESH_INTERVAL).await;
         }
     });
 }
@@ -6510,19 +6701,7 @@ async fn api_startup_warm(
             .warm
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        apply_warm_target_attempts(&mut warm, &startup_attempts, attempt_at_ms);
-        warm.last_warm_attempt_at_ms = Some(u128::from(attempt_at_ms));
-        if startup_attempts.iter().any(|attempt| {
-            matches!(
-                attempt.result,
-                WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)
-            )
-        }) {
-            warm.last_warm_success_at_ms = Some(u128::from(attempt_at_ms));
-            warm.last_error = None;
-        } else {
-            warm.last_error = Some("startup warm failed".to_string());
-        }
+        record_startup_warm_attempts(&mut warm, &startup_attempts, attempt_at_ms);
     }
     Json(attach_timing(
         json!({
@@ -6845,6 +7024,16 @@ async fn api_run(
             &transport_plan,
             &report_snapshot,
         );
+    }
+    let run_warm_routes = response
+        .get("normalizedConfig")
+        .map(warm_routes_from_normalized_config_value)
+        .unwrap_or_default();
+    if !run_warm_routes.is_empty() {
+        let should_rewarm_now = mark_operator_activity(&state, run_warm_routes);
+        if should_rewarm_now {
+            execute_continuous_warm_pass(&state).await;
+        }
     }
     response["backend"] = Value::String("rust".to_string());
     response["metadataUri"] = response
@@ -7499,6 +7688,100 @@ mod tests {
         })
     }
 
+    fn sample_execution() -> crate::config::NormalizedExecution {
+        serde_json::from_value(json!({
+            "simulate": false,
+            "send": true,
+            "txFormat": "legacy",
+            "commitment": "confirmed",
+            "skipPreflight": true,
+            "trackSendBlockHeight": true,
+            "provider": "helius-sender",
+            "endpointProfile": "ams",
+            "mevProtect": false,
+            "mevMode": "off",
+            "jitodontfront": false,
+            "autoGas": true,
+            "autoMode": "balanced",
+            "priorityFeeSol": "0",
+            "tipSol": "0",
+            "maxPriorityFeeSol": "0",
+            "maxTipSol": "0",
+            "buyProvider": "hellomoon",
+            "buyEndpointProfile": "fra",
+            "buyMevProtect": true,
+            "buyMevMode": "secure",
+            "buyJitodontfront": false,
+            "buyAutoGas": true,
+            "buyAutoMode": "balanced",
+            "buyPriorityFeeSol": "0",
+            "buyTipSol": "0",
+            "buySlippagePercent": "90",
+            "buyMaxPriorityFeeSol": "0",
+            "buyMaxTipSol": "0",
+            "sellAutoGas": true,
+            "sellAutoMode": "balanced",
+            "sellProvider": "jito-bundle",
+            "sellEndpointProfile": "ewr",
+            "sellMevProtect": false,
+            "sellMevMode": "off",
+            "sellJitodontfront": false,
+            "sellPriorityFeeSol": "0",
+            "sellTipSol": "0",
+            "sellSlippagePercent": "90",
+            "sellMaxPriorityFeeSol": "0",
+            "sellMaxTipSol": "0"
+        }))
+        .expect("sample execution")
+    }
+
+    fn sample_follow_job(state: FollowJobState) -> FollowJobRecord {
+        FollowJobRecord {
+            schemaVersion: FOLLOW_RESPONSE_SCHEMA_VERSION,
+            traceId: "trace".to_string(),
+            jobId: "job".to_string(),
+            state,
+            createdAtMs: 1,
+            updatedAtMs: 1,
+            launchpad: "pump".to_string(),
+            quoteAsset: "sol".to_string(),
+            launchMode: String::new(),
+            selectedWalletKey: "wallet".to_string(),
+            execution: sample_execution(),
+            tokenMayhemMode: false,
+            jitoTipAccount: String::new(),
+            buyTipAccount: String::new(),
+            sellTipAccount: String::new(),
+            preferPostSetupCreatorVaultForSell: false,
+            mint: None,
+            launchCreator: None,
+            launchSignature: None,
+            submitAtMs: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            reportPath: None,
+            transportPlan: None,
+            followLaunch: NormalizedFollowLaunch {
+                enabled: false,
+                source: String::new(),
+                schemaVersion: 1,
+                snipes: vec![],
+                devAutoSell: None,
+                constraints: crate::config::NormalizedFollowLaunchConstraints {
+                    pumpOnly: false,
+                    retryBudget: 0,
+                    requireDaemonReadiness: false,
+                    blockOnRequiredPrechecks: false,
+                },
+            },
+            actions: vec![],
+            deferredSetup: None,
+            cancelRequested: false,
+            lastError: None,
+            timings: FollowJobTimings::default(),
+        }
+    }
+
     #[tokio::test]
     async fn health_reports_rust_native_only_mode() {
         let response = health().await;
@@ -7967,6 +8250,82 @@ mod tests {
     }
 
     #[test]
+    fn stale_in_flight_warm_pass_is_detected() {
+        let timeout_ms = u128::from(configured_continuous_warm_pass_timeout_ms());
+        let now_ms = current_time_ms();
+        let warm = WarmControlState {
+            warm_pass_in_flight: true,
+            last_warm_attempt_at_ms: Some(now_ms.saturating_sub(timeout_ms + 1_000)),
+            ..WarmControlState::default()
+        };
+        assert!(warm_pass_in_flight_is_stale(&warm, now_ms));
+    }
+
+    #[test]
+    fn recent_in_flight_warm_pass_is_not_stale() {
+        let timeout_ms = u128::from(configured_continuous_warm_pass_timeout_ms());
+        let now_ms = current_time_ms();
+        let warm = WarmControlState {
+            warm_pass_in_flight: true,
+            last_warm_attempt_at_ms: Some(now_ms.saturating_sub(timeout_ms.saturating_sub(1_000))),
+            ..WarmControlState::default()
+        };
+        assert!(!warm_pass_in_flight_is_stale(&warm, now_ms));
+    }
+
+    #[test]
+    fn background_request_gate_stays_active_for_follow_jobs() {
+        let now_ms = current_time_ms();
+        let warm = WarmControlState {
+            last_activity_at_ms: now_ms.saturating_sub(u128::from(configured_idle_warm_timeout_ms()) + 5_000),
+            follow_jobs_active: true,
+            ..WarmControlState::default()
+        };
+        assert!(background_request_gate_active(&warm, now_ms));
+    }
+
+    #[test]
+    fn startup_warm_success_rearms_operator_activity() {
+        let mut warm = WarmControlState::default();
+        let attempt_at_ms = 5_000;
+        record_startup_warm_attempts(
+            &mut warm,
+            &[build_warm_target_attempt(
+                "state",
+                None,
+                "Warm RPC",
+                "https://warm.example/rpc",
+                WarmAttemptResult::Success,
+            )],
+            attempt_at_ms,
+        );
+        assert_eq!(warm.last_activity_at_ms, u128::from(attempt_at_ms));
+        assert_eq!(warm.last_warm_success_at_ms, Some(u128::from(attempt_at_ms)));
+        assert!(warm.browser_active);
+        assert!(warm.continuous_active);
+        assert_eq!(warm.current_reason, "active-operator-activity");
+    }
+
+    #[test]
+    fn sync_follow_job_warm_state_collects_active_job_routes() {
+        let mut warm = WarmControlState::default();
+        sync_follow_job_warm_state(&mut warm, 1, &[sample_follow_job(FollowJobState::Running)]);
+        assert!(warm.follow_jobs_active);
+        assert_eq!(warm.follow_job_routes.len(), 3);
+        assert!(warm.follow_job_routes.iter().any(|route| {
+            route.provider == "helius-sender" && route.endpoint_profile == "ams"
+        }));
+        assert!(warm.follow_job_routes.iter().any(|route| {
+            route.provider == "hellomoon"
+                && route.endpoint_profile == "fra"
+                && route.hellomoon_mev_mode == "secure"
+        }));
+        assert!(warm.follow_job_routes.iter().any(|route| {
+            route.provider == "jito-bundle" && route.endpoint_profile == "ewr"
+        }));
+    }
+
+    #[test]
     fn helius_sender_ping_endpoint_rewrites_fast_path() {
         assert_eq!(
             helius_sender_ping_endpoint_url("http://fra-sender.helius-rpc.com/fast"),
@@ -8204,6 +8563,7 @@ async fn main() {
     });
     spawn_fee_market_snapshot_refresh_task(state.clone(), rpc_url.clone());
     spawn_engine_blockhash_refresh_task(state.clone(), rpc_url, "confirmed");
+    spawn_follow_job_activity_refresh_task(state.clone());
     spawn_continuous_warm_task(state.clone());
     let restored_workers = restore_workers(&state.runtime).await;
     let app = Router::new()

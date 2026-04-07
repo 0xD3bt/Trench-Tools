@@ -202,9 +202,14 @@ pub fn create_default_persistent_config() -> Value {
             "automaticDevSell": {
                 "enabled": false,
                 "percent": 100,
+                "triggerFamily": "time",
                 "triggerMode": "block-offset",
                 "delayMs": 0,
-                "targetBlockOffset": 0
+                "targetBlockOffset": 0,
+                "marketCapEnabled": false,
+                "marketCapThreshold": "",
+                "marketCapScanTimeoutSeconds": 30,
+                "marketCapTimeoutAction": "stop"
             }
         },
         "presets": {
@@ -593,6 +598,20 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
     } else {
         "block-offset".to_string()
     };
+    let legacy_auto_sell_market_cap_threshold =
+        string_value(legacy_auto_sell.get("marketCapThreshold"));
+    let legacy_auto_sell_market_cap_enabled = bool_value(
+        legacy_auto_sell.get("marketCapEnabled"),
+        !legacy_auto_sell_market_cap_threshold.trim().is_empty(),
+    ) || !legacy_auto_sell_market_cap_threshold.trim().is_empty();
+    let legacy_auto_sell_trigger_family =
+        string_value(legacy_auto_sell.get("triggerFamily")).if_empty_then(
+            if legacy_auto_sell_market_cap_enabled {
+                "market-cap".to_string()
+            } else {
+                "time".to_string()
+            },
+        );
     json!({
         "defaults": {
             "launchpad": launchpad,
@@ -605,9 +624,23 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
             "automaticDevSell": {
                 "enabled": bool_value(legacy_auto_sell.get("enabled"), false),
                 "percent": number_value(legacy_auto_sell.get("percent"), 100),
+                "triggerFamily": legacy_auto_sell_trigger_family,
                 "triggerMode": legacy_auto_sell_trigger_mode,
                 "delayMs": number_value(legacy_auto_sell.get("delaySeconds"), 0) * 1000,
-                "targetBlockOffset": 0
+                "targetBlockOffset": 0,
+                "marketCapEnabled": legacy_auto_sell_market_cap_enabled,
+                "marketCapThreshold": legacy_auto_sell_market_cap_threshold,
+                "marketCapScanTimeoutSeconds": number_value(
+                    legacy_auto_sell.get("marketCapScanTimeoutSeconds"),
+                    if legacy_auto_sell.get("marketCapScanTimeoutMinutes").is_some() {
+                        number_value(legacy_auto_sell.get("marketCapScanTimeoutMinutes"), 15) * 60
+                    } else {
+                        30
+                    }
+                ),
+                "marketCapTimeoutAction": string_value(
+                    legacy_auto_sell.get("marketCapTimeoutAction")
+                ).if_empty_then("stop".to_string())
             }
         },
         "presets": {
@@ -694,6 +727,27 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
             mode
         }
     };
+    let automatic_dev_sell_market_cap_threshold = string_value(
+        merged_defaults
+            .get("automaticDevSell")
+            .and_then(|value| value.get("marketCapThreshold")),
+    );
+    let automatic_dev_sell_market_cap_enabled = bool_value(
+        merged_defaults
+            .get("automaticDevSell")
+            .and_then(|value| value.get("marketCapEnabled")),
+        !automatic_dev_sell_market_cap_threshold.trim().is_empty(),
+    ) || !automatic_dev_sell_market_cap_threshold.trim().is_empty();
+    let automatic_dev_sell_trigger_family = string_value(
+        merged_defaults
+            .get("automaticDevSell")
+            .and_then(|value| value.get("triggerFamily")),
+    )
+    .if_empty_then(if automatic_dev_sell_market_cap_enabled {
+        "market-cap".to_string()
+    } else {
+        "time".to_string()
+    });
     json!({
         "defaults": {
             "launchpad": launchpad,
@@ -709,12 +763,37 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
             "automaticDevSell": {
                 "enabled": bool_value(merged_defaults.get("automaticDevSell").and_then(|value| value.get("enabled")), false),
                 "percent": number_value(merged_defaults.get("automaticDevSell").and_then(|value| value.get("percent")), 100),
+                "triggerFamily": automatic_dev_sell_trigger_family,
                 "triggerMode": automatic_dev_sell_trigger_mode,
                 "delayMs": number_value(
                     merged_defaults.get("automaticDevSell").and_then(|value| value.get("delayMs")),
                     number_value(merged_defaults.get("automaticDevSell").and_then(|value| value.get("delaySeconds")), 0) * 1000
                 ),
-                "targetBlockOffset": number_value(merged_defaults.get("automaticDevSell").and_then(|value| value.get("targetBlockOffset")), 0)
+                "targetBlockOffset": number_value(merged_defaults.get("automaticDevSell").and_then(|value| value.get("targetBlockOffset")), 0),
+                "marketCapEnabled": automatic_dev_sell_market_cap_enabled,
+                "marketCapThreshold": automatic_dev_sell_market_cap_threshold,
+                "marketCapScanTimeoutSeconds": number_value(
+                    merged_defaults.get("automaticDevSell").and_then(|value| value.get("marketCapScanTimeoutSeconds")),
+                    if merged_defaults
+                        .get("automaticDevSell")
+                        .and_then(|value| value.get("marketCapScanTimeoutMinutes"))
+                        .is_some()
+                    {
+                        number_value(
+                            merged_defaults
+                                .get("automaticDevSell")
+                                .and_then(|value| value.get("marketCapScanTimeoutMinutes")),
+                            15
+                        ) * 60
+                    } else {
+                        30
+                    }
+                ),
+                "marketCapTimeoutAction": string_value(
+                    merged_defaults
+                        .get("automaticDevSell")
+                        .and_then(|value| value.get("marketCapTimeoutAction"))
+                ).if_empty_then("stop".to_string())
             }
         },
         "presets": {
@@ -933,5 +1012,46 @@ mod tests {
         assert!(preset["creationSettings"].get("policy").is_none());
         assert!(preset["buySettings"].get("policy").is_none());
         assert!(preset["sellSettings"].get("policy").is_none());
+    }
+
+    #[test]
+    fn normalize_persistent_config_preserves_market_cap_auto_sell_fields() {
+        let normalized = normalize_persistent_config(json!({
+            "defaults": {
+                "launchpad": "pump",
+                "mode": "regular",
+                "activePresetId": "preset1",
+                "automaticDevSell": {
+                    "enabled": true,
+                    "percent": 65,
+                    "triggerFamily": "market-cap",
+                    "triggerMode": "block-offset",
+                    "delayMs": 0,
+                    "targetBlockOffset": 0,
+                    "marketCapEnabled": true,
+                    "marketCapThreshold": "100k",
+                    "marketCapScanTimeoutSeconds": 45,
+                    "marketCapTimeoutAction": "sell"
+                }
+            },
+            "presets": {
+                "items": [{
+                    "id": "preset1",
+                    "label": "P1",
+                    "creationSettings": {},
+                    "buySettings": {},
+                    "sellSettings": {}
+                }]
+            }
+        }));
+
+        let auto_sell = &normalized["defaults"]["automaticDevSell"];
+        assert_eq!(auto_sell["enabled"], true);
+        assert_eq!(auto_sell["percent"], 65);
+        assert_eq!(auto_sell["triggerFamily"], "market-cap");
+        assert_eq!(auto_sell["marketCapEnabled"], true);
+        assert_eq!(auto_sell["marketCapThreshold"], "100k");
+        assert_eq!(auto_sell["marketCapScanTimeoutSeconds"], 45);
+        assert_eq!(auto_sell["marketCapTimeoutAction"], "sell");
     }
 }

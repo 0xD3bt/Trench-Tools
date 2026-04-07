@@ -17,6 +17,8 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::transport::{JitoBundleEndpoint, TransportPlan, configured_hellomoon_api_key};
 
+const SIGNATURE_CONFIRMATION_RPC_POLL_INTERVAL_MS: u64 = 400;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledTransaction {
     pub label: String,
@@ -740,7 +742,7 @@ async fn wait_for_confirmation(
         signature,
         commitment,
         max_attempts,
-        1500,
+        SIGNATURE_CONFIRMATION_RPC_POLL_INTERVAL_MS,
         track_confirmed_block_height,
     )
     .await

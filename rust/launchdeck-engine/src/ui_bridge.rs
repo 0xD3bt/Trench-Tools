@@ -1203,7 +1203,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             .trim()
             .parse::<u64>()
             .map(|value| value.saturating_mul(60).to_string())
-            .unwrap_or_else(|_| "15".to_string())
+            .unwrap_or_else(|_| "30".to_string())
     } else if !form
         .automaticDevSellMarketCapScanTimeoutMinutes
         .trim()
