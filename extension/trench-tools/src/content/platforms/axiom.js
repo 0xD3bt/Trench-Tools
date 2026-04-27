@@ -1524,6 +1524,290 @@
         return link;
       }
 
+      const AXIOM_VAMP_CAPTURE_STORAGE_PREFIX = "trenchTools.vampImageCapture.";
+      const AXIOM_VAMP_CAPTURE_TTL_MS = 15 * 60 * 1000;
+      const AXIOM_VAMP_MAX_CAPTURE_DIMENSION = 512;
+      const AXIOM_VAMP_MAX_INLINE_DATA_URL_LENGTH = 1_000_000;
+      const AXIOM_VAMP_MAX_STORED_DATA_URL_LENGTH = 2_000_000;
+
+      function axiomVampCaptureStorageKey() {
+        return `${AXIOM_VAMP_CAPTURE_STORAGE_PREFIX}${Date.now()}.${Math.random().toString(36).slice(2)}`;
+      }
+
+      function axiomVampImageSource(image) {
+        return String(
+          image.currentSrc ||
+          image.src ||
+          image.getAttribute("src") ||
+          ""
+        ).trim();
+      }
+
+      function axiomImageAddressFromSource(source) {
+        const raw = String(source || "").trim();
+        if (!raw || raw.startsWith("data:")) {
+          return "";
+        }
+        try {
+          const parsed = new URL(raw, window.location.href);
+          if (parsed.hostname !== "axiomtrading.axiom-cdn.io") {
+            return "";
+          }
+          return parsed.pathname
+            .split("/")
+            .pop()
+            .replace(/\.[^.]+$/, "")
+            .trim();
+        } catch (_error) {
+          return "";
+        }
+      }
+
+      function isVisibleAxiomVampImage(image) {
+        if (!(image instanceof HTMLImageElement)) {
+          return false;
+        }
+        const rect = image.getBoundingClientRect();
+        const style = window.getComputedStyle(image);
+        return rect.width >= 40
+          && rect.height >= 40
+          && rect.bottom > 0
+          && rect.right > 0
+          && rect.top < window.innerHeight
+          && rect.left < window.innerWidth
+          && style.display !== "none"
+          && style.visibility !== "hidden"
+          && Number(style.opacity || "1") > 0.01;
+      }
+
+      function scoreAxiomVampImageCandidate(image, contractAddress) {
+        if (!isVisibleAxiomVampImage(image)) {
+          return -1;
+        }
+        const source = axiomVampImageSource(image);
+        if (!source) {
+          return -1;
+        }
+        const sourceAddress = axiomImageAddressFromSource(source);
+        if (contractAddress && sourceAddress && sourceAddress !== contractAddress) {
+          return -1;
+        }
+        const normalizedSource = source.toLowerCase();
+        const normalizedAlt = String(image.alt || "").toLowerCase();
+        const normalizedClassName = String(image.className || "").toLowerCase();
+        if (
+          normalizedAlt === "vamp" ||
+          normalizedSource.includes("vamp-icon") ||
+          normalizedSource.includes("trench-tools")
+        ) {
+          return -1;
+        }
+        const rect = image.getBoundingClientRect();
+        let score = 0;
+        if (source.startsWith("data:image/")) score += 120;
+        if (contractAddress && source.includes(contractAddress)) score += 220;
+        if (normalizedSource.includes("axiomtrading.axiom-cdn.io")) score += 170;
+        if (normalizedSource.includes("axiom-assets.axiom-cdn.io/pfps/")) score -= 120;
+        if (normalizedClassName.includes("object-cover")) score += 25;
+        if (rect.width >= 56 && rect.width <= 96 && rect.height >= 56 && rect.height <= 96) {
+          score += 35;
+        }
+        if (image.naturalWidth > 0 && image.naturalHeight > 0) score += 20;
+        return score;
+      }
+
+      function selectAxiomVampImageCandidate(card, contractAddress) {
+        if (!(card instanceof Element)) {
+          return null;
+        }
+        const candidates = Array.from(card.querySelectorAll("img"))
+          .map((image) => ({
+            image,
+            score: scoreAxiomVampImageCandidate(image, contractAddress),
+          }))
+          .filter((entry) => entry.score > 0)
+          .sort((left, right) => right.score - left.score);
+        const selected = candidates[0];
+        if (!selected || selected.score < 50) {
+          return null;
+        }
+        return selected.image;
+      }
+
+      function canvasDataUrlFromImage(image) {
+        if (!(image instanceof HTMLImageElement) || !image.complete || !image.naturalWidth || !image.naturalHeight) {
+          return "";
+        }
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = image.naturalWidth;
+          canvas.height = image.naturalHeight;
+          const context = canvas.getContext("2d");
+          if (!context) return "";
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          return canvas.toDataURL("image/png");
+        } catch (_error) {
+          return "";
+        }
+      }
+
+      function blobToDataUrl(blob) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.addEventListener("load", () => resolve(String(reader.result || "")), { once: true });
+          reader.addEventListener("error", () => reject(reader.error || new Error("Failed to read image.")), { once: true });
+          reader.readAsDataURL(blob);
+        });
+      }
+
+      async function compressedImageDataUrlFromBlob(blob) {
+        if (typeof createImageBitmap !== "function") {
+          return blobToDataUrl(blob);
+        }
+        let bitmap = null;
+        try {
+          bitmap = await createImageBitmap(blob);
+          const scale = Math.min(
+            1,
+            AXIOM_VAMP_MAX_CAPTURE_DIMENSION / Math.max(bitmap.width, bitmap.height, 1)
+          );
+          const width = Math.max(1, Math.round(bitmap.width * scale));
+          const height = Math.max(1, Math.round(bitmap.height * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const context = canvas.getContext("2d");
+          if (!context) {
+            return blobToDataUrl(blob);
+          }
+          context.drawImage(bitmap, 0, 0, width, height);
+          return canvas.toDataURL("image/webp", 0.92);
+        } catch (_error) {
+          return blobToDataUrl(blob);
+        } finally {
+          if (bitmap && typeof bitmap.close === "function") {
+            bitmap.close();
+          }
+        }
+      }
+
+      async function dataUrlFromAxiomVampImage(image) {
+        const source = axiomVampImageSource(image);
+        if (!source) {
+          return "";
+        }
+        if (source.startsWith("data:image/")) {
+          return source.length <= AXIOM_VAMP_MAX_INLINE_DATA_URL_LENGTH
+            ? source
+            : (canvasDataUrlFromImage(image) || source);
+        }
+        const response = await fetch(source, {
+          cache: "force-cache",
+          credentials: "omit",
+        });
+        if (!response.ok) {
+          throw new Error(`Axiom image fetch failed with status ${response.status}.`);
+        }
+        const blob = await response.blob();
+        if (!String(blob.type || "").startsWith("image/")) {
+          throw new Error("Axiom image response was not an image.");
+        }
+        if (blob.size > 8_000_000) {
+          throw new Error("Axiom image is too large.");
+        }
+        return compressedImageDataUrlFromBlob(blob);
+      }
+
+      async function persistAxiomVampImageCapture(capture) {
+        if (
+          typeof chrome === "undefined" ||
+          !chrome.storage?.local
+        ) {
+          return "";
+        }
+        await cleanupStaleAxiomVampImageCaptures();
+        if (!capture || !capture.dataUrl) {
+          return "";
+        }
+        const storageKey = axiomVampCaptureStorageKey();
+        await chrome.storage.local.set({
+          [storageKey]: {
+            ...capture,
+            createdAt: Number(capture.createdAt || 0) || Date.now(),
+          },
+        });
+        return storageKey;
+      }
+
+      async function removeStoredAxiomVampImageCapture(storageKey) {
+        if (
+          !storageKey ||
+          typeof chrome === "undefined" ||
+          !chrome.storage?.local
+        ) {
+          return;
+        }
+        try {
+          await chrome.storage.local.remove(storageKey);
+        } catch (_error) {
+          // Best-effort cleanup; stale captures are also swept before future persists.
+        }
+      }
+
+      async function cleanupStaleAxiomVampImageCaptures() {
+        if (typeof chrome === "undefined" || !chrome.storage?.local) {
+          return;
+        }
+        let stored = null;
+        try {
+          stored = await chrome.storage.local.get(null);
+        } catch (_error) {
+          return;
+        }
+        const now = Date.now();
+        const staleKeys = Object.entries(stored || {})
+          .filter(([key, value]) => {
+            if (!String(key || "").startsWith(AXIOM_VAMP_CAPTURE_STORAGE_PREFIX)) {
+              return false;
+            }
+            const createdAt = Number(value && typeof value === "object" ? value.createdAt : 0);
+            return !createdAt || now - createdAt > AXIOM_VAMP_CAPTURE_TTL_MS;
+          })
+          .map(([key]) => key);
+        if (!staleKeys.length) {
+          return;
+        }
+        try {
+          await chrome.storage.local.remove(staleKeys);
+        } catch (_error) {
+          // Ignore cleanup failures so the vamp flow can continue.
+        }
+      }
+
+
+      async function captureAxiomVampImage(card, contractAddress) {
+        const image = selectAxiomVampImageCandidate(card, contractAddress);
+        if (!image) {
+          return null;
+        }
+        const dataUrl = await dataUrlFromAxiomVampImage(image);
+        if (!dataUrl || !dataUrl.startsWith("data:image/")) {
+          return null;
+        }
+        if (dataUrl.length > AXIOM_VAMP_MAX_STORED_DATA_URL_LENGTH) {
+          return null;
+        }
+        const sourceUrl = axiomVampImageSource(image);
+        return {
+          dataUrl,
+          sourceUrl: sourceUrl.startsWith("data:") ? "" : sourceUrl,
+          contractAddress,
+          name: String(image.alt || "").trim(),
+          createdAt: Date.now(),
+          source: "axiom-pulse",
+        };
+      }
+
       async function handleAxiomPulseVampClick(card) {
         const liveRoute = await resolvePulseTradeRouteWithFallback(
           card,
@@ -1535,11 +1819,24 @@
           throw new Error("Token not found.");
         }
         const mode = pulseVampResolveBehavior();
-        await helpers.openLaunchdeckOverlay({
-          mode: "create",
-          contractAddress,
-          instaLaunch: mode === "insta",
-        });
+        let vampImageKey = "";
+        try {
+          const capturedImage = await captureAxiomVampImage(card, contractAddress);
+          vampImageKey = await persistAxiomVampImageCapture(capturedImage);
+        } catch (error) {
+          console.warn("Axiom Vamp image capture failed; falling back to metadata import.", error);
+        }
+        try {
+          await helpers.openLaunchdeckOverlay({
+            mode: "create",
+            contractAddress,
+            instaLaunch: mode === "insta",
+            vampImageKey,
+          });
+        } catch (error) {
+          await removeStoredAxiomVampImageCapture(vampImageKey);
+          throw error;
+        }
       }
 
       function mountAxiomWatchlistQuickButtons() {

@@ -9,6 +9,10 @@ const launchdeckSource = path.join(repoRoot, "ui", "launchdeck");
 const imagesSource = path.join(repoRoot, "ui", "images");
 const launchdeckTarget = path.join(extensionRoot, "launchdeck");
 const imagesTarget = path.join(extensionRoot, "images");
+const extensionBootstrapTarget = path.join(launchdeckTarget, "extension-bootstrap.js");
+const extensionBootstrapSnapshot = fs.existsSync(extensionBootstrapTarget)
+  ? fs.readFileSync(extensionBootstrapTarget)
+  : null;
 
 function ensureDir(targetPath) {
   fs.mkdirSync(targetPath, { recursive: true });
@@ -36,5 +40,8 @@ resetDir(launchdeckTarget);
 resetDir(imagesTarget);
 copyDir(launchdeckSource, launchdeckTarget);
 copyDir(imagesSource, imagesTarget);
+if (extensionBootstrapSnapshot) {
+  fs.writeFileSync(extensionBootstrapTarget, extensionBootstrapSnapshot);
+}
 
 console.log("Packaged LaunchDeck shell assets into the extension.");

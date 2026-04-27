@@ -264,6 +264,7 @@ const vampStatus = document.getElementById("vamp-status");
 const vampError = document.getElementById("vamp-error");
 let vampAutoImportTimer = null;
 let vampInFlightAddress = "";
+let consumedVampImageCaptureKey = "";
 const OUTPUT_SECTION_VISIBILITY_KEY = "launchdeck.outputSectionVisible";
 const REPORTS_TERMINAL_VISIBILITY_KEY = "launchdeck.reportsTerminalVisible";
 const REPORTS_TERMINAL_LIST_WIDTH_KEY = "launchdeck.reportsTerminalListWidth";
@@ -3890,6 +3891,95 @@ function scheduleVampAutoImport() {
   }, 150);
 }
 
+function imageExtensionForMime(mimeType) {
+  const normalized = String(mimeType || "").trim().toLowerCase();
+  if (normalized === "image/png") return ".png";
+  if (normalized === "image/jpeg" || normalized === "image/jpg") return ".jpg";
+  if (normalized === "image/webp") return ".webp";
+  if (normalized === "image/gif") return ".gif";
+  if (normalized === "image/avif") return ".avif";
+  return ".png";
+}
+
+function dataUrlMimeType(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:([^;,]+)[;,]/i);
+  return match ? match[1].toLowerCase() : "";
+}
+
+function safeCapturedImageBaseName(capture, contractAddress) {
+  const name = String(capture && capture.name || "").trim()
+    || String(contractAddress || "").trim()
+    || "axiom-vamp-image";
+  return name
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48)
+    || "axiom-vamp-image";
+}
+
+async function takeStoredVampImageCapture(contractAddress) {
+  const captureKey = extensionShellConfig && extensionShellConfig.vampImageKey
+    ? String(extensionShellConfig.vampImageKey).trim()
+    : "";
+  if (
+    !captureKey
+    || captureKey === consumedVampImageCaptureKey
+    || !window.chrome
+    || !window.chrome.storage
+    || !window.chrome.storage.local
+  ) {
+    return null;
+  }
+  consumedVampImageCaptureKey = captureKey;
+  const stored = await window.chrome.storage.local.get(captureKey);
+  await window.chrome.storage.local.remove(captureKey);
+  const capture = stored && stored[captureKey] && typeof stored[captureKey] === "object"
+    ? stored[captureKey]
+    : null;
+  if (!capture || typeof capture.dataUrl !== "string") {
+    return null;
+  }
+  const captureMint = String(capture.contractAddress || "").trim();
+  if (captureMint && contractAddress && captureMint !== contractAddress) {
+    return null;
+  }
+  const createdAt = Number(capture.createdAt || 0);
+  if (createdAt && Date.now() - createdAt > 15 * 60 * 1000) {
+    return null;
+  }
+  return capture;
+}
+
+async function uploadCapturedVampImage(contractAddress) {
+  const capture = await takeStoredVampImageCapture(contractAddress);
+  if (!capture) {
+    return false;
+  }
+  const dataUrl = String(capture.dataUrl || "").trim();
+  if (!dataUrl.startsWith("data:image/")) {
+    throw new Error("Captured Axiom image was not an image.");
+  }
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+  const mimeType = blob.type || dataUrlMimeType(dataUrl) || "image/png";
+  if (!String(mimeType).startsWith("image/")) {
+    throw new Error("Captured Axiom image had an unsupported type.");
+  }
+  const fileName = `${safeCapturedImageBaseName(capture, contractAddress)}-axiom${imageExtensionForMime(mimeType)}`;
+  const formData = new FormData();
+  formData.append("file", blob, fileName);
+  const uploadResponse = await fetch("/api/upload-image", {
+    method: "POST",
+    body: formData,
+  });
+  const payload = await uploadResponse.json();
+  if (!uploadResponse.ok || !payload.ok) {
+    throw new Error(payload.error || "Captured Axiom image upload failed.");
+  }
+  await selectImportedImage(payload);
+  return true;
+}
+
 async function importVampToken(contractAddressOverride = "") {
   const contractAddress = String(
     contractAddressOverride || (vampContractInput ? vampContractInput.value.trim() : ""),
@@ -3911,7 +4001,18 @@ async function importVampToken(contractAddressOverride = "") {
   if (vampImport) vampImport.disabled = true;
   if (vampCancel) vampCancel.disabled = true;
   if (vampClose) vampClose.disabled = true;
+  let usedCapturedImage = false;
+  let capturedImageWarning = "";
   try {
+    try {
+      usedCapturedImage = await uploadCapturedVampImage(contractAddress);
+      if (usedCapturedImage && imageStatus) {
+        imageStatus.textContent = "Axiom image imported to library. Importing token metadata...";
+      }
+    } catch (error) {
+      capturedImageWarning = `Axiom image import failed; using metadata fallback. ${error.message}`;
+    }
+
     const response = await fetch("/api/vamp", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -3942,21 +4043,29 @@ async function importVampToken(contractAddressOverride = "") {
     clearMetadataUploadCache({ clearInput: true });
     updateTokenFieldCounts();
 
-    if (payload.image) {
+    if (!usedCapturedImage && payload.image) {
       await selectImportedImage(payload.image);
+    } else if (usedCapturedImage) {
+      scheduleMetadataPreupload({ immediate: true });
     }
 
     const detectionNotes = payload.token && payload.token.detection && Array.isArray(payload.token.detection.notes)
       ? payload.token.detection.notes.filter(Boolean)
       : [];
     imageStatus.textContent = [
-      payload.image ? "Token image imported to library." : "",
+      usedCapturedImage
+        ? "Axiom image imported to library."
+        : (payload.image ? "Token image imported to library." : ""),
+      capturedImageWarning,
       payload.warning || "",
       detectionNotes.join(" "),
     ].filter(Boolean).join(" ");
     imagePath.textContent = "";
     if (vampModal) hideVampModal();
   } catch (error) {
+    if (usedCapturedImage && imageStatus) {
+      imageStatus.textContent = `Axiom image imported to library. Metadata import failed: ${error.message}`;
+    }
     if (vampError) {
       vampError.textContent = error.message;
     } else if (imageStatus) {

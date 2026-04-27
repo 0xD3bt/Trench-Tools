@@ -25,6 +25,7 @@
     shell: search.get("shell") || (search.get("popout") === "1" ? "popout" : "overlay"),
     mode: search.get("mode") || "webapp",
     contractAddress: search.get("contractAddress") || "",
+    vampImageKey: search.get("vampImageKey") || "",
     instaLaunch: search.get("instaLaunch") === "1",
   };
 

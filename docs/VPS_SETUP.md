@@ -161,7 +161,7 @@ Second, add the optional startup script. We highly recommend this because it boo
 #!/usr/bin/env bash
 set -euo pipefail
 apt-get update
-apt-get install -y curl
+apt-get install -y ca-certificates curl
 curl -fsSL https://raw.githubusercontent.com/0xD3bt/Trench-Tools/master/scripts/vps-bootstrap.sh -o /root/vps-bootstrap.sh
 bash /root/vps-bootstrap.sh
 ```
@@ -229,7 +229,7 @@ If you did not use the deploy-time startup script, run the bootstrap manually:
 
 ```bash
 apt-get update
-apt-get install -y curl
+apt-get install -y ca-certificates curl
 curl -fsSL https://raw.githubusercontent.com/0xD3bt/Trench-Tools/master/scripts/vps-bootstrap.sh -o /root/vps-bootstrap.sh
 bash /root/vps-bootstrap.sh
 ```

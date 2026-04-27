@@ -109,12 +109,15 @@ export function createLaunchdeckShellController() {
     });
   }
 
-  function buildShellUrl({ shell, mode, contractAddress = "", instaLaunch = false } = {}) {
+  function buildShellUrl({ shell, mode, contractAddress = "", instaLaunch = false, vampImageKey = "" } = {}) {
     const url = new URL(chrome.runtime.getURL("launchdeck/index.html"));
     url.searchParams.set("shell", shell || "overlay");
     url.searchParams.set("mode", mode || "webapp");
     if (contractAddress) {
       url.searchParams.set("contractAddress", String(contractAddress).trim());
+    }
+    if (vampImageKey) {
+      url.searchParams.set("vampImageKey", String(vampImageKey).trim());
     }
     if (instaLaunch) {
       url.searchParams.set("instaLaunch", "1");
@@ -173,7 +176,7 @@ export function createLaunchdeckShellController() {
     wrapper.style.display = isOpen ? displayMode : "none";
   }
 
-  function openOverlay({ mode = "create", contractAddress = "", instaLaunch = false } = {}) {
+  function openOverlay({ mode = "create", contractAddress = "", instaLaunch = false, vampImageKey = "" } = {}) {
     const { wrapper, iframe } = ensureOverlayFrame();
     applyOverlayPresentation(wrapper, iframe, mode);
     const nextUrl = buildShellUrl({
@@ -181,6 +184,7 @@ export function createLaunchdeckShellController() {
       mode,
       contractAddress,
       instaLaunch,
+      vampImageKey,
     });
     const currentUrl = iframe.getAttribute("data-shell-url") || "";
     if (currentUrl !== nextUrl) {
@@ -195,7 +199,7 @@ export function createLaunchdeckShellController() {
     }
   }
 
-  function openPopout({ mode = "webapp", contractAddress = "", instaLaunch = false } = {}) {
+  function openPopout({ mode = "webapp", contractAddress = "", instaLaunch = false, vampImageKey = "" } = {}) {
     const popupSize = typeof Layout.getDefaultPopoutOuterSize === "function"
       ? Layout.getDefaultPopoutOuterSize(mode, window.screen)
       : { width: 552, height: 727 };
@@ -208,6 +212,7 @@ export function createLaunchdeckShellController() {
         mode,
         contractAddress,
         instaLaunch,
+        vampImageKey,
       }),
       "launchdeck-popout",
       `popup=yes,width=${popupSize.width},height=${popupSize.height},left=${popupPosition.left},top=${popupPosition.top},resizable=yes,scrollbars=yes`,
