@@ -1,242 +1,161 @@
-# Environment Variable Reference
+# Environment Reference
 
-This page is the exhaustive env reference for LaunchDeck.
+Use [.env.example](../.env.example) for first setup. Use [.env.advanced](../.env.advanced) only when you intentionally need tuning or overrides.
 
-Use `.env.example` for normal setup.
+Never commit `.env`. Examples below use placeholders only.
 
-Use this page when you want to know:
+## Starter Variables
 
-- every supported env var
-- what it does
-- what happens when it is left blank
-- whether it belongs in normal setup or advanced tuning
+These are the values most users may need.
 
-`docs/CONFIG.md` is the human-readable setup guide. This page is the reference sheet.
+- `TRENCH_TOOLS_MODE` - launcher mode. Blank defaults to `both`. Use `ee` for execution engine only, `ld` for LaunchDeck only, `both` for all services.
+- `TRENCH_TOOL_FEE` - voluntary Trench Tools fee. Blank or `0.1` = `0.1%`, `0` = off, `0.2` = increased support at `0.2%`.
+- `SOLANA_PRIVATE_KEY`, `SOLANA_PRIVATE_KEY2`, ... - wallet private-key slots. Optional label format: `YOUR_PRIVATE_KEY,Main Wallet`.
+- `SOLANA_RPC_URL` - primary HTTP RPC for reads, confirmations, and general runtime behavior. Recommended Helius Gatekeeper format: `https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`.
+- `SOLANA_WS_URL` - primary websocket for live watchers. Recommended Helius format: `wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`.
+- `USER_REGION` - default region profile for region-aware providers. Groups: `global`, `us`, `eu`, `asia`. Metros: `slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo`.
+- `WARM_RPC_URL` - optional low-priority warm/cache/block-height RPC. Blank reuses `SOLANA_RPC_URL`. Shyft is a good fit here.
+- `WARM_WS_URL` - optional low-priority websocket for non-critical balance/account subscriptions. Blank reuses `SOLANA_WS_URL`.
+- `HELLOMOON_API_KEY` - optional Hello Moon Lunar Lander API key.
+- `BAGS_API_KEY` - optional Bags API key for Bags launchpad flows.
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` - blank/default uses pump-fun metadata upload. Set `pinata` to use Pinata.
+- `PINATA_JWT` - required only when metadata provider is `pinata`.
 
-## Easy-setup variables
+## Launcher / Host Overrides
 
-These are the only variables most operators need on day one.
+Most users should leave these blank because the launcher sets safe defaults.
 
-| Variable | Effective default when blank | What it does | Normal setup? |
-| --- | --- | --- | --- |
-| `SOLANA_PRIVATE_KEY` | unset | First wallet slot loaded by the UI and engine | Yes |
-| `SOLANA_PRIVATE_KEY2`, `SOLANA_PRIVATE_KEY3`, ... | unset | Additional wallet slots; optional `<privatekey>,<label>` format is supported | Yes |
-| `SOLANA_RPC_URL` | unset | Main Solana HTTP RPC for reads, confirmations, and general runtime RPC behavior | Yes |
-| `SOLANA_WS_URL` | unset | Main watcher websocket for realtime follow behavior | Yes |
-| `USER_REGION` | provider fallback | Shared default routing profile for region-aware providers | Yes |
-| `LAUNCHDECK_WARM_RPC_URL` | reuse `SOLANA_RPC_URL` | Startup warm, continuous warm probes, and block-height reads | Yes |
-| `HELLOMOON_API_KEY` | unset | Enables Hello Moon execution paths | Optional |
-| `BAGS_API_KEY` | unset | Enables Bags identity and Bags launchpad usage | Optional |
-| `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` | `pump-fun` | Metadata upload provider | Optional |
-| `PINATA_JWT` | unset | Required only when metadata provider is `pinata` | Optional |
-| `LAUNCHDECK_BENCHMARK_MODE` | `full` | Report timing detail level | Optional |
+- `TRENCH_TOOLS_DATA_ROOT` - shared data root. Launcher default: `.local/trench-tools`.
+- `TRENCH_TOOLS_TERMINALS` - Windows launcher log windows. Default: `none`. Use `logs` only when you want live log windows.
+- `EXECUTION_ENGINE_PORT` - execution engine port. Default: `8788`.
+- `LAUNCHDECK_PORT` - LaunchDeck host port. Default: `8789`.
+- `LAUNCHDECK_FOLLOW_DAEMON_PORT` - follow daemon port. Default: `8790`.
+- `LOG_DIR` - process log directory. Default: `.local/logs`.
 
-## Wallet loading
+## Core RPC / Helius Overrides
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `SOLANA_PRIVATE_KEY` | unset | Primary wallet slot | Label format: `<privatekey>,<label>` |
-| `SOLANA_PRIVATE_KEY2`, `SOLANA_PRIVATE_KEY3`, ... | unset | Additional wallet slots | Any numeric suffix is accepted; untagged wallets appear as numbered slots |
-| `SOLANA_KEYPAIR_PATH` | unset | Optional filesystem keypair path | Advanced override only |
+- `HELIUS_RPC_URL` - optional Helius HTTP override for priority-fee estimates. Blank uses a Helius `SOLANA_RPC_URL` when detected.
+- `HELIUS_WS_URL` - optional Helius websocket override for transactionSubscribe watchers. Blank uses a Helius `SOLANA_WS_URL` when detected.
+- `LAUNCHDECK_EXTRA_STANDARD_RPC_SEND_URLS` - optional submit-only fanout endpoints for the deferred Standard RPC provider path. Not recommended in default setup while Standard RPC is pending re-validation.
 
-## Core RPC, websocket, and routing
+## Region / Provider Routing
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `SOLANA_RPC_URL` | unset | Main HTTP RPC | Recommended: Helius Gatekeeper HTTP |
-| `SOLANA_WS_URL` | unset | Main watcher websocket | Recommended: Helius standard websocket |
-| `USER_REGION` | provider fallback | Shared region or metro selection | Supports `global`, `us`, `eu`, `asia`, `slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo`, comma lists |
-| `LAUNCHDECK_WARM_RPC_URL` | reuse `SOLANA_RPC_URL` | Warm RPC for startup warm, continuous warm, and block-height reads | Recommended: separate Shyft RPC |
-| `LAUNCHDECK_EXTRA_STANDARD_RPC_SEND_URLS` | none | Extra submit-only RPC fanout endpoints for `standard-rpc` | Comma-separated; `SOLANA_RPC_URL` stays primary read/confirm RPC |
-| `LAUNCHDECK_STANDARD_RPC_SEND_URLS` | legacy fallback only | Old name for the extra standard-RPC send list | Supported for backward compatibility; prefer `LAUNCHDECK_EXTRA_STANDARD_RPC_SEND_URLS` |
+- `USER_REGION_HELIUS_SENDER` - Helius Sender-specific region override. Blank uses `USER_REGION`.
+- `USER_REGION_HELLOMOON` - Hello Moon-specific region override. Blank uses `USER_REGION`.
+- `USER_REGION_JITO_BUNDLE` - Jito-specific region override. Deferred provider path.
+- `HELIUS_SENDER_ENDPOINT` - explicit Helius Sender endpoint. Blank keeps region fanout.
+- `HELIUS_SENDER_BASE_URL` - alternate Helius Sender base URL. Usually blank.
+- `HELLOMOON_QUIC_ENDPOINT` - explicit Hello Moon QUIC endpoint in `host:port` format. Blank keeps region routing.
+- `HELLOMOON_MEV_PROTECT` - enables Hello Moon QUIC MEV protection when set to `1`, `true`, `yes`, or `on`.
+- `JITO_BUNDLE_BASE_URLS`, `JITO_SEND_BUNDLE_ENDPOINT`, `JITO_BUNDLE_STATUS_ENDPOINT` - Jito bundle endpoints. Deferred provider path; not recommended in setup guides until re-tested.
 
-### USER_REGION behavior
+## Provider / Launchpad Integrations
 
-Current practical routing rules:
+- `BAGS_API_BASE_URL` - Bags API base URL override. Usually blank.
+- `LAUNCHDECK_BAGS_HELPER_BLOCKHASH_FROM_RUST` - pass Rust-cached blockhash values into Bags helper requests. Blank defaults to enabled.
+- `LAUNCHDECK_BAGS_SETUP_JITO_TIP_MIN_LAMPORTS` - minimum Bags setup Jito tip. Blank uses code default.
+- `LAUNCHDECK_BAGS_SETUP_JITO_TIP_CAP_LAMPORTS` - maximum Bags setup Jito tip. Blank uses code default.
+- `LAUNCHDECK_BAGS_SETUP_CONFIRM_TIMEOUT_SECS` - Bags setup confirmation timeout. Blank uses code default.
+- `LAUNCHDECK_BAGS_SETUP_GATE_COMMITMENT` - commitment gate before Bags final launch build. Supported: `processed`, `confirmed`, `finalized`.
 
-- `eu` fans out across Amsterdam + Frankfurt
-- `us` fans out across Salt Lake City + Newark on Helius Sender
-- `asia` fans out across Singapore + Tokyo on Helius Sender
-- Hello Moon `us`, `slc`, and `ewr` map to New York + Ashburn
-- Hello Moon `lon` maps to Frankfurt + Amsterdam
-- Hello Moon `asia` and `sg` map to Tokyo
+## Warmup / Keep-warm
 
-## Helius-specific overrides
+- `LAUNCHDECK_ENABLE_STARTUP_WARM` - one-shot startup warm. Blank/default enabled.
+- `LAUNCHDECK_ENABLE_CONTINUOUS_WARM` - active keep-warm. Blank/default enabled.
+- `LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND` - suspend warm loops while idle. Blank/default enabled.
+- `TRADING_RESOURCE_MODE` - blank keeps credit-saving idle suspension. `always-on` keeps balance streams and provider warm loops active while idle.
+- `LAUNCHDECK_IDLE_WARM_TIMEOUT_MS` - idle timeout before warm suspension. Blank uses code default.
+- `LAUNCHDECK_CONTINUOUS_WARM_INTERVAL_MS` - active keep-warm cadence. Blank uses code default.
+- `LAUNCHDECK_CONTINUOUS_WARM_PASS_TIMEOUT_MS` - timeout for one warm pass. Blank uses code default.
+- `LAUNCHDECK_WARM_PROBE_TIMEOUT_MS` - timeout for one warm probe. Blank uses code default.
+- `LAUNCHDECK_DISABLE_STARTUP_WARM` - legacy fallback to disable startup warm. Prefer `LAUNCHDECK_ENABLE_STARTUP_WARM=false`.
+- `LAUNCHDECK_LAUNCHPAD_WARM_CONTEXT` - build warm context during launch requests. Blank/default enabled.
+- `LAUNCHDECK_LAUNCHPAD_PARALLEL_WARM_FETCH` - opt-in parallel warm fetch. Blank/default disabled.
+- `LAUNCHDECK_LAUNCHPAD_WARM_MAX_PARALLEL_FETCH` - parallel warm fetch cap. Blank uses code default.
+- `EXECUTION_ENGINE_WARM_PUMP`, `EXECUTION_ENGINE_WARM_BONK`, `EXECUTION_ENGINE_WARM_BAGS` - execution-engine per-family warm toggles. Operational safety switches; normally blank.
 
-These are override-only in most setups.
+## Block Height / Follow Timing
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `HELIUS_RPC_URL` | derive from `SOLANA_RPC_URL` when it is already Helius; otherwise unused | Override-only Helius HTTP RPC for priority-fee estimation | Set this only when your main RPC is non-Helius but you still want Helius fee estimates |
-| `HELIUS_WS_URL` | derive from `SOLANA_WS_URL` when it is already Helius; otherwise unused | Override-only Helius websocket for enhanced watchers | Set this only when your main watcher websocket is non-Helius or intentionally separate |
-| `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE` | `true` | Enables Helius `transactionSubscribe` probing and fallback logic | If the probe fails, LaunchDeck falls back automatically to standard websocket watchers |
+- `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS` - shared block-height cache TTL. Blank uses code default.
+- `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS` - max age for sampled block-height diagnostics. Blank uses code default.
+- `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS` - follow offset worker cadence. Blank uses code default.
+- `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER` - use local timer approximation for follow offsets. Disabled by default.
+- `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS` - legacy/no-op after offset-worker migration. Safe to delete from local envs.
 
-## Warmup, keep-alive, and block-height
+## Reporting / Traffic / UI
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `LAUNCHDECK_ENABLE_STARTUP_WARM` | `true` | One-shot startup warm pass | Recommended: leave on |
-| `LAUNCHDECK_ENABLE_CONTINUOUS_WARM` | `true` | Active keep-warm loop while the app is in use | Recommended: leave on |
-| `LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND` | `true` | Suspends warm traffic while idle | Recommended: leave on |
-| `LAUNCHDECK_IDLE_WARM_TIMEOUT_MS` | `75000` | Idle time before warm suspend kicks in | Advanced tuning |
-| `LAUNCHDECK_CONTINUOUS_WARM_INTERVAL_MS` | `50000` | Continuous warm cadence | Advanced tuning |
-| `LAUNCHDECK_CONTINUOUS_WARM_PASS_TIMEOUT_MS` | `120000` | Max wall-clock budget for a continuous warm pass | Advanced tuning |
-| `LAUNCHDECK_WARM_PROBE_TIMEOUT_MS` | `5000` | Timeout for a single warm probe request | Advanced tuning |
-| `LAUNCHDECK_DISABLE_STARTUP_WARM` | disabled unless explicitly true and the positive flag is unset | Legacy negative startup-warm flag | Backward-compat only |
-| `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS` | `200` | Shared block-height cache TTL | Advanced tuning |
-| `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS` | `1000` | Max age of sampled block-height data before forcing refresh | Advanced tuning |
-| `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS` | `400` | Confirmed-block offset worker cadence | Advanced follow tuning |
-| `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER` | `false` | Approximate low-request follow offset timing mode | Trades accuracy for fewer RPC reads |
-| `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS` | legacy / not the main offset timing path | Old follow block-height refresh knob | Leave unset unless you explicitly need it |
-| `LAUNCHDECK_RPC_TRAFFIC_METER` | enabled | Counts metered outbound RPC/provider traffic for the UI | Disable with `0`, `false`, `no`, or `off` |
+- `LAUNCHDECK_BENCHMARK_MODE` - report timing detail. Supported: `off`, `light`, `full`. Blank defaults to `full`.
+- `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT` - report send/confirm block heights when supported. Usually blank.
+- `LAUNCHDECK_RPC_TRAFFIC_METER` - UI rolling RPC traffic counter. Blank/default enabled; set false-like values to disable.
+- `LAUNCHDECK_WALLET_STATUS_REFRESH_INTERVAL_MS` - frontend wallet-balance refresh cadence. Blank uses code default.
 
-## Benchmarking and auto-fee
+## Auto Fee Estimates
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `LAUNCHDECK_BENCHMARK_MODE` | `full` | Report timing detail level | Supported: `off`, `light`, `full`; legacy `basic` maps to `light` |
-| `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT` | off by default | Default for `execution.trackSendBlockHeight` | Only relevant when benchmark mode is `full` |
-| `LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL` | `high` | Helius auto-fee priority level | Supported: `recommended`, `none`, `low`, `medium`, `high`, `veryHigh`, `unsafeMax` |
-| `LAUNCHDECK_HELIUS_PRIORITY_REFRESH_INTERVAL_MS` | `6000` | Refresh cadence for Helius fee estimates | Advanced tuning |
-| `LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE` | `p99` | Jito tip-floor percentile selector | Supported: `p25`, `p50`, `p75`, `p95`, `p99` |
-| `LAUNCHDECK_WALLET_STATUS_REFRESH_INTERVAL_MS` | `30000` | Wallet balance/status refresh cadence in the UI | Auto-pauses during idle suspend |
+These are advanced tuning knobs. Most users should keep them blank and let defaults apply.
 
-## Compute-unit defaults
+- `AUTO_FEE_BUFFER_PERCENT` - extra buffer added to live estimates. Default: `10`.
+- `HELIUS_PRIORITY_LEVEL` - Helius priority level. Default: `high`. Supported: `recommended`, `none`, `low`, `medium`, `high`, `veryHigh`, `unsafeMax`.
+- `HELIUS_PRIORITY_REFRESH_INTERVAL_MS` - Helius estimate refresh interval. Default: `30000`.
+- `HELIUS_PRIORITY_STALE_MS` - Helius estimate stale window. Default: `45000`.
+- `JITO_TIP_PERCENTILE` - Jito tip percentile. Default: `p99`. Supported: `p25`, `p50`, `p75`, `p95`, `p99`.
+- `JITO_TIP_REFRESH_INTERVAL_MS` - Jito websocket reconnect/refresh cadence. Default: `2000`.
+- `JITO_TIP_STALE_MS` - Jito tip stale window. Default: `45000`.
 
-These are only used when a request does not already set its own compute unit limit.
+Legacy aliases still accepted:
 
-| Variable | Effective default when blank | What it does |
-| --- | --- | --- |
-| `LAUNCHDECK_LAUNCH_COMPUTE_UNIT_LIMIT` | `340000` | Default launch compute unit limit |
-| `LAUNCHDECK_AGENT_SETUP_COMPUTE_UNIT_LIMIT` | `180000` | Default agent setup compute unit limit |
-| `LAUNCHDECK_FOLLOW_UP_COMPUTE_UNIT_LIMIT` | `175000` | Default follow-up compute unit limit |
-| `LAUNCHDECK_SNIPER_BUY_COMPUTE_UNIT_LIMIT` | `120000` | Default sniper buy compute unit limit |
-| `LAUNCHDECK_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT` | `145000` | Default automatic dev sell compute unit limit |
-| `LAUNCHDECK_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT` | `90000` | Default Bonk USD1 top-up compute unit limit |
+- `LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL`
+- `LAUNCHDECK_HELIUS_PRIORITY_REFRESH_INTERVAL_MS`
+- `LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE`
+- `TRENCH_AUTO_FEE_BUFFER_PERCENT`
 
-## Host, daemon, and capacity
+Use the shorter names for new installs.
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `LAUNCHDECK_PORT` | `8789` | Main host port | Normal local UI port |
-| `LAUNCHDECK_ENGINE_AUTH_TOKEN` | built-in local token | Main host local control token | Local runtime internal auth |
-| `LAUNCHDECK_FOLLOW_DAEMON_TRANSPORT` | `local-http` | Follow daemon transport mode | Current shipped default |
-| `LAUNCHDECK_FOLLOW_DAEMON_URL` | `http://127.0.0.1:<follow-daemon-port>` | Explicit follow daemon base URL | Override only |
-| `LAUNCHDECK_FOLLOW_DAEMON_PORT` | `8790` | Follow daemon port | Default local daemon port |
-| `LAUNCHDECK_FOLLOW_DAEMON_AUTH_TOKEN` | built-in local token | Follow daemon local control token | Local runtime internal auth |
-| `LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS` | uncapped | Max active follow jobs | Blank or `0` means uncapped |
-| `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES` | uncapped | Max concurrent follow compiles | Blank or `0` means uncapped |
-| `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS` | uncapped | Max concurrent follow sends | Blank or `0` means uncapped |
-| `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS` | `5000` | Wait time for follow capacity when caps are set | Only matters when a cap is set |
-| `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY` | `true` | Enables the special Pump pre-signed buy rebuild/retry path for `creator_vault` / `Custom 2006` failures | Disable only if you intentionally do not want LaunchDeck to resend that recovery buy |
-| `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY` | `true` | Enables the special Pump dev-auto-sell / sniper-sell rebuild/retry path for `creator_vault` / `Custom 2006` failures | Disable only if you intentionally do not want LaunchDeck to resend that recovery sell |
+## Voluntary Fee
 
-## Market-cap follow reference
+- `TRENCH_TOOL_FEE` - user-facing voluntary fee. Blank or `0.1` = `0.1%`, `0` = off, `0.2` = increased support at `0.2%`.
+- `EXECUTION_ENGINE_WRAPPER_DEFAULT_FEE_BPS` - legacy alias for existing installs. Values are basis points: blank or `10` = `0.1%`, `0` = off, `20` = `0.2%`. Prefer `TRENCH_TOOL_FEE` for new installs.
+- `ALT_COVERAGE_DIAGNOSTICS` - emit ALT coverage diagnostics to logs. Debugging only.
 
-These only matter for market-cap-triggered follow actions.
+## Execution-engine Rollout / Safety
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `LAUNCHDECK_SOL_USD_HTTP_PRICE_URL` | CoinGecko simple-price SOL/USD URL | Fallback HTTP price source for SOL/USD market-cap normalization | Used when Helius SOL pricing is unavailable |
+- `EXECUTION_ENGINE_ENABLE_PUMP_NATIVE` - enable/disable native Pump family path. Operational safety switch.
+- `EXECUTION_ENGINE_ENABLE_BONK_NATIVE` - enable/disable native Bonk family path. Operational safety switch.
+- `EXECUTION_ENGINE_ENABLE_METEORA_NATIVE` - enable/disable native Meteora family path. Operational safety switch.
+- `EXECUTION_ENGINE_ALLOW_NON_CANONICAL_POOL_TRADES` - allow pinned non-canonical Pump AMM pool trades. Keep off unless you understand the risk.
 
-## Helper runtime
+## Follow Daemon
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `LAUNCHDECK_LAUNCHPAD_HELPER_TIMEOUT_MS` | `30000` | Shared timeout for helper-backed launchpad scripts | Advanced tuning |
-| `LAUNCHDECK_LAUNCHPAD_HELPER_MAX_CONCURRENCY` | `4` | Shared helper concurrency cap | Advanced tuning |
-| `LAUNCHDECK_ENABLE_BAGS_HELPER_WORKER` | `true` | Persistent Bags helper worker toggle | Recommended: leave on |
-| `LAUNCHDECK_ENABLE_BONK_HELPER_WORKER` | `true` | Persistent Bonk helper worker toggle | Recommended: leave on |
-| `LAUNCHDECK_LAUNCHPAD_WARM_CONTEXT` | `true` | Builds per-request launchpad warm context such as blockhash priming | Advanced tuning |
-| `LAUNCHDECK_LAUNCHPAD_PARALLEL_WARM_FETCH` | `false` | Opt-in parallel warm fetch mode for launchpad warm context | Disabled by default because the builder does not advertise parallelism unless explicitly enabled |
-| `LAUNCHDECK_LAUNCHPAD_WARM_MAX_PARALLEL_FETCH` | `8` | Upper bound for launchpad warm-context parallel fetches | Only matters when parallel warm fetch is enabled |
+- `LAUNCHDECK_FOLLOW_DAEMON_TRANSPORT` - follow daemon transport. Default is local HTTP.
+- `LAUNCHDECK_FOLLOW_DAEMON_URL` - explicit follow daemon URL. Blank uses local default.
+- `LAUNCHDECK_FOLLOW_DAEMON_PORT` - follow daemon port. Default: `8790`.
+- `LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS` - max simultaneous follow jobs. Blank/0 means uncapped.
+- `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES` - max concurrent follow compiles. Blank/0 means uncapped.
+- `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS` - max concurrent follow sends. Blank/0 means uncapped.
+- `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS` - wait time for daemon capacity. Only matters when caps are set.
+- `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY` - Pump buy creator-vault retry path. Blank/default enabled.
+- `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY` - Pump sell creator-vault retry path. Blank/default enabled.
 
-## Local paths
+## Compute / Slippage Overrides
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `LAUNCHDECK_LOCAL_DATA_DIR` | `.local/launchdeck` | Base local-data directory | Root for most persisted state |
-| `LAUNCHDECK_SEND_LOG_DIR` | `.local/launchdeck/send-reports` | Launch report directory | Override only when you want a custom path |
-| `LAUNCHDECK_ENGINE_RUNTIME_PATH` | `.local/engine-runtime.json` | Engine runtime state path | Separate from `LAUNCHDECK_LOCAL_DATA_DIR` subtree |
-| `LAUNCHDECK_FOLLOW_DAEMON_STATE_PATH` | `.local/launchdeck/follow-daemon-state.json` | Follow daemon state path | Override only when needed |
+- `TRUSTED_STABLE_SWAP_MAX_SLIPPAGE_BPS` - stable-swap safety cap. Advanced risk setting.
+- `LAUNCHDECK_LAUNCH_COMPUTE_UNIT_LIMIT` - launch transaction compute unit override.
+- `LAUNCHDECK_AGENT_SETUP_COMPUTE_UNIT_LIMIT` - setup transaction compute unit override.
+- `LAUNCHDECK_FOLLOW_UP_COMPUTE_UNIT_LIMIT` - follow transaction compute unit override.
+- `LAUNCHDECK_SNIPER_BUY_COMPUTE_UNIT_LIMIT` - sniper-buy compute unit override.
+- `LAUNCHDECK_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT` - dev-auto-sell compute unit override.
+- `LAUNCHDECK_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT` - USD1 top-up compute unit override.
 
-Other default local outputs under `LAUNCHDECK_LOCAL_DATA_DIR`:
+## Local State / Token Overrides
 
-- `app-config.json`
-- `image-library.json`
-- `lookup-tables.json`
-- `uploads/`
-- `send-reports/`
+The launcher points state at `.local/trench-tools`. Only override these when running binaries manually or when you know why you need custom paths.
 
-## Provider routing and endpoint overrides
+- `LAUNCHDECK_LOCAL_DATA_DIR` - base LaunchDeck local state directory.
+- `LAUNCHDECK_SEND_LOG_DIR` - launch report directory.
+- `LAUNCHDECK_ENGINE_RUNTIME_PATH` - engine runtime state file path.
+- `LAUNCHDECK_FOLLOW_DAEMON_STATE_PATH` - follow daemon state file path.
+- `LAUNCHDECK_EXECUTION_ENGINE_TOKEN` - direct shared bearer token override. Avoid for normal use.
+- `LAUNCHDECK_EXECUTION_ENGINE_TOKEN_FILE` - shared bearer token file override. Default file: `.local/trench-tools/default-engine-token.txt`.
 
-These bypass or narrow the normal profile-based routing.
+## Developer Script Compatibility
 
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `USER_REGION_HELIUS_SENDER` | inherit `USER_REGION` | Provider-specific Sender routing override | Use only when Sender should differ from the shared region |
-| `USER_REGION_HELLOMOON` | inherit `USER_REGION` | Provider-specific Hello Moon routing override | Use only when Hello Moon should differ from the shared region |
-| `USER_REGION_JITO_BUNDLE` | inherit `USER_REGION` | Provider-specific Jito routing override | Use only when Jito should differ from the shared region |
-| `HELIUS_SENDER_ENDPOINT` | none | Explicit Sender endpoint override | Bypasses normal profile fanout |
-| `HELIUS_SENDER_BASE_URL` | none | Alternate Sender base URL | Advanced/private integration override |
-| `HELLOMOON_QUIC_ENDPOINT` | none | Explicit Hello Moon QUIC endpoint override | Format: `host:port` |
-| `HELLOMOON_MEV_PROTECT` | `false` | Hello Moon connection-level MEV protection toggle | Applies to the QUIC connection |
-| `JITO_BUNDLE_BASE_URLS` | none | Explicit Jito base URL set | Comma-separated |
-| `JITO_SEND_BUNDLE_ENDPOINT` | none | Explicit Jito bundle send endpoint | Pair with explicit status endpoint |
-| `JITO_BUNDLE_STATUS_ENDPOINT` | none | Explicit Jito bundle status endpoint | Pair with explicit send endpoint |
-
-## Metadata upload
-
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` | `pump-fun` | Metadata upload provider | Supported: `pump-fun`, `pinata` |
-| `PINATA_JWT` | unset | Pinata auth token | Required only when provider is `pinata` |
-
-Current behavior:
-
-- `pinata` uploads fall back to `pump-fun` if Pinata fails
-- the UI surfaces that fallback as a warning
-
-## Launchpad and provider integration variables
-
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `BAGS_API_KEY` | unset | Bags API key | Needed for Bags usage |
-| `BAGS_API_BASE_URL` | vendor default | Bags API base URL override | Advanced override |
-| `HELLOMOON_API_KEY` | unset | Hello Moon Lunar Lander API key | Needed for Hello Moon execution |
-| `LAUNCHDECK_BAGS_HELPER_BLOCKHASH_FROM_RUST` | `true` | Passes the Rust-cached blockhash into the Bags helper for prepare/build-launch | Recommended: leave on |
-| `LAUNCHDECK_BAGS_SETUP_JITO_TIP_MIN_LAMPORTS` | `1000` | Minimum Bags setup Jito tip | Advanced tuning |
-| `LAUNCHDECK_BAGS_SETUP_JITO_TIP_CAP_LAMPORTS` | `1000000` | Maximum Bags setup Jito tip | Advanced tuning |
-| `LAUNCHDECK_BAGS_SETUP_CONFIRM_TIMEOUT_SECS` | `20` | Wall-clock cap for confirming a Bags setup transaction batch | Advanced tuning |
-| `LAUNCHDECK_BAGS_SETUP_GATE_COMMITMENT` | `confirmed` | Commitment required before Bags builds the final launch transaction after setup | Supported: `processed`, `confirmed`, `finalized` |
-
-## Script and tooling compatibility
-
-| Variable | Effective default when blank | What it does | Notes |
-| --- | --- | --- | --- |
-| `RPC_URL` | unset | Generic script compatibility alias | Main LaunchDeck runtime does not need this when `SOLANA_RPC_URL` is set |
-
-## Recommended defaults summary
-
-If you want the shortest possible checklist, keep these as your baseline:
-
-- `SOLANA_RPC_URL`: Helius Gatekeeper HTTP
-- `SOLANA_WS_URL`: Helius standard websocket
-- `LAUNCHDECK_WARM_RPC_URL`: Shyft
-- `LAUNCHDECK_ENABLE_STARTUP_WARM=true`
-- `LAUNCHDECK_ENABLE_CONTINUOUS_WARM=true`
-- `LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND=true`
-- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
-- `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY=true`
-- `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY=true`
-- `LAUNCHDECK_ENABLE_BAGS_HELPER_WORKER=true`
-- `LAUNCHDECK_ENABLE_BONK_HELPER_WORKER=true`
-
-## Related docs
-
-- `README.md`
-- `docs/CONFIG.md`
-- `docs/PROVIDERS.md`
-- `.env.example`
-- `.env.advanced`
-
+- `RPC_URL` - compatibility alias for standalone utility scripts. Main runtime should use `SOLANA_RPC_URL`.

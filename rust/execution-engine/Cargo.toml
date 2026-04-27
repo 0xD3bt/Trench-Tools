@@ -1,0 +1,37 @@
+[package]
+name = "execution-engine"
+version = "1.0.0"
+edition = "2024"
+default-run = "execution-engine"
+
+[dependencies]
+# Shared deps are pinned in the workspace Cargo.toml.
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
+dotenvy = { workspace = true }
+bs58 = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }
+solana-sdk = { workspace = true }
+solana-system-interface = { workspace = true }
+spl-associated-token-account = { workspace = true }
+spl-token = { workspace = true }
+futures-util = { workspace = true }
+sha2 = { workspace = true }
+
+shared-auth = { path = "../shared-auth" }
+shared-extension-runtime = { path = "../shared-extension-runtime" }
+shared-execution-routing = { path = "../shared-execution-routing" }
+shared-fee-market = { path = "../shared-fee-market" }
+shared-transaction-submit = { path = "../shared-transaction-submit" }
+tokio-stream = { version = "0.1", features = ["sync"] }
+solana-address-lookup-table-interface = { version = "3.0.1", features = ["bincode", "bytemuck"] }
+zip = "8.5.1"
+borsh = { version = "1.6.1", features = ["derive"] }
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+spl-token-2022-interface = "2.1.0"

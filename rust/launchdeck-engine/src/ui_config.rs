@@ -7,14 +7,14 @@ use crate::{
 use serde_json::{Value, json};
 use std::{env, fs};
 
-const PRESET_IDS: [&str; 3] = ["preset1", "preset2", "preset3"];
 const DEFAULT_PROVIDER: &str = "helius-sender";
-const DEFAULT_CREATION_PRIORITY_FEE_SOL: &str = "0.000001";
-const DEFAULT_CREATION_TIP_SOL: &str = "0.0002";
-const DEFAULT_TRADE_PRIORITY_FEE_SOL: &str = "0.000001";
-const DEFAULT_TRADE_TIP_SOL: &str = "0.0002";
-const DEFAULT_TRADE_SLIPPAGE_PERCENT: &str = "20";
-const DEFAULT_DEV_BUY_AMOUNTS: [&str; 3] = ["0.5", "1", "2"];
+const DEFAULT_CREATION_PRIORITY_FEE_SOL: &str = "0.001";
+const DEFAULT_CREATION_TIP_SOL: &str = "0.001";
+const DEFAULT_TRADE_PRIORITY_FEE_SOL: &str = "0.001";
+const DEFAULT_TRADE_TIP_SOL: &str = "0.001";
+const DEFAULT_TRADE_SLIPPAGE_PERCENT: &str = "";
+const DEFAULT_WRAPPER_FEE_BPS: u64 = 10;
+const DEFAULT_QUICK_DEV_BUY_AMOUNTS: [&str; 3] = ["0.5", "1", "2"];
 
 fn configured_track_send_block_height_env_enabled() -> bool {
     matches!(
@@ -147,6 +147,65 @@ fn normalize_mev_mode(raw: Option<&Value>, fallback: &str) -> String {
     fallback_norm
 }
 
+fn normalize_buy_funding_policy(raw: Option<&Value>, fallback: Option<&Value>) -> Option<String> {
+    match first_non_empty(&[string_value(raw), string_value(fallback)])
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "sol_only" | "sol-only" | "sol only" => Some("sol_only".to_string()),
+        "prefer_usd1_else_topup"
+        | "prefer_usd1_else_top_up"
+        | "prefer-usd1-else-topup"
+        | "prefer-usd1-else-top-up"
+        | "prefer usd1 else topup"
+        | "prefer usd1 else top up" => Some("prefer_usd1_else_topup".to_string()),
+        "usd1_only" | "usd1-only" | "usd1 only" => Some("usd1_only".to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_wrapper_fee_bps_value(raw: Option<&Value>, fallback: Option<&Value>) -> Value {
+    // Mirror the on-chain allow-list (0, 10, 20 bps).
+    fn coerce(value: Option<&Value>) -> Option<u64> {
+        match value? {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            _ => None,
+        }
+    }
+    let raw_or_fallback = coerce(raw)
+        .or_else(|| coerce(fallback))
+        .unwrap_or(DEFAULT_WRAPPER_FEE_BPS);
+    let clamped = match raw_or_fallback {
+        0 => 0,
+        1..=10 => 10,
+        11..=20 => 20,
+        _ => 20,
+    };
+    Value::Number(serde_json::Number::from(clamped))
+}
+
+fn normalize_sell_settlement_policy(
+    raw: Option<&Value>,
+    fallback: Option<&Value>,
+) -> Option<String> {
+    match first_non_empty(&[string_value(raw), string_value(fallback)])
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "always_to_sol" | "always-to-sol" | "always to sol" => Some("always_to_sol".to_string()),
+        "always_to_usd1" | "always-to-usd1" | "always to usd1" => {
+            Some("always_to_usd1".to_string())
+        }
+        "match_stored_entry_preference"
+        | "match-stored-entry-preference"
+        | "match stored entry preference" => Some("match_stored_entry_preference".to_string()),
+        _ => None,
+    }
+}
+
 fn creation_settings(
     provider: &str,
     endpoint_profile: &str,
@@ -209,7 +268,51 @@ fn trade_settings(
     settings
 }
 
-fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
+fn default_quick_dev_buy_amounts() -> Vec<String> {
+    DEFAULT_QUICK_DEV_BUY_AMOUNTS
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn normalize_quick_dev_buy_amounts(raw: Option<&Value>, preset_items: &[Value]) -> Vec<String> {
+    let fallback = default_quick_dev_buy_amounts();
+    let mut values = raw
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|entry| entry.as_str().unwrap_or_default().trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if values.is_empty() {
+        values = preset_items
+            .iter()
+            .take(fallback.len())
+            .enumerate()
+            .map(|(index, preset)| {
+                string_value(
+                    preset
+                        .get("creationSettings")
+                        .and_then(|settings| settings.get("devBuySol")),
+                )
+                .if_empty_then(fallback[index].clone())
+            })
+            .collect();
+    }
+    while values.len() < fallback.len() {
+        values.push(fallback[values.len()].clone());
+    }
+    values.truncate(fallback.len());
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| value.if_empty_then(fallback[index].clone()))
+        .collect()
+}
+
+fn preset_template(index: usize) -> Value {
     let mut buy = trade_settings("", "", "", "", "", false, "", "off");
     if let Some(object) = buy.as_object_mut() {
         object.insert(
@@ -218,9 +321,9 @@ fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
         );
     }
     json!({
-        "id": id,
-        "label": label,
-        "creationSettings": creation_settings("", "", "", "", false, "", dev_buy_sol, "off"),
+        "id": format!("preset{}", index + 1),
+        "label": format!("Preset {}", index + 1),
+        "creationSettings": creation_settings("", "", "", "", false, "", "", "off"),
         "buySettings": buy,
         "sellSettings": trade_settings("", "", "", "", "", false, "", "off"),
         "postLaunchStrategy": "none",
@@ -232,10 +335,14 @@ pub fn create_default_persistent_config() -> Value {
         "defaults": {
             "launchpad": "pump",
             "mode": "regular",
-            "activePresetId": "preset1",
+            "activePresetId": "",
             "presetEditing": false,
+            "quickDevBuyAmounts": default_quick_dev_buy_amounts(),
             "misc": {
-                "trackSendBlockHeight": configured_track_send_block_height_default()
+                "trackSendBlockHeight": configured_track_send_block_height_default(),
+                "defaultBuyFundingPolicy": "sol_only",
+                "defaultSellSettlementPolicy": "always_to_sol",
+                "wrapperDefaultFeeBps": DEFAULT_WRAPPER_FEE_BPS
             },
             "automaticDevSell": {
                 "enabled": false,
@@ -251,9 +358,7 @@ pub fn create_default_persistent_config() -> Value {
             }
         },
         "presets": {
-            "items": PRESET_IDS.iter().enumerate().map(|(index, id)| {
-                default_preset(id, &format!("P{}", index + 1), DEFAULT_DEV_BUY_AMOUNTS[index])
-            }).collect::<Vec<_>>()
+            "items": Vec::<Value>::new()
         }
     })
 }
@@ -345,7 +450,7 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                 fallback_creation
                     .get("priorityFeeSol")
                     .and_then(Value::as_str)
-                    .unwrap_or("0.001"),
+                    .unwrap_or(DEFAULT_CREATION_PRIORITY_FEE_SOL),
             ),
         bool_value(
             creation.and_then(|value| value.get("autoFee")),
@@ -448,12 +553,21 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                 "",
             )),
         );
+    if let Some(policy) = normalize_buy_funding_policy(
+        buy.and_then(|value| value.get("buyFundingPolicy")),
+        fallback_buy.get("buyFundingPolicy"),
+    ) {
+        buy_settings
+            .as_object_mut()
+            .expect("buy settings object")
+            .insert("buyFundingPolicy".to_string(), Value::String(policy));
+    }
     let sell_mev_mode = normalize_mev_mode(
         sell.and_then(|value| value.get("mevMode"))
             .or_else(|| sell.and_then(|value| value.get("mevProtect"))),
         &string_value(fallback_sell.get("mevMode")),
     );
-    let sell_settings = trade_settings(
+    let mut sell_settings = trade_settings(
         sell.and_then(|value| value.get("provider"))
             .and_then(Value::as_str)
             .unwrap_or(
@@ -508,6 +622,15 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
             ),
         &sell_mev_mode,
     );
+    if let Some(policy) = normalize_sell_settlement_policy(
+        sell.and_then(|value| value.get("sellSettlementPolicy")),
+        fallback_sell.get("sellSettlementPolicy"),
+    ) {
+        sell_settings
+            .as_object_mut()
+            .expect("sell settings object")
+            .insert("sellSettlementPolicy".to_string(), Value::String(policy));
+    }
     let post_launch_strategy = preset_obj
         .and_then(|value| value.get("postLaunchStrategy"))
         .and_then(Value::as_str)
@@ -526,155 +649,26 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
 }
 
 fn migrate_legacy_config(parsed: &Value) -> Value {
-    let base = create_default_persistent_config();
     let defaults = parsed.get("defaults").unwrap_or(&Value::Null);
-    let launch_defaults = defaults.get("launchExecution").unwrap_or(&Value::Null);
-    let buy_defaults = defaults.get("buyExecution").unwrap_or(&Value::Null);
     let legacy_auto_sell = defaults.get("automaticDevSell").unwrap_or(&Value::Null);
-    let launch_presets = parsed
-        .get("presets")
-        .and_then(|value| value.get("launch"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let sniper_presets = parsed
-        .get("presets")
-        .and_then(|value| value.get("sniper"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let base_items = base
-        .get("presets")
-        .and_then(|value| value.get("items"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let items = PRESET_IDS
-        .iter()
-        .enumerate()
-        .map(|(index, id)| {
-            let fallback_preset = base_items.get(index).cloned().unwrap_or_else(|| default_preset(id, &format!("P{}", index + 1), DEFAULT_DEV_BUY_AMOUNTS[index]));
-            let launch_preset = launch_presets.get(index).cloned().unwrap_or(Value::Null);
-            let sniper_preset = sniper_presets.get(index).cloned().unwrap_or(Value::Null);
-            let launch_execution = launch_preset.get("execution").unwrap_or(launch_defaults);
-            let buy_execution = sniper_preset.get("execution").unwrap_or(buy_defaults);
-            let creation_priority = first_non_empty(&[
-                string_value(launch_execution.get("priorityFeeSol")),
-                string_value(launch_defaults.get("priorityFeeSol")),
-            ]);
-            let buy_priority = first_non_empty(&[
-                string_value(buy_execution.get("priorityFeeSol")),
-                string_value(buy_execution.get("maxPriorityFeeSol")),
-                string_value(buy_defaults.get("priorityFeeSol")),
-                string_value(buy_defaults.get("maxPriorityFeeSol")),
-                string_value(fallback_preset.get("buySettings").and_then(|v| v.get("priorityFeeSol"))),
-            ]);
-            let buy_tip = first_non_empty(&[
-                string_value(buy_execution.get("tipSol")),
-                string_value(buy_execution.get("maxTipSol")),
-                string_value(buy_defaults.get("tipSol")),
-                string_value(buy_defaults.get("maxTipSol")),
-                string_value(fallback_preset.get("buySettings").and_then(|v| v.get("tipSol"))),
-            ]);
-            normalize_preset_shape(Some(&json!({
-                "id": string_value(launch_preset.get("id")).if_empty_then(id.to_string()),
-                "label": first_non_empty(&[string_value(launch_preset.get("label")), string_value(sniper_preset.get("label")), format!("P{}", index + 1)]),
-                "creationSettings": {
-                    "provider": normalize_provider(&string_value(launch_execution.get("provider")), string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("provider"))).as_str()),
-                    "endpointProfile": first_non_empty(&[
-                        string_value(launch_execution.get("endpointProfile")),
-                        string_value(launch_defaults.get("endpointProfile")),
-                        string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("endpointProfile"))),
-                    ]),
-                    "tipSol": first_non_empty(&[
-                        string_value(launch_execution.get("tipSol")),
-                        string_value(launch_execution.get("maxTipSol")),
-                        string_value(launch_defaults.get("tipSol")),
-                        string_value(launch_defaults.get("maxTipSol")),
-                        string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("tipSol"))),
-                    ]),
-                    "priorityFeeSol": creation_priority,
-                    "autoFee": bool_value(
-                        launch_execution.get("autoGas"),
-                        bool_value(fallback_preset.get("creationSettings").and_then(|v| v.get("autoFee")), false),
-                    ),
-                    "maxFeeSol": first_non_empty(&[
-                        string_value(launch_execution.get("maxPriorityFeeSol")),
-                        string_value(launch_execution.get("maxTipSol")),
-                        string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("maxFeeSol"))),
-                    ]),
-                    "devBuySol": normalize_decimal_string(&string_value(launch_preset.get("buyAmountSol")), &string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("devBuySol")))),
-                },
-                "buySettings": {
-                    "provider": normalize_provider(&string_value(buy_execution.get("provider")), &string_value(fallback_preset.get("buySettings").and_then(|v| v.get("provider")))),
-                    "endpointProfile": first_non_empty(&[
-                        string_value(buy_execution.get("buyEndpointProfile")),
-                        string_value(buy_execution.get("endpointProfile")),
-                        string_value(buy_defaults.get("buyEndpointProfile")),
-                        string_value(buy_defaults.get("endpointProfile")),
-                        string_value(fallback_preset.get("buySettings").and_then(|v| v.get("endpointProfile"))),
-                    ]),
-                    "priorityFeeSol": buy_priority,
-                    "tipSol": buy_tip,
-                    "slippagePercent": string_value(fallback_preset.get("buySettings").and_then(|v| v.get("slippagePercent"))),
-                    "autoFee": bool_value(
-                        buy_execution.get("buyAutoGas").or_else(|| buy_execution.get("autoGas")),
-                        bool_value(fallback_preset.get("buySettings").and_then(|v| v.get("autoFee")), false),
-                    ),
-                    "maxFeeSol": first_non_empty(&[
-                        string_value(buy_execution.get("buyMaxPriorityFeeSol")),
-                        string_value(buy_execution.get("buyMaxTipSol")),
-                        string_value(buy_execution.get("maxPriorityFeeSol")),
-                        string_value(buy_execution.get("maxTipSol")),
-                        string_value(fallback_preset.get("buySettings").and_then(|v| v.get("maxFeeSol"))),
-                    ]),
-                    "snipeBuyAmountSol": normalize_decimal_string(&string_value(sniper_preset.get("buyAmountSol")), &string_value(fallback_preset.get("buySettings").and_then(|v| v.get("snipeBuyAmountSol")))),
-                },
-                "sellSettings": {
-                    "provider": normalize_provider(&string_value(buy_execution.get("provider")), &string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("provider")))),
-                    "endpointProfile": first_non_empty(&[
-                        string_value(buy_execution.get("sellEndpointProfile")),
-                        string_value(buy_execution.get("buyEndpointProfile")),
-                        string_value(buy_execution.get("endpointProfile")),
-                        string_value(buy_defaults.get("sellEndpointProfile")),
-                        string_value(buy_defaults.get("buyEndpointProfile")),
-                        string_value(buy_defaults.get("endpointProfile")),
-                        string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("endpointProfile"))),
-                    ]),
-                    "priorityFeeSol": if buy_priority.is_empty() { string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("priorityFeeSol"))) } else { buy_priority.clone() },
-                    "tipSol": if buy_tip.is_empty() { string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("tipSol"))) } else { buy_tip.clone() },
-                    "slippagePercent": string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("slippagePercent"))),
-                    "autoFee": bool_value(
-                        buy_execution.get("sellAutoGas")
-                            .or_else(|| buy_execution.get("buyAutoGas"))
-                            .or_else(|| buy_execution.get("autoGas")),
-                        bool_value(fallback_preset.get("sellSettings").and_then(|v| v.get("autoFee")), false),
-                    ),
-                    "maxFeeSol": first_non_empty(&[
-                        string_value(buy_execution.get("sellMaxPriorityFeeSol")),
-                        string_value(buy_execution.get("sellMaxTipSol")),
-                        string_value(buy_execution.get("buyMaxPriorityFeeSol")),
-                        string_value(buy_execution.get("buyMaxTipSol")),
-                        string_value(buy_execution.get("maxPriorityFeeSol")),
-                        string_value(buy_execution.get("maxTipSol")),
-                        string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("maxFeeSol"))),
-                    ]),
-                },
-                "postLaunchStrategy": first_non_empty(&[string_value(defaults.get("postLaunchStrategy")), "none".to_string()])
-            })), &fallback_preset, index)
-        })
-        .collect::<Vec<_>>();
+    let items = Vec::<Value>::new();
 
     let launchpad = string_value(defaults.get("launchpad")).if_empty_then("pump".to_string());
     let mode = string_value(defaults.get("mode")).if_empty_then("regular".to_string());
-    let active_preset_id = {
-        let value = string_value(defaults.get("activePresetId"));
-        if PRESET_IDS.contains(&value.as_str()) {
-            value
-        } else {
-            "preset1".to_string()
-        }
+    let requested_active_preset_id = string_value(defaults.get("activePresetId"));
+    let active_preset_id = if items
+        .iter()
+        .any(|preset| string_value(preset.get("id")) == requested_active_preset_id)
+    {
+        requested_active_preset_id
+    } else {
+        items
+            .first()
+            .and_then(|preset| preset.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     };
     let legacy_auto_sell_trigger_mode = if number_value(legacy_auto_sell.get("delaySeconds"), 0) > 0
     {
@@ -684,24 +678,27 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
     };
     let legacy_auto_sell_market_cap_threshold =
         string_value(legacy_auto_sell.get("marketCapThreshold"));
-    let legacy_auto_sell_market_cap_enabled = bool_value(
-        legacy_auto_sell.get("marketCapEnabled"),
-        !legacy_auto_sell_market_cap_threshold.trim().is_empty(),
-    ) || !legacy_auto_sell_market_cap_threshold.trim().is_empty();
-    let legacy_auto_sell_trigger_family =
-        string_value(legacy_auto_sell.get("triggerFamily")).if_empty_then(
-            if legacy_auto_sell_market_cap_enabled {
-                "market-cap".to_string()
-            } else {
-                "time".to_string()
-            },
-        );
+    let legacy_auto_sell_market_cap_enabled =
+        bool_value(
+            legacy_auto_sell.get("marketCapEnabled"),
+            !legacy_auto_sell_market_cap_threshold.trim().is_empty(),
+        ) || !legacy_auto_sell_market_cap_threshold.trim().is_empty();
+    let legacy_auto_sell_trigger_family = string_value(legacy_auto_sell.get("triggerFamily"))
+        .if_empty_then(if legacy_auto_sell_market_cap_enabled {
+            "market-cap".to_string()
+        } else {
+            "time".to_string()
+        });
     json!({
         "defaults": {
             "launchpad": launchpad,
             "mode": mode,
             "activePresetId": active_preset_id,
             "presetEditing": bool_value(defaults.get("presetEditing"), false),
+            "quickDevBuyAmounts": normalize_quick_dev_buy_amounts(
+                defaults.get("quickDevBuyAmounts"),
+                &items
+            ),
             "misc": {
                 "trackSendBlockHeight": configured_track_send_block_height_default()
             },
@@ -770,35 +767,37 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let items = PRESET_IDS
+    let items = merged_items
         .iter()
         .enumerate()
-        .map(|(index, id)| {
-            let fallback = base_items.get(index).cloned().unwrap_or_else(|| {
-                default_preset(
-                    id,
-                    &format!("P{}", index + 1),
-                    DEFAULT_DEV_BUY_AMOUNTS[index],
-                )
-            });
-            let existing = merged_items
-                .iter()
-                .find(|entry| string_value(entry.get("id")) == *id)
-                .or_else(|| merged_items.get(index));
-            normalize_preset_shape(existing, &fallback, index)
+        .map(|(index, existing)| {
+            let fallback = base_items
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| preset_template(index));
+            normalize_preset_shape(Some(existing), &fallback, index)
         })
         .collect::<Vec<_>>();
     let launchpad =
         string_value(merged_defaults.get("launchpad")).if_empty_then("pump".to_string());
     let mode = string_value(merged_defaults.get("mode")).if_empty_then("regular".to_string());
-    let active_preset_id = {
-        let value = string_value(merged_defaults.get("activePresetId"));
-        if PRESET_IDS.contains(&value.as_str()) {
-            value
-        } else {
-            "preset1".to_string()
-        }
+    let requested_active_preset_id = string_value(merged_defaults.get("activePresetId"));
+    let active_preset_id = if items
+        .iter()
+        .any(|preset| string_value(preset.get("id")) == requested_active_preset_id)
+    {
+        requested_active_preset_id
+    } else {
+        items
+            .first()
+            .and_then(|preset| preset.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     };
+    let quick_dev_buy_amounts =
+        normalize_quick_dev_buy_amounts(merged_defaults.get("quickDevBuyAmounts"), &items);
     let automatic_dev_sell_trigger_mode = {
         let mode = string_value(
             merged_defaults
@@ -816,12 +815,13 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
             .get("automaticDevSell")
             .and_then(|value| value.get("marketCapThreshold")),
     );
-    let automatic_dev_sell_market_cap_enabled = bool_value(
-        merged_defaults
-            .get("automaticDevSell")
-            .and_then(|value| value.get("marketCapEnabled")),
-        !automatic_dev_sell_market_cap_threshold.trim().is_empty(),
-    ) || !automatic_dev_sell_market_cap_threshold.trim().is_empty();
+    let automatic_dev_sell_market_cap_enabled =
+        bool_value(
+            merged_defaults
+                .get("automaticDevSell")
+                .and_then(|value| value.get("marketCapEnabled")),
+            !automatic_dev_sell_market_cap_threshold.trim().is_empty(),
+        ) || !automatic_dev_sell_market_cap_threshold.trim().is_empty();
     let automatic_dev_sell_trigger_family = string_value(
         merged_defaults
             .get("automaticDevSell")
@@ -838,6 +838,7 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
             "mode": mode,
             "activePresetId": active_preset_id,
             "presetEditing": bool_value(merged_defaults.get("presetEditing"), false),
+            "quickDevBuyAmounts": quick_dev_buy_amounts,
             "misc": {
                 "sniperDraft": merged_defaults
                     .get("misc")
@@ -874,10 +875,34 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
                         .get("misc")
                         .and_then(|value| value.get("autoSellDraftsByLaunchpad"))
                 ),
+                "defaultBuyFundingPolicy": normalize_buy_funding_policy(
+                    merged_defaults
+                        .get("misc")
+                        .and_then(|value| value.get("defaultBuyFundingPolicy")),
+                    base.get("defaults")
+                        .and_then(|value| value.get("misc"))
+                        .and_then(|value| value.get("defaultBuyFundingPolicy")),
+                )
+                .unwrap_or_else(|| "sol_only".to_string()),
+                "defaultSellSettlementPolicy": normalize_sell_settlement_policy(
+                    merged_defaults
+                        .get("misc")
+                        .and_then(|value| value.get("defaultSellSettlementPolicy")),
+                    base.get("defaults")
+                        .and_then(|value| value.get("misc"))
+                        .and_then(|value| value.get("defaultSellSettlementPolicy")),
+                )
+                .unwrap_or_else(|| "always_to_sol".to_string()),
                 "trackSendBlockHeight": bool_value(
                     merged_defaults.get("misc").and_then(|value| value.get("trackSendBlockHeight")),
                     configured_track_send_block_height_default()
-                )
+                ),
+                "wrapperDefaultFeeBps": normalize_wrapper_fee_bps_value(
+                    merged_defaults.get("misc").and_then(|value| value.get("wrapperDefaultFeeBps")),
+                    base.get("defaults")
+                        .and_then(|value| value.get("misc"))
+                        .and_then(|value| value.get("wrapperDefaultFeeBps")),
+                ),
             },
             "automaticDevSell": {
                 "enabled": bool_value(merged_defaults.get("automaticDevSell").and_then(|value| value.get("enabled")), false),
@@ -956,29 +981,39 @@ mod tests {
     #[test]
     fn default_persistent_config_uses_safe_sender_baseline() {
         let config = create_default_persistent_config();
+        assert_eq!(
+            config["defaults"]["misc"]["wrapperDefaultFeeBps"],
+            json!(DEFAULT_WRAPPER_FEE_BPS)
+        );
+        assert_eq!(
+            config["defaults"]["quickDevBuyAmounts"],
+            json!(["0.5", "1", "2"])
+        );
         let presets = config["presets"]["items"]
             .as_array()
             .expect("preset items array");
-        assert_eq!(presets.len(), 3);
-        for preset in presets {
-            assert_eq!(preset["creationSettings"]["provider"], "helius-sender");
-            assert_eq!(preset["creationSettings"]["priorityFeeSol"], "0.000001");
-            assert_eq!(preset["creationSettings"]["tipSol"], "0.0002");
-            assert_eq!(preset["creationSettings"]["autoFee"], false);
-            assert_eq!(preset["creationSettings"]["mevMode"], "off");
-            assert_eq!(preset["buySettings"]["provider"], "helius-sender");
-            assert_eq!(preset["buySettings"]["priorityFeeSol"], "0.000001");
-            assert_eq!(preset["buySettings"]["tipSol"], "0.0002");
-            assert_eq!(preset["buySettings"]["slippagePercent"], "20");
-            assert_eq!(preset["buySettings"]["autoFee"], false);
-            assert_eq!(preset["buySettings"]["mevMode"], "off");
-            assert_eq!(preset["sellSettings"]["provider"], "helius-sender");
-            assert_eq!(preset["sellSettings"]["priorityFeeSol"], "0.000001");
-            assert_eq!(preset["sellSettings"]["tipSol"], "0.0002");
-            assert_eq!(preset["sellSettings"]["slippagePercent"], "20");
-            assert_eq!(preset["sellSettings"]["autoFee"], false);
-            assert_eq!(preset["sellSettings"]["mevMode"], "off");
-        }
+        assert!(presets.is_empty());
+
+        let preset = preset_template(0);
+        assert!(preset.get("buyAmountsSol").is_none());
+        assert!(preset.get("sellAmountsPercent").is_none());
+        assert_eq!(preset["creationSettings"]["provider"], "helius-sender");
+        assert_eq!(preset["creationSettings"]["priorityFeeSol"], "0.001");
+        assert_eq!(preset["creationSettings"]["tipSol"], "0.001");
+        assert_eq!(preset["creationSettings"]["autoFee"], false);
+        assert_eq!(preset["creationSettings"]["mevMode"], "off");
+        assert_eq!(preset["buySettings"]["provider"], "helius-sender");
+        assert_eq!(preset["buySettings"]["priorityFeeSol"], "0.001");
+        assert_eq!(preset["buySettings"]["tipSol"], "0.001");
+        assert_eq!(preset["buySettings"]["slippagePercent"], "");
+        assert_eq!(preset["buySettings"]["autoFee"], false);
+        assert_eq!(preset["buySettings"]["mevMode"], "off");
+        assert_eq!(preset["sellSettings"]["provider"], "helius-sender");
+        assert_eq!(preset["sellSettings"]["priorityFeeSol"], "0.001");
+        assert_eq!(preset["sellSettings"]["tipSol"], "0.001");
+        assert_eq!(preset["sellSettings"]["slippagePercent"], "");
+        assert_eq!(preset["sellSettings"]["autoFee"], false);
+        assert_eq!(preset["sellSettings"]["mevMode"], "off");
     }
 
     #[test]
@@ -1031,6 +1066,59 @@ mod tests {
     }
 
     #[test]
+    fn normalize_persistent_config_promotes_quick_dev_buy_amounts_to_defaults() {
+        let normalized = normalize_persistent_config(json!({
+            "defaults": {
+                "launchpad": "pump",
+                "mode": "regular",
+                "activePresetId": "preset1"
+            },
+            "presets": {
+                "items": [
+                    {
+                        "id": "preset1",
+                        "label": "P1",
+                        "creationSettings": { "devBuySol": "0.25" }
+                    },
+                    {
+                        "id": "preset2",
+                        "label": "P2",
+                        "creationSettings": { "devBuySol": "0.75" }
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(
+            normalized["defaults"]["quickDevBuyAmounts"],
+            json!(["0.25", "0.75", "2"])
+        );
+    }
+
+    #[test]
+    fn normalize_persistent_config_preserves_global_quick_dev_buy_amounts() {
+        let normalized = normalize_persistent_config(json!({
+            "defaults": {
+                "launchpad": "pump",
+                "mode": "regular",
+                "quickDevBuyAmounts": ["0.1", "", "3", "5"]
+            },
+            "presets": {
+                "items": [{
+                    "id": "preset1",
+                    "label": "P1",
+                    "creationSettings": { "devBuySol": "9" }
+                }]
+            }
+        }));
+
+        assert_eq!(
+            normalized["defaults"]["quickDevBuyAmounts"],
+            json!(["0.1", "1", "3"])
+        );
+    }
+
+    #[test]
     fn normalizes_new_shape_and_preserves_endpoint_profile_while_stripping_policy() {
         let normalized = normalize_persistent_config(json!({
             "defaults": {
@@ -1057,7 +1145,8 @@ mod tests {
                         "priorityFeeSol": "0.02",
                         "tipSol": "0.01",
                         "slippagePercent": "42",
-                        "snipeBuyAmountSol": "0.5"
+                        "snipeBuyAmountSol": "0.5",
+                        "buyFundingPolicy": "sol_only"
                     },
                     "sellSettings": {
                         "provider": "helius-sender",
@@ -1065,7 +1154,8 @@ mod tests {
                         "policy": "fast",
                         "priorityFeeSol": "0.01",
                         "tipSol": "0.02",
-                        "slippagePercent": "33"
+                        "slippagePercent": "33",
+                        "sellSettlementPolicy": "always_to_sol"
                     }
                 }]
             }
@@ -1076,13 +1166,63 @@ mod tests {
         assert!(preset["creationSettings"].get("policy").is_none());
         assert_eq!(preset["buySettings"]["endpointProfile"], "asia");
         assert!(preset["buySettings"].get("policy").is_none());
+        assert_eq!(preset["buySettings"]["buyFundingPolicy"], "sol_only");
         assert_eq!(preset["sellSettings"]["endpointProfile"], "fra");
         assert!(preset["sellSettings"].get("policy").is_none());
+        assert_eq!(
+            preset["sellSettings"]["sellSettlementPolicy"],
+            "always_to_sol"
+        );
         assert_eq!(preset["buySettings"]["snipeBuyAmountSol"], "0.5");
     }
 
     #[test]
-    fn migrates_legacy_shape_preserving_endpoint_profile_while_dropping_policy() {
+    fn normalizes_policy_aliases_to_canonical_snake_case() {
+        let normalized = normalize_persistent_config(json!({
+            "defaults": {
+                "launchpad": "pump",
+                "mode": "regular",
+                "misc": {
+                    "defaultBuyFundingPolicy": "prefer usd1 else topup",
+                    "defaultSellSettlementPolicy": "always-to-usd1"
+                }
+            },
+            "presets": {
+                "items": [{
+                    "id": "preset1",
+                    "label": "P1",
+                    "creationSettings": {},
+                    "buySettings": {
+                        "buyFundingPolicy": "prefer-usd1-else-topup"
+                    },
+                    "sellSettings": {
+                        "sellSettlementPolicy": "match stored entry preference"
+                    }
+                }]
+            }
+        }));
+
+        assert_eq!(
+            normalized["defaults"]["misc"]["defaultBuyFundingPolicy"],
+            "prefer_usd1_else_topup"
+        );
+        assert_eq!(
+            normalized["defaults"]["misc"]["defaultSellSettlementPolicy"],
+            "always_to_usd1"
+        );
+        let preset = &normalized["presets"]["items"][0];
+        assert_eq!(
+            preset["buySettings"]["buyFundingPolicy"],
+            "prefer_usd1_else_topup"
+        );
+        assert_eq!(
+            preset["sellSettings"]["sellSettlementPolicy"],
+            "match_stored_entry_preference"
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_shape_to_empty_preset_list() {
         let normalized = normalize_persistent_config(json!({
             "defaults": {
                 "launchpad": "pump",
@@ -1121,16 +1261,10 @@ mod tests {
                 }]
             }
         }));
-
-        let preset = &normalized["presets"]["items"][0];
-        assert_eq!(preset["creationSettings"]["provider"], "helius-sender");
-        assert_eq!(preset["buySettings"]["provider"], "jito-bundle");
-        assert_eq!(preset["creationSettings"]["endpointProfile"], "us");
-        assert_eq!(preset["buySettings"]["endpointProfile"], "ams");
-        assert_eq!(preset["sellSettings"]["endpointProfile"], "ams");
-        assert!(preset["creationSettings"].get("policy").is_none());
-        assert!(preset["buySettings"].get("policy").is_none());
-        assert!(preset["sellSettings"].get("policy").is_none());
+        let items = normalized["presets"]["items"]
+            .as_array()
+            .expect("preset items array");
+        assert!(items.is_empty());
     }
 
     #[test]

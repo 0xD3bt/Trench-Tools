@@ -1,230 +1,184 @@
 # Architecture
 
-This document explains how LaunchDeck is organized today from an operator perspective: what runs locally, what each process is responsible for, how a launch request moves through the system, and where local state is stored.
+Trench Tools is local-first. The browser talks to local Rust hosts, those hosts use your configured RPC/provider accounts, and your private keys stay on the machine or VPS running the stack.
 
-## High-Level Shape
+## The Three Pieces
 
-LaunchDeck is a local multi-process application with three main layers:
+- `execution engine` (`execution-engine`, port `8788`) - local Rust trading host. Owns wallets, presets, fee/route resolution, transaction build/sign/send, confirmations, PnL, local ledger, event stream, and the voluntary Trench Tools fee setting.
+- `Trench Tools extension` - Chrome/Edge extension. Injects into supported terminals and sends trade requests to the execution engine. It also embeds LaunchDeck when the LaunchDeck host is running.
+- `LaunchDeck` (`launchdeck-engine`, port `8789`, plus `launchdeck-follow-daemon`, port `8790`) - launchpad feature. Owns deploy, snipe, dev-buy, dev-sell, follow, launch reports, and launchpad-specific UI routes.
 
-- `ui/launchdeck/`: the current browser application shell for form entry, presets, settings, image management, dashboard/reporting, runtime status, and follow-action configuration
-- `rust/launchdeck-engine`: the main Rust host that serves the UI and owns config normalization, launch execution, reporting, and local persistence
-- `rust/launchdeck-engine/src/bin/launchdeck-follow-daemon.rs`: a separate Rust daemon for follow actions that need to keep running after the main launch request has been submitted
+## Process Map
 
-Archived pre-shell UI and legacy helpers live under `Legacy/`. They are not the current frontend/runtime path.
+```mermaid
+flowchart LR
+  Browser[Browser]
+  Extension[Trench Tools extension]
+  ExecEngine[execution-engine :8788]
+  LdEngine[launchdeck-engine :8789]
+  Follow[launchdeck-follow-daemon :8790]
+  Rpc[RPC and websocket providers]
+  Senders[Helius Sender or Hello Moon]
+  Disk[".local/trench-tools"]
 
-There is also an operator CLI:
+  Browser --> Extension
+  Extension -->|"trades, wallets, presets, PnL, SSE"| ExecEngine
+  Extension -->|"Launch, Snipe, Reports"| LdEngine
+  LdEngine -->|"follow jobs"| Follow
+  ExecEngine --> Senders
+  ExecEngine --> Rpc
+  LdEngine --> Rpc
+  Follow --> Rpc
+  ExecEngine --> Disk
+  LdEngine --> Disk
+  Follow --> Disk
+```
 
-- `rust/launchdeck-engine/src/bin/launchdeck-cli.rs`
+## Auth Flow
 
-That CLI uses the same normalization, launchpad dispatch, transport, and reporting stack as the UI host.
+Both browser-facing hosts use the same shared bearer token.
 
-## Process Model
+```mermaid
+flowchart LR
+  Browser[Trench Tools extension]
+  ExecEngine[execution-engine :8788]
+  LdEngine[launchdeck-engine :8789]
+  Follow[launchdeck-follow-daemon :8790]
+  Token[".local/trench-tools/default-engine-token.txt"]
 
-LaunchDeck normally runs as two local Rust processes:
+  Browser -->|"Bearer token: trades, presets, wallets, SSE"| ExecEngine
+  Browser -->|"Bearer token: Launch, Snipe, Reports"| LdEngine
+  LdEngine -->|"internal HTTP"| Follow
+  ExecEngine -->|"writes token on first start"| Token
+  Token -->|"paste into Options -> Global settings"| Browser
+```
 
-- the main host on `LAUNCHDECK_PORT`, default `8789`
-- the follow daemon on `LAUNCHDECK_FOLLOW_DAEMON_PORT`, default `8790`
+The extension can probe:
 
-### Main Host Responsibilities
+```text
+http://127.0.0.1:8788/api/extension/auth/bootstrap
+```
 
-The main host is responsible for:
+That bootstrap route is unauthenticated and tells the extension where the default token file lives. Other extension routes require the bearer token.
 
-- serving `GET /` and the static browser assets
-- serving browser-facing `/api/*` routes
-- serving internal `/engine/*` routes
-- serving uploaded files under `/uploads/*`
-- reading and writing persisted app settings
-- loading wallet inventory from `SOLANA_PRIVATE_KEY*`
-- normalizing launch configs from the UI
-- choosing provider-aware transport behavior
-- building, simulating, and sending launch transactions
-- reserving and arming follow jobs with the daemon
-- writing durable reports
-- exposing runtime warm telemetry and operator activity endpoints
-- exposing the image library, report browser, and Bags identity control plane
+## execution-engine Responsibilities
 
-### Follow Daemon Responsibilities
+The execution engine owns the trade path:
 
-The follow daemon is responsible for:
+- wallet loading from `SOLANA_PRIVATE_KEY*`
+- execution-engine presets
+- wallet groups used by extension trading
+- quote/route/fee resolution
+- transaction build/sign/send for supported trade families
+- confirmation handling
+- local trade ledger and batch history
+- SSE balance/PnL/event stream
+- voluntary Trench Tools fee behavior
+- extension runtime status
 
-- accepting reserved and armed follow jobs
-- maintaining websocket-backed watchers for slots, signatures, and market conditions
-- executing delayed sniper buys
-- executing automatic dev sell actions
-- executing snipe sells
-- tracking job state outside the main request lifecycle
-- persisting follow telemetry, watcher health, and timing profiles
+Anything that submits an extension trade goes through this host.
 
-Same-time sniper buys are compiled and submitted by the main host, not the daemon, because they must land alongside the launch path itself.
+## Extension Responsibilities
 
-## Request Flow
+The extension owns browser integration:
 
-A normal UI-driven launch follows this path:
+- site injection
+- terminal-specific DOM adapters
+- floating launcher / panel / popout surfaces
+- Options page
+- preset editing
+- wallet group editing
+- host/token connection settings
+- forwarding trade requests to `execution-engine`
+- forwarding LaunchDeck surfaces to `launchdeck-engine`
 
-1. the browser loads bootstrap and settings data from the Rust host
-2. the operator fills token metadata, launch settings, provider settings, and optional follow actions
-3. the browser pre-uploads metadata when possible and sends the request to the main host
-4. the host converts UI state into the raw config shape and normalizes it
-5. the host validates launchpad rules, provider rules, and follow-action rules
-6. the host builds launchpad-specific transactions and a provider-specific transport plan
-7. the host simulates and/or sends the launch flow
-8. if follow behavior is enabled, the host reserves and then arms a follow job with launch-specific context
-9. the follow daemon takes over delayed and watcher-driven actions
-10. reports are persisted for later review in Dashboard
+Terminal adapters are the only place that should scrape site DOM. Panel/background code should consume normalized data from adapters.
 
-## Launchpad Boundaries
+## LaunchDeck Responsibilities
 
-### Pump
+LaunchDeck owns launchpad workflows:
 
-Pump is the most native path in the current runtime.
+- deploy/build/simulate/send flows
+- launchpad-specific settings and presets
+- snipe workflows
+- dev buy / dev sell
+- follow jobs and follow sells
+- launch reports and local history
+- metadata/image workflows
 
-- launch assembly is native Rust
-- transaction shaping is Rust-owned
-- reporting is Rust-owned
-- follow integration is Rust-owned
+LaunchDeck can run standalone at:
 
-Verified Pump modes:
+```text
+http://127.0.0.1:8789
+```
 
-- `regular`
-- `cashback`
-- `agent-custom`
-- `agent-unlocked`
-- `agent-locked`
+The extension popout can also show LaunchDeck when `launchdeck-engine` is running.
 
-Verified Pump support also includes:
+## Follow Daemon Responsibilities
 
-- immediate dev buy
-- same-time sniper buys
+The follow daemon is separate so delayed/follow work does not depend on one browser request staying open.
+
+It owns:
+
 - delayed sniper buys
-- snipe sells
-- automatic dev sell
-- compile-time and daemon-side follow handling for agent-mode creator-vault transitions
+- confirmed-block/offset actions
+- dev-auto-sell jobs
+- follow sells
+- watcher health
+- persisted follow job state
 
-### Bonk
+It normally stays behind `launchdeck-engine`.
 
-Bonk is Rust-orchestrated but not fully Rust-assembled.
+## Local State
 
-- validation is Rust-owned
-- transport planning is Rust-owned
-- reporting is Rust-owned
-- follow integration is Rust-owned
-- launch assembly uses the Raydium LaunchLab-backed helper bridge
+The launcher points runtime state at:
 
-Verified Bonk support includes:
+```text
+.local/trench-tools
+```
 
-- `regular`
-- `bonkers`
-- `sol`
-- `usd1`
-- immediate dev buy
-- same-time sniper buys
-- delayed sniper buys
-- snipe sells
-- automatic dev sell
+Important files:
 
-### Bagsapp
+- `.local/trench-tools/default-engine-token.txt` - shared bearer token
+- `.local/trench-tools/engine-runtime.json` - runtime settings/state
+- `.local/trench-tools/follow-daemon-state.json` - follow daemon state
+- `.local/trench-tools/launchdeck-pending-ledger.jsonl` - pending LaunchDeck ledger records when execution engine is offline
 
-Bagsapp is a supported launchpad path when configured.
+Logs default to:
 
-- availability depends on Bags credentials
-- launch/trade assembly uses the hosted Bags API or SDK bridge
-- Rust still owns normalization, transport planning, reporting, and the UI integration layer
-- current operator support includes `bags-2-2`, `bags-025-1`, `bags-1-025`, `sol`, immediate dev buy, same-time sniper buys, delayed sniper buys, snipe sells, and automatic dev sell
+```text
+.local/logs
+```
 
-## Provider And Transport Layer
+These paths are local operator state. Do not commit them.
 
-LaunchDeck uses explicit provider choices rather than hidden provider fallback.
+## Runtime Modes
 
-Current providers:
+- `ee` - starts only `execution-engine`; extension trading and PnL work.
+- `ld` - starts `launchdeck-engine` and `launchdeck-follow-daemon`; standalone LaunchDeck works.
+- `both` - starts all three; normal full setup.
 
-- `helius-sender`
-- `hellomoon`
-- `standard-rpc`
-- `jito-bundle`
+LaunchDeck can queue confirmed trade records locally when `execution-engine` is unavailable and replay them into the execution ledger once the execution host comes back.
 
-From those providers, the engine resolves a transport class:
+## Provider Boundary
 
-- `single`
-- `sequential`
-- `bundle`
+The provider is only the send path. The stack also has separate RPC and websocket paths.
 
-The selected provider controls:
+- Send provider: `Helius Sender` or `Hello Moon`
+- Read/confirm RPC: `SOLANA_RPC_URL`
+- Watcher websocket: `SOLANA_WS_URL`
+- Warm/cache/block-height RPC: `WARM_RPC_URL`
 
-- whether tip is used
-- whether priority fee is required or optional
-- whether `skipPreflight` must be forced
-- whether sends are standard sequential sends or bundle sends
-- whether endpoint profiles are available
-- which endpoint group is used
+This split keeps low-latency sends separate from general reads, watchers, and warm probes.
 
-The browser expresses intent, but the engine owns final transaction shaping.
+## Security Boundary
 
-Examples:
+The default boundary is your machine or VPS:
 
-- `standard-rpc` ignores tip
-- `helius-sender` hard-fails if Sender requirements are not satisfied
-- `hellomoon` hard-fails if QUIC requirements are not satisfied
-- `jito-bundle` may drop creation priority in some multi-transaction launch flows
+- local hosts bind to loopback by default
+- browser-facing routes require the shared bearer token
+- private keys live in `.env`
+- runtime state lives under `.local/trench-tools`
+- raw ports should not be exposed publicly
 
-## Engine-Owned Decisions
-
-The engine, not the UI, decides:
-
-- validation of supported launchpad and mode combinations
-- provider compatibility checks
-- transaction format choice such as `legacy`, `v0`, or `v0-alt`
-- address lookup table usage
-- metadata upload fallback behavior
-- same-time fee safeguards
-- delayed snipe-buy prepare versus finalize timing
-
-This is why the same saved preset can produce different final wire behavior depending on provider, transaction count, and launch shape.
-
-## Persistence Model
-
-By default LaunchDeck stores operator data under `.local/launchdeck`:
-
-- `app-config.json`
-- `image-library.json`
-- `lookup-tables.json`
-- `follow-daemon-state.json`
-- `uploads/`
-- `send-reports/`
-
-Other runtime state lives here:
-
-- `.local/engine-runtime.json` for host runtime worker state by default
-
-The important point for operators is that settings, images, uploads, and historical reports survive restarts unless you explicitly remove the local data directory.
-
-## Performance-Oriented Runtime Features
-
-The current runtime uses several caching and warm-up paths to reduce launch latency:
-
-- startup launchpad warm for lookup tables, Pump global state, Bonk state, and Bags helper state
-- background metadata pre-upload from the browser
-- warmed lookup tables cached in memory and persisted locally
-- cached blockhash refresh in the host and daemon
-- cached Pump global state for compile-time launch assembly and dev-buy quoting
-- arm-time preparation of delayed sniper buys
-- daemon-side hot-state refresh for delayed follow jobs
-- runtime-status and warm-target telemetry surfaced back to the UI
-- concurrency for same-time compile and non-bundle submit paths that preserve launch ordering
-
-Reports separate user-visible wait from backend execution so operators can tell whether latency came from metadata, compile, or chain confirmation.
-
-## Frontend Module Layout
-
-The UI is still one browser app, but it is now organized as a shell plus feature/domain modules:
-
-- `ui/launchdeck/index.html`: current shell and modal/layout markup
-- `ui/launchdeck/app.js`: main app composition and shared state
-- `ui/launchdeck/sniper-feature.js`: sniper editor behavior
-- `ui/launchdeck/auto-sell-feature.js`: dev auto-sell and sniper autosell behavior
-- `ui/launchdeck/images-feature.js`: image-library rendering and actions
-- `ui/launchdeck/reports-feature.js`: dashboard/report terminal behavior
-- `ui/launchdeck/app/settings-domain.js`: settings modal and preset routing defaults
-- `ui/launchdeck/app/wallet-runtime-domain.js`: wallet refresh, runtime status, warm indicators, and follow status chrome
-- `ui/launchdeck/app/reports-history.js` and `ui/launchdeck/app/reports-presenters.js`: launch-history assembly plus dashboard presentation
-
-This is mainly useful to know when you are trying to understand which part of the app owns a feature such as snipers, auto-sell, image library behavior, dashboard rendering, or runtime indicators.
+For remote access, prefer SSH tunnels. If you intentionally expose a host for extension use, use HTTPS and browser host-permission grants. See [../SECURITY.md](../SECURITY.md).

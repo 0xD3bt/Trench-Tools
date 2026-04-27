@@ -1,186 +1,116 @@
 # Configuration
 
-This page is the main setup and configuration guide for LaunchDeck.
+This guide explains the recommended Trench Tools setup and the defaults most users should leave alone. Use [.env.example](../.env.example) for first setup and [.env.advanced](../.env.advanced) only when you intentionally need more knobs.
 
-If you are setting LaunchDeck up for the first time:
+## The Three Pieces
 
-1. start with `.env.example`
-2. fill only the values already listed there
-3. leave the advanced defaults alone unless you have a specific reason to change them
+- `execution engine` (`execution-engine`, `8788`) owns trades, wallets, presets, fee/route resolution, sends, confirmations, PnL, and the extension event stream.
+- `Trench Tools extension` talks to the execution engine for trades and to LaunchDeck for launchpad screens.
+- `LaunchDeck` (`launchdeck-engine`, `8789`, plus `launchdeck-follow-daemon`, `8790`) owns deploy, snipe, dev-buy, dev-sell, follow, and reports.
 
-If you want the full variable list and defaults, use `docs/ENV_REFERENCE.md`.
+## Recommended Stack
 
-If you are provisioning a brand-new server first, use `docs/VPS_SETUP.md` before this page. That guide covers the current Ubuntu/VPS bootstrap flow, required system dependencies, SSH-tunnel access pattern, and the `scripts/vps-bootstrap.sh` installer.
+For most operators today:
 
-## Recommended First Setup
+- run on a VPS close to your provider endpoints and RPCs
+- use [Helius Developer tier](https://www.helius.dev/pricing), about $50/month, or better for primary infrastructure
+- `SOLANA_RPC_URL`: Helius Gatekeeper HTTP
+- `SOLANA_WS_URL`: Helius standard websocket
+- `WARM_RPC_URL`: separate [Shyft](https://shyft.to/) RPC if you want warm/cache traffic off the main Helius budget
+- provider: `Helius Sender` or `Hello Moon`
 
-For most operators, the current recommended production stack is:
-
-- run LaunchDeck on a VPS rather than on a normal everyday workstation
-- place the VPS near the provider endpoints and RPCs you actually plan to use
-- EU VPS location: Frankfurt or Amsterdam
-- US VPS location: New York / Newark area or Salt Lake City area
-- Asia VPS location: Singapore or Tokyo
-- Helius dev tier for the main stack
-- Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
-- Helius standard websocket for `SOLANA_WS_URL`
-- Shyft free tier for `LAUNCHDECK_WARM_RPC_URL`
-- `helius-sender` or `hellomoon` as the execution provider
-
-Why this is the default recommendation:
-
-- Helius Gatekeeper HTTP benchmarked best for the main HTTP RPC path
-- Helius standard websocket benchmarked best for the watcher websocket path
-- Helius dev tier gives much better watcher quality and overall runtime behavior than a bare-minimum free setup
-- Shyft is fast, cheap, and a good fit for warm/cache/block-height traffic
-
-Current recommended `.env` shape:
+Examples:
 
 ```bash
 SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
 SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
-LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY
-USER_REGION=eu
+WARM_RPC_URL=https://rpc.shyft.to?api_key=YOUR_SHYFT_API_KEY
+WARM_WS_URL=wss://rpc.shyft.to?api_key=YOUR_SHYFT_API_KEY
 ```
 
-Put your Helius key immediately after `api-key=`. Put your Shyft key immediately after `api_key=`.
+Why this split:
 
-## What To Set First
+- Helius Gatekeeper HTTP has benchmarked best for the main HTTP/read path.
+- Helius standard websocket has benchmarked best for watcher websocket subscriptions.
+- Shyft is a good low-priority warm RPC so warm/cache/block-height traffic does not drain your main Helius budget.
 
-For most operators, `.env.example` is enough.
+Benchmark your own setup from the exact machine and region you use. Do not assume shared latency numbers will match your VPS, provider tier, or route.
 
-Those are the values we suggest setting first:
+## Starter `.env`
 
-- `SOLANA_PRIVATE_KEY` or your `SOLANA_PRIVATE_KEY*` wallet set
-- `SOLANA_RPC_URL`
-- `SOLANA_WS_URL`
-- `USER_REGION`
-- `LAUNCHDECK_WARM_RPC_URL`
+Most users only need:
 
-Optional but common:
+```bash
+TRENCH_TOOL_FEE=
+TRENCH_TOOLS_MODE=
+SOLANA_PRIVATE_KEY=
+SOLANA_RPC_URL=
+SOLANA_WS_URL=
+USER_REGION=
+WARM_RPC_URL=
+WARM_WS_URL=
+HELLOMOON_API_KEY=
+BAGS_API_KEY=
+LAUNCHDECK_METADATA_UPLOAD_PROVIDER=
+PINATA_JWT=
+```
 
-- `HELLOMOON_API_KEY`
-- `BAGS_API_KEY`
-- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
-- `PINATA_JWT`
-- `LAUNCHDECK_BENCHMARK_MODE`
+Fill only what you need. Leave advanced defaults alone until the runtime is healthy.
 
-You usually do not need to set these in a first setup:
+## Run Mode
 
-- `HELIUS_RPC_URL`
-- `HELIUS_WS_URL`
-- warm toggles
-- helper worker toggles
-- daemon ports
-- capacity limits
-- path overrides
-- explicit endpoint overrides
+`TRENCH_TOOLS_MODE` is optional. Blank defaults to `both`.
 
-Those already have runtime defaults or only matter for special cases.
+- `ee`: start `execution-engine` only. Use this for extension trading and PnL.
+- `ld`: start `launchdeck-engine` plus `launchdeck-follow-daemon`. Use this for standalone LaunchDeck.
+- `both`: start all three. This is the normal full setup.
 
-## What Is Already Enabled
+After setting the value, use the simple repo-root commands:
 
-LaunchDeck already defaults to the setup we recommend in most cases.
+```bash
+npm start
+npm stop
+npm restart
+```
 
-These are already on or already set to the shipped defaults:
+You can still override the mode for a one-off run:
 
-- startup warm
-- continuous warm
-- idle warm suspend
-- Helius `transactionSubscribe` probe/fallback behavior
-- Bonk helper worker
-- Bags helper worker
-- benchmark mode `full`
-- Helius priority level `high`
-- Jito percentile `p99`
-- wallet refresh `30000ms`
-- main host port `8789`
-- follow daemon port `8790`
+```bash
+./trench-tools-start.sh --mode both
+```
 
-In practice, the easiest setup is to leave those alone.
+or on Windows:
 
-## Runtime Model
+```powershell
+.\trench-tools-start.ps1 --mode both
+```
 
-LaunchDeck separates:
+## Wallets
 
-- execution transport
-- read/confirm RPC
-- watcher websocket
-- warm/block-height RPC
+Wallet slots are open-ended:
 
-That split is important.
+```bash
+SOLANA_PRIVATE_KEY=YOUR_PRIVATE_KEY,Main Wallet
+SOLANA_PRIVATE_KEY2=YOUR_PRIVATE_KEY,Sniper 2
+SOLANA_PRIVATE_KEY3=YOUR_PRIVATE_KEY,Sniper 3
+```
 
-In a normal setup:
+The comma label is optional. Untagged wallets show by slot number.
 
-- `execution.provider` decides how creation, buy, and sell transactions are sent
-- `SOLANA_RPC_URL` is used for reads, confirmations, and general runtime RPC behavior
-- `SOLANA_WS_URL` is used for realtime watchers
-- `LAUNCHDECK_WARM_RPC_URL` is used for startup warm, continuous warm probes, and block-height observation
+Do not share `.env`. Do not paste private keys into screenshots, public issues, Discord, or support messages.
 
-Those are related, but they are not the same path.
+## Region Routing
 
-### Warmup and keep-alive
+`USER_REGION` is the shared default profile for region-aware providers.
 
-LaunchDeck currently uses:
-
-- startup warm
-- continuous warm
-- idle warm suspend
-
-How that works:
-
-- startup warm runs once at startup
-- continuous warm keeps active execution paths and watcher paths hot while the app is in use
-- idle warm suspend pauses that background warm traffic when the app is idle
-- changing routes in settings triggers an immediate rewarm of the new effective paths
-- saving unchanged routes does not force a needless rewarm
-
-What gets warmed:
-
-- your warm RPC path
-- fee-market snapshots
-- Helius Sender endpoints when they are active
-- Hello Moon QUIC or Hello Moon bundle endpoints, depending on the active Hello Moon mode
-- Jito endpoints when they are active
-- the watcher websocket path
-
-Watcher websocket warm is driven by the configured websocket path, not by per-provider endpoint fanout.
-
-## Helius RPC and WS overrides
-
-You only need these when your main `SOLANA_RPC_URL` / `SOLANA_WS_URL` are not already the Helius values you want.
-
-- `HELIUS_RPC_URL`
-  Override-only. Use this when your main `SOLANA_RPC_URL` is not Helius but you still want Helius priority-fee estimates.
-- `HELIUS_WS_URL`
-  Override-only. Use this when your main `SOLANA_WS_URL` is not Helius or when you intentionally want a separate Helius watcher path.
-
-If your normal `SOLANA_RPC_URL` and `SOLANA_WS_URL` already point to Helius, LaunchDeck picks that up automatically.
-
-## Helius transactionSubscribe
-
-`LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE` is default-on when blank.
-
-That means:
-
-- if the watcher websocket is Helius, LaunchDeck probes the Helius `transactionSubscribe` path automatically
-- if it works, LaunchDeck uses it
-- if it does not work, LaunchDeck falls back to standard websocket watchers automatically
-
-You usually do not need to touch this setting at all.
-
-## USER_REGION and endpoint profiles
-
-`USER_REGION` is the shared default routing profile for region-aware providers.
-
-Supported groups:
+Groups:
 
 - `global`
 - `us`
 - `eu`
 - `asia`
 
-Supported metro tokens:
+Metros:
 
 - `slc`
 - `ewr`
@@ -190,140 +120,126 @@ Supported metro tokens:
 - `sg`
 - `tyo`
 
-Recommended practical usage:
+Practical guidance:
 
-- `eu` fans out across Amsterdam and Frankfurt
-- `asia` fans out across Singapore and Tokyo on Helius Sender
-- `us` fans out across Salt Lake City and Newark on Helius Sender
-- if those grouped metros are far apart, place your server in one of them and use the exact metro token when you want to stay pinned there
+- EU: use `eu`, `fra`, or `ams`; place the VPS in Frankfurt or Amsterdam.
+- US: use `ewr` or `slc` when you want to pin closer to one side; `us` fans out across a wide region.
+- Asia: use `sg` or `tyo` when you know which side you are closer to; `asia` spans far-apart endpoints.
 
-Provider-specific notes:
+Helius Sender supports exact metro routing where those metros exist. Hello Moon maps unsupported metros to the closest endpoints it exposes. For example, Hello Moon does not expose every Helius metro one-to-one.
 
-- Helius Sender supports exact metro routing where those metros exist
-- Hello Moon maps unsupported metros onto the closest Hello Moon endpoints it actually exposes
-- Hello Moon `asia` and `sg` currently use Tokyo
-- Hello Moon `lon` currently uses the EU pair: Frankfurt + Amsterdam
-- Hello Moon `us`, `slc`, and `ewr` currently use the US pair: New York + Ashburn
+Provider-specific overrides (`USER_REGION_HELIUS_SENDER`, `USER_REGION_HELLOMOON`, `USER_REGION_JITO_BUNDLE`) live in [.env.advanced](../.env.advanced). Most users should not set them.
 
-Use provider-specific overrides only when one provider needs a different region than your shared default:
+## Warmup And Keep-warm
 
-- `USER_REGION_HELIUS_SENDER`
-- `USER_REGION_HELLOMOON`
-- `USER_REGION_JITO_BUNDLE`
+Trench Tools separates:
 
-## Provider recommendations
+- execution transport
+- read/confirm RPC
+- watcher websocket
+- warm/cache/block-height RPC
 
-For most operators:
+In practice:
 
-- start with `helius-sender`
-- use `hellomoon` when you want a strong alternate low-latency path
-- use `standard-rpc` when you want explicit plain-RPC transport behavior
-- use `jito-bundle` when you explicitly want bundle semantics
-
-Provider details and endpoint catalogs live in `docs/PROVIDERS.md`.
-
-## Metadata upload
-
-LaunchDeck supports:
-
-- `pump-fun`
-- `pinata`
+- `Helius Sender` or `Hello Moon` handle the low-latency send path.
+- `SOLANA_RPC_URL` handles reads, confirmations, and general runtime RPC behavior.
+- `SOLANA_WS_URL` handles realtime watchers.
+- `WARM_RPC_URL` handles startup warm, keep-warm probes, and block-height reads.
 
 Default behavior:
 
-- blank `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` means `pump-fun`
-- if `pinata` is selected, `PINATA_JWT` is required
-- if Pinata upload fails, LaunchDeck automatically falls back to `pump-fun`
-- the UI now surfaces that fallback to the user instead of silently hiding it
+- startup warm runs once when the runtime starts
+- continuous warm keeps active routes hot while the app is being used
+- idle warm suspend pauses background warm traffic while idle
+- watcher websocket warm probes the configured watcher path
 
-## Helper workers
+If your RPC budget is effectively unlimited, `TRADING_RESOURCE_MODE=always-on` disables idle suspension for balance streams and provider warm loops. It does not change confirmation windows or provider safety limits.
 
-Bonk and Bags helper workers now default on:
+## Helius Priority Fees
 
-- `LAUNCHDECK_ENABLE_BAGS_HELPER_WORKER`
-- `LAUNCHDECK_ENABLE_BONK_HELPER_WORKER`
+If `SOLANA_RPC_URL` is a Helius URL, Trench Tools can use it for Helius priority-fee estimates automatically.
 
-That is the recommended default.
+Only set `HELIUS_RPC_URL` if:
 
-Use `false` only if you intentionally want one-shot helper execution instead of a long-lived helper process.
+- your main `SOLANA_RPC_URL` is not Helius, and
+- you still want Helius priority-fee estimates.
 
-## Benchmarking and auto-fee
+Only set `HELIUS_WS_URL` if:
 
-Current shipped defaults:
+- your `SOLANA_WS_URL` is not Helius, or
+- you intentionally want a separate Helius watcher path.
 
-- `LAUNCHDECK_BENCHMARK_MODE=full` when blank
-- `LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL=high` when blank
-- `LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE=p99` when blank
-- `LAUNCHDECK_HELIUS_PRIORITY_REFRESH_INTERVAL_MS=6000` when blank
+The advanced defaults are:
 
-Practical default:
+- `AUTO_FEE_BUFFER_PERCENT=10`
+- `HELIUS_PRIORITY_LEVEL=high`
+- `HELIUS_PRIORITY_REFRESH_INTERVAL_MS=30000`
+- `HELIUS_PRIORITY_STALE_MS=45000`
 
-- keep `high + p99`
-- use a Max Auto Fee in the UI if you want a hard cost cap
+See [ENV_REFERENCE.md](ENV_REFERENCE.md) before changing them.
 
-Benchmarking docs:
+## Voluntary Support Fee
 
-- `docs/BENCHMARKING.md`
-- `Benchmarking/README.md`
-
-## Host and daemon defaults
-
-Default local ports:
-
-- main host: `8789`
-- follow daemon: `8790`
-
-Default follow transport:
-
-- `local-http`
-
-You usually do not need to change those unless:
-
-- another process already uses the port
-- you are intentionally wiring a non-default deployment
-
-## Local persistence
-
-By default, LaunchDeck writes local state under `.local/launchdeck`, with the engine runtime file at `.local/engine-runtime.json`.
-
-Common outputs:
-
-- app config
-- image library
-- lookup tables
-- uploads
-- send reports
-- follow-daemon state
-- engine runtime state
-
-## Settings saves and route changes
-
-The settings modal saves your operator defaults and active presets locally.
-
-Important runtime behavior:
-
-- changing the effective execution routes causes an immediate rewarm of the new paths
-- saving unchanged routes does not restart the current warm schedule
-- changing env vars still requires a runtime restart
-
-Restart when you change:
-
-- wallets
-- RPC URLs
-- websocket URLs
-- region overrides
-- metadata provider credentials
-- provider integration keys
-
-Use:
+Trench Tools defaults to a voluntary `0.1%` fee on supported trade paths.
 
 ```bash
-npm restart
+TRENCH_TOOL_FEE=
 ```
 
-## Full variable reference
+Values:
 
-For the complete list of supported environment variables, effective defaults, and override behavior, use:
+- blank or `0.1`: `0.1%`
+- `0`: off
+- `0.2`: increased support at `0.2%`
 
-- `docs/ENV_REFERENCE.md`
-- `.env.advanced`
+Restart the runtime after changing `.env`. If Trench Tools has saved you money and time and you want to support development and future tools, consider leaving the default `0.1%` fee enabled.
+
+## Metadata Upload
+
+Blank/default uses pump-fun metadata upload.
+
+Use Pinata only when you want it:
+
+```bash
+LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata
+PINATA_JWT=YOUR_PINATA_JWT
+```
+
+Get a JWT from [Pinata](https://pinata.cloud/).
+
+## Local State
+
+The unified launcher stores local runtime state under:
+
+```text
+.local/trench-tools
+```
+
+The shared default auth token is:
+
+```text
+.local/trench-tools/default-engine-token.txt
+```
+
+Logs default to:
+
+```text
+.local/logs
+```
+
+Do not commit `.local/`, `.env`, reports containing sensitive data, or screenshots with tokens/keys.
+
+## Advanced Settings
+
+Use [.env.advanced](../.env.advanced) and [ENV_REFERENCE.md](ENV_REFERENCE.md) for:
+
+- host/port/log overrides
+- provider endpoint overrides
+- warm timing
+- Auto Fee tuning
+- follow daemon capacity
+- launchpad compute/slippage overrides
+- local state path overrides
+- deferred provider settings
+
+If a setting is not in [.env.example](../.env.example), assume you do not need it for first setup.

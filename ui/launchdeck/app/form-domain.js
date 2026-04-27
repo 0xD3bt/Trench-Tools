@@ -149,19 +149,25 @@
         creationTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
         creationMaxFeeSol,
         maxPriorityFeeSol: isNamedChecked("creationAutoFeeEnabled") ? creationMaxFeeSol : (creationCapabilities.priority ? (getNamedValue("creationPriorityFeeSol") || "") : ""),
-        maxTipSol: isNamedChecked("creationAutoFeeEnabled") ? creationMaxFeeSol : (creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : ""),
+        maxTipSol: creationCapabilities.tip
+          ? (isNamedChecked("creationAutoFeeEnabled") ? creationMaxFeeSol : (getNamedValue("creationTipSol") || ""))
+          : "",
         buyPriorityFeeSol: buyCapabilities.priority ? (getNamedValue("buyPriorityFeeSol") || "") : "",
         buyTipSol: buyCapabilities.tip ? (getNamedValue("buyTipSol") || "") : "",
         buySlippagePercent: getNamedValue("buySlippagePercent") || "",
         buyMaxFeeSol,
         buyMaxPriorityFeeSol: isNamedChecked("buyAutoFeeEnabled") ? buyMaxFeeSol : (buyCapabilities.priority ? (getNamedValue("buyPriorityFeeSol") || "") : ""),
-        buyMaxTipSol: isNamedChecked("buyAutoFeeEnabled") ? buyMaxFeeSol : (buyCapabilities.tip ? (getNamedValue("buyTipSol") || "") : ""),
+        buyMaxTipSol: buyCapabilities.tip
+          ? (isNamedChecked("buyAutoFeeEnabled") ? buyMaxFeeSol : (getNamedValue("buyTipSol") || ""))
+          : "",
         sellPriorityFeeSol: sellCapabilities.priority ? (getNamedValue("sellPriorityFeeSol") || "") : "",
         sellTipSol: sellCapabilities.tip ? (getNamedValue("sellTipSol") || "") : "",
         sellSlippagePercent: getNamedValue("sellSlippagePercent") || "",
         sellMaxFeeSol,
         sellMaxPriorityFeeSol: isNamedChecked("sellAutoFeeEnabled") ? sellMaxFeeSol : (sellCapabilities.priority ? (getNamedValue("sellPriorityFeeSol") || "") : ""),
-        sellMaxTipSol: isNamedChecked("sellAutoFeeEnabled") ? sellMaxFeeSol : (sellCapabilities.tip ? (getNamedValue("sellTipSol") || "") : ""),
+        sellMaxTipSol: sellCapabilities.tip
+          ? (isNamedChecked("sellAutoFeeEnabled") ? sellMaxFeeSol : (getNamedValue("sellTipSol") || ""))
+          : "",
         enableJito: getProvider() === "jito-bundle" || Number(getNamedValue("creationTipSol") || 0) > 0,
         jitoTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
         skipPreflight: getNamedValue("skipPreflight") === "true",

@@ -4,8 +4,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
 use reqwest::multipart::{Form, Part};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use shared_fee_market::{DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE, extract_jito_tip_floor_lamports};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_sdk::{
     hash::Hash,
@@ -13,7 +14,7 @@ use solana_sdk::{
     message::{AddressLookupTableAccount, VersionedMessage, v0},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    transaction::{Transaction, VersionedTransaction},
+    transaction::VersionedTransaction,
 };
 use solana_system_interface::instruction::transfer;
 use spl_associated_token_account::{
@@ -24,49 +25,39 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    process::Stdio,
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    sync::Semaphore,
-    time::{Duration, Instant, sleep, timeout},
-};
+use tokio::time::{Duration, Instant, sleep};
+use uuid::Uuid;
 
 use crate::{
     config::{
         NormalizedConfig, NormalizedExecution, NormalizedRecipient,
-        configured_bags_rust_blockhash_for_helper, configured_bags_setup_gate_commitment,
+        configured_bags_rust_blockhash_override, configured_bags_setup_gate_commitment,
         configured_default_dev_auto_sell_compute_unit_limit,
         configured_default_launch_compute_unit_limit,
         configured_default_sniper_buy_compute_unit_limit, validate_launchpad_support,
     },
     follow::BagsLaunchMetadata,
-    helper_worker::{
-        HelperWorkerClient, HelperWorkerConfig, HelperWorkerError, helper_worker_enabled,
-    },
     launchpad_dispatch::{launchpad_action_backend, launchpad_action_rollout_state},
     paths,
     provider_tip::provider_required_tip_lamports,
     pump_native::{LaunchQuote, NativeCompileTimings},
     report::{InstructionSummary, LaunchReport, TransactionSummary, build_report, render_report},
     rpc::{
-        CompiledTransaction, fetch_latest_blockhash_cached,
-        COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS, fetch_latest_blockhash_cached_with_prime,
+        COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS, CompiledTransaction, fetch_latest_blockhash_cached,
+        fetch_latest_blockhash_cached_with_prime,
     },
     transport::TransportPlan,
 };
 
 const PACKET_LIMIT_BYTES: usize = 1232;
+const SHARED_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc";
 const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
-const DEFAULT_HELPER_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_HELPER_MAX_CONCURRENCY: usize = 4;
 const DEFAULT_BAGS_SETUP_JITO_TIP_CAP_LAMPORTS: u64 = 1_000_000;
 const DEFAULT_BAGS_SETUP_JITO_TIP_MIN_LAMPORTS: u64 = 1_000;
-const DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE: &str = "p99";
 const BAGS_ENGINE_FEE_ESTIMATE_MAX_AGE: Duration = Duration::from_secs(10);
 const BAGS_DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
 const BAGS_DAMM_V2_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
@@ -83,6 +74,7 @@ const BAGS_FEE_SHARE_V2_MAX_CLAIMERS_NON_LUT: usize = 15;
 const BAGS_NATIVE_MINT: &str = "So11111111111111111111111111111111111111112";
 const BAGS_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const BAGS_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 const JITODONTFRONT_ACCOUNT: &str = "jitodontfront111111111111111111111111111111";
 const BAGS_TOTAL_SUPPLY_BASE_UNITS: &str = "1000000000000000000";
 const BAGS_INITIAL_SQRT_PRICE_STR: &str = "3141367320245630";
@@ -92,6 +84,8 @@ const BAGS_CURVE_POINTS: [(&str, &str); 2] = [
     ("13043817825332782", "2425988008058820449100000000000000"),
 ];
 const DBC_POOL_BY_BASE_MINT_OFFSET: usize = 136;
+const DAMM_POOL_TOKEN_A_MINT_OFFSET: usize = 168;
+const DAMM_POOL_TOKEN_B_MINT_OFFSET: usize = 200;
 const DBC_POOL_CONFIG_DISCRIMINATOR: [u8; 8] = [26, 108, 14, 123, 116, 230, 129, 43];
 const DBC_VIRTUAL_POOL_DISCRIMINATOR: [u8; 8] = [213, 224, 5, 209, 98, 69, 119, 92];
 const CPAMM_POOL_DISCRIMINATOR: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
@@ -113,50 +107,8 @@ const DAMM_V2_MIGRATION_FEE_ADDRESS: [&str; 7] = [
     "A8gMrEPJkacWkcb3DGwtJwTe16HktSEfvwtuDh2MCtck",
 ];
 
-fn helper_timeout_ms() -> u64 {
-    std::env::var("LAUNCHDECK_LAUNCHPAD_HELPER_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_HELPER_TIMEOUT_MS)
-}
-
-fn helper_semaphore() -> Arc<Semaphore> {
-    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEMAPHORE
-        .get_or_init(|| {
-            let limit = std::env::var("LAUNCHDECK_LAUNCHPAD_HELPER_MAX_CONCURRENCY")
-                .ok()
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(DEFAULT_HELPER_MAX_CONCURRENCY);
-            Arc::new(Semaphore::new(limit))
-        })
-        .clone()
-}
-
-fn bags_helper_fallback_status() -> &'static Mutex<HashMap<String, NativeHelperFallbackStatus>> {
-    static STATUS: OnceLock<Mutex<HashMap<String, NativeHelperFallbackStatus>>> = OnceLock::new();
-    STATUS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn record_bags_helper_fallback(action: &str, error: &str) {
-    if let Ok(mut status) = bags_helper_fallback_status().lock() {
-        let entry = status.entry(action.trim().to_string()).or_default();
-        entry.count = entry.count.saturating_add(1);
-        entry.lastError = error.trim().to_string();
-        entry.lastFallbackAtMs = Some(unix_now_seconds().saturating_mul(1000));
-    }
-}
-
 pub fn bags_runtime_status_payload() -> Value {
-    let fallback_status = bags_helper_fallback_status()
-        .lock()
-        .map(|status| status.clone())
-        .unwrap_or_default();
-    json!({
-        "fallbacks": fallback_status,
-    })
+    json!({})
 }
 
 #[derive(Debug, Clone)]
@@ -267,77 +219,13 @@ pub struct BagsImportContext {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct HelperTxConfig<'a> {
-    computeUnitLimit: u64,
-    computeUnitPriceMicroLamports: u64,
-    tipLamports: u64,
-    tipAccount: &'a str,
-    jitodontfront: bool,
-    singleBundleTipLastTx: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HelperCompiledTransaction {
-    label: String,
-    format: String,
-    blockhash: String,
-    lastValidBlockHeight: u64,
-    serializedBase64: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BagsPoolAddressClassification {
+    pub mint: String,
+    pub market_key: String,
+    pub family: String,
     #[serde(default)]
-    lookupTablesUsed: Vec<String>,
-    #[serde(default)]
-    computeUnitLimit: Option<u64>,
-    #[serde(default)]
-    computeUnitPriceMicroLamports: Option<u64>,
-    #[serde(default)]
-    inlineTipLamports: Option<u64>,
-    #[serde(default)]
-    inlineTipAccount: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HelperLaunchResponse {
-    mint: String,
-    launchCreator: String,
-    #[serde(default)]
-    configKey: String,
-    #[serde(default)]
-    metadataUri: String,
-    #[serde(default)]
-    identityLabel: String,
-    #[serde(default)]
-    migrationFeeOption: Option<i64>,
-    #[serde(default)]
-    expectedMigrationFamily: String,
-    #[serde(default)]
-    expectedDammConfigKey: String,
-    #[serde(default)]
-    expectedDammDerivationMode: String,
-    #[serde(default)]
-    preMigrationDbcPoolAddress: String,
-    #[serde(default)]
-    setupBundles: Vec<HelperBundleResponse>,
-    #[serde(default)]
-    setupTransactions: Vec<HelperCompiledTransaction>,
-    compiledTransactions: Vec<HelperCompiledTransaction>,
-    #[serde(default)]
-    timings: Option<HelperPrepareLaunchTimings>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HelperBundleResponse {
-    #[serde(default)]
-    label: String,
-    #[serde(default)]
-    compiledTransactions: Vec<HelperCompiledTransaction>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperLaunchTransactionResponse {
-    compiledTransaction: HelperCompiledTransaction,
-    #[serde(default)]
-    timings: Option<HelperLaunchBuildTimings>,
+    pub config_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -349,13 +237,6 @@ struct HelperPrepareLaunchTimings {
     feeRecipientResolveMs: Option<u128>,
     #[serde(default)]
     metadataUploadMs: Option<u128>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(non_snake_case)]
-struct HelperLaunchBuildTimings {
-    #[serde(default)]
-    launchBuildMs: Option<u128>,
 }
 
 #[derive(Debug, Clone)]
@@ -400,16 +281,6 @@ struct BagsFeeShareConfigResponse {
     bundles: Vec<Vec<BagsApiSerializedTransaction>>,
     #[serde(default)]
     meteoraConfigKey: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperFollowBuyResponse {
-    compiledTransaction: HelperCompiledTransaction,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperFollowSellResponse {
-    compiledTransaction: Option<HelperCompiledTransaction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,6 +583,16 @@ struct CachedBagsLaunchHints {
     expected_damm_config_key: Option<Pubkey>,
     expected_damm_derivation_mode: String,
     pre_migration_dbc_pool_address: Option<Pubkey>,
+    post_migration_damm_pool_address: Option<Pubkey>,
+}
+
+impl CachedBagsLaunchHints {
+    fn is_route_locked_pool(&self) -> bool {
+        self.post_migration_damm_pool_address.is_some()
+            && self
+                .expected_damm_derivation_mode
+                .eq_ignore_ascii_case("route-locked-pool")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -722,200 +603,6 @@ struct NativeBagsImportMarket {
     venue: String,
     detection_source: String,
     notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-struct NativeHelperFallbackStatus {
-    count: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    lastError: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lastFallbackAtMs: Option<u64>,
-}
-
-fn project_root() -> Result<PathBuf, String> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .and_then(|path| path.parent())
-        .map(PathBuf::from)
-        .ok_or_else(|| "Failed to resolve LaunchDeck project root.".to_string())
-}
-
-fn helper_script_path() -> Result<PathBuf, String> {
-    Err("Bags helper runtime has been retired; native Rust execution is required.".to_string())
-}
-
-fn bags_worker_enabled() -> bool {
-    helper_worker_enabled("LAUNCHDECK_ENABLE_BAGS_HELPER_WORKER")
-}
-
-fn worker_client() -> Result<Arc<HelperWorkerClient>, String> {
-    static CLIENT: OnceLock<Result<Arc<HelperWorkerClient>, String>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            let project_root = project_root()?;
-            let script_path = helper_script_path()?;
-            Ok(Arc::new(HelperWorkerClient::new(HelperWorkerConfig {
-                helper_name: "Bags",
-                project_root,
-                script_path,
-                timeout_ms: helper_timeout_ms(),
-            })))
-        })
-        .clone()
-}
-
-fn parse_helper_output<R: DeserializeOwned>(
-    output_stdout: &[u8],
-    helper_name: &str,
-) -> Result<R, String> {
-    let stdout = String::from_utf8_lossy(output_stdout);
-    let trimmed = stdout.trim();
-    let mut candidates = Vec::new();
-    if !trimmed.is_empty() {
-        candidates.push(trimmed.to_string());
-        if let Some(last_line) = trimmed.lines().rev().find(|line| !line.trim().is_empty()) {
-            let last_line = last_line.trim();
-            if !last_line.is_empty() && !candidates.iter().any(|entry| entry == last_line) {
-                candidates.push(last_line.to_string());
-            }
-        }
-        for (index, ch) in trimmed.char_indices().rev() {
-            if ch != '{' && ch != '[' {
-                continue;
-            }
-            let candidate = trimmed[index..].trim();
-            if candidate.is_empty() || candidates.iter().any(|entry| entry == candidate) {
-                continue;
-            }
-            candidates.push(candidate.to_string());
-            if candidates.len() >= 12 {
-                break;
-            }
-        }
-    }
-    for candidate in &candidates {
-        if let Ok(parsed) = serde_json::from_str::<R>(candidate) {
-            return Ok(parsed);
-        }
-    }
-    let preview = trimmed.chars().take(240).collect::<String>();
-    Err(format!(
-        "Failed to parse {helper_name} helper output. stdout preview: {}",
-        if preview.is_empty() {
-            "(empty)".to_string()
-        } else {
-            preview.replace('\n', "\\n")
-        }
-    ))
-}
-
-async fn run_helper_once<T: Serialize, R: DeserializeOwned>(request: &T) -> Result<R, String> {
-    let _permit = helper_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|_| "Bags helper semaphore closed unexpectedly.".to_string())?;
-    let script_path = helper_script_path()?;
-    let request_bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
-    let mut child = Command::new("node")
-        .arg(script_path)
-        .current_dir(project_root()?)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Failed to start Bags helper: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&request_bytes)
-            .await
-            .map_err(|error| format!("Failed to send Bags helper request: {error}"))?;
-    }
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Bags helper stdout was unavailable.".to_string())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Bags helper stderr was unavailable.".to_string())?;
-    let stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-            .map_err(|error| error.to_string())
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-            .map_err(|error| error.to_string())
-    });
-    let status = match timeout(Duration::from_millis(helper_timeout_ms()), child.wait()).await {
-        Ok(result) => result.map_err(|error| format!("Bags helper failed to complete: {error}"))?,
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(format!(
-                "Bags helper timed out after {}ms.",
-                helper_timeout_ms()
-            ));
-        }
-    };
-    let output_stdout = stdout_task
-        .await
-        .map_err(|error| format!("Bags helper stdout task failed: {error}"))?
-        .map_err(|error| format!("Failed to read Bags helper stdout: {error}"))?;
-    let output_stderr = stderr_task
-        .await
-        .map_err(|error| format!("Bags helper stderr task failed: {error}"))?
-        .map_err(|error| format!("Failed to read Bags helper stderr: {error}"))?;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&output_stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            "Bags helper exited with a non-zero status.".to_string()
-        } else {
-            format!("Bags helper error: {stderr}")
-        });
-    }
-    parse_helper_output(&output_stdout, "Bags")
-}
-
-async fn run_helper<T: Serialize, R: DeserializeOwned>(request: &T) -> Result<R, String> {
-    if bags_worker_enabled() {
-        match worker_client()?.request::<T, R>(request).await {
-            Ok(response) => return Ok(response),
-            Err(HelperWorkerError::Request(error)) => return Err(error),
-            Err(HelperWorkerError::Transport(error)) => {
-                eprintln!("Bags worker transport failed, falling back to one-shot helper: {error}");
-            }
-        }
-    }
-    run_helper_once(request).await
-}
-
-fn helper_tx_config(
-    compute_unit_limit: Option<u64>,
-    compute_unit_price_micro_lamports: u64,
-    tip_lamports: u64,
-    tip_account: &str,
-    jitodontfront: bool,
-    single_bundle_tip_last_tx: bool,
-) -> HelperTxConfig<'_> {
-    HelperTxConfig {
-        computeUnitLimit: compute_unit_limit
-            .unwrap_or_else(configured_default_launch_compute_unit_limit),
-        computeUnitPriceMicroLamports: compute_unit_price_micro_lamports,
-        tipLamports: tip_lamports,
-        tipAccount: tip_account,
-        jitodontfront,
-        singleBundleTipLastTx: single_bundle_tip_last_tx,
-    }
 }
 
 fn effective_bags_setup_tip_lamports(
@@ -991,7 +678,9 @@ fn bags_setup_jito_tip_min_lamports() -> u64 {
 }
 
 fn bags_setup_jito_tip_percentile() -> String {
-    let value = std::env::var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE")
+    let value = std::env::var("JITO_TIP_PERCENTILE")
+        .or_else(|_| std::env::var("TRENCH_AUTO_FEE_JITO_TIP_PERCENTILE"))
+        .or_else(|_| std::env::var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE"))
         .unwrap_or_else(|_| DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE.to_string());
     let trimmed = value.trim().to_lowercase();
     match trimmed.as_str() {
@@ -1183,7 +872,11 @@ fn format_decimal_u128(value: u128, decimals: u32, precision: u32) -> String {
     }
 }
 
-fn format_biguint_decimal(value: &BigUint, decimals: u32, precision: u32) -> Result<String, String> {
+fn format_biguint_decimal(
+    value: &BigUint,
+    decimals: u32,
+    precision: u32,
+) -> Result<String, String> {
     let raw = value
         .to_u128()
         .ok_or_else(|| "Bags quote amount overflowed u128 formatting range.".to_string())?;
@@ -1262,7 +955,11 @@ fn bags_get_delta_amount_base_unsigned(
     }
     let numerator = big_sub(upper_sqrt_price, lower_sqrt_price, "base numerator")?;
     let denominator = lower_sqrt_price * upper_sqrt_price;
-    Ok(big_div_rounding(liquidity * numerator, &denominator, round_up))
+    Ok(big_div_rounding(
+        liquidity * numerator,
+        &denominator,
+        round_up,
+    ))
 }
 
 fn bags_get_delta_amount_quote_unsigned(
@@ -1332,8 +1029,11 @@ fn bags_get_quote_to_base_output(amount_in: &BigUint) -> Result<BigUint, String>
                 true,
             )?;
             if amount_left < max_amount_in {
-                let next_sqrt_price =
-                    bags_get_next_sqrt_price_from_input(&sqrt_price, &point.liquidity, &amount_left)?;
+                let next_sqrt_price = bags_get_next_sqrt_price_from_input(
+                    &sqrt_price,
+                    &point.liquidity,
+                    &amount_left,
+                )?;
                 let output_amount = bags_get_delta_amount_base_unsigned(
                     &sqrt_price,
                     &next_sqrt_price,
@@ -1413,7 +1113,11 @@ fn bags_get_fee_amount_included(amount: &BigUint, fee_numerator: u64) -> BigUint
     }
     let fee_numerator = BigUint::from(fee_numerator);
     let denominator = BigUint::from(DBC_FEE_DENOMINATOR) - &fee_numerator;
-    big_div_rounding(amount * BigUint::from(DBC_FEE_DENOMINATOR), &denominator, true)
+    big_div_rounding(
+        amount * BigUint::from(DBC_FEE_DENOMINATOR),
+        &denominator,
+        true,
+    )
 }
 
 fn bags_get_fee_amount_excluded(amount: &BigUint, fee_numerator: u64) -> BigUint {
@@ -1429,7 +1133,11 @@ fn bags_get_fee_amount_excluded(amount: &BigUint, fee_numerator: u64) -> BigUint
     amount - trading_fee
 }
 
-fn native_quote_launch(launch_mode: &str, mode: &str, amount: &str) -> Result<Option<LaunchQuote>, String> {
+fn native_quote_launch(
+    launch_mode: &str,
+    mode: &str,
+    amount: &str,
+) -> Result<Option<LaunchQuote>, String> {
     let input = amount.trim();
     if input.is_empty() {
         return Ok(None);
@@ -1438,7 +1146,11 @@ fn native_quote_launch(launch_mode: &str, mode: &str, amount: &str) -> Result<Op
     if buy_mode != "sol" && buy_mode != "tokens" {
         return Err(format!(
             "Unsupported Bags dev buy quote mode: {}. Expected sol or tokens.",
-            if buy_mode.is_empty() { "(empty)" } else { buy_mode.as_str() }
+            if buy_mode.is_empty() {
+                "(empty)"
+            } else {
+                buy_mode.as_str()
+            }
         ));
     }
     let fee_numerator = bags_cliff_fee_numerator_for_mode(launch_mode);
@@ -1556,7 +1268,9 @@ fn parse_optional_pubkey(value: &str) -> Option<Pubkey> {
     }
 }
 
-fn normalize_cached_bags_launch_hints(bags_launch: Option<&BagsLaunchMetadata>) -> CachedBagsLaunchHints {
+fn normalize_cached_bags_launch_hints(
+    bags_launch: Option<&BagsLaunchMetadata>,
+) -> CachedBagsLaunchHints {
     let Some(source) = bags_launch else {
         return CachedBagsLaunchHints::default();
     };
@@ -1567,11 +1281,15 @@ fn normalize_cached_bags_launch_hints(bags_launch: Option<&BagsLaunchMetadata>) 
         expected_damm_config_key: parse_optional_pubkey(&source.expectedDammConfigKey),
         expected_damm_derivation_mode: source.expectedDammDerivationMode.trim().to_string(),
         pre_migration_dbc_pool_address: parse_optional_pubkey(&source.preMigrationDbcPoolAddress),
+        post_migration_damm_pool_address: parse_optional_pubkey(
+            &source.postMigrationDammPoolAddress,
+        ),
     }
 }
 
 fn bags_token_program_pubkey() -> Result<Pubkey, String> {
-    Pubkey::from_str(BAGS_TOKEN_PROGRAM_ID).map_err(|error| format!("Invalid SPL token program id: {error}"))
+    Pubkey::from_str(BAGS_TOKEN_PROGRAM_ID)
+        .map_err(|error| format!("Invalid SPL token program id: {error}"))
 }
 
 pub fn derive_follow_owner_token_account(owner: &Pubkey, mint: &Pubkey) -> Result<Pubkey, String> {
@@ -1697,8 +1415,9 @@ fn build_merged_compute_budget_instructions(
     existing_compute_unit_price_micro_lamports: Option<u64>,
     tx_config: &NativeBagsVersionedTxConfig,
 ) -> Result<Vec<Instruction>, String> {
-    let effective_compute_unit_limit =
-        existing_compute_unit_limit.unwrap_or_default().max(tx_config.compute_unit_limit);
+    let effective_compute_unit_limit = existing_compute_unit_limit
+        .unwrap_or_default()
+        .max(tx_config.compute_unit_limit);
     let effective_compute_unit_price_micro_lamports = existing_compute_unit_price_micro_lamports
         .unwrap_or_default()
         .max(tx_config.compute_unit_price_micro_lamports);
@@ -1739,14 +1458,14 @@ fn is_inline_tip_instruction(
     if tip_account.trim().is_empty() || tip_lamports == 0 {
         return false;
     }
-    if instruction.program_id != solana_system_interface::program::ID || instruction.accounts.len() < 2 {
+    if instruction.program_id != solana_system_interface::program::ID
+        || instruction.accounts.len() < 2
+    {
         return false;
     }
-    let Ok(system_instruction) =
-        bincode::deserialize::<solana_system_interface::instruction::SystemInstruction>(
-            &instruction.data,
-        )
-    else {
+    let Ok(system_instruction) = bincode::deserialize::<
+        solana_system_interface::instruction::SystemInstruction,
+    >(&instruction.data) else {
         return false;
     };
     match system_instruction {
@@ -1788,7 +1507,9 @@ fn sign_existing_versioned_transaction_with_owner(
         .iter()
         .take(required_signatures)
         .position(|pubkey| pubkey == &owner.pubkey())
-        .ok_or_else(|| "Owner pubkey was not a required signer on the Bags transaction.".to_string())?;
+        .ok_or_else(|| {
+            "Owner pubkey was not a required signer on the Bags transaction.".to_string()
+        })?;
     if transaction.signatures.len() != required_signatures {
         return Err("Bags transaction signatures did not match required signer count.".to_string());
     }
@@ -1836,6 +1557,35 @@ async fn resolve_lookup_table_accounts_for_bags_transaction(
     Ok(resolved)
 }
 
+async fn load_shared_lookup_table_for_bags_transaction(
+    rpc_url: &str,
+    commitment: &str,
+) -> Result<Vec<AddressLookupTableAccount>, String> {
+    let shared = Pubkey::from_str(SHARED_SUPER_LOOKUP_TABLE)
+        .map_err(|error| format!("Invalid shared Bags lookup table address: {error}"))?;
+    Ok(vec![
+        load_lookup_table_account_for_bags_transaction(rpc_url, &shared, commitment).await?,
+    ])
+}
+
+fn validate_bags_shared_lookup_table_usage(
+    label: &str,
+    lookup_tables_used: &[String],
+) -> Result<(), String> {
+    let used = lookup_tables_used
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if used.len() != 1 || used[0] != SHARED_SUPER_LOOKUP_TABLE {
+        return Err(format!(
+            "{label} must actually use the shared Bags lookup table {SHARED_SUPER_LOOKUP_TABLE}; used [{}].",
+            used.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_bags_transaction_account_keys(
     transaction: &VersionedTransaction,
     lookup_tables: &[AddressLookupTableAccount],
@@ -1852,17 +1602,21 @@ fn resolve_bags_transaction_account_keys(
             .find(|table| table.key == lookup.account_key)
             .ok_or_else(|| format!("Address lookup table not found: {}", lookup.account_key))?;
         for index in &lookup.writable_indexes {
-            let address = table
-                .addresses
-                .get(usize::from(*index))
-                .ok_or_else(|| format!("Writable ALT index {index} was out of bounds for {}", table.key))?;
+            let address = table.addresses.get(usize::from(*index)).ok_or_else(|| {
+                format!(
+                    "Writable ALT index {index} was out of bounds for {}",
+                    table.key
+                )
+            })?;
             writable.push(*address);
         }
         for index in &lookup.readonly_indexes {
-            let address = table
-                .addresses
-                .get(usize::from(*index))
-                .ok_or_else(|| format!("Readonly ALT index {index} was out of bounds for {}", table.key))?;
+            let address = table.addresses.get(usize::from(*index)).ok_or_else(|| {
+                format!(
+                    "Readonly ALT index {index} was out of bounds for {}",
+                    table.key
+                )
+            })?;
             readonly.push(*address);
         }
     }
@@ -1907,12 +1661,13 @@ fn decompile_bags_versioned_transaction_instructions(
 async fn ensure_tx_config_on_bags_versioned_transaction(
     rpc_url: &str,
     owner: &Keypair,
-    mut transaction: VersionedTransaction,
+    transaction: VersionedTransaction,
     tx_config: &NativeBagsVersionedTxConfig,
     commitment: &str,
     blockhash_override: Option<(String, u64)>,
 ) -> Result<VersionedTransaction, String> {
     if versioned_transaction_has_additional_required_signers(&transaction, &owner.pubkey()) {
+        let mut transaction = transaction;
         sign_existing_versioned_transaction_with_owner(&mut transaction, owner)?;
         return Ok(transaction);
     }
@@ -1924,10 +1679,15 @@ async fn ensure_tx_config_on_bags_versioned_transaction(
         Hash::from_str(blockhash.trim())
             .map_err(|error| format!("Invalid Bags latest blockhash: {error}"))?
     };
-    let address_lookup_table_accounts =
-        resolve_lookup_table_accounts_for_bags_transaction(rpc_url, &transaction, commitment).await?;
-    let instructions =
-        decompile_bags_versioned_transaction_instructions(&transaction, &address_lookup_table_accounts)?;
+    let shared_lookup_table_accounts =
+        load_shared_lookup_table_for_bags_transaction(rpc_url, commitment).await?;
+    let source_lookup_table_accounts =
+        resolve_lookup_table_accounts_for_bags_transaction(rpc_url, &transaction, commitment)
+            .await?;
+    let instructions = decompile_bags_versioned_transaction_instructions(
+        &transaction,
+        &source_lookup_table_accounts,
+    )?;
     let (
         mut filtered_instructions,
         preserved_compute_budget_instructions,
@@ -1971,7 +1731,7 @@ async fn ensure_tx_config_on_bags_versioned_transaction(
     let message = v0::Message::try_compile(
         &owner.pubkey(),
         &rebuilt_instructions,
-        &address_lookup_table_accounts,
+        &shared_lookup_table_accounts,
         fresh_blockhash,
     )
     .map_err(|error| format!("Failed to rebuild Bags versioned transaction: {error}"))?;
@@ -1999,20 +1759,21 @@ fn compiled_transaction_from_bags_versioned_transaction(
     let serialized = bincode::serialize(transaction)
         .map_err(|error| format!("Failed to serialize Bags versioned transaction: {error}"))?;
     let serialized_base64 = BASE64.encode(&serialized);
+    let lookup_tables_used = transaction
+        .message
+        .address_table_lookups()
+        .unwrap_or(&[])
+        .iter()
+        .map(|lookup| lookup.account_key.to_string())
+        .collect::<Vec<_>>();
     Ok(CompiledTransaction {
         label,
-        format: "v0".to_string(),
+        format: "v0-alt".to_string(),
         blockhash: transaction.message.recent_blockhash().to_string(),
         lastValidBlockHeight: last_valid_block_height,
         serializedBase64: serialized_base64.clone(),
         signature: crate::rpc::precompute_transaction_signature(&serialized_base64),
-        lookupTablesUsed: transaction
-            .message
-            .address_table_lookups()
-            .unwrap_or(&[])
-            .iter()
-            .map(|lookup| lookup.account_key.to_string())
-            .collect(),
+        lookupTablesUsed: lookup_tables_used,
         computeUnitLimit: compute_unit_limit,
         computeUnitPriceMicroLamports: compute_unit_price_micro_lamports,
         inlineTipLamports: inline_tip_lamports,
@@ -2076,12 +1837,22 @@ fn helper_slippage_minimum_amount(amount_out: u64, slippage_bps: u64) -> u64 {
     if slippage_bps == 0 {
         amount_out
     } else {
-        ((u128::from(amount_out) * u128::from(10_000u64.saturating_sub(slippage_bps.min(10_000)))) / 10_000u128)
-            as u64
+        let minimum = ((u128::from(amount_out)
+            * u128::from(10_000u64.saturating_sub(slippage_bps.min(10_000))))
+            / 10_000u128) as u64;
+        if amount_out > 0 && minimum == 0 {
+            1
+        } else {
+            minimum
+        }
     }
 }
 
-fn build_local_trade_fail_closed_error(code: &str, message: &str, extras: &[(&str, String)]) -> String {
+fn build_local_trade_fail_closed_error(
+    code: &str,
+    message: &str,
+    extras: &[(&str, String)],
+) -> String {
     let detail = extras
         .iter()
         .filter_map(|(key, value)| {
@@ -2108,8 +1879,14 @@ fn build_follow_buy_tx_config(
     Ok(NativeFollowTxConfig {
         compute_unit_limit: u32::try_from(configured_default_sniper_buy_compute_unit_limit())
             .map_err(|_| "Configured Bags buy compute unit limit is too large.".to_string())?,
-        compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
-        tip_lamports: follow_tip_lamports_for_provider(&execution.buyProvider, &execution.buyTipSol, "buy tip")?,
+        compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(
+            &execution.buyPriorityFeeSol,
+        )?,
+        tip_lamports: follow_tip_lamports_for_provider(
+            &execution.buyProvider,
+            &execution.buyTipSol,
+            "buy tip",
+        )?,
         tip_account: jito_tip_account.trim().to_string(),
         jitodontfront: execution.buyJitodontfront,
     })
@@ -2122,7 +1899,9 @@ fn build_follow_sell_tx_config(
     Ok(NativeFollowTxConfig {
         compute_unit_limit: u32::try_from(configured_default_dev_auto_sell_compute_unit_limit())
             .map_err(|_| "Configured Bags sell compute unit limit is too large.".to_string())?,
-        compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
+        compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(
+            &execution.sellPriorityFeeSol,
+        )?,
         tip_lamports: follow_tip_lamports_for_provider(
             &execution.sellProvider,
             &execution.sellTipSol,
@@ -2134,7 +1913,11 @@ fn build_follow_sell_tx_config(
 }
 
 fn apply_jitodontfront_to_instruction(instruction: &mut Instruction, dontfront: &Pubkey) {
-    if instruction.accounts.iter().any(|meta| meta.pubkey == *dontfront) {
+    if instruction
+        .accounts
+        .iter()
+        .any(|meta| meta.pubkey == *dontfront)
+    {
         return;
     }
     instruction
@@ -2149,7 +1932,9 @@ fn build_native_follow_instructions(
 ) -> Result<Vec<Instruction>, String> {
     let mut instructions = Vec::new();
     if tx_config.compute_unit_limit > 0 {
-        instructions.push(build_compute_unit_limit_instruction(tx_config.compute_unit_limit)?);
+        instructions.push(build_compute_unit_limit_instruction(
+            tx_config.compute_unit_limit,
+        )?);
     }
     if tx_config.compute_unit_price_micro_lamports > 0 {
         instructions.push(build_compute_unit_price_instruction(
@@ -2171,7 +1956,16 @@ fn build_native_follow_instructions(
     Ok(instructions)
 }
 
-async fn compile_legacy_follow_transaction(
+fn build_bags_uniqueness_memo_instruction(label: &str) -> Result<Instruction, String> {
+    Ok(Instruction {
+        program_id: Pubkey::from_str(MEMO_PROGRAM_ID)
+            .map_err(|error| format!("Invalid Bags memo program id: {error}"))?,
+        accounts: vec![],
+        data: format!("{label}:{}", Uuid::new_v4()).into_bytes(),
+    })
+}
+
+async fn compile_shared_alt_follow_transaction(
     label: &str,
     rpc_url: &str,
     commitment: &str,
@@ -2179,27 +1973,49 @@ async fn compile_legacy_follow_transaction(
     tx_config: &NativeFollowTxConfig,
     core_instructions: Vec<Instruction>,
 ) -> Result<CompiledTransaction, String> {
-    let instructions = build_native_follow_instructions(core_instructions, tx_config, &owner.pubkey())?;
+    let mut instructions =
+        build_native_follow_instructions(core_instructions, tx_config, &owner.pubkey())?;
+    instructions.push(build_bags_uniqueness_memo_instruction(label)?);
+    let lookup_tables = load_shared_lookup_table_for_bags_transaction(rpc_url, commitment).await?;
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, commitment).await?;
-    let transaction = Transaction::new_signed_with_payer(
+    let hash = Hash::from_str(&blockhash)
+        .map_err(|error| format!("Invalid blockhash for follow transaction: {error}"))?;
+    let message = v0::Message::try_compile(&owner.pubkey(), &instructions, &lookup_tables, hash)
+        .map_err(|error| {
+            format!("Failed to compile Bags shared-ALT follow transaction: {error}")
+        })?;
+    let lookup_tables_used = message
+        .address_table_lookups
+        .iter()
+        .map(|lookup| lookup.account_key.to_string())
+        .collect::<Vec<_>>();
+    validate_bags_shared_lookup_table_usage(label, &lookup_tables_used)?;
+    let message_for_diagnostics = message.clone();
+    let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &[owner])
+        .map_err(|error| format!("Failed to sign Bags shared-ALT follow transaction: {error}"))?;
+    let serialized = bincode::serialize(&transaction).map_err(|error| {
+        format!("Failed to serialize Bags shared-ALT follow transaction: {error}")
+    })?;
+    crate::alt_diagnostics::emit_alt_coverage_diagnostics(
+        "launchdeck-engine",
+        label,
         &instructions,
-        Some(&owner.pubkey()),
-        &[owner],
-        Hash::from_str(&blockhash).map_err(|error| format!("Invalid blockhash for follow transaction: {error}"))?,
+        &lookup_tables,
+        &message_for_diagnostics,
+        Some(serialized.len()),
+        &[],
     );
-    let serialized = bincode::serialize(&transaction)
-        .map_err(|error| format!("Failed to serialize Bags follow transaction: {error}"))?;
     let serialized_base64 = BASE64.encode(serialized);
     let signature = crate::rpc::precompute_transaction_signature(&serialized_base64);
     Ok(CompiledTransaction {
         label: label.to_string(),
-        format: "legacy".to_string(),
+        format: "v0-alt".to_string(),
         blockhash,
         lastValidBlockHeight: last_valid_block_height,
         serializedBase64: serialized_base64,
         signature,
-        lookupTablesUsed: vec![],
+        lookupTablesUsed: lookup_tables_used,
         computeUnitLimit: Some(u64::from(tx_config.compute_unit_limit)),
         computeUnitPriceMicroLamports: if tx_config.compute_unit_price_micro_lamports > 0 {
             Some(tx_config.compute_unit_price_micro_lamports)
@@ -2211,7 +2027,8 @@ async fn compile_legacy_follow_transaction(
         } else {
             None
         },
-        inlineTipAccount: if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty() {
+        inlineTipAccount: if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty()
+        {
             Some(tx_config.tip_account.clone())
         } else {
             None
@@ -2422,8 +2239,55 @@ fn bags_native_mint_pubkey() -> Result<Pubkey, String> {
     Pubkey::from_str(BAGS_NATIVE_MINT).map_err(|error| format!("Invalid Bags native mint: {error}"))
 }
 
+pub fn classify_bags_pool_address(
+    address: &str,
+    owner: &Pubkey,
+    data: &[u8],
+) -> Result<Option<BagsPoolAddressClassification>, String> {
+    let market_key = address.trim();
+    if market_key.is_empty() {
+        return Ok(None);
+    }
+    if *owner == bags_dbc_program_pubkey()? {
+        let pool = match decode_dbc_virtual_pool(data) {
+            Ok(pool) => pool,
+            Err(_) => return Ok(None),
+        };
+        return Ok(Some(BagsPoolAddressClassification {
+            mint: pool.base_mint.to_string(),
+            market_key: market_key.to_string(),
+            family: "dbc".to_string(),
+            config_key: pool.config.to_string(),
+        }));
+    }
+    if *owner == bags_damm_v2_program_pubkey()? {
+        let pool = match decode_damm_pool(data) {
+            Ok(pool) => pool,
+            Err(_) => return Ok(None),
+        };
+        let native_mint = bags_native_mint_pubkey()?.to_string();
+        let mint_a = pool.token_a_mint.to_string();
+        let mint_b = pool.token_b_mint.to_string();
+        let mint = if mint_a == native_mint && mint_b != native_mint {
+            mint_b
+        } else if mint_b == native_mint && mint_a != native_mint {
+            mint_a
+        } else {
+            return Ok(None);
+        };
+        return Ok(Some(BagsPoolAddressClassification {
+            mint,
+            market_key: market_key.to_string(),
+            family: "damm-v2".to_string(),
+            config_key: String::new(),
+        }));
+    }
+    Ok(None)
+}
+
 fn bags_dbc_program_pubkey() -> Result<Pubkey, String> {
-    Pubkey::from_str(BAGS_DBC_PROGRAM_ID).map_err(|error| format!("Invalid Bags DBC program id: {error}"))
+    Pubkey::from_str(BAGS_DBC_PROGRAM_ID)
+        .map_err(|error| format!("Invalid Bags DBC program id: {error}"))
 }
 
 fn bags_damm_v2_program_pubkey() -> Result<Pubkey, String> {
@@ -2439,31 +2303,54 @@ fn pubkey_order_pair<'a>(left: &'a Pubkey, right: &'a Pubkey) -> (&'a Pubkey, &'
     }
 }
 
-fn derive_dbc_pool_address(quote_mint: &Pubkey, base_mint: &Pubkey, config: &Pubkey) -> Result<Pubkey, String> {
+fn derive_dbc_pool_address(
+    quote_mint: &Pubkey,
+    base_mint: &Pubkey,
+    config: &Pubkey,
+) -> Result<Pubkey, String> {
     let program_id = bags_dbc_program_pubkey()?;
     let (first, second) = pubkey_order_pair(quote_mint, base_mint);
     let (pool, _) = Pubkey::find_program_address(
-        &[b"pool", &config.to_bytes(), &first.to_bytes(), &second.to_bytes()],
+        &[
+            b"pool",
+            &config.to_bytes(),
+            &first.to_bytes(),
+            &second.to_bytes(),
+        ],
         &program_id,
     );
     Ok(pool)
 }
 
-fn derive_damm_pool_address(config: &Pubkey, mint: &Pubkey, quote_mint: &Pubkey) -> Result<Pubkey, String> {
+fn derive_damm_pool_address(
+    config: &Pubkey,
+    mint: &Pubkey,
+    quote_mint: &Pubkey,
+) -> Result<Pubkey, String> {
     let program_id = bags_damm_v2_program_pubkey()?;
     let (first, second) = pubkey_order_pair(mint, quote_mint);
     let (pool, _) = Pubkey::find_program_address(
-        &[b"pool", &config.to_bytes(), &first.to_bytes(), &second.to_bytes()],
+        &[
+            b"pool",
+            &config.to_bytes(),
+            &first.to_bytes(),
+            &second.to_bytes(),
+        ],
         &program_id,
     );
     Ok(pool)
 }
 
-fn derive_damm_customizable_pool_address(mint: &Pubkey, quote_mint: &Pubkey) -> Result<Pubkey, String> {
+fn derive_damm_customizable_pool_address(
+    mint: &Pubkey,
+    quote_mint: &Pubkey,
+) -> Result<Pubkey, String> {
     let program_id = bags_damm_v2_program_pubkey()?;
     let (first, second) = pubkey_order_pair(mint, quote_mint);
-    let (pool, _) =
-        Pubkey::find_program_address(&[b"cpool", &first.to_bytes(), &second.to_bytes()], &program_id);
+    let (pool, _) = Pubkey::find_program_address(
+        &[b"cpool", &first.to_bytes(), &second.to_bytes()],
+        &program_id,
+    );
     Ok(pool)
 }
 
@@ -2481,19 +2368,23 @@ fn derive_canonical_damm_pool_address(
 ) -> Result<Option<Pubkey>, String> {
     let native_mint = bags_native_mint_pubkey()?;
     match config.migration_fee_option {
-        0..=5 => {
-            let config_address =
-                Pubkey::from_str(DAMM_V2_MIGRATION_FEE_ADDRESS[config.migration_fee_option as usize])
-                    .map_err(|error| format!("Invalid DAMM migration fee address: {error}"))?;
-            Ok(Some(derive_damm_pool_address(&config_address, mint, &native_mint)?))
+        0..=6 => {
+            let config_address = Pubkey::from_str(
+                DAMM_V2_MIGRATION_FEE_ADDRESS[config.migration_fee_option as usize],
+            )
+            .map_err(|error| format!("Invalid DAMM migration fee address: {error}"))?;
+            Ok(Some(derive_damm_pool_address(
+                &config_address,
+                mint,
+                &native_mint,
+            )?))
         }
-        6 => Ok(Some(derive_damm_customizable_pool_address(mint, &native_mint)?)),
         _ => Ok(None),
     }
 }
 
-fn is_completed_dbc_pool(pool: &DecodedDbcVirtualPool, config: &DecodedDbcPoolConfig) -> bool {
-    pool.is_migrated || pool.quote_reserve >= config.migration_quote_threshold
+fn is_completed_dbc_pool(pool: &DecodedDbcVirtualPool, _config: &DecodedDbcPoolConfig) -> bool {
+    pool.is_migrated
 }
 
 async fn rpc_fetch_first_dbc_pool_by_mint(
@@ -2537,15 +2428,84 @@ async fn rpc_fetch_first_dbc_pool_by_mint(
         .json()
         .await
         .map_err(|error| format!("Failed to parse Bags DBC pool response: {error}"))?;
-    let Some(account) = parsed.result.into_iter().next() else {
+    let mut accounts = parsed.result.into_iter();
+    let Some(account) = accounts.next() else {
         return Ok(None);
     };
-    let pubkey =
-        Pubkey::from_str(&account.pubkey).map_err(|error| format!("Invalid DBC pool pubkey: {error}"))?;
+    if accounts.next().is_some() {
+        return Err(format!(
+            "Multiple Bags DBC pools were found for mint {mint}; canonical pool could not be proven from RPC."
+        ));
+    }
+    let pubkey = Pubkey::from_str(&account.pubkey)
+        .map_err(|error| format!("Invalid DBC pool pubkey: {error}"))?;
     let bytes = BASE64
         .decode(account.account.data.0.trim())
         .map_err(|error| format!("Failed to decode Bags DBC pool account: {error}"))?;
     Ok(Some((pubkey, bytes)))
+}
+
+async fn resolve_local_damm_market_account(
+    rpc_url: &str,
+    mint: &Pubkey,
+    commitment: &str,
+    bags_launch: Option<&BagsLaunchMetadata>,
+) -> Result<Option<(Pubkey, DecodedDammPool, Option<Pubkey>)>, String> {
+    let cached = normalize_cached_bags_launch_hints(bags_launch);
+    let canonical_dbc = load_canonical_dbc_market(rpc_url, mint, commitment, bags_launch).await?;
+    let derived = if let Some((_dbc_pool_address, dbc_pool, config)) = canonical_dbc.as_ref() {
+        if !dbc_pool.is_migrated {
+            return Ok(None);
+        }
+        derive_canonical_damm_pool_address(mint, config)?
+            .map(|pool_address| {
+                let config_address = if config.migration_fee_option <= 6 {
+                    Some(
+                        Pubkey::from_str(
+                            DAMM_V2_MIGRATION_FEE_ADDRESS[config.migration_fee_option as usize],
+                        )
+                        .map_err(|error| format!("Invalid DAMM migration fee address: {error}"))?,
+                    )
+                } else {
+                    None
+                };
+                Ok::<_, String>((pool_address, config_address))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let cached_pool = resolve_cached_damm_pool_address(mint, &cached)?;
+    if let (Some((derived_pool, _)), Some((cached_pool, _))) =
+        (derived.as_ref(), cached_pool.as_ref())
+        && !cached.is_route_locked_pool()
+    {
+        if derived_pool != cached_pool {
+            return Err(format!(
+                "Cached Bags DAMM pool {cached_pool} does not match canonical derived DAMM pool {derived_pool} for mint {mint}."
+            ));
+        }
+    }
+    let Some((pool_address, config_address)) = cached_pool.or(derived) else {
+        return Ok(None);
+    };
+    let Some(pool_bytes) =
+        rpc_fetch_account_data(rpc_url, &pool_address, commitment, "damm-v2-pool").await?
+    else {
+        return Err(format!(
+            "Canonical Bags DAMM pool {pool_address} for mint {mint} was not found on RPC."
+        ));
+    };
+    let pool = decode_damm_pool(&pool_bytes)?;
+    let native_mint = bags_native_mint_pubkey()?;
+    if !((pool.token_a_mint == *mint && pool.token_b_mint == native_mint)
+        || (pool.token_b_mint == *mint && pool.token_a_mint == native_mint))
+    {
+        return Err(format!(
+            "Canonical Bags DAMM pool {pool_address} does not trade mint {mint} against SOL."
+        ));
+    }
+    Ok(Some((pool_address, pool, config_address)))
 }
 
 async fn rpc_fetch_account_data(
@@ -2750,23 +2710,28 @@ fn resolve_cached_damm_pool_address(
     mint: &Pubkey,
     cached: &CachedBagsLaunchHints,
 ) -> Result<Option<(Pubkey, Option<Pubkey>)>, String> {
-    let native_mint = bags_native_mint_pubkey()?;
-    if cached.migration_fee_option == Some(6)
-        || cached.expected_migration_family.eq_ignore_ascii_case("customizable")
-    {
-        return Ok(Some((
-            derive_damm_customizable_pool_address(mint, &native_mint)?,
-            cached.expected_damm_config_key,
-        )));
+    if let Some(pool_address) = cached.post_migration_damm_pool_address {
+        return Ok(Some((pool_address, cached.expected_damm_config_key)));
     }
+    let native_mint = bags_native_mint_pubkey()?;
     if let Some(config_address) = cached.expected_damm_config_key {
         return Ok(Some((
             derive_damm_pool_address(&config_address, mint, &native_mint)?,
             Some(config_address),
         )));
     }
+    if cached.migration_fee_option == Some(6)
+        || cached
+            .expected_migration_family
+            .eq_ignore_ascii_case("customizable")
+    {
+        return Ok(Some((
+            derive_damm_customizable_pool_address(mint, &native_mint)?,
+            cached.expected_damm_config_key,
+        )));
+    }
     if let Some(migration_fee_option) = cached.migration_fee_option {
-        if (0..=5).contains(&migration_fee_option) {
+        if (0..=6).contains(&migration_fee_option) {
             let config_address =
                 Pubkey::from_str(DAMM_V2_MIGRATION_FEE_ADDRESS[migration_fee_option as usize])
                     .map_err(|error| format!("Invalid DAMM migration fee address: {error}"))?;
@@ -2815,7 +2780,11 @@ async fn maybe_create_ata_instruction(
     }
 }
 
-fn build_wrap_sol_instructions(owner: &Pubkey, wrapped_ata: &Pubkey, amount_lamports: u64) -> Result<Vec<Instruction>, String> {
+fn build_wrap_sol_instructions(
+    owner: &Pubkey,
+    wrapped_ata: &Pubkey,
+    amount_lamports: u64,
+) -> Result<Vec<Instruction>, String> {
     Ok(vec![
         transfer(owner, wrapped_ata, amount_lamports),
         spl_token::instruction::sync_native(&bags_token_program_pubkey()?, wrapped_ata)
@@ -2967,15 +2936,16 @@ fn bags_dbc_rate_limiter_fee_numerator(
     let max_index = if fee_increment_bps == 0 {
         BigUint::ZERO
     } else {
-        BigUint::from((DBC_MAX_FEE_NUMERATOR.saturating_sub(cliff_fee_numerator))
-            / ((u64::from(fee_increment_bps) * DBC_FEE_DENOMINATOR) / DBC_BASIS_POINT_MAX))
+        BigUint::from(
+            (DBC_MAX_FEE_NUMERATOR.saturating_sub(cliff_fee_numerator))
+                / ((u64::from(fee_increment_bps) * DBC_FEE_DENOMINATOR) / DBC_BASIS_POINT_MAX),
+        )
     };
     let i = (BigUint::from(fee_increment_bps) * BigUint::from(DBC_FEE_DENOMINATOR))
         / BigUint::from(DBC_BASIS_POINT_MAX);
     let trading_fee_numerator = if a < max_index {
-        let numerator1 = &c
-            + (&c * &a)
-            + ((&i * &a * (&a + BigUint::from(1u8))) / BigUint::from(2u8));
+        let numerator1 =
+            &c + (&c * &a) + ((&i * &a * (&a + BigUint::from(1u8))) / BigUint::from(2u8));
         let numerator2 = &c + (&i * (&a + BigUint::from(1u8)));
         (&reference * numerator1) + (&b * numerator2)
     } else {
@@ -2987,8 +2957,11 @@ fn bags_dbc_rate_limiter_fee_numerator(
         let left_amount = (&d * &reference) + &b;
         first_fee + (left_amount * BigUint::from(DBC_MAX_FEE_NUMERATOR))
     };
-    let trading_fee =
-        big_div_rounding(trading_fee_numerator, &BigUint::from(DBC_FEE_DENOMINATOR), true);
+    let trading_fee = big_div_rounding(
+        trading_fee_numerator,
+        &BigUint::from(DBC_FEE_DENOMINATOR),
+        true,
+    );
     big_div_rounding(
         trading_fee * BigUint::from(DBC_FEE_DENOMINATOR),
         &BigUint::from(input_amount),
@@ -3033,7 +3006,8 @@ fn bags_dbc_trade_fee_numerator_for_amount(
         let period = if current_point < pool.activation_point {
             u64::from(base.first_factor)
         } else {
-            ((current_point - pool.activation_point) / base.second_factor).min(u64::from(base.first_factor))
+            ((current_point - pool.activation_point) / base.second_factor)
+                .min(u64::from(base.first_factor))
         };
         if base.base_fee_mode == 0 {
             fee_numerator = base
@@ -3041,11 +3015,16 @@ fn bags_dbc_trade_fee_numerator_for_amount(
                 .saturating_sub(period.saturating_mul(base.third_factor));
         } else if base.base_fee_mode == 1 {
             let one = BigUint::from(1u8) << DBC_RESOLUTION_BITS;
-            let reduction =
-                (BigUint::from(base.third_factor) << DBC_RESOLUTION_BITS) / BigUint::from(DBC_BASIS_POINT_MAX);
-            let decay_base = if reduction >= one { BigUint::ZERO } else { &one - reduction };
+            let reduction = (BigUint::from(base.third_factor) << DBC_RESOLUTION_BITS)
+                / BigUint::from(DBC_BASIS_POINT_MAX);
+            let decay_base = if reduction >= one {
+                BigUint::ZERO
+            } else {
+                &one - reduction
+            };
             let decay = big_pow_q64(&decay_base, period);
-            fee_numerator = ((BigUint::from(base.cliff_fee_numerator) * decay) >> DBC_RESOLUTION_BITS)
+            fee_numerator = ((BigUint::from(base.cliff_fee_numerator) * decay)
+                >> DBC_RESOLUTION_BITS)
                 .to_u64()
                 .unwrap_or(base.cliff_fee_numerator);
         }
@@ -3056,7 +3035,8 @@ fn bags_dbc_trade_fee_numerator_for_amount(
             * BigUint::from(pool.volatility_accumulator)
             * BigUint::from(config.dynamic_fee.bin_step)
             * BigUint::from(config.dynamic_fee.variable_fee_control);
-        let dynamic = (dynamic + BigUint::from(99_999_999_999u64)) / BigUint::from(100_000_000_000u64);
+        let dynamic =
+            (dynamic + BigUint::from(99_999_999_999u64)) / BigUint::from(100_000_000_000u64);
         fee_numerator = (BigUint::from(fee_numerator) + dynamic)
             .to_u64()
             .unwrap_or(DBC_MAX_FEE_NUMERATOR)
@@ -3117,8 +3097,11 @@ fn bags_dbc_swap_amount_from_base_to_quote(
                 true,
             )?;
             if amount_left < max_amount_in {
-                let next_sqrt_price =
-                    bags_get_next_sqrt_price_from_amount_base_rounding_up(&sqrt_price, &current_liquidity, &amount_left)?;
+                let next_sqrt_price = bags_get_next_sqrt_price_from_amount_base_rounding_up(
+                    &sqrt_price,
+                    &current_liquidity,
+                    &amount_left,
+                )?;
                 total_output += bags_get_delta_amount_quote_unsigned(
                     &next_sqrt_price,
                     &sqrt_price,
@@ -3142,8 +3125,11 @@ fn bags_dbc_swap_amount_from_base_to_quote(
         if curve.is_empty() || curve[0].liquidity.is_zero() {
             return Err("Not enough liquidity to process the entire amount".to_string());
         }
-        let next_sqrt_price =
-            bags_get_next_sqrt_price_from_amount_base_rounding_up(&sqrt_price, &curve[0].liquidity, &amount_left)?;
+        let next_sqrt_price = bags_get_next_sqrt_price_from_amount_base_rounding_up(
+            &sqrt_price,
+            &curve[0].liquidity,
+            &amount_left,
+        )?;
         total_output += bags_get_delta_amount_quote_unsigned(
             &next_sqrt_price,
             &sqrt_price,
@@ -3177,8 +3163,11 @@ fn bags_dbc_swap_amount_from_quote_to_base(
                 true,
             )?;
             if amount_left < max_amount_in {
-                let next_sqrt_price =
-                    bags_get_next_sqrt_price_from_input(&sqrt_price, &point.liquidity, &amount_left)?;
+                let next_sqrt_price = bags_get_next_sqrt_price_from_input(
+                    &sqrt_price,
+                    &point.liquidity,
+                    &amount_left,
+                )?;
                 total_output += bags_get_delta_amount_base_unsigned(
                     &sqrt_price,
                     &next_sqrt_price,
@@ -3259,7 +3248,10 @@ fn bags_dbc_swap_quote_exact_in(
     let output_u64 = output
         .to_u64()
         .ok_or_else(|| "Bags follow quote output overflowed u64.".to_string())?;
-    Ok((output_u64, helper_slippage_minimum_amount(output_u64, slippage_bps)))
+    Ok((
+        output_u64,
+        helper_slippage_minimum_amount(output_u64, slippage_bps),
+    ))
 }
 
 fn cpamm_get_fee_mode(collect_fee_mode: u8, b_to_a: bool) -> bool {
@@ -3320,14 +3312,19 @@ fn cpamm_trade_fee_numerator(pool: &DecodedDammPool, current_point: u64) -> BigU
         let period = ((current_point - pool.activation_point) / base.period_frequency)
             .min(u64::from(base.number_of_period));
         if base.fee_scheduler_mode == 0 {
-            fee_numerator = BigUint::from(base.cliff_fee_numerator.saturating_sub(
-                period.saturating_mul(base.reduction_factor),
-            ));
+            fee_numerator = BigUint::from(
+                base.cliff_fee_numerator
+                    .saturating_sub(period.saturating_mul(base.reduction_factor)),
+            );
         } else {
             let one = BigUint::from(1u8) << CPAMM_SCALE_OFFSET;
-            let reduction =
-                (BigUint::from(base.reduction_factor) << CPAMM_SCALE_OFFSET) / BigUint::from(CPAMM_BASIS_POINT_MAX);
-            let decay_base = if reduction >= one { BigUint::ZERO } else { &one - reduction };
+            let reduction = (BigUint::from(base.reduction_factor) << CPAMM_SCALE_OFFSET)
+                / BigUint::from(CPAMM_BASIS_POINT_MAX);
+            let decay_base = if reduction >= one {
+                BigUint::ZERO
+            } else {
+                &one - reduction
+            };
             let decay = big_pow_q64(&decay_base, period);
             fee_numerator = (BigUint::from(base.cliff_fee_numerator) * decay) >> CPAMM_SCALE_OFFSET;
         }
@@ -3366,7 +3363,8 @@ fn cpamm_swap_amount_out(
     };
     let sqrt_price = biguint_from_u128(pool.sqrt_price);
     let liquidity = biguint_from_u128(pool.liquidity);
-    let next_sqrt_price = cpamm_get_next_sqrt_price(&actual_in_amount, &sqrt_price, &liquidity, a_to_b)?;
+    let next_sqrt_price =
+        cpamm_get_next_sqrt_price(&actual_in_amount, &sqrt_price, &liquidity, a_to_b)?;
     let raw_out = if a_to_b {
         cpamm_get_amount_b_from_liquidity_delta(&liquidity, &sqrt_price, &next_sqrt_price, false)?
     } else {
@@ -3390,7 +3388,8 @@ async fn load_canonical_dbc_market(
     bags_launch: Option<&BagsLaunchMetadata>,
 ) -> Result<Option<(Pubkey, DecodedDbcVirtualPool, DecodedDbcPoolConfig)>, String> {
     let cached = normalize_cached_bags_launch_hints(bags_launch);
-    let Some((pool_address, pool_bytes)) = rpc_fetch_first_dbc_pool_by_mint(rpc_url, mint, commitment).await?
+    let Some((pool_address, pool_bytes)) =
+        rpc_fetch_first_dbc_pool_by_mint(rpc_url, mint, commitment).await?
     else {
         return Ok(None);
     };
@@ -3445,8 +3444,13 @@ async fn native_fetch_local_dbc_market_snapshot(
         return Ok(None);
     }
     let supply = fetch_bags_token_supply_value(rpc_url, mint, commitment).await?;
-    let supply_amount = BigUint::parse_bytes(supply.amount.trim().as_bytes(), 10)
-        .ok_or_else(|| format!("Invalid Bags token supply amount for {mint}: {}", supply.amount))?;
+    let supply_amount =
+        BigUint::parse_bytes(supply.amount.trim().as_bytes(), 10).ok_or_else(|| {
+            format!(
+                "Invalid Bags token supply amount for {mint}: {}",
+                supply.amount
+            )
+        })?;
     let price_quote_amount = BigUint::from(10u64).pow(supply.decimals);
     let current_point = current_point_for_dbc_config(rpc_url, &config, commitment).await?;
     let raw_out = bags_dbc_swap_amount_from_base_to_quote(
@@ -3456,13 +3460,7 @@ async fn native_fetch_local_dbc_market_snapshot(
     )?;
     let out_after_fee = bags_get_fee_amount_excluded(
         &raw_out,
-        bags_dbc_trade_fee_numerator_for_amount(
-            &pool,
-            &config,
-            current_point,
-            0,
-            raw_out.to_u64(),
-        ),
+        bags_dbc_trade_fee_numerator_for_amount(&pool, &config, current_point, 0, raw_out.to_u64()),
     );
     let market_cap = if price_quote_amount.is_zero() {
         BigUint::ZERO
@@ -3491,42 +3489,19 @@ async fn native_fetch_local_damm_market_snapshot(
     commitment: &str,
     bags_launch: Option<&BagsLaunchMetadata>,
 ) -> Result<Option<BagsMarketSnapshot>, String> {
-    let cached = normalize_cached_bags_launch_hints(bags_launch);
-    let Some((pool_address, pool, config)) =
-        load_canonical_dbc_market(rpc_url, mint, commitment, bags_launch).await?
+    let Some((_resolved_pool_address, damm_pool, _resolved_config_address)) =
+        resolve_local_damm_market_account(rpc_url, mint, commitment, bags_launch).await?
     else {
         return Ok(None);
     };
-    if !pool.is_migrated {
-        return Ok(None);
-    }
-    let resolved = if let Some(resolved) = resolve_cached_damm_pool_address(mint, &cached)? {
-        Some(resolved)
-    } else if let Some(pool_address) = derive_canonical_damm_pool_address(mint, &config)? {
-        let config_address = if config.migration_fee_option <= 6 {
-            Some(
-                Pubkey::from_str(DAMM_V2_MIGRATION_FEE_ADDRESS[config.migration_fee_option as usize])
-                    .map_err(|error| format!("Invalid DAMM migration fee address: {error}"))?,
-            )
-        } else {
-            None
-        };
-        Some((pool_address, config_address))
-    } else {
-        None
-    };
-    let Some((resolved_pool_address, _resolved_config_address)) = resolved else {
-        return Ok(None);
-    };
-    let Some(pool_bytes) =
-        rpc_fetch_account_data(rpc_url, &resolved_pool_address, commitment, "damm-v2-pool").await?
-    else {
-        return Ok(None);
-    };
-    let damm_pool = decode_damm_pool(&pool_bytes)?;
     let supply = fetch_bags_token_supply_value(rpc_url, mint, commitment).await?;
-    let supply_amount = BigUint::parse_bytes(supply.amount.trim().as_bytes(), 10)
-        .ok_or_else(|| format!("Invalid Bags token supply amount for {mint}: {}", supply.amount))?;
+    let supply_amount =
+        BigUint::parse_bytes(supply.amount.trim().as_bytes(), 10).ok_or_else(|| {
+            format!(
+                "Invalid Bags token supply amount for {mint}: {}",
+                supply.amount
+            )
+        })?;
     let price_quote_amount = BigUint::from(10u64).pow(supply.decimals);
     let (current_slot, current_time) = current_time_for_damm(rpc_url, commitment).await?;
     let current_point = if damm_pool.activation_type == 0 {
@@ -3540,17 +3515,18 @@ async fn native_fetch_local_damm_market_snapshot(
     } else {
         (supply_amount.clone() * &out_amount) / &price_quote_amount
     };
-    let token_a_reserve =
-        BigUint::from(fetch_bags_token_account_amount(rpc_url, &damm_pool.token_a_vault, commitment).await?);
-    let token_b_reserve =
-        BigUint::from(fetch_bags_token_account_amount(rpc_url, &damm_pool.token_b_vault, commitment).await?);
+    let token_a_reserve = BigUint::from(
+        fetch_bags_token_account_amount(rpc_url, &damm_pool.token_a_vault, commitment).await?,
+    );
+    let token_b_reserve = BigUint::from(
+        fetch_bags_token_account_amount(rpc_url, &damm_pool.token_b_vault, commitment).await?,
+    );
     let is_token_a_base = damm_pool.token_a_mint == *mint;
     let (real_token_reserves, real_sol_reserves) = if is_token_a_base {
         (token_a_reserve, token_b_reserve)
     } else {
         (token_b_reserve, token_a_reserve)
     };
-    let _ = pool_address;
     Ok(Some(BagsMarketSnapshot {
         mint: mint.to_string(),
         creator: damm_pool.creator.to_string(),
@@ -3578,16 +3554,20 @@ async fn native_fetch_bags_market_snapshot(
     let mint_pubkey =
         Pubkey::from_str(mint).map_err(|error| format!("Invalid Bags mint address: {error}"))?;
     if let Some(snapshot) =
-        native_fetch_local_dbc_market_snapshot(rpc_url, &mint_pubkey, "processed", bags_launch).await?
+        native_fetch_local_dbc_market_snapshot(rpc_url, &mint_pubkey, "processed", bags_launch)
+            .await?
     {
         return Ok(snapshot);
     }
     if let Some(snapshot) =
-        native_fetch_local_damm_market_snapshot(rpc_url, &mint_pubkey, "processed", bags_launch).await?
+        native_fetch_local_damm_market_snapshot(rpc_url, &mint_pubkey, "processed", bags_launch)
+            .await?
     {
         return Ok(snapshot);
     }
-    Err(format!("No canonical Bags market snapshot found for {mint}."))
+    Err(format!(
+        "No canonical Bags market snapshot found for {mint}."
+    ))
 }
 
 async fn detect_local_canonical_import_market(
@@ -3617,21 +3597,20 @@ async fn detect_local_canonical_import_market(
         }));
     }
     if pool.is_migrated {
-        let Some(damm_pool) = derive_canonical_damm_pool_address(mint, &config)? else {
+        let Some((damm_pool, _pool, _config_address)) =
+            resolve_local_damm_market_account(rpc_url, mint, commitment, None).await?
+        else {
             return Ok(None);
         };
-        if rpc_fetch_account_data(rpc_url, &damm_pool, commitment, "damm-v2-pool")
-            .await?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        let mut notes =
-            vec!["Recovered canonical post-migration DAMM v2 market from RPC without Bags trade quotes."
-                .to_string()];
+        let mut notes = vec![
+            "Recovered canonical post-migration DAMM v2 market from RPC without Bags trade quotes."
+                .to_string(),
+        ];
         let family = expected_migration_family_from_config(&config);
         if !family.is_empty() {
-            notes.push(format!("Resolved migration family from DBC config: {family}."));
+            notes.push(format!(
+                "Resolved migration family from DBC config: {family}."
+            ));
         }
         return Ok(Some(NativeBagsImportMarket {
             mode: bags_mode_from_fee_values(
@@ -3707,7 +3686,9 @@ async fn native_detect_bags_import_context(
     let credentials = read_active_bags_credentials();
     let mut notes = Vec::new();
     let creators = if credentials.api_key.trim().is_empty() {
-        notes.push("Bags creator routes were skipped because no Bags API key is configured.".to_string());
+        notes.push(
+            "Bags creator routes were skipped because no Bags API key is configured.".to_string(),
+        );
         Vec::new()
     } else {
         match fetch_bags_token_creators(mint, credentials.api_key.trim()).await {
@@ -3758,7 +3739,10 @@ async fn native_detect_bags_import_context(
                 wallet
             ));
         }
-        let is_supported_social = matches!(provider.as_str(), "github" | "twitter" | "x" | "kick" | "tiktok");
+        let is_supported_social = matches!(
+            provider.as_str(),
+            "github" | "twitter" | "x" | "kick" | "tiktok"
+        );
         fee_recipients.push(if is_supported_social && !provider_username.is_empty() {
             BagsImportRecipient {
                 r#type: provider.clone(),
@@ -3784,7 +3768,9 @@ async fn native_detect_bags_import_context(
             Ok(value) => value,
             Err(_) => None,
         };
-    let (mode, market_key, config_key, venue, detection_source) = if let Some(local_market) = local_market {
+    let (mode, market_key, config_key, venue, detection_source) = if let Some(local_market) =
+        local_market
+    {
         notes.extend(local_market.notes.clone());
         (
             local_market.mode,
@@ -3804,9 +3790,11 @@ async fn native_detect_bags_import_context(
         )
     };
     if mode.is_empty() {
-        notes.push("Bags mode could not be recovered confidently from current market state.".to_string());
+        notes.push(
+            "Bags mode could not be recovered confidently from current market state.".to_string(),
+        );
     }
-    if creators.is_empty() && market_key.is_empty() {
+    if market_key.trim().is_empty() || config_key.trim().is_empty() || venue.trim().is_empty() {
         return Ok(None);
     }
     Ok(Some(BagsImportContext {
@@ -3977,6 +3965,7 @@ async fn upload_bags_token_info_and_metadata(
     config: &NormalizedConfig,
 ) -> Result<BagsTokenInfoResponse, String> {
     let (image_bytes, filename, content_type) = load_bags_launch_image(&config.imageLocalPath)?;
+    let description = bags_token_metadata_description(config);
     let image_part = Part::bytes(image_bytes)
         .file_name(filename)
         .mime_str(content_type)
@@ -3985,7 +3974,7 @@ async fn upload_bags_token_info_and_metadata(
         .part("image", image_part)
         .text("name", config.token.name.clone())
         .text("symbol", config.token.symbol.trim().to_string())
-        .text("description", config.token.description.clone());
+        .text("description", description);
     if !config.token.telegram.trim().is_empty() {
         form = form.text("telegram", config.token.telegram.clone());
     }
@@ -3996,7 +3985,10 @@ async fn upload_bags_token_info_and_metadata(
         form = form.text("twitter", config.token.twitter.clone());
     }
     let response = bags_launch_http_client()
-        .post(format!("{}/token-launch/create-token-info", bags_api_base_url()))
+        .post(format!(
+            "{}/token-launch/create-token-info",
+            bags_api_base_url()
+        ))
         .header("x-api-key", api_key)
         .multipart(form)
         .send()
@@ -4024,6 +4016,18 @@ async fn upload_bags_token_info_and_metadata(
         .transpose()
         .map_err(|error| format!("Failed to parse Bags token metadata payload: {error}"))?
         .ok_or_else(|| "Bags token metadata upload returned an empty response.".to_string())
+}
+
+fn bags_token_metadata_description(config: &NormalizedConfig) -> String {
+    let description = config.token.description.trim();
+    if !description.is_empty() {
+        return description.to_string();
+    }
+    let name = config.token.name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    config.token.symbol.trim().to_string()
 }
 
 async fn resolve_bags_fee_claimers(
@@ -4071,19 +4075,18 @@ async fn resolve_bags_fee_claimers(
                     } else if lookup.notFound {
                         format!(
                             "Failed to get launch wallet for {} user {}: not found",
-                            lookup.provider,
-                            lookup.lookupTarget
+                            lookup.provider, lookup.lookupTarget
                         )
                     } else {
                         format!(
                             "Failed to get launch wallet for {} user {}",
-                            lookup.provider,
-                            lookup.lookupTarget
+                            lookup.provider, lookup.lookupTarget
                         )
                     });
                 }
-                Pubkey::from_str(lookup.wallet.trim())
-                    .map_err(|error| format!("Invalid Bags fee-share wallet returned by API: {error}"))?
+                Pubkey::from_str(lookup.wallet.trim()).map_err(|error| {
+                    format!("Invalid Bags fee-share wallet returned by API: {error}")
+                })?
             }
         } else {
             return Err(format!(
@@ -4110,8 +4113,9 @@ async fn resolve_bags_fee_claimers(
             let user_bps = *merged_claimers
                 .get(&address)
                 .ok_or_else(|| format!("Missing merged Bags fee-share wallet {address}."))?;
-            let pubkey = Pubkey::from_str(&address)
-                .map_err(|error| format!("Invalid merged Bags fee-share wallet {address}: {error}"))?;
+            let pubkey = Pubkey::from_str(&address).map_err(|error| {
+                format!("Invalid merged Bags fee-share wallet {address}: {error}")
+            })?;
             let user_bps = u16::try_from(user_bps)
                 .map_err(|_| format!("Bags fee-share bps overflowed for wallet {address}."))?;
             Ok((pubkey, user_bps))
@@ -4133,84 +4137,6 @@ async fn resolve_bags_fee_claimers(
         );
     }
     Ok(resolved)
-}
-
-fn normalize_estimate_to_lamports(value: Option<&Value>) -> Option<u64> {
-    let numeric = match value {
-        Some(Value::Number(raw)) => raw.as_f64()?,
-        Some(Value::String(raw)) => raw.trim().parse::<f64>().ok()?,
-        _ => return None,
-    };
-    if !numeric.is_finite() || numeric <= 0.0 {
-        return None;
-    }
-    let lamports = if numeric < 1.0 {
-        (numeric * 1_000_000_000.0).round()
-    } else {
-        numeric.round()
-    };
-    if lamports <= 0.0 {
-        None
-    } else {
-        Some(lamports as u64)
-    }
-}
-
-fn jito_tip_percentile_value<'a>(sample: &'a Value, percentile: &str) -> Option<&'a Value> {
-    match percentile {
-        "p25" => sample
-            .get("p25")
-            .or_else(|| sample.get("percentile25"))
-            .or_else(|| sample.get("tipFloor25"))
-            .or_else(|| sample.get("landed_tips_25th_percentile")),
-        "p50" => sample
-            .get("p50")
-            .or_else(|| sample.get("percentile50"))
-            .or_else(|| sample.get("tipFloor50"))
-            .or_else(|| sample.get("landed_tips_50th_percentile")),
-        "p75" => sample
-            .get("p75")
-            .or_else(|| sample.get("percentile75"))
-            .or_else(|| sample.get("tipFloor75"))
-            .or_else(|| sample.get("landed_tips_75th_percentile")),
-        "p95" => sample
-            .get("p95")
-            .or_else(|| sample.get("percentile95"))
-            .or_else(|| sample.get("tipFloor95"))
-            .or_else(|| sample.get("landed_tips_95th_percentile")),
-        _ => sample
-            .get("p99")
-            .or_else(|| sample.get("percentile99"))
-            .or_else(|| sample.get("tipFloor99"))
-            .or_else(|| sample.get("landed_tips_99th_percentile")),
-    }
-}
-
-fn extract_jito_tip_floor_lamports(payload: &Value, percentile: &str) -> Option<u64> {
-    if let Some(value) = normalize_estimate_to_lamports(jito_tip_percentile_value(payload, percentile))
-    {
-        return Some(value);
-    }
-    if let Some(value) = payload
-        .get("params")
-        .and_then(|params| params.get("result"))
-        .and_then(|result| extract_jito_tip_floor_lamports(result, percentile))
-    {
-        return Some(value);
-    }
-    for key in ["data", "result", "value"] {
-        if let Some(value) = payload
-            .get(key)
-            .and_then(|child| extract_jito_tip_floor_lamports(child, percentile))
-        {
-            return Some(value);
-        }
-    }
-    payload.as_array().and_then(|entries| {
-        entries
-            .iter()
-            .find_map(|entry| extract_jito_tip_floor_lamports(entry, percentile))
-    })
 }
 
 async fn fetch_bags_engine_fee_estimate(
@@ -4318,8 +4244,55 @@ fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, Str
 }
 
 fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
-    let percent = parse_decimal_u64(slippage_percent, 2, "slippage percent")?;
-    Ok(percent.min(10_000))
+    let trimmed = slippage_percent.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    if trimmed.starts_with('-') {
+        return Err("Invalid slippage percent: expected a non-negative decimal.".to_string());
+    }
+    let parts = trimmed.split('.').collect::<Vec<_>>();
+    if parts.len() > 2 {
+        return Err("Invalid slippage percent: expected a decimal value.".to_string());
+    }
+    let whole = parts[0];
+    let fractional = parts.get(1).copied().unwrap_or("");
+    if (whole.is_empty() && fractional.is_empty())
+        || !whole.chars().all(|ch| ch.is_ascii_digit())
+        || !fractional.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err("Invalid slippage percent: expected a non-negative decimal.".to_string());
+    }
+    if fractional.len() > 2 {
+        return Err("slippage percent supports at most 2 decimal places.".to_string());
+    }
+    let whole_bps = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid slippage percent: {error}"))?
+            .checked_mul(100)
+            .ok_or_else(|| "slippage percent is too large.".to_string())?
+    };
+    let fractional_bps = if fractional.is_empty() {
+        0
+    } else {
+        let mut padded = fractional.to_string();
+        while padded.len() < 2 {
+            padded.push('0');
+        }
+        padded
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid slippage percent: {error}"))?
+    };
+    let bps = whole_bps
+        .checked_add(fractional_bps)
+        .ok_or_else(|| "slippage percent is too large.".to_string())?;
+    if bps > 10_000 {
+        return Err("slippage percent must be between 0 and 100.".to_string());
+    }
+    Ok(bps)
 }
 
 fn follow_tip_lamports_for_provider(
@@ -4358,23 +4331,6 @@ fn helper_bags_launch_metadata(metadata: Option<&BagsLaunchMetadata>) -> Value {
             "preMigrationDbcPoolAddress": metadata.preMigrationDbcPoolAddress,
         }),
         None => Value::Null,
-    }
-}
-
-fn convert_compiled_transaction(source: HelperCompiledTransaction) -> CompiledTransaction {
-    let signature = crate::rpc::precompute_transaction_signature(&source.serializedBase64);
-    CompiledTransaction {
-        label: source.label,
-        format: source.format,
-        blockhash: source.blockhash,
-        lastValidBlockHeight: source.lastValidBlockHeight,
-        serializedBase64: source.serializedBase64,
-        signature,
-        lookupTablesUsed: source.lookupTablesUsed,
-        computeUnitLimit: source.computeUnitLimit,
-        computeUnitPriceMicroLamports: source.computeUnitPriceMicroLamports,
-        inlineTipLamports: source.inlineTipLamports,
-        inlineTipAccount: source.inlineTipAccount,
     }
 }
 
@@ -4627,62 +4583,6 @@ fn decode_bags_versioned_transaction(encoded: &str) -> Result<VersionedTransacti
         .map_err(|error| format!("Failed to deserialize Bags versioned transaction: {error}"))
 }
 
-fn helper_prepare_response_to_native_prepared(
-    response: HelperLaunchResponse,
-    include_send_phases: bool,
-) -> NativePreparedBagsLaunch {
-    let setup_bundles = if include_send_phases {
-        response
-            .setupBundles
-            .iter()
-            .map(|bundle| {
-                bundle
-                    .compiledTransactions
-                    .iter()
-                    .cloned()
-                    .map(convert_compiled_transaction)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let setup_transactions = if include_send_phases {
-        response
-            .setupTransactions
-            .iter()
-            .cloned()
-            .map(convert_compiled_transaction)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    NativePreparedBagsLaunch {
-        mint: response.mint,
-        launch_creator: response.launchCreator,
-        config_key: response.configKey,
-        metadata_uri: response.metadataUri,
-        identity_label: response.identityLabel,
-        migration_fee_option: response.migrationFeeOption,
-        expected_migration_family: response.expectedMigrationFamily,
-        expected_damm_config_key: response.expectedDammConfigKey,
-        expected_damm_derivation_mode: response.expectedDammDerivationMode,
-        pre_migration_dbc_pool_address: response.preMigrationDbcPoolAddress,
-        compiled_transactions: response
-            .compiledTransactions
-            .into_iter()
-            .map(convert_compiled_transaction)
-            .collect(),
-        setup_bundles,
-        setup_transactions,
-        timings: response.timings.unwrap_or(HelperPrepareLaunchTimings {
-            prepareLaunchMs: None,
-            feeRecipientResolveMs: None,
-            metadataUploadMs: None,
-        }),
-    }
-}
-
 fn build_native_bags_artifacts_from_prepared(
     prepared: NativePreparedBagsLaunch,
     config: &NormalizedConfig,
@@ -4762,7 +4662,8 @@ fn build_native_bags_artifacts_from_prepared(
             prepared.pre_migration_dbc_pool_address.trim()
         ));
     }
-    report.transactions = build_transaction_summaries(&prepared.compiled_transactions, config.tx.dumpBase64);
+    report.transactions =
+        build_transaction_summaries(&prepared.compiled_transactions, config.tx.dumpBase64);
     let text = render_report(&report);
     let mut report = serde_json::to_value(report).map_err(|error| error.to_string())?;
     if !prepared.metadata_uri.trim().is_empty() {
@@ -4776,8 +4677,7 @@ fn build_native_bags_artifacts_from_prepared(
             Value::String(prepared.expected_migration_family.clone());
     }
     if !prepared.expected_damm_config_key.trim().is_empty() {
-        report["expectedDammConfigKey"] =
-            Value::String(prepared.expected_damm_config_key.clone());
+        report["expectedDammConfigKey"] = Value::String(prepared.expected_damm_config_key.clone());
     }
     if !prepared.expected_damm_derivation_mode.trim().is_empty() {
         report["expectedDammDerivationMode"] =
@@ -4856,8 +4756,40 @@ async fn summarize_launch_migration_config(
         } else {
             "config-derived".to_string()
         },
-        pre_migration_dbc_pool_address: derive_dbc_pool_address(&bags_native_mint_pubkey()?, mint, config_key)?
-            .to_string(),
+        pre_migration_dbc_pool_address: derive_dbc_pool_address(
+            &bags_native_mint_pubkey()?,
+            mint,
+            config_key,
+        )?
+        .to_string(),
+    })
+}
+
+pub async fn summarize_bags_launch_metadata_from_config(
+    rpc_url: &str,
+    mint: &str,
+    config_key: &str,
+    commitment: &str,
+) -> Result<BagsLaunchMetadata, String> {
+    let normalized_config = config_key.trim();
+    if normalized_config.is_empty() {
+        return Ok(BagsLaunchMetadata::default());
+    }
+    let mint_pubkey =
+        Pubkey::from_str(mint).map_err(|error| format!("Invalid Bags mint address: {error}"))?;
+    let config_pubkey = Pubkey::from_str(normalized_config)
+        .map_err(|error| format!("Invalid Bags config address: {error}"))?;
+    let summary =
+        summarize_launch_migration_config(rpc_url, &mint_pubkey, &config_pubkey, commitment)
+            .await?;
+    Ok(BagsLaunchMetadata {
+        configKey: normalized_config.to_string(),
+        migrationFeeOption: summary.migration_fee_option,
+        expectedMigrationFamily: summary.expected_migration_family,
+        expectedDammConfigKey: summary.expected_damm_config_key,
+        expectedDammDerivationMode: summary.expected_damm_derivation_mode,
+        preMigrationDbcPoolAddress: summary.pre_migration_dbc_pool_address,
+        postMigrationDammPoolAddress: String::new(),
     })
 }
 
@@ -4908,15 +4840,14 @@ async fn native_prepare_bags_launch(
         &config.execution.commitment,
     )
     .await?;
-    let shared_last_valid_block_height = if let Some((_, last_valid_block_height)) =
-        blockhash_override.clone()
-    {
-        last_valid_block_height
-    } else {
-        fetch_latest_blockhash_cached(rpc_url, &config.execution.commitment)
-            .await?
-            .1
-    };
+    let shared_last_valid_block_height =
+        if let Some((_, last_valid_block_height)) = blockhash_override.clone() {
+            last_valid_block_height
+        } else {
+            fetch_latest_blockhash_cached(rpc_url, &config.execution.commitment)
+                .await?
+                .1
+        };
     let direct_tx_config = NativeBagsVersionedTxConfig {
         compute_unit_limit: config
             .tx
@@ -4924,21 +4855,23 @@ async fn native_prepare_bags_launch(
             .and_then(|value| u64::try_from(value).ok())
             .unwrap_or_else(configured_default_launch_compute_unit_limit),
         compute_unit_price_micro_lamports: u64::try_from(
-            config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0),
+            config
+                .tx
+                .computeUnitPriceMicroLamports
+                .unwrap_or_default()
+                .max(0),
         )
         .unwrap_or_default(),
         tip_lamports: setup_tip_lamports,
         tip_account: config.tx.jitoTipAccount.clone(),
         jitodontfront: config.execution.jitodontfront,
     };
-    let bundled_tx_config = if uses_single_bundle_tip_last_tx(
-        &config.execution.provider,
-        &config.execution.mevMode,
-    ) {
-        direct_tx_config.without_inline_tip()
-    } else {
-        direct_tx_config.clone()
-    };
+    let bundled_tx_config =
+        if uses_single_bundle_tip_last_tx(&config.execution.provider, &config.execution.mevMode) {
+            direct_tx_config.without_inline_tip()
+        } else {
+            direct_tx_config.clone()
+        };
     let mut signed_setup_transactions = Vec::new();
     for transaction in &config_result.transactions {
         let decoded = decode_bags_versioned_transaction(&transaction.transaction)?;
@@ -5090,67 +5023,6 @@ pub async fn warm_bags_helper_ping() -> Result<Value, String> {
     }))
 }
 
-fn build_prepare_launch_helper_request(
-    config: &NormalizedConfig,
-    wallet_secret: &[u8],
-    rpc_url: &str,
-    setup_tip_lamports: u64,
-    blockhash_override: Option<(String, u64)>,
-) -> Result<Value, String> {
-    let mut request = json!({
-        "action": "prepare-launch",
-        "rpcUrl": rpc_url,
-        "commitment": config.execution.commitment,
-        "ownerSecret": decode_secret_base64(wallet_secret),
-        "slippageBps": slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
-        "txConfig": helper_tx_config(
-            config
-                .tx
-                .computeUnitLimit
-                .and_then(|value| u64::try_from(value).ok())
-                .or_else(|| Some(configured_default_launch_compute_unit_limit())),
-            u64::try_from(config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0))
-                .unwrap_or_default(),
-            setup_tip_lamports,
-            &config.tx.jitoTipAccount,
-            config.execution.jitodontfront,
-            uses_single_bundle_tip_last_tx(&config.execution.provider, &config.execution.mevMode),
-        ),
-        "mode": config.mode,
-        "imageLocalPath": config.imageLocalPath,
-        "token": {
-            "name": config.token.name,
-            "symbol": config.token.symbol,
-            "description": config.token.description,
-            "website": config.token.website,
-            "twitter": config.token.twitter,
-            "telegram": config.token.telegram,
-        },
-        "feeSharing": config.feeSharing.recipients.iter().map(|entry| json!({
-            "type": entry.r#type.clone().unwrap_or_else(|| "wallet".to_string()),
-            "address": entry.address,
-            "githubUsername": entry.githubUsername,
-            "githubUserId": entry.githubUserId,
-            "shareBps": entry.shareBps,
-        })).collect::<Vec<_>>(),
-        "devBuy": config.devBuy.as_ref().map(|dev_buy| json!({
-            "mode": dev_buy.mode,
-            "amount": dev_buy.amount,
-        })),
-        "identityLabel": "Wallet Only",
-    });
-    if let Some((blockhash, last_valid_block_height)) = blockhash_override {
-        if let Some(obj) = request.as_object_mut() {
-            obj.insert("recentBlockhash".to_string(), Value::String(blockhash));
-            obj.insert(
-                "lastValidBlockHeight".to_string(),
-                Value::Number(last_valid_block_height.into()),
-            );
-        }
-    }
-    Ok(request)
-}
-
 pub async fn try_compile_native_bags(
     rpc_url: &str,
     config: &NormalizedConfig,
@@ -5166,7 +5038,7 @@ pub async fn try_compile_native_bags(
         return Ok(None);
     }
     validate_launchpad_support(config).map_err(|error| error.to_string())?;
-    let (fee_estimate, blockhash_override) = if configured_bags_rust_blockhash_for_helper() {
+    let (fee_estimate, blockhash_override) = if configured_bags_rust_blockhash_override() {
         let fee_fut = estimate_bags_fee_market(rpc_url, config);
         let bh_fut = fetch_latest_blockhash_cached_with_prime(
             rpc_url,
@@ -5214,7 +5086,7 @@ pub async fn compile_launch_transaction(
 ) -> Result<BagsLaunchTransactionArtifacts, String> {
     let tip_lamports = u64::try_from(config.tx.jitoTipLamports.max(0)).unwrap_or_default();
     let setup_gate_commitment = configured_bags_setup_gate_commitment();
-    let blockhash_override = if configured_bags_rust_blockhash_for_helper() {
+    let blockhash_override = if configured_bags_rust_blockhash_override() {
         Some(fetch_latest_blockhash_cached(rpc_url, &config.execution.commitment).await?)
     } else {
         None
@@ -5229,12 +5101,8 @@ pub async fn compile_launch_transaction(
         if dev_buy.amount.trim().is_empty() {
             0
         } else {
-            u64::try_from(parse_decimal_to_u128(
-                &dev_buy.amount,
-                9,
-                "dev buy amount",
-            )?)
-            .map_err(|_| "dev buy amount is too large.".to_string())?
+            u64::try_from(parse_decimal_to_u128(&dev_buy.amount, 9, "dev buy amount")?)
+                .map_err(|_| "dev buy amount is too large.".to_string())?
         }
     } else {
         0
@@ -5247,7 +5115,11 @@ pub async fn compile_launch_transaction(
             .and_then(|value| u64::try_from(value).ok())
             .unwrap_or_else(configured_default_launch_compute_unit_limit),
         compute_unit_price_micro_lamports: u64::try_from(
-            config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0),
+            config
+                .tx
+                .computeUnitPriceMicroLamports
+                .unwrap_or_default()
+                .max(0),
         )
         .unwrap_or_default(),
         tip_lamports,
@@ -5319,10 +5191,9 @@ pub async fn compile_launch_transaction(
             Some(tx_config.tip_account.clone())
         },
     )?;
-    let compiled_transaction = normalized
-        .drain(..)
-        .next()
-        .ok_or_else(|| "Bags launch transaction normalization returned no transactions.".to_string())?;
+    let compiled_transaction = normalized.drain(..).next().ok_or_else(|| {
+        "Bags launch transaction normalization returned no transactions.".to_string()
+    })?;
     Ok(BagsLaunchTransactionArtifacts {
         compiled_transaction,
         launch_build_ms: Some(launch_build_started_at.elapsed().as_millis()),
@@ -5342,39 +5213,11 @@ async fn load_local_damm_market(
     commitment: &str,
     bags_launch: Option<&BagsLaunchMetadata>,
 ) -> Result<Option<(Pubkey, DecodedDammPool, Option<Pubkey>)>, String> {
-    let cached = normalize_cached_bags_launch_hints(bags_launch);
-    let Some((_dbc_pool_address, dbc_pool, config)) =
-        load_canonical_dbc_market(rpc_url, mint, commitment, bags_launch).await?
+    let Some((pool_address, pool, config_address)) =
+        resolve_local_damm_market_account(rpc_url, mint, commitment, bags_launch).await?
     else {
         return Ok(None);
     };
-    if !dbc_pool.is_migrated {
-        return Ok(None);
-    }
-    let resolved = if let Some(resolved) = resolve_cached_damm_pool_address(mint, &cached)? {
-        Some(resolved)
-    } else if let Some(pool_address) = derive_canonical_damm_pool_address(mint, &config)? {
-        let config_address = if config.migration_fee_option <= 6 {
-            Some(
-                Pubkey::from_str(DAMM_V2_MIGRATION_FEE_ADDRESS[config.migration_fee_option as usize])
-                    .map_err(|error| format!("Invalid DAMM migration fee address: {error}"))?,
-            )
-        } else {
-            None
-        };
-        Some((pool_address, config_address))
-    } else {
-        None
-    };
-    let Some((pool_address, config_address)) = resolved else {
-        return Ok(None);
-    };
-    let Some(pool_bytes) =
-        rpc_fetch_account_data(rpc_url, &pool_address, commitment, "damm-v2-pool").await?
-    else {
-        return Ok(None);
-    };
-    let pool = decode_damm_pool(&pool_bytes)?;
     Ok(Some((pool_address, pool, config_address)))
 }
 
@@ -5435,16 +5278,22 @@ async fn native_fail_closed_bags_trade_error(
         "damm_quote_failed"
     };
     let cached = normalize_cached_bags_launch_hints(bags_launch);
-    let Some((pool_address, pool_bytes)) = rpc_fetch_first_dbc_pool_by_mint(rpc_url, mint, commitment).await?
+    let Some((pool_address, pool_bytes)) =
+        rpc_fetch_first_dbc_pool_by_mint(rpc_url, mint, commitment).await?
     else {
         return Ok(build_local_trade_fail_closed_error(
             "dbc_pool_not_found",
-            &format!("Canonical Bags {action} requires a local Meteora DBC pool, but none was found."),
+            &format!(
+                "Canonical Bags {action} requires a local Meteora DBC pool, but none was found."
+            ),
             &[
                 ("mint", mint.to_string()),
                 (
                     "configKey",
-                    cached.config_key.map(|value| value.to_string()).unwrap_or_default(),
+                    cached
+                        .config_key
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
                 ),
                 (
                     "expectedPool",
@@ -5461,7 +5310,9 @@ async fn native_fail_closed_bags_trade_error(
         if pool_address != expected_pool {
             return Ok(build_local_trade_fail_closed_error(
                 "dbc_pool_mismatch",
-                &format!("Resolved DBC pool did not match the cached LaunchDeck Bags pool for {action}."),
+                &format!(
+                    "Resolved DBC pool did not match the cached LaunchDeck Bags pool for {action}."
+                ),
                 &[
                     ("mint", mint.to_string()),
                     ("resolvedPool", pool_address.to_string()),
@@ -5474,7 +5325,9 @@ async fn native_fail_closed_bags_trade_error(
         if pool.config != expected_config {
             return Ok(build_local_trade_fail_closed_error(
                 "dbc_config_mismatch",
-                &format!("Resolved DBC config did not match the cached LaunchDeck Bags config for {action}."),
+                &format!(
+                    "Resolved DBC config did not match the cached LaunchDeck Bags config for {action}."
+                ),
                 &[
                     ("mint", mint.to_string()),
                     ("resolvedConfig", pool.config.to_string()),
@@ -5490,7 +5343,10 @@ async fn native_fail_closed_bags_trade_error(
         return Ok(build_local_trade_fail_closed_error(
             "dbc_config_not_found",
             &format!("Canonical Bags {action} could not load the expected local DBC config."),
-            &[("mint", mint.to_string()), ("configKey", config_key.to_string())],
+            &[
+                ("mint", mint.to_string()),
+                ("configKey", config_key.to_string()),
+            ],
         ));
     };
     let config = decode_dbc_pool_config(&config_bytes)?;
@@ -5498,7 +5354,10 @@ async fn native_fail_closed_bags_trade_error(
         return Ok(build_local_trade_fail_closed_error(
             "dbc_config_not_found",
             &format!("Canonical Bags {action} could not load the expected local DBC config."),
-            &[("mint", mint.to_string()), ("configKey", config_key.to_string())],
+            &[
+                ("mint", mint.to_string()),
+                ("configKey", config_key.to_string()),
+            ],
         ));
     }
     let derived_pool_address = derive_dbc_pool_address(&config.quote_mint, mint, &config_key)?;
@@ -5506,7 +5365,9 @@ async fn native_fail_closed_bags_trade_error(
         if derived_pool_address != expected_pool {
             return Ok(build_local_trade_fail_closed_error(
                 "dbc_pool_not_derived",
-                &format!("Cached LaunchDeck Bags DBC pool does not match deterministic derivation for {action}."),
+                &format!(
+                    "Cached LaunchDeck Bags DBC pool does not match deterministic derivation for {action}."
+                ),
                 &[
                     ("mint", mint.to_string()),
                     ("derivedPool", derived_pool_address.to_string()),
@@ -5518,7 +5379,9 @@ async fn native_fail_closed_bags_trade_error(
     if pool_address != derived_pool_address {
         return Ok(build_local_trade_fail_closed_error(
             "dbc_pool_not_derived",
-            &format!("Resolved DBC pool did not match deterministic derivation for canonical Bags {action}."),
+            &format!(
+                "Resolved DBC pool did not match deterministic derivation for canonical Bags {action}."
+            ),
             &[
                 ("mint", mint.to_string()),
                 ("resolvedPool", pool_address.to_string()),
@@ -5529,7 +5392,9 @@ async fn native_fail_closed_bags_trade_error(
     if !pool.is_migrated && !is_completed_dbc_pool(&pool, &config) {
         return Ok(build_local_trade_fail_closed_error(
             dbc_failure_code,
-            &format!("Canonical Bags {action} stayed on the local DBC path but returned no usable result."),
+            &format!(
+                "Canonical Bags {action} stayed on the local DBC path but returned no usable result."
+            ),
             &[
                 ("mint", mint.to_string()),
                 ("pool", pool_address.to_string()),
@@ -5537,10 +5402,14 @@ async fn native_fail_closed_bags_trade_error(
             ],
         ));
     }
-    let Some((damm_pool_address, damm_config_address)) = resolve_cached_damm_pool_address(mint, &cached)? else {
+    let Some((damm_pool_address, damm_config_address)) =
+        resolve_cached_damm_pool_address(mint, &cached)?
+    else {
         return Ok(build_local_trade_fail_closed_error(
             "migration_family_unresolved",
-            &format!("Canonical Bags {action} could not resolve the migrated DAMM v2 family from cached launch metadata."),
+            &format!(
+                "Canonical Bags {action} could not resolve the migrated DAMM v2 family from cached launch metadata."
+            ),
             &[
                 ("mint", mint.to_string()),
                 (
@@ -5550,7 +5419,10 @@ async fn native_fail_closed_bags_trade_error(
                         .map(|value| value.to_string())
                         .unwrap_or_default(),
                 ),
-                ("expectedMigrationFamily", cached.expected_migration_family.clone()),
+                (
+                    "expectedMigrationFamily",
+                    cached.expected_migration_family.clone(),
+                ),
                 (
                     "expectedDammConfigKey",
                     cached
@@ -5564,7 +5436,9 @@ async fn native_fail_closed_bags_trade_error(
     if !rpc_account_exists(rpc_url, &damm_pool_address, commitment, "damm-v2-pool").await? {
         return Ok(build_local_trade_fail_closed_error(
             "canonical_damm_pool_not_found",
-            &format!("Canonical Bags {action} resolved to a migrated DAMM v2 pool that was not found on-chain."),
+            &format!(
+                "Canonical Bags {action} resolved to a migrated DAMM v2 pool that was not found on-chain."
+            ),
             &[
                 ("mint", mint.to_string()),
                 ("pool", damm_pool_address.to_string()),
@@ -5582,14 +5456,21 @@ async fn native_fail_closed_bags_trade_error(
     else {
         return Ok(build_local_trade_fail_closed_error(
             "canonical_damm_pool_not_found",
-            &format!("Canonical Bags {action} resolved to a migrated DAMM v2 pool that could not be loaded."),
-            &[("mint", mint.to_string()), ("pool", damm_pool_address.to_string())],
+            &format!(
+                "Canonical Bags {action} resolved to a migrated DAMM v2 pool that could not be loaded."
+            ),
+            &[
+                ("mint", mint.to_string()),
+                ("pool", damm_pool_address.to_string()),
+            ],
         ));
     };
     let _ = decode_damm_pool(&pool_bytes)?;
     Ok(build_local_trade_fail_closed_error(
         damm_failure_code,
-        &format!("Canonical Bags {action} resolved to the local DAMM v2 pool but returned no usable result."),
+        &format!(
+            "Canonical Bags {action} resolved to the local DAMM v2 pool but returned no usable result."
+        ),
         &[
             ("mint", mint.to_string()),
             ("pool", damm_pool_address.to_string()),
@@ -5620,7 +5501,10 @@ async fn native_try_build_local_dbc_follow_buy(
         else {
             return Ok(None);
         };
-        if pool_address != context.pool_address || pool.is_migrated || is_completed_dbc_pool(&pool, &config) {
+        if pool_address != context.pool_address
+            || pool.is_migrated
+            || is_completed_dbc_pool(&pool, &config)
+        {
             return Ok(None);
         }
         let current_point = current_point_for_dbc_config(rpc_url, &config, commitment).await?;
@@ -5642,8 +5526,14 @@ async fn native_try_build_local_dbc_follow_buy(
         return Ok(None);
     }
     let amount_in = u64::try_from(amount_in).map_err(|_| "buy amount is too large.".to_string())?;
-    let (_out_amount, minimum_amount_out) =
-        bags_dbc_swap_quote_exact_in(&pool, &config, false, amount_in, slippage_bps, current_point)?;
+    let (_out_amount, minimum_amount_out) = bags_dbc_swap_quote_exact_in(
+        &pool,
+        &config,
+        false,
+        amount_in,
+        slippage_bps,
+        current_point,
+    )?;
     let owner_pubkey = owner.pubkey();
     let input_token_program = token_program_for_flag(config.quote_token_flag)?;
     let output_token_program = token_program_for_flag(pool.pool_type)?;
@@ -5674,7 +5564,11 @@ async fn native_try_build_local_dbc_follow_buy(
     if let Some(ix) = create_output_ata {
         instructions.push(ix);
     }
-    instructions.extend(build_wrap_sol_instructions(&owner_pubkey, &input_token_account, amount_in)?);
+    instructions.extend(build_wrap_sol_instructions(
+        &owner_pubkey,
+        &input_token_account,
+        amount_in,
+    )?);
     instructions.push(build_dbc_swap_instruction(
         &owner_pubkey,
         &pool_address,
@@ -5688,7 +5582,7 @@ async fn native_try_build_local_dbc_follow_buy(
     )?);
     instructions.push(build_unwrap_sol_instruction(&owner_pubkey, &owner_pubkey)?);
     Ok(Some(
-        compile_legacy_follow_transaction(
+        compile_shared_alt_follow_transaction(
             "follow-buy",
             rpc_url,
             commitment,
@@ -5719,12 +5613,16 @@ async fn native_try_build_local_dbc_follow_sell(
         return Ok(None);
     }
     let owner_pubkey = owner.pubkey();
-    let owner_token_account =
-        get_associated_token_address_with_program_id(&owner_pubkey, mint, &bags_token_program_pubkey()?);
-    let raw_amount = match fetch_bags_token_account_amount(rpc_url, &owner_token_account, commitment).await {
-        Ok(value) => value,
-        Err(_) => return Ok(Some(None)),
-    };
+    let owner_token_account = get_associated_token_address_with_program_id(
+        &owner_pubkey,
+        mint,
+        &bags_token_program_pubkey()?,
+    );
+    let raw_amount =
+        match fetch_bags_token_account_amount(rpc_url, &owner_token_account, commitment).await {
+            Ok(value) => value,
+            Err(_) => return Ok(Some(None)),
+        };
     if raw_amount == 0 {
         return Ok(Some(None));
     }
@@ -5733,8 +5631,14 @@ async fn native_try_build_local_dbc_follow_sell(
         return Ok(Some(None));
     }
     let current_point = current_point_for_dbc_config(rpc_url, &config, commitment).await?;
-    let (_out_amount, minimum_amount_out) =
-        bags_dbc_swap_quote_exact_in(&pool, &config, true, sell_amount, slippage_bps, current_point)?;
+    let (_out_amount, minimum_amount_out) = bags_dbc_swap_quote_exact_in(
+        &pool,
+        &config,
+        true,
+        sell_amount,
+        slippage_bps,
+        current_point,
+    )?;
     let input_token_program = token_program_for_flag(pool.pool_type)?;
     let output_token_program = token_program_for_flag(config.quote_token_flag)?;
     let (input_token_account, create_input_ata) = maybe_create_ata_instruction(
@@ -5777,7 +5681,7 @@ async fn native_try_build_local_dbc_follow_sell(
     )?);
     instructions.push(build_unwrap_sol_instruction(&owner_pubkey, &owner_pubkey)?);
     Ok(Some(Some(
-        compile_legacy_follow_transaction(
+        compile_shared_alt_follow_transaction(
             "follow-sell",
             rpc_url,
             commitment,
@@ -5835,9 +5739,14 @@ async fn native_try_build_local_damm_follow_buy(
         return Ok(None);
     }
     let amount_in = u64::try_from(amount_in).map_err(|_| "buy amount is too large.".to_string())?;
-    let out_amount = cpamm_swap_amount_out(&BigUint::from(amount_in), &bags_native_mint_pubkey()?, &pool, current_point)?
-        .to_u64()
-        .ok_or_else(|| "Bags DAMM follow quote overflowed u64.".to_string())?;
+    let out_amount = cpamm_swap_amount_out(
+        &BigUint::from(amount_in),
+        &bags_native_mint_pubkey()?,
+        &pool,
+        current_point,
+    )?
+    .to_u64()
+    .ok_or_else(|| "Bags DAMM follow quote overflowed u64.".to_string())?;
     let minimum_amount_out = helper_slippage_minimum_amount(out_amount, slippage_bps);
     let owner_pubkey = owner.pubkey();
     let input_token_program = if pool.token_a_mint == bags_native_mint_pubkey()? {
@@ -5877,7 +5786,11 @@ async fn native_try_build_local_damm_follow_buy(
     if let Some(ix) = create_output_ata {
         instructions.push(ix);
     }
-    instructions.extend(build_wrap_sol_instructions(&owner_pubkey, &input_token_account, amount_in)?);
+    instructions.extend(build_wrap_sol_instructions(
+        &owner_pubkey,
+        &input_token_account,
+        amount_in,
+    )?);
     instructions.push(build_damm_swap_instruction(
         &owner_pubkey,
         &pool_address,
@@ -5889,7 +5802,7 @@ async fn native_try_build_local_damm_follow_buy(
     )?);
     instructions.push(build_unwrap_sol_instruction(&owner_pubkey, &owner_pubkey)?);
     Ok(Some(
-        compile_legacy_follow_transaction(
+        compile_shared_alt_follow_transaction(
             "follow-buy",
             rpc_url,
             commitment,
@@ -5917,12 +5830,16 @@ async fn native_try_build_local_damm_follow_sell(
         return Ok(None);
     };
     let owner_pubkey = owner.pubkey();
-    let owner_token_account =
-        get_associated_token_address_with_program_id(&owner_pubkey, mint, &bags_token_program_pubkey()?);
-    let raw_amount = match fetch_bags_token_account_amount(rpc_url, &owner_token_account, commitment).await {
-        Ok(value) => value,
-        Err(_) => return Ok(Some(None)),
-    };
+    let owner_token_account = get_associated_token_address_with_program_id(
+        &owner_pubkey,
+        mint,
+        &bags_token_program_pubkey()?,
+    );
+    let raw_amount =
+        match fetch_bags_token_account_amount(rpc_url, &owner_token_account, commitment).await {
+            Ok(value) => value,
+            Err(_) => return Ok(Some(None)),
+        };
     if raw_amount == 0 {
         return Ok(Some(None));
     }
@@ -5931,10 +5848,15 @@ async fn native_try_build_local_damm_follow_sell(
         return Ok(Some(None));
     }
     let (current_slot, current_time) = current_time_for_damm(rpc_url, commitment).await?;
-    let current_point = if pool.activation_type == 0 { current_slot } else { current_time };
-    let out_amount = cpamm_swap_amount_out(&BigUint::from(sell_amount), mint, &pool, current_point)?
-        .to_u64()
-        .ok_or_else(|| "Bags DAMM follow quote overflowed u64.".to_string())?;
+    let current_point = if pool.activation_type == 0 {
+        current_slot
+    } else {
+        current_time
+    };
+    let out_amount =
+        cpamm_swap_amount_out(&BigUint::from(sell_amount), mint, &pool, current_point)?
+            .to_u64()
+            .ok_or_else(|| "Bags DAMM follow quote overflowed u64.".to_string())?;
     let minimum_amount_out = helper_slippage_minimum_amount(out_amount, slippage_bps);
     let input_token_program = if pool.token_a_mint == *mint {
         token_program_for_flag(pool.token_a_flag)?
@@ -5984,7 +5906,7 @@ async fn native_try_build_local_damm_follow_sell(
     )?);
     instructions.push(build_unwrap_sol_instruction(&owner_pubkey, &owner_pubkey)?);
     Ok(Some(Some(
-        compile_legacy_follow_transaction(
+        compile_shared_alt_follow_transaction(
             "follow-sell",
             rpc_url,
             commitment,
@@ -6165,15 +6087,11 @@ pub async fn lookup_bags_fee_recipient(
         "twitter" => "twitter",
         "kick" => "kick",
         "tiktok" => "tiktok",
-        "" => {
-            return Err(
-                "Unsupported Bags fee-share recipient type: (missing)".to_string()
-            )
-        }
+        "" => return Err("Unsupported Bags fee-share recipient type: (missing)".to_string()),
         other => {
             return Err(format!(
                 "Unsupported Bags fee-share recipient type: {other}"
-            ))
+            ));
         }
     };
     let social_handle = username.trim().trim_start_matches('@').to_string();
@@ -6339,7 +6257,7 @@ pub async fn poll_bags_market_cap_lamports(
 mod tests {
     use super::*;
     use crate::config::{RawConfig, normalize_raw_config};
-    use serde_json::{Value, json};
+    use serde_json::json;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -6418,6 +6336,28 @@ mod tests {
     }
 
     #[test]
+    fn bags_metadata_description_falls_back_when_import_is_blank() {
+        let mut config = sample_bags_config();
+        config.token.description = "   ".to_string();
+        config.token.name = "ELFA".to_string();
+        config.token.symbol = "ELFA".to_string();
+
+        assert_eq!(bags_token_metadata_description(&config), "ELFA");
+    }
+
+    #[test]
+    fn bags_metadata_description_preserves_user_description() {
+        let mut config = sample_bags_config();
+        config.token.description = "  imported description  ".to_string();
+        config.token.name = "ELFA".to_string();
+
+        assert_eq!(
+            bags_token_metadata_description(&config),
+            "imported description"
+        );
+    }
+
+    #[test]
     fn bags_setup_tip_percentile_follows_shared_auto_fee_setting() {
         let _guard = env_lock().lock().expect("lock env");
         unsafe {
@@ -6453,7 +6393,10 @@ mod tests {
     fn slippage_percent_maps_to_expected_bps() {
         assert_eq!(slippage_bps_from_percent("20").expect("20%"), 2_000);
         assert_eq!(slippage_bps_from_percent("0.5").expect("0.5%"), 50);
+        assert_eq!(slippage_bps_from_percent("99.99").expect("99.99%"), 9_999);
         assert_eq!(slippage_bps_from_percent("100").expect("100%"), 10_000);
+        slippage_bps_from_percent("99.999").expect_err("too many decimals");
+        slippage_bps_from_percent("100.01").expect_err("above 100%");
     }
 
     #[test]
@@ -6482,32 +6425,6 @@ mod tests {
     }
 
     #[test]
-    fn prepare_launch_helper_request_preserves_github_user_id_fee_recipients() {
-        let request = build_prepare_launch_helper_request(
-            &sample_bags_config(),
-            &[1_u8, 2_u8, 3_u8],
-            "https://rpc.example",
-            123_456,
-            None,
-        )
-        .expect("helper request");
-        let fee_sharing = request
-            .get("feeSharing")
-            .and_then(Value::as_array)
-            .expect("fee sharing array");
-        assert_eq!(fee_sharing.len(), 1);
-        let first = &fee_sharing[0];
-        assert_eq!(
-            first.get("githubUserId").and_then(Value::as_str),
-            Some("123456")
-        );
-        assert_eq!(
-            first.get("githubUsername").and_then(Value::as_str),
-            Some("")
-        );
-    }
-
-    #[test]
     fn bags_mode_mapping_accepts_known_fee_pairs() {
         assert_eq!(bags_mode_from_fee_values(200, 200), "bags-2-2");
         assert_eq!(bags_mode_from_fee_values(25, 100), "bags-025-1");
@@ -6515,7 +6432,9 @@ mod tests {
         assert_eq!(bags_mode_from_fee_values(7, 9), "");
     }
 
-    fn sample_initial_dbc_follow_state(mode: &str) -> (DecodedDbcVirtualPool, DecodedDbcPoolConfig) {
+    fn sample_initial_dbc_follow_state(
+        mode: &str,
+    ) -> (DecodedDbcVirtualPool, DecodedDbcPoolConfig) {
         let initial_sqrt = bags_initial_sqrt_price()
             .to_u128()
             .expect("initial sqrt price should fit in u128");
@@ -6576,7 +6495,8 @@ mod tests {
         .to_u64()
         .expect("expected output");
         let (actual, minimum) =
-            bags_dbc_swap_quote_exact_in(&pool, &config, false, amount_in, 0, 0).expect("follow quote");
+            bags_dbc_swap_quote_exact_in(&pool, &config, false, amount_in, 0, 0)
+                .expect("follow quote");
         assert_eq!(actual, expected);
         assert_eq!(minimum, expected);
     }
@@ -6591,14 +6511,12 @@ mod tests {
             &BigUint::from(amount_in),
         )
         .expect("raw output");
-        let expected = bags_get_fee_amount_excluded(
-            &raw_out,
-            bags_cliff_fee_numerator_for_mode("bags-2-2"),
-        )
-        .to_u64()
-        .expect("expected output");
-        let (actual, minimum) =
-            bags_dbc_swap_quote_exact_in(&pool, &config, true, amount_in, 0, 0).expect("follow quote");
+        let expected =
+            bags_get_fee_amount_excluded(&raw_out, bags_cliff_fee_numerator_for_mode("bags-2-2"))
+                .to_u64()
+                .expect("expected output");
+        let (actual, minimum) = bags_dbc_swap_quote_exact_in(&pool, &config, true, amount_in, 0, 0)
+            .expect("follow quote");
         assert_eq!(actual, expected);
         assert_eq!(minimum, expected);
     }
@@ -6642,7 +6560,10 @@ mod tests {
         unsafe {
             std::env::remove_var("LAUNCHDECK_BAGSAPP_QUOTE_BACKEND");
         }
-        assert_eq!(native.as_ref().map(|quote| &quote.mode), helper.as_ref().map(|quote| &quote.mode));
+        assert_eq!(
+            native.as_ref().map(|quote| &quote.mode),
+            helper.as_ref().map(|quote| &quote.mode)
+        );
         assert_eq!(
             native.as_ref().map(|quote| &quote.estimatedTokens),
             helper.as_ref().map(|quote| &quote.estimatedTokens)
@@ -6675,7 +6596,10 @@ mod tests {
         unsafe {
             std::env::remove_var("LAUNCHDECK_BAGSAPP_QUOTE_BACKEND");
         }
-        assert_eq!(native.as_ref().map(|quote| &quote.mode), helper.as_ref().map(|quote| &quote.mode));
+        assert_eq!(
+            native.as_ref().map(|quote| &quote.mode),
+            helper.as_ref().map(|quote| &quote.mode)
+        );
         assert_eq!(
             native.as_ref().map(|quote| &quote.estimatedTokens),
             helper.as_ref().map(|quote| &quote.estimatedTokens)
@@ -6692,8 +6616,8 @@ mod tests {
 
     #[test]
     fn cached_customizable_damm_resolution_uses_customizable_pool() {
-        let mint = Pubkey::from_str("So11111111111111111111111111111111111111111")
-            .expect("test mint");
+        let mint =
+            Pubkey::from_str("So11111111111111111111111111111111111111111").expect("test mint");
         let hints = CachedBagsLaunchHints {
             migration_fee_option: Some(6),
             expected_migration_family: "customizable".to_string(),
@@ -6705,8 +6629,33 @@ mod tests {
         assert_eq!(config, None);
         assert_eq!(
             pool,
-            derive_damm_customizable_pool_address(&mint, &bags_native_mint_pubkey().expect("native mint"))
-                .expect("derive customizable"),
+            derive_damm_customizable_pool_address(
+                &mint,
+                &bags_native_mint_pubkey().expect("native mint")
+            )
+            .expect("derive customizable"),
+        );
+    }
+
+    #[test]
+    fn cached_customizable_damm_resolution_prefers_expected_config_key() {
+        let mint =
+            Pubkey::from_str("So11111111111111111111111111111111111111111").expect("test mint");
+        let config_key = Pubkey::new_unique();
+        let hints = CachedBagsLaunchHints {
+            migration_fee_option: Some(6),
+            expected_migration_family: "customizable".to_string(),
+            expected_damm_config_key: Some(config_key),
+            ..Default::default()
+        };
+        let (pool, config) = resolve_cached_damm_pool_address(&mint, &hints)
+            .expect("resolve cached damm")
+            .expect("config-derived customizable pool");
+        assert_eq!(config, Some(config_key));
+        assert_eq!(
+            pool,
+            derive_damm_pool_address(&config_key, &mint, &bags_native_mint_pubkey().unwrap())
+                .expect("derive config pool"),
         );
     }
 
@@ -6728,5 +6677,61 @@ mod tests {
         assert!(payload.get("slippageBps").is_none());
         assert_eq!(payload["initialBuyLamports"], json!(500_000_000u64));
         assert_eq!(payload["configKey"], json!(config_key.to_string()));
+    }
+
+    #[test]
+    fn bags_shared_lookup_table_usage_requires_actual_shared_alt() {
+        let error = validate_bags_shared_lookup_table_usage("follow-buy", &[])
+            .expect_err("missing shared alt usage should fail");
+        assert!(error.contains("must actually use the shared Bags lookup table"));
+        assert!(
+            validate_bags_shared_lookup_table_usage(
+                "follow-buy",
+                &[SHARED_SUPER_LOOKUP_TABLE.to_string()],
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn bags_api_preserved_transactions_keep_provider_message() {
+        let owner = Keypair::new();
+        let provider_signer = Keypair::new();
+        let instruction = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new_readonly(provider_signer.pubkey(), true),
+            ],
+            data: vec![],
+        };
+        let message =
+            v0::Message::try_compile(&owner.pubkey(), &[instruction], &[], Hash::new_unique())
+                .expect("compile provider message");
+        let transaction = VersionedTransaction::try_new(
+            VersionedMessage::V0(message.clone()),
+            &[&owner, &provider_signer],
+        )
+        .expect("sign provider transaction");
+        let config = NativeBagsVersionedTxConfig {
+            compute_unit_limit: 340_000,
+            compute_unit_price_micro_lamports: 1,
+            tip_lamports: 0,
+            tip_account: String::new(),
+            jitodontfront: false,
+        };
+
+        let ensured = ensure_tx_config_on_bags_versioned_transaction(
+            "",
+            &owner,
+            transaction,
+            &config,
+            "confirmed",
+            None,
+        )
+        .await
+        .expect("preserve multi-signer transaction");
+
+        assert_eq!(ensured.message, VersionedMessage::V0(message));
     }
 }

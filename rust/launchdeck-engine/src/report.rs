@@ -13,10 +13,8 @@ use crate::{
     wallet::list_solana_env_wallets,
 };
 
-const DEFAULT_LOOKUP_TABLES: [&str; 2] = [
-    "AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ",
-    "BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj",
-];
+const SHARED_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc";
+const DEFAULT_LOOKUP_TABLES: [&str; 1] = [SHARED_SUPER_LOOKUP_TABLE];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstructionSummary {
@@ -1884,7 +1882,10 @@ pub fn render_report(report: &LaunchReport) -> String {
         "Skip preflight: {} | max retries: {}",
         report.execution.skipPreflight, report.execution.maxRetries
     ));
-    lines.push(format!("Track send slot: {}", report.execution.trackSendBlockHeight));
+    lines.push(format!(
+        "Track send slot: {}",
+        report.execution.trackSendBlockHeight
+    ));
     if let Some(endpoint) = &report.execution.heliusSenderEndpoint {
         lines.push(format!("Helius Sender responder: {}", endpoint));
     }
@@ -2107,10 +2108,9 @@ pub fn render_report(report: &LaunchReport) -> String {
             if let Some(slot) = sent.confirmedObservedSlot {
                 summary.push_str(&format!(" | observed confirm slot={slot}"));
             }
-            if let (Some(send_slot), Some(confirmed_slot)) = (
-                sent.sendObservedSlot,
-                sent.confirmedObservedSlot,
-            ) {
+            if let (Some(send_slot), Some(confirmed_slot)) =
+                (sent.sendObservedSlot, sent.confirmedObservedSlot)
+            {
                 summary.push_str(&format!(
                     " | observed slots to confirm={}",
                     confirmed_slot.saturating_sub(send_slot)
@@ -2247,8 +2247,7 @@ mod tests {
         assert_eq!(
             report.requestedLookupTables,
             vec![
-                "AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ".to_string(),
-                "BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj".to_string(),
+                "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc".to_string(),
                 "CustomLookup1111111111111111111111111111111".to_string()
             ]
         );
@@ -2352,9 +2351,6 @@ mod tests {
             format_market_cap_threshold_for_display("100000000000"),
             "100k"
         );
-        assert_eq!(
-            format_market_cap_threshold_for_display("250000000"),
-            "250"
-        );
+        assert_eq!(format_market_cap_threshold_for_display("250000000"), "250");
     }
 }

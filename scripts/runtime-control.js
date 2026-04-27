@@ -1,8 +1,10 @@
 const { spawn } = require("child_process");
+const fs = require("fs");
 const path = require("path");
 
 const action = process.argv[2];
 const validActions = new Set(["start", "stop", "restart"]);
+const defaultMode = "both";
 
 if (!validActions.has(action)) {
   console.error(`Usage: node scripts/runtime-control.js <${Array.from(validActions).join("|")}>`);
@@ -12,32 +14,91 @@ if (!validActions.has(action)) {
 const projectRoot = path.resolve(__dirname, "..");
 const isWindows = process.platform === "win32";
 
-const scriptPath = (() => {
-  if (isWindows) {
-    return path.join(projectRoot, action === "stop" ? "stop.ps1" : "start.ps1");
+function resolvePosixShell() {
+  const candidates = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+    }
   }
-  return path.join(projectRoot, `${action}.sh`);
-})();
+  return "bash";
+}
 
-const command = isWindows ? "powershell" : "bash";
-const args = isWindows
-  ? ["-ExecutionPolicy", "Bypass", "-File", scriptPath]
-  : [scriptPath];
+const command = isWindows ? "powershell" : resolvePosixShell();
 
-const child = spawn(command, args, {
-  cwd: projectRoot,
-  stdio: "inherit",
-});
+function scriptPathFor(kind) {
+  if (isWindows) {
+    return path.join(projectRoot, kind === "stop" ? "trench-tools-stop.ps1" : "trench-tools-start.ps1");
+  }
+  return path.join(projectRoot, kind === "stop" ? "trench-tools-stop.sh" : "trench-tools-start.sh");
+}
 
-child.on("exit", (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal);
+function argsFor(scriptPath) {
+  if (isWindows) {
+    // `-NoProfile` skips user profile scripts, which add noise/latency and
+    // occasionally break on minimal/pristine Windows VPS images.
+    return ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "--mode", defaultMode];
+  }
+  return [scriptPath, "--mode", defaultMode];
+}
+
+function run(kind) {
+  const scriptPath = scriptPathFor(kind);
+  const child = spawn(command, argsFor(scriptPath), {
+    cwd: projectRoot,
+    stdio: "inherit",
+  });
+
+  const forwardSignal = (signal) => {
+    try {
+      child.kill(signal);
+    } catch {
+    }
+  };
+  const sigintHandler = () => forwardSignal("SIGINT");
+  const sigtermHandler = () => forwardSignal("SIGTERM");
+  process.on("SIGINT", sigintHandler);
+  process.on("SIGTERM", sigtermHandler);
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      process.off("SIGINT", sigintHandler);
+      process.off("SIGTERM", sigtermHandler);
+    };
+    child.on("exit", (code, signal) => {
+      cleanup();
+      if (signal) {
+        reject(Object.assign(new Error(`${path.basename(scriptPath)} exited with signal ${signal}`), { signal }));
+        return;
+      }
+      if (code && code !== 0) {
+        reject(new Error(`${path.basename(scriptPath)} exited with code ${code}`));
+        return;
+      }
+      resolve();
+    });
+
+    child.on("error", (error) => {
+      cleanup();
+      reject(new Error(`Failed to run ${path.basename(scriptPath)}: ${error.message}`));
+    });
+  });
+}
+
+(async () => {
+  if (action === "restart") {
+    await run("start");
     return;
   }
-  process.exit(code == null ? 1 : code);
-});
-
-child.on("error", (error) => {
-  console.error(`Failed to run ${path.basename(scriptPath)}: ${error.message}`);
+  await run(action);
+})().catch((error) => {
+  if (error && error.signal) {
+    process.kill(process.pid, error.signal);
+    return;
+  }
+  console.error(error.message);
   process.exit(1);
 });

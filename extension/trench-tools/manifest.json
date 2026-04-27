@@ -1,0 +1,155 @@
+{
+  "manifest_version": 3,
+  "name": "Trench Tools",
+  "version": "1.0.0",
+  "description": "Adds Trench.Tools trading buttons to your favorite terminals for the fastest possible execution and deployments.",
+  "icons": {
+    "16": "assets/trench-tools-favicon.png",
+    "32": "assets/trench-tools-favicon.png",
+    "48": "assets/trench-tools-favicon.png",
+    "128": "assets/trench-tools-favicon.png"
+  },
+  "permissions": [
+    "storage",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8788/*",
+    "http://localhost:8788/*",
+    "http://127.0.0.1:8789/*",
+    "http://localhost:8789/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background/index.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://axiom.trade/*"
+      ],
+      "js": [
+        "src/content/platforms/axiom-override.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://axiom.trade/*"
+      ],
+      "js": [
+        "src/content/platforms/axiom-blocker.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://axiom.trade/*"
+      ],
+      "js": [
+        "src/content/loaders/axiom-loader.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://j7tracker.io/*"
+      ],
+      "js": [
+        "src/content/loaders/j7-loader.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Trench Tools",
+    "default_popup": "src/popup/index.html",
+    "default_icon": {
+      "16": "assets/trench-tools-favicon.png",
+      "32": "assets/trench-tools-favicon.png",
+      "48": "assets/trench-tools-favicon.png"
+    }
+  },
+  "options_page": "src/options/index.html",
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "https://axiom.trade/*",
+        "https://j7tracker.io/*"
+      ],
+      "resources": [
+        "assets/trench-tools-favicon.png",
+        "assets/trench-tools-boot-logo.png",
+        "assets/TT-compact.png",
+        "assets/link-icon.png",
+        "assets/confirmed-icon.png",
+        "assets/fail-icon.png",
+        "assets/vamp-icon.png",
+        "assets/Notification-1.mp3",
+        "assets/notification-2.mp3",
+        "assets/notification-3.mp3",
+        "assets/notification-4.mp3",
+        "assets/notification-5.mp3",
+        "assets/notification-6.mp3",
+        "src/content/runtime.js",
+        "src/content/index.js",
+        "src/content/launchdeck-shell.js",
+        "src/content/platforms/axiom.js",
+        "src/content/platforms/j7.js",
+        "src/content/platforms/axiom-override.js",
+        "src/shared/background-rpc.js",
+        "src/shared/storage-migrations.js",
+        "src/panel/index.html",
+        "src/panel/index.js",
+        "src/panel/styles.css",
+        "launchdeck/index.html",
+        "launchdeck/styles.css",
+        "launchdeck/layout.js",
+        "launchdeck/request-utils.js",
+        "launchdeck/render-utils.js",
+        "launchdeck/reports-feature.js",
+        "launchdeck/images-feature.js",
+        "launchdeck/auto-sell-feature.js",
+        "launchdeck/sniper-feature.js",
+        "launchdeck/extension-bootstrap.js",
+        "launchdeck/shared-constants.js",
+        "launchdeck/app.js",
+        "launchdeck/app/form-domain.js",
+        "launchdeck/app/quote-preview-domain.js",
+        "launchdeck/app/runtime-actions.js",
+        "launchdeck/app/fee-routing.js",
+        "launchdeck/app/split-editors-domain.js",
+        "launchdeck/app/settings-domain.js",
+        "launchdeck/app/wallet-runtime-domain.js",
+        "launchdeck/app/live-sync.js",
+        "launchdeck/app/reports-history.js",
+        "launchdeck/app/reports-presenters.js",
+        "launchdeck/app/local-binders.js",
+        "launchdeck/app/image-metadata-domain.js",
+        "images/solana-mark.svg",
+        "images/usd1-mark.svg",
+        "images/modal-close.svg",
+        "images/trench-tools-favicon.png",
+        "images/trench-tools-boot-logo.png",
+        "images/solana-mark.png",
+        "images/usd1-mark.png",
+        "images/modal-close.png",
+        "images/pump-mark.png",
+        "images/bonk-mark.png",
+        "images/bagsapp-mark.png",
+        "images/recipient-github.png",
+        "images/recipient-x.png",
+        "images/recipient-kick.png",
+        "images/recipient-tiktok.png",
+        "images/recipient-wallet.png",
+        "images/recipient-copy.png",
+        "images/recipient-remove.png"
+      ]
+    }
+  ]
+}

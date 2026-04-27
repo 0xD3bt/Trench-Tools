@@ -3,6 +3,7 @@
 use crate::provider_tip::{provider_min_tip_sol_label, provider_required_tip_lamports};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use shared_execution_routing::execution::NormalizedExecution;
 use std::env;
 use thiserror::Error;
 
@@ -13,8 +14,8 @@ const DEFAULT_LAUNCH_COMPUTE_UNIT_LIMIT: u64 = 340_000;
 const DEFAULT_AGENT_SETUP_COMPUTE_UNIT_LIMIT: u64 = 180_000;
 const DEFAULT_FOLLOW_UP_COMPUTE_UNIT_LIMIT: u64 = 175_000;
 const DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT: u64 = 120_000;
-const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 145_000;
-const DEFAULT_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT: u64 = 90_000;
+const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 240_000;
+const DEFAULT_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT: u64 = 175_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchpadActionBackendMode {
@@ -33,6 +34,8 @@ pub enum ConfigError {
 pub struct RawConfig {
     #[serde(default)]
     pub mode: String,
+    #[serde(default)]
+    pub defaults: Value,
     #[serde(default)]
     pub launchpad: String,
     #[serde(default)]
@@ -412,6 +415,7 @@ pub struct NormalizedConfig {
     pub mode: String,
     pub launchpad: String,
     pub quoteAsset: String,
+    pub wrapperDefaultFeeBps: u16,
     pub token: NormalizedToken,
     pub signer: NormalizedSigner,
     pub agent: NormalizedAgent,
@@ -582,60 +586,6 @@ pub struct NormalizedBags {
     pub identityVerifiedWallet: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NormalizedExecution {
-    pub simulate: bool,
-    pub send: bool,
-    pub txFormat: String,
-    pub commitment: String,
-    pub skipPreflight: bool,
-    pub trackSendBlockHeight: bool,
-    pub provider: String,
-    pub endpointProfile: String,
-    #[serde(default)]
-    pub mevProtect: bool,
-    #[serde(default)]
-    pub mevMode: String,
-    #[serde(default)]
-    pub jitodontfront: bool,
-    pub autoGas: bool,
-    pub autoMode: String,
-    pub priorityFeeSol: String,
-    pub tipSol: String,
-    pub maxPriorityFeeSol: String,
-    pub maxTipSol: String,
-    pub buyProvider: String,
-    pub buyEndpointProfile: String,
-    #[serde(default)]
-    pub buyMevProtect: bool,
-    #[serde(default)]
-    pub buyMevMode: String,
-    #[serde(default)]
-    pub buyJitodontfront: bool,
-    pub buyAutoGas: bool,
-    pub buyAutoMode: String,
-    pub buyPriorityFeeSol: String,
-    pub buyTipSol: String,
-    pub buySlippagePercent: String,
-    pub buyMaxPriorityFeeSol: String,
-    pub buyMaxTipSol: String,
-    pub sellAutoGas: bool,
-    pub sellAutoMode: String,
-    pub sellProvider: String,
-    pub sellEndpointProfile: String,
-    #[serde(default)]
-    pub sellMevProtect: bool,
-    #[serde(default)]
-    pub sellMevMode: String,
-    #[serde(default)]
-    pub sellJitodontfront: bool,
-    pub sellPriorityFeeSol: String,
-    pub sellTipSol: String,
-    pub sellSlippagePercent: String,
-    pub sellMaxPriorityFeeSol: String,
-    pub sellMaxTipSol: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct NormalizedDevBuy {
     pub mode: String,
@@ -795,6 +745,7 @@ fn configured_compute_unit_limit_env(name: &str, fallback: u64) -> u64 {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
+        .map(|value| value.max(fallback))
         .unwrap_or(fallback)
 }
 
@@ -1338,6 +1289,29 @@ fn normalize_quote_asset(raw: &RawConfig, launchpad: &str) -> Result<String, Con
     }
 }
 
+fn normalize_wrapper_default_fee_bps(raw: &RawConfig) -> u16 {
+    fn read_u64(value: Option<&Value>) -> Option<u64> {
+        match value? {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            _ => None,
+        }
+    }
+
+    let raw_bps = read_u64(
+        raw.defaults
+            .get("misc")
+            .and_then(|value| value.get("wrapperDefaultFeeBps")),
+    )
+    .unwrap_or(10);
+    match raw_bps {
+        0 => 0,
+        1..=10 => 10,
+        11..=20 => 20,
+        _ => 20,
+    }
+}
+
 fn normalize_dev_buy(raw: &RawConfig) -> Result<Option<NormalizedDevBuy>, ConfigError> {
     let object_mode = raw
         .devBuy
@@ -1629,13 +1603,12 @@ fn normalize_follow_launch(
         }
         let post_buy_sell = match &entry.postBuySell {
             Some(sell) => {
-                let normalized_sell =
-                    normalize_follow_sell(
-                        sell,
-                        &wallet_env_key,
-                        &format!("snipe-{}-sell", index + 1),
-                        SNIPER_AUTO_SELL_MAX_TARGET_BLOCK_OFFSET,
-                    )?;
+                let normalized_sell = normalize_follow_sell(
+                    sell,
+                    &wallet_env_key,
+                    &format!("snipe-{}-sell", index + 1),
+                    SNIPER_AUTO_SELL_MAX_TARGET_BLOCK_OFFSET,
+                )?;
                 if let Some(sell) = &normalized_sell {
                     if sell.delayMs.is_some() {
                         return Err(ConfigError::Message(format!(
@@ -1779,6 +1752,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         mode
     };
     let quote_asset = normalize_quote_asset(&raw, &launchpad)?;
+    let wrapper_default_fee_bps = normalize_wrapper_default_fee_bps(&raw);
     let post_launch_strategy = parse_choice(
         &raw.postLaunch.strategy,
         "postLaunch.strategy",
@@ -1839,6 +1813,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         mode: mode.clone(),
         launchpad,
         quoteAsset: quote_asset,
+        wrapperDefaultFeeBps: wrapper_default_fee_bps,
         token: NormalizedToken {
             name: parse_limited_string(&raw.token.name, "token.name", TOKEN_NAME_MAX_LENGTH, true)?,
             symbol: parse_limited_string(
@@ -1995,6 +1970,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             buySlippagePercent: raw.execution.buySlippagePercent.trim().to_string(),
             buyMaxPriorityFeeSol: raw.execution.buyMaxPriorityFeeSol.trim().to_string(),
             buyMaxTipSol: raw.execution.buyMaxTipSol.trim().to_string(),
+            buyFundingPolicy: "sol_only".to_string(),
             sellAutoGas: parse_bool(&raw.execution.sellAutoGas, false),
             sellAutoMode: if is_blank(&raw.execution.sellAutoMode) {
                 "sellAuto".to_string()
@@ -2025,6 +2001,8 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             sellSlippagePercent: raw.execution.sellSlippagePercent.trim().to_string(),
             sellMaxPriorityFeeSol: raw.execution.sellMaxPriorityFeeSol.trim().to_string(),
             sellMaxTipSol: raw.execution.sellMaxTipSol.trim().to_string(),
+            sellSettlementPolicy: "always_to_sol".to_string(),
+            sellSettlementAsset: "sol".to_string(),
         },
         devBuy: normalize_dev_buy(&raw)?,
         postLaunch: NormalizedPostLaunch {
@@ -2222,8 +2200,8 @@ pub fn launchpad_warm_max_parallel_fetches() -> usize {
         .unwrap_or(8)
 }
 
-/// When unset or non-false: pass Rust-cached blockhash into the Bags helper for prepare/build-launch.
-pub fn configured_bags_rust_blockhash_for_helper() -> bool {
+/// When unset or non-false: pass the Rust-cached blockhash into Bags prepare/build-launch requests.
+pub fn configured_bags_rust_blockhash_override() -> bool {
     match env::var("LAUNCHDECK_BAGS_HELPER_BLOCKHASH_FROM_RUST") {
         Ok(value) => {
             let trimmed = value.trim();
@@ -2256,6 +2234,7 @@ pub fn configured_bags_setup_gate_commitment() -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn configured_launchpad_action_backend_mode(
     launchpad: &str,
     action: &str,
@@ -2422,8 +2401,40 @@ mod tests {
         assert_eq!(normalized.execution.endpointProfile, "global");
         assert_eq!(normalized.execution.buyProvider, "helius-sender");
         assert_eq!(normalized.execution.buyEndpointProfile, "global");
+        assert_eq!(normalized.wrapperDefaultFeeBps, 10);
         assert!(normalized.devBuy.is_none());
         assert!(!normalized.followLaunch.enabled);
+    }
+
+    #[test]
+    fn normalizes_wrapper_default_fee_bps_from_defaults_misc() {
+        let mut raw = sample_raw_config();
+        raw.defaults = json!({
+            "misc": {
+                "wrapperDefaultFeeBps": 20
+            }
+        });
+        let normalized =
+            normalize_raw_config(raw).expect("config with wrapper fee should normalize");
+        assert_eq!(normalized.wrapperDefaultFeeBps, 20);
+
+        let mut raw = sample_raw_config();
+        raw.defaults = json!({
+            "misc": {
+                "wrapperDefaultFeeBps": 7
+            }
+        });
+        let normalized = normalize_raw_config(raw).expect("config should clamp wrapper fee");
+        assert_eq!(normalized.wrapperDefaultFeeBps, 10);
+
+        let mut raw = sample_raw_config();
+        raw.defaults = json!({
+            "misc": {
+                "wrapperDefaultFeeBps": 999
+            }
+        });
+        let normalized = normalize_raw_config(raw).expect("config should cap wrapper fee");
+        assert_eq!(normalized.wrapperDefaultFeeBps, 20);
     }
 
     #[test]
@@ -2491,7 +2502,7 @@ mod tests {
                     raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
                 }
                 "jito-bundle" => {
-                    raw.tx.jitoTipLamports = Some(json!(200_000));
+                    raw.tx.jitoTipLamports = Some(json!(1_000));
                     raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
                 }
                 _ => {}
@@ -2557,7 +2568,7 @@ mod tests {
     fn jito_bundle_requires_priority_and_minimum_tip() {
         let mut raw = sample_raw_config();
         raw.execution.provider = "jito-bundle".to_string();
-        raw.tx.jitoTipLamports = Some(json!(100_000));
+        raw.tx.jitoTipLamports = Some(json!(1_000));
         raw.tx.computeUnitPriceMicroLamports = Some(json!(0));
         let error = normalize_raw_config(raw).expect_err("jito bundle should require priority");
         assert_eq!(
@@ -2567,12 +2578,12 @@ mod tests {
 
         let mut raw = sample_raw_config();
         raw.execution.provider = "jito-bundle".to_string();
-        raw.tx.jitoTipLamports = Some(json!(100_000));
+        raw.tx.jitoTipLamports = Some(json!(999));
         raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
         let error = normalize_raw_config(raw).expect_err("jito bundle should require minimum tip");
         assert_eq!(
             error.to_string(),
-            "tx.jitoTipLamports must be at least 200000 when execution.provider is jito-bundle."
+            "tx.jitoTipLamports must be at least 1000 when execution.provider is jito-bundle."
         );
     }
 
@@ -2607,12 +2618,12 @@ mod tests {
         raw.execution.buyProvider = "jito-bundle".to_string();
         raw.execution.buyAutoGas = Some(json!(false));
         raw.execution.buyPriorityFeeSol = "0.001".to_string();
-        raw.execution.buyTipSol = "0.0001".to_string();
+        raw.execution.buyTipSol = "0.0000005".to_string();
         let error =
             normalize_raw_config(raw).expect_err("manual buy tip floor should be validated");
         assert_eq!(
             error.to_string(),
-            "execution.buyTipSol must be at least 0.0002 SOL when execution.buyProvider is jito-bundle."
+            "execution.buyTipSol must be at least 0.000001 SOL when execution.buyProvider is jito-bundle."
         );
     }
 
@@ -3111,7 +3122,11 @@ mod tests {
         .expect("follow launch raw");
 
         let error = normalize_raw_config(raw).expect_err("legacy lte should be rejected");
-        assert!(error.to_string().contains("marketCap.direction must be gte"));
+        assert!(
+            error
+                .to_string()
+                .contains("marketCap.direction must be gte")
+        );
     }
 
     #[test]
@@ -3134,7 +3149,11 @@ mod tests {
 
         let error =
             normalize_raw_config(raw).expect_err("blank threshold should be rejected when enabled");
-        assert!(error.to_string().contains("marketCap.threshold is required"));
+        assert!(
+            error
+                .to_string()
+                .contains("marketCap.threshold is required")
+        );
     }
 
     #[test]

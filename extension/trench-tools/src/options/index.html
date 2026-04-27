@@ -1,0 +1,1208 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trench Tools Settings</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="settings-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <img class="brand-mark" src="../../images/trench-tools-boot-logo.png" alt="Trench Tools" />
+          <div>
+            <h1>Trench Tools</h1>
+            <p class="muted">Execution engine settings</p>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-button" data-section-target="sites" type="button">Sites</button>
+          <button class="nav-button active" data-section-target="presets" type="button">Presets</button>
+          <button class="nav-button" data-section-target="wallets" type="button">Wallets</button>
+          <button class="nav-button" data-section-target="rewards" type="button">Rewards</button>
+          <button class="nav-button" data-section-target="appearance" type="button">Appearance</button>
+          <button class="nav-button" data-section-target="global" type="button">Global settings</button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div id="host-status-badge" class="status-badge">Checking host...</div>
+          <button id="reload-host-button" class="secondary-button block-button" type="button">Reload from host</button>
+        </div>
+      </aside>
+
+      <main class="content">
+        <section id="section-sites" class="section">
+          <header class="section-header">
+            <div>
+              <h2>Sites</h2>
+              <p class="muted">Choose exactly where Trench Tools is active on each supported website.</p>
+            </div>
+          </header>
+          <div class="site-settings-stack">
+            <section class="card site-platform-card site-platform-card-wide">
+              <div class="site-platform-row">
+                <div class="site-platform-brand">
+                  <img class="site-platform-icon" src="../../assets/Axiom-logo.jpg" alt="Axiom" />
+                  <div class="site-platform-meta">
+                    <h3>Axiom</h3>
+                    <p class="muted">axiom.trade</p>
+                  </div>
+                </div>
+                <label class="site-switch-row" for="site-axiom-enabled">
+                  <span>Enabled</span>
+                  <input id="site-axiom-enabled" class="site-toggle" type="checkbox" />
+                </label>
+              </div>
+              <div class="site-feature-groups">
+                <section class="site-feature-group">
+                  <h4>Trading buttons</h4>
+                  <div class="site-feature-grid">
+                    <label class="site-feature-chip" for="site-axiom-instant-trade">
+                      <span>Token page instant trade</span>
+                      <input id="site-axiom-instant-trade" class="site-toggle" type="checkbox" />
+                    </label>
+                    <label class="site-feature-chip" for="site-axiom-pulse-qb">
+                      <span>Pulse quick buy</span>
+                      <input id="site-axiom-pulse-qb" class="site-toggle" type="checkbox" />
+                    </label>
+                    <label class="site-feature-chip" for="site-axiom-watchlist">
+                      <span>Watchlist quick buy</span>
+                      <input id="site-axiom-watchlist" class="site-toggle" type="checkbox" />
+                    </label>
+                    <label class="site-feature-chip" for="site-axiom-wallet-tracker">
+                      <span>Portfolio / wallet tracker quick buy</span>
+                      <input id="site-axiom-wallet-tracker" class="site-toggle" type="checkbox" />
+                    </label>
+                  </div>
+                </section>
+                <section class="site-feature-group">
+                  <h4>Panels</h4>
+                  <div class="site-feature-grid">
+                    <label class="site-feature-chip" for="site-axiom-launcher">
+                      <span>Floating launcher</span>
+                      <input id="site-axiom-launcher" class="site-toggle" type="checkbox" />
+                    </label>
+                    <label class="site-feature-chip" for="site-axiom-pulse-panel">
+                      <span>Pulse panel</span>
+                      <input id="site-axiom-pulse-panel" class="site-toggle" type="checkbox" />
+                    </label>
+                  </div>
+                </section>
+                <section class="site-feature-group">
+                  <h4>LaunchDeck</h4>
+                  <div class="site-feature-grid">
+                    <label class="site-feature-chip" for="site-axiom-launchdeck">
+                      <span>LaunchDeck injection enabled</span>
+                      <input id="site-axiom-launchdeck" class="site-toggle" type="checkbox" />
+                    </label>
+                    <label class="site-feature-chip site-feature-chip-compound" for="site-axiom-pulse-vamp">
+                      <span class="site-feature-chip-main">
+                        <span>Pulse Vamp</span>
+                        <input id="site-axiom-pulse-vamp" class="site-toggle" type="checkbox" />
+                      </span>
+                      <select
+                        id="site-axiom-pulse-vamp-mode"
+                        class="site-feature-chip-select"
+                        aria-label="Pulse Vamp click behavior"
+                        title="What happens when the vamp icon on a Pulse card is clicked."
+                      >
+                        <option value="prefill">Open deploy w/ prefill</option>
+                        <option value="insta">Insta-launch</option>
+                      </select>
+                    </label>
+                  </div>
+                </section>
+              </div>
+            </section>
+
+            <div class="site-settings-grid hidden" aria-hidden="true">
+              <section class="card site-platform-card">
+                <div class="site-platform-row">
+                  <div class="site-platform-brand">
+                    <img class="site-platform-icon" src="../../assets/j7tracker-logo.png" alt="J7 Tracker" />
+                    <div class="site-platform-meta">
+                      <h3>J7 Tracker</h3>
+                      <p class="muted">j7tracker.io</p>
+                    </div>
+                  </div>
+                  <label class="site-switch-row" for="site-j7-enabled">
+                    <span>Enabled</span>
+                    <input id="site-j7-enabled" class="site-toggle" type="checkbox" />
+                  </label>
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section id="section-presets" class="section active">
+          <header class="section-header">
+            <div>
+              <h2>Presets</h2>
+              <p class="muted">Edit execution-engine presets and LaunchDeck presets from one compact settings surface.</p>
+            </div>
+          </header>
+          <section class="settings-panel">
+            <div class="panel-heading">
+              <div>
+                <h3>Execution Engine Presets</h3>
+                <p class="muted">These drive the extension quick-trade panel and multi-wallet execution flow.</p>
+              </div>
+              <div class="action-row">
+                <button id="add-execution-preset-button" class="secondary-button" type="button">Add engine preset</button>
+              </div>
+            </div>
+            <div id="execution-preset-list" class="preset-preview-grid"></div>
+          </section>
+          <section class="settings-panel">
+            <div class="panel-heading">
+              <div>
+                <h3>LaunchDeck Presets</h3>
+                <p class="muted">These stay on the LaunchDeck config path and remain editable here and inside the LaunchDeck settings modal.</p>
+              </div>
+              <div class="action-row">
+                <button id="add-launchdeck-preset-button" class="secondary-button" type="button">Add LaunchDeck preset</button>
+              </div>
+            </div>
+            <div id="launchdeck-preset-list" class="preset-preview-grid"></div>
+          </section>
+        </section>
+
+        <section id="section-wallets" class="section">
+          <header class="section-header wallets-header">
+            <div class="wallets-header-copy">
+              <h2><span class="wallets-header-gear" aria-hidden="true">⚙</span> Wallets</h2>
+              <p class="muted">Manage active wallets and chose how buy amounts are distributed across your wallets.</p>
+            </div>
+            <div class="action-row">
+              <button id="add-wallet-button" class="secondary-button compact-button" type="button">+ Add wallet</button>
+            </div>
+          </header>
+
+          <section class="wallets-block">
+            <div class="wallets-block-label">ACTIVE WALLETS</div>
+            <div id="active-wallets-card" class="wallets-block-card">
+              <div id="active-wallets-grid" class="active-wallets-grid"></div>
+            </div>
+          </section>
+
+          <section class="wallets-block">
+            <div class="wallets-block-label">WALLET GROUPS</div>
+            <div id="wallet-groups-card" class="wallets-block-card wallet-groups-card">
+              <div id="wallet-groups-list" class="wallet-groups-list"></div>
+              <button id="open-create-group-modal" class="create-group-button" type="button">
+                <span class="create-group-icon" aria-hidden="true">+</span>
+                <span>New Group</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="wallets-block">
+            <div class="wallets-block-label">BUY DISTRIBUTION</div>
+            <div class="wallets-block-card buy-distribution-card">
+              <button
+                id="buy-distribution-split"
+                class="distribution-option"
+                type="button"
+                data-distribution-mode="split"
+                data-tooltip="The buy amount is divided equally across all active wallets. Example: 1 SOL with 5 wallets = 0.2 SOL per wallet."
+                data-tooltip-position="top"
+              >
+                <span class="distribution-radio" aria-hidden="true"></span>
+                <span class="distribution-label">Split Amount</span>
+                <span class="distribution-info" aria-hidden="true">i</span>
+              </button>
+              <button
+                id="buy-distribution-each"
+                class="distribution-option"
+                type="button"
+                data-distribution-mode="each"
+                data-tooltip="Each active wallet buys the full specified amount. Example: 1 SOL with 5 wallets = 1 SOL per wallet (5 SOL total)."
+                data-tooltip-position="top"
+              >
+                <span class="distribution-radio" aria-hidden="true"></span>
+                <span class="distribution-label">Full Amount Each</span>
+                <span class="distribution-info" aria-hidden="true">i</span>
+              </button>
+            </div>
+          </section>
+        </section>
+
+        <div id="wallet-edit-modal" class="modal-overlay hidden">
+          <div class="modal-card wallet-edit-modal-card">
+            <div class="modal-header">
+              <div class="modal-brand-row">
+                <div>
+                  <h2 id="wallet-edit-modal-title">Add wallet</h2>
+                  <p class="muted">Wallets created here are stored by the execution engine on this machine.</p>
+                </div>
+              </div>
+              <button id="wallet-edit-modal-close" class="modal-close-button" type="button" aria-label="Close">×</button>
+            </div>
+
+            <div class="modal-body">
+              <div class="wallet-edit-identity-row">
+                <div class="wallet-edit-emoji-field">
+                  <span class="field-label">Icon</span>
+                  <button id="wallet-edit-emoji-button" class="wallet-edit-emoji-button" type="button" aria-haspopup="true" aria-expanded="false">
+                    <span id="wallet-edit-emoji-glyph" class="wallet-edit-emoji-glyph">😀</span>
+                  </button>
+                  <div id="wallet-edit-emoji-popover" class="wallet-edit-emoji-popover hidden" role="menu" aria-label="Choose an emoji"></div>
+                </div>
+                <label class="field wallet-edit-label-field">
+                  <span>Wallet label</span>
+                  <input id="wallet-edit-label" type="text" placeholder="Primary wallet" autocomplete="off" />
+                </label>
+              </div>
+              <label class="field" id="wallet-edit-public-key-row">
+                <span>Public address</span>
+                <input id="wallet-edit-public-key" type="text" readonly />
+              </label>
+              <details class="wallet-edit-private-key-details" id="wallet-edit-private-key-row">
+                <summary class="wallet-edit-private-key-summary">
+                  <span id="wallet-edit-private-key-summary-label">Rotate private key (optional)</span>
+                  <span class="wallet-edit-private-key-chevron" aria-hidden="true">›</span>
+                </summary>
+                <div class="wallet-edit-private-key-body">
+                  <label class="field">
+                    <span id="wallet-edit-private-key-label">Private key</span>
+                    <textarea id="wallet-edit-private-key" placeholder="Paste wallet private key (base58)" autocomplete="off" spellcheck="false"></textarea>
+                  </label>
+                  <p class="muted wallet-edit-private-key-hint">The secret stays on this machine and overwrites the value in your <code>.env</code> slot.</p>
+                </div>
+              </details>
+              <label class="wallet-edit-toggle">
+                <input id="wallet-edit-enabled" type="checkbox" checked />
+                <span>Enabled for trading</span>
+              </label>
+            </div>
+
+            <div class="modal-footer wallet-edit-modal-footer">
+              <button id="wallet-edit-modal-delete" class="danger-button wallet-edit-modal-delete hidden" type="button">Delete wallet</button>
+              <div class="wallet-edit-modal-primary-actions">
+                <button id="wallet-edit-modal-cancel" class="secondary-button" type="button">Cancel</button>
+                <button id="wallet-edit-modal-save" class="primary-button" type="button">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="create-group-modal" class="modal-overlay hidden">
+          <div class="modal-card create-group-modal-card">
+            <div class="modal-header">
+              <div class="modal-brand-row">
+                <div>
+                  <h2 id="create-group-modal-title">Create wallet group</h2>
+                  <p class="muted">Group wallets together for quick switching in the trading panel.</p>
+                </div>
+              </div>
+              <button id="create-group-modal-close" class="modal-close-button" type="button" aria-label="Close">×</button>
+            </div>
+
+            <div class="modal-body create-group-modal-body">
+              <div class="create-group-identity-row">
+                <div class="create-group-emoji-wrapper">
+                  <button id="create-group-emoji-button" class="wallet-edit-emoji-button" type="button" aria-haspopup="true" aria-expanded="false">
+                    <span id="create-group-emoji-glyph" class="wallet-edit-emoji-glyph">🎯</span>
+                  </button>
+                  <div id="create-group-emoji-popover" class="wallet-edit-emoji-popover hidden" role="menu" aria-label="Choose a group emoji"></div>
+                </div>
+                <label class="create-group-name-field">
+                  <input
+                    id="create-group-name-input"
+                    type="text"
+                    placeholder="Group name (e.g. Sniping, Copy, Farm)"
+                    autocomplete="off"
+                  />
+                </label>
+              </div>
+
+              <div class="create-group-section">
+                <div class="create-group-section-label">Select wallets</div>
+                <div id="create-group-wallet-list" class="create-group-wallet-list"></div>
+              </div>
+
+              <div class="create-group-toggle-row">
+                <label class="create-group-toggle">
+                  <input id="create-group-variance-toggle" type="checkbox" />
+                  <span class="create-group-toggle-copy">
+                    <strong>Buy Amount Variance</strong>
+                    <span class="muted">Randomize each wallet's buy by up to this %, so the amounts aren't identical. Works with both Split and Full Amount.</span>
+                  </span>
+                </label>
+                <div id="create-group-variance-slider-row" class="slider-row create-group-variance-slider-row hidden">
+                  <input id="create-group-variance-slider" type="range" min="0" max="100" step="1" value="10" />
+                  <label class="inline-number-field">
+                    <input id="create-group-variance-input" type="number" min="0" max="100" step="1" value="10" />
+                    <span>%</span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="create-group-toggle-row">
+                <label class="create-group-toggle">
+                  <input id="create-group-stagger-toggle" type="checkbox" />
+                  <span class="create-group-toggle-copy">
+                    <strong>Staggered Buys</strong>
+                    <span class="muted">Add a delay between wallet buys during the batch.</span>
+                  </span>
+                </label>
+                <div id="create-group-stagger-fields" class="create-group-stagger-fields hidden">
+                  <div class="segmented-control create-group-stagger-strategy">
+                    <button class="segmented-button" type="button" data-stagger-strategy="fixed">Fixed</button>
+                    <button class="segmented-button" type="button" data-stagger-strategy="random">Random</button>
+                  </div>
+                  <div id="create-group-stagger-fixed" class="create-group-stagger-input">
+                    <label class="stagger-field">
+                      <span class="stagger-field-prefix">Delay</span>
+                      <span class="input-with-suffix">
+                        <input id="create-group-stagger-ms" type="number" min="0" max="2000" step="25" value="150" />
+                        <span class="input-suffix">ms</span>
+                      </span>
+                    </label>
+                  </div>
+                  <div id="create-group-stagger-random" class="create-group-stagger-input hidden">
+                    <label class="stagger-field">
+                      <span class="stagger-field-prefix">Min</span>
+                      <span class="input-with-suffix">
+                        <input id="create-group-stagger-min-ms" type="number" min="0" max="2000" step="25" value="50" />
+                        <span class="input-suffix">ms</span>
+                      </span>
+                    </label>
+                    <label class="stagger-field">
+                      <span class="stagger-field-prefix">Max</span>
+                      <span class="input-with-suffix">
+                        <input id="create-group-stagger-max-ms" type="number" min="0" max="2000" step="25" value="250" />
+                        <span class="input-suffix">ms</span>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="modal-footer create-group-modal-footer">
+              <button id="create-group-modal-delete" class="danger-button create-group-modal-delete hidden" type="button">Delete group</button>
+              <div class="create-group-modal-primary-actions">
+                <button id="create-group-modal-cancel" class="secondary-button" type="button">Cancel</button>
+                <button id="create-group-modal-save" class="primary-button create-group-save-button" type="button">Create</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <section id="section-rewards" class="section">
+          <header class="section-header">
+            <div>
+              <h2>Rewards</h2>
+              <p class="muted">Claim Pump creator fees, Pump cashback, and Bags creator fees for enabled wallets.</p>
+            </div>
+            <div class="action-row">
+              <button id="rewards-refresh-button" class="secondary-button" type="button">Refresh</button>
+            </div>
+          </header>
+
+          <section class="rewards-total-card">
+            <div>
+              <p class="rewards-total-label">Total claimable across supported platforms</p>
+              <div id="rewards-total-claimable" class="rewards-total-value">0 SOL</div>
+              <p id="rewards-last-refreshed" class="muted rewards-last-refreshed">Not refreshed yet.</p>
+            </div>
+            <div id="rewards-total-legend" class="rewards-total-legend"></div>
+          </section>
+
+          <div id="rewards-status" class="muted rewards-status"></div>
+          <div id="rewards-provider-grid" class="rewards-provider-grid"></div>
+        </section>
+
+        <section id="section-appearance" class="section">
+          <header class="section-header">
+            <div>
+              <h2>Appearance</h2>
+              <p class="muted">Tweak how Trench Tools looks and sounds across every surface.</p>
+            </div>
+          </header>
+
+          <div class="appearance-stack">
+            <section class="settings-panel appearance-panel appearance-sounds-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>Confirmation sounds</h3>
+                  <p class="muted">Plays the moment a buy or sell transaction lands, at the same time as the confirmed toast.</p>
+                </div>
+              </div>
+
+              <div class="appearance-sound-pair">
+                <div class="appearance-sound-side" data-sound-side="buy">
+                  <div class="appearance-sound-side-head">
+                    <span class="appearance-sound-side-title">Buy</span>
+                    <label class="appearance-toggle" for="appearance-buy-sound-enabled">
+                      <input id="appearance-buy-sound-enabled" type="checkbox" data-sound-enabled="buy" />
+                      <span>Enabled</span>
+                    </label>
+                  </div>
+
+                  <div class="appearance-sound-row">
+                    <select id="appearance-buy-sound-template" class="appearance-sound-select" data-sound-template="buy">
+                      <option value="notification-1">Notification 1</option>
+                      <option value="notification-2">Notification 2</option>
+                      <option value="notification-3">Notification 3</option>
+                      <option value="notification-4">Notification 4</option>
+                      <option value="notification-5">Notification 5</option>
+                      <option value="notification-6">Notification 6</option>
+                      <option value="custom">Custom upload</option>
+                    </select>
+                    <button
+                      id="appearance-buy-sound-preview"
+                      class="secondary-button appearance-sound-preview"
+                      type="button"
+                      data-sound-preview="buy"
+                      aria-label="Preview buy sound"
+                      title="Preview buy sound"
+                    >Preview</button>
+                  </div>
+
+                  <div id="appearance-buy-sound-custom-row" class="appearance-custom-row" data-sound-custom-row="buy">
+                    <div class="appearance-custom-info">
+                      <span id="appearance-buy-sound-custom-name" class="appearance-custom-name muted" data-sound-custom-name="buy">No custom sound uploaded yet.</span>
+                      <button
+                        id="appearance-buy-sound-custom-clear"
+                        class="link-button appearance-custom-clear hidden"
+                        type="button"
+                        data-sound-custom-clear="buy"
+                      >Remove</button>
+                    </div>
+                    <label class="appearance-custom-upload">
+                      <input
+                        id="appearance-buy-sound-custom-input"
+                        type="file"
+                        accept="audio/*"
+                        hidden
+                        data-sound-custom-input="buy"
+                      />
+                      <span class="secondary-button appearance-custom-upload-button">Upload audio</span>
+                    </label>
+                    <p class="muted appearance-custom-hint">MP3 / WAV / OGG up to 3 MB. Stored locally.</p>
+                  </div>
+
+                  <p id="appearance-buy-sound-status" class="muted appearance-status" data-sound-status="buy" aria-live="polite"></p>
+                </div>
+
+                <div class="appearance-sound-side" data-sound-side="sell">
+                  <div class="appearance-sound-side-head">
+                    <span class="appearance-sound-side-title">Sell</span>
+                    <label class="appearance-toggle" for="appearance-sell-sound-enabled">
+                      <input id="appearance-sell-sound-enabled" type="checkbox" data-sound-enabled="sell" />
+                      <span>Enabled</span>
+                    </label>
+                  </div>
+
+                  <div class="appearance-sound-row">
+                    <select id="appearance-sell-sound-template" class="appearance-sound-select" data-sound-template="sell">
+                      <option value="notification-1">Notification 1</option>
+                      <option value="notification-2">Notification 2</option>
+                      <option value="notification-3">Notification 3</option>
+                      <option value="notification-4">Notification 4</option>
+                      <option value="notification-5">Notification 5</option>
+                      <option value="notification-6">Notification 6</option>
+                      <option value="custom">Custom upload</option>
+                    </select>
+                    <button
+                      id="appearance-sell-sound-preview"
+                      class="secondary-button appearance-sound-preview"
+                      type="button"
+                      data-sound-preview="sell"
+                      aria-label="Preview sell sound"
+                      title="Preview sell sound"
+                    >Preview</button>
+                  </div>
+
+                  <div id="appearance-sell-sound-custom-row" class="appearance-custom-row" data-sound-custom-row="sell">
+                    <div class="appearance-custom-info">
+                      <span id="appearance-sell-sound-custom-name" class="appearance-custom-name muted" data-sound-custom-name="sell">No custom sound uploaded yet.</span>
+                      <button
+                        id="appearance-sell-sound-custom-clear"
+                        class="link-button appearance-custom-clear hidden"
+                        type="button"
+                        data-sound-custom-clear="sell"
+                      >Remove</button>
+                    </div>
+                    <label class="appearance-custom-upload">
+                      <input
+                        id="appearance-sell-sound-custom-input"
+                        type="file"
+                        accept="audio/*"
+                        hidden
+                        data-sound-custom-input="sell"
+                      />
+                      <span class="secondary-button appearance-custom-upload-button">Upload audio</span>
+                    </label>
+                    <p class="muted appearance-custom-hint">MP3 / WAV / OGG up to 3 MB. Stored locally.</p>
+                  </div>
+
+                  <p id="appearance-sell-sound-status" class="muted appearance-status" data-sound-status="sell" aria-live="polite"></p>
+                </div>
+              </div>
+
+              <label class="field appearance-volume-field">
+                <span class="appearance-volume-label">
+                  <span>Volume</span>
+                  <span id="appearance-sound-volume-value" class="appearance-volume-value">70</span>
+                </span>
+                <div class="slider-row appearance-volume-row">
+                  <input
+                    id="appearance-sound-volume-slider"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value="70"
+                  />
+                  <label class="inline-number-field">
+                    <input
+                      id="appearance-sound-volume-input"
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="1"
+                      value="70"
+                    />
+                    <span>%</span>
+                  </label>
+                </div>
+              </label>
+            </section>
+          </div>
+        </section>
+
+        <section id="section-connection" class="section">
+          <header class="section-header">
+            <div>
+              <h2>Global settings</h2>
+              <p class="muted">Connection, network endpoints, and engine defaults applied to every trade.</p>
+            </div>
+            <div class="action-row global-settings-save-row">
+              <span id="engine-settings-dirty-badge" class="settings-dirty-badge hidden">Unsaved changes</span>
+              <button id="save-engine-settings-button" class="primary-button" type="button">Save engine settings</button>
+            </div>
+          </header>
+
+          <div class="global-settings-stack">
+            <section
+              id="host-auth-token-merge-notice"
+              class="settings-panel connection-panel connection-panel-warning"
+              hidden
+            >
+              <div class="panel-heading">
+                <div>
+                  <h3>Shared access token merge</h3>
+                  <p class="muted" id="host-auth-token-merge-notice-body">
+                    The upgrade found different execution-host and LaunchDeck tokens. It kept your execution-host token as the shared bearer and left the older LaunchDeck token in storage for manual recovery. If LaunchDeck now rejects requests, re-enter the correct shared token below or create a new one from the engine.
+                  </p>
+                </div>
+                <button id="host-auth-token-merge-notice-dismiss" class="secondary-button" type="button">Dismiss</button>
+              </div>
+            </section>
+
+            <section class="settings-panel connection-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>Primary connection</h3>
+                  <p class="muted">The execution host is fixed to the local engine for now. Paste the shared engine token created by the backend.</p>
+                </div>
+              </div>
+              <div class="compact-grid compact-grid-2">
+                <label class="field">
+                  <span>Execution host</span>
+                  <input id="host-input" class="fixed-host-input" type="text" placeholder="http://127.0.0.1:8788" readonly aria-readonly="true" title="Temporarily fixed to the local execution engine." />
+                  <small class="muted">Temporarily locked to the local execution engine.</small>
+                </label>
+                <label class="field">
+                  <span>Shared access token</span>
+                  <input id="host-auth-token-input" type="password" placeholder="tt_..." />
+                </label>
+              </div>
+              <div class="action-row connection-actions">
+                <button id="save-host-button" class="primary-button" type="button">Save token</button>
+                <button id="test-host-button" class="secondary-button" type="button" title="Probes the execution host only. Use the LaunchDeck host section below to probe LaunchDeck.">Test execution host</button>
+              </div>
+              <div class="connection-feedback">
+                <p id="connection-status" class="muted">Idle</p>
+                <p id="auth-bootstrap-hint" class="muted">No auth bootstrap info loaded yet.</p>
+              </div>
+            </section>
+
+            <section class="settings-panel connection-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>LaunchDeck host</h3>
+                  <p class="muted">The embedded LaunchDeck shell is fixed to the local LaunchDeck host for now. It reuses the same access token above.</p>
+                </div>
+              </div>
+              <div class="compact-grid compact-grid-1">
+                <label class="field">
+                  <span>LaunchDeck host</span>
+                  <input id="launchdeck-host-input" class="fixed-host-input" type="text" placeholder="http://127.0.0.1:8789" readonly aria-readonly="true" title="Temporarily fixed to the local LaunchDeck engine." />
+                  <small class="muted">Temporarily locked to the local LaunchDeck engine.</small>
+                </label>
+              </div>
+              <div class="action-row connection-actions">
+                <button id="test-launchdeck-host-button" class="secondary-button" type="button">Test LaunchDeck connection</button>
+              </div>
+              <div class="connection-feedback">
+                <p id="launchdeck-connection-status" class="muted">Idle</p>
+                <p class="muted">Launch and reports need this host. Trading and PnL stay on the execution host.</p>
+              </div>
+            </section>
+
+            <section class="settings-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>Network endpoints</h3>
+                  <p class="muted">Primary RPC paths used by the engine and warming layer.</p>
+                </div>
+              </div>
+              <div class="compact-grid compact-grid-3">
+                <label class="field">
+                  <span>Primary RPC URL</span>
+                  <input id="engine-rpc-url" type="text" placeholder="https://..." />
+                </label>
+                <label class="field">
+                  <span>Websocket URL</span>
+                  <input id="engine-ws-url" type="text" placeholder="wss://..." />
+                </label>
+                <label class="field">
+                  <span>Warm RPC URL</span>
+                  <input id="engine-warm-rpc-url" type="text" placeholder="https://..." />
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>Region &amp; routing</h3>
+                  <p class="muted">One region controls every preset. Individual presets no longer override this.</p>
+                </div>
+              </div>
+              <div class="compact-grid compact-grid-1">
+                <label class="field">
+                  <span>Region (USER_REGION)</span>
+                  <select id="engine-endpoint-profile">
+                    <option value="">global</option>
+                    <option value="us">us</option>
+                    <option value="eu">eu</option>
+                    <option value="asia">asia</option>
+                    <option value="slc">slc</option>
+                    <option value="ewr">ewr</option>
+                    <option value="lon">lon</option>
+                    <option value="fra">fra</option>
+                    <option value="ams">ams</option>
+                    <option value="sg">sg</option>
+                    <option value="tyo">tyo</option>
+                    <option value="custom">custom…</option>
+                  </select>
+                </label>
+                <input id="engine-commitment" type="hidden" value="confirmed" />
+              </div>
+              <div id="engine-endpoint-profile-custom-row" class="compact-grid compact-grid-1 hidden">
+                <label class="field">
+                  <span>Custom region tag</span>
+                  <input id="engine-endpoint-profile-custom" type="text" placeholder="fra,ams" />
+                </label>
+              </div>
+              <input id="engine-provider" type="hidden" />
+            </section>
+
+            <input id="engine-buy-slippage" type="hidden" />
+            <input id="engine-sell-slippage" type="hidden" />
+            <input id="engine-buy-mev-mode" type="hidden" value="off" />
+            <input id="engine-sell-mev-mode" type="hidden" value="off" />
+
+            <section class="settings-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>PnL &amp; History</h3>
+                  <p class="muted">Choose how coin PnL defaults are displayed and manage the execution engine's local history files.</p>
+                </div>
+              </div>
+              <div class="compact-grid compact-grid-2">
+                <label class="field">
+                  <span>Default tracking mode</span>
+                  <select id="engine-pnl-tracking-mode">
+                    <option value="local">Local journal</option>
+                    <option value="rpc">RPC resync</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>
+                    <input id="engine-pnl-include-fees" type="checkbox" />
+                    Include fees in PnL by default
+                  </span>
+                  <small class="muted">When off, the panel opens in Gross PnL mode. When on, it opens in Net PnL mode.</small>
+                </label>
+              </div>
+              <div class="action-row connection-actions">
+                <button id="export-pnl-history-button" class="secondary-button" type="button">Export local history (.zip)</button>
+                <button id="wipe-pnl-history-button" class="danger-button" type="button">Wipe all local history</button>
+              </div>
+            </section>
+
+            <section class="settings-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>Voluntary fee</h3>
+                  <p class="muted">Fee added to every SOL-touching buy or sell. The on-chain program never accepts a value above 0.2%.</p>
+                </div>
+              </div>
+              <div class="compact-grid compact-grid-2">
+                <label class="field">
+                  <span>Default fee tier</span>
+                  <select id="engine-wrapper-default-fee-bps">
+                    <option value="0">0% (no fee)</option>
+                    <option value="10">0.1%</option>
+                    <option value="20">0.2%</option>
+                  </select>
+                  <small class="muted">Applied to the SOL input of buys/top-ups and the final SOL output of sells. Never applied twice on multi-hop routes.</small>
+                </label>
+              </div>
+            </section>
+
+            <details class="settings-panel settings-panel-collapsible">
+              <summary>Advanced</summary>
+              <input id="engine-skip-preflight" type="hidden" value="on" />
+              <input id="engine-track-send-block-height" type="hidden" value="off" />
+              <div class="compact-grid compact-grid-1">
+                <label class="field">
+                  <span>Max active batches</span>
+                  <input id="engine-max-active-batches" type="number" min="1" step="1" />
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-2 compact-grid-spaced">
+                <label class="field">
+                  <span>Helius RPC URL</span>
+                  <input id="engine-helius-rpc-url" type="text" placeholder="https://..." />
+                </label>
+                <label class="field">
+                  <span>Helius websocket URL</span>
+                  <input id="engine-helius-ws-url" type="text" placeholder="wss://..." />
+                </label>
+              </div>
+              <label class="field compact-grid-spaced hidden" aria-hidden="true">
+                <span>Extra standard RPC send URLs</span>
+                <textarea id="engine-standard-rpc-send-urls" placeholder="https://rpc1, https://rpc2"></textarea>
+              </label>
+              <label class="field compact-grid-spaced">
+                <span>
+                  <input id="engine-allow-non-canonical-pool-trades" type="checkbox" />
+                  Allow non-canonical pool trades
+                </span>
+                <small class="muted">
+                  When enabled, trades can target a user-pinned Pump AMM pool
+                  even when it is not the canonical / main pool for the token
+                  (e.g. a low-liquidity secondary pool selected via contract
+                  address search). Leave off for the safest default.
+                </small>
+              </label>
+            </details>
+          </div>
+
+          <input type="hidden" id="engine-shared-region" value="" />
+          <input type="hidden" id="engine-helius-sender-region" value="" />
+        </section>
+      </main>
+    </div>
+
+    <div id="preset-modal" class="modal-overlay hidden">
+      <div class="modal-card preset-modal-card">
+        <div class="modal-header">
+          <div class="modal-brand-row">
+            <img class="modal-brand-mark" src="../../images/trench-tools-boot-logo.png" alt="Trench Tools" />
+            <div>
+              <h2 id="preset-modal-title">Create new preset</h2>
+              <p class="muted">Create a custom trading panel setup.</p>
+            </div>
+          </div>
+          <button id="preset-modal-close" class="modal-close-button" type="button" aria-label="Close">×</button>
+        </div>
+
+        <div class="modal-body">
+          <section class="settings-panel modal-panel">
+            <label class="field">
+              <span>Preset name</span>
+              <input id="preset-modal-label" type="text" placeholder="e.g. Quick buy 1 SOL" />
+            </label>
+            <input id="preset-modal-id" type="hidden" />
+          </section>
+
+          <div class="preset-modal-grid">
+            <section class="settings-panel modal-panel preset-section-panel">
+              <div class="panel-heading preset-section-heading">
+                <div class="preset-section-heading-copy">
+                  <h3>Buy</h3>
+                  <p class="muted">Quick-buy defaults.</p>
+                </div>
+                <label class="preset-auto-fee-switch" title="Auto Fee: uses live route-aware fee estimates. Priority fee and tip are optional while it's on; if Auto Fee is unavailable, set values are used as fallbacks, otherwise 0.001 SOL is used for each required component. Max Auto Fee caps live auto estimates.">
+                  <input id="preset-modal-buy-auto-fee" type="checkbox" />
+                  <span class="preset-auto-fee-switch-track" aria-hidden="true"></span>
+                  <span class="preset-auto-fee-switch-label">Auto fee</span>
+                </label>
+              </div>
+              <label class="field">
+                <span>Quick buy amounts (SOL)</span>
+                <div class="amount-grid-stack" data-buy-amount-stack data-buy-amount-rows="1">
+                  <div class="amount-grid" data-buy-amount-row="1">
+                    <input data-buy-amount-input type="text" inputmode="decimal" placeholder="0.5" />
+                    <input data-buy-amount-input type="text" inputmode="decimal" placeholder="1.0" />
+                    <input data-buy-amount-input type="text" inputmode="decimal" placeholder="2.0" />
+                    <input data-buy-amount-input type="text" inputmode="decimal" placeholder="3.0" />
+                    <button
+                      class="amount-grid-add"
+                      type="button"
+                      data-buy-amount-add
+                      title="Add a second row of quick-buy amounts"
+                      aria-label="Add a second row of quick-buy amounts"
+                    >+</button>
+                  </div>
+                  <div class="amount-grid" data-buy-amount-row="2" hidden>
+                    <input data-buy-amount-input type="text" inputmode="decimal" placeholder="5.0" />
+                    <input data-buy-amount-input type="text" inputmode="decimal" placeholder="10" />
+                    <input data-buy-amount-input type="text" inputmode="decimal" placeholder="25" />
+                    <input data-buy-amount-input type="text" inputmode="decimal" placeholder="50" />
+                    <button
+                      class="amount-grid-remove"
+                      type="button"
+                      data-buy-amount-remove
+                      title="Remove the second row of quick-buy amounts"
+                      aria-label="Remove the second row of quick-buy amounts"
+                    >&times;</button>
+                  </div>
+                </div>
+              </label>
+              <div class="compact-grid compact-grid-2 route-row" data-route-row="preset-buy">
+                <label class="field">
+                  <span>Route</span>
+                  <select id="preset-modal-buy-provider" class="preset-route-select">
+                    <option value="helius-sender">Helius Sender</option>
+                    <option value="hellomoon">Hello Moon</option>
+                    <option value="standard-rpc" disabled hidden>Standard RPC</option>
+                    <option value="jito-bundle" disabled hidden>Jito Bundle</option>
+                  </select>
+                </label>
+                <label class="field mev-field">
+                  <span>MEV mode</span>
+                  <select id="preset-modal-buy-mev-mode">
+                    <option value="off">off</option>
+                    <option value="reduced">reduced</option>
+                    <option value="secure">secure</option>
+                  </select>
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-4">
+                <label class="field">
+                  <span>Slippage %</span>
+                  <input id="preset-modal-buy-slippage" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="priority" data-auto-fee-checkbox="preset-modal-buy-auto-fee">Priority fee</span>
+                  <input id="preset-modal-buy-fee" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="tip" data-auto-fee-checkbox="preset-modal-buy-auto-fee">Tip</span>
+                  <input id="preset-modal-buy-tip" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span>Max Auto Fee</span>
+                  <input id="preset-modal-buy-max-fee" type="text" inputmode="decimal" placeholder="cap" />
+                </label>
+              </div>
+              <input id="preset-modal-buy-endpoint-profile" type="hidden" />
+              <input id="preset-modal-buy-auto-tip" type="hidden" />
+            </section>
+
+            <section class="settings-panel modal-panel preset-section-panel">
+              <div class="panel-heading preset-section-heading">
+                <div class="preset-section-heading-copy">
+                  <h3>Sell</h3>
+                  <p class="muted">Quick-sell defaults.</p>
+                </div>
+                <label class="preset-auto-fee-switch" title="Auto Fee: uses live route-aware fee estimates. Priority fee and tip are optional while it's on; if Auto Fee is unavailable, set values are used as fallbacks, otherwise 0.001 SOL is used for each required component. Max Auto Fee caps live auto estimates.">
+                  <input id="preset-modal-sell-auto-fee" type="checkbox" />
+                  <span class="preset-auto-fee-switch-track" aria-hidden="true"></span>
+                  <span class="preset-auto-fee-switch-label">Auto fee</span>
+                </label>
+              </div>
+              <label class="field">
+                <span>Quick sell percentages</span>
+                <div class="amount-grid-stack" data-sell-percent-stack data-sell-percent-rows="1">
+                  <div class="amount-grid" data-sell-percent-row="1">
+                    <input data-sell-percent-input type="text" inputmode="decimal" placeholder="25" />
+                    <input data-sell-percent-input type="text" inputmode="decimal" placeholder="50" />
+                    <input data-sell-percent-input type="text" inputmode="decimal" placeholder="75" />
+                    <input data-sell-percent-input type="text" inputmode="decimal" placeholder="100" />
+                    <button
+                      class="amount-grid-add"
+                      type="button"
+                      data-sell-percent-add
+                      title="Add a second row of quick-sell percentages"
+                      aria-label="Add a second row of quick-sell percentages"
+                    >+</button>
+                  </div>
+                  <div class="amount-grid" data-sell-percent-row="2" hidden>
+                    <input data-sell-percent-input type="text" inputmode="decimal" placeholder="10" />
+                    <input data-sell-percent-input type="text" inputmode="decimal" placeholder="15" />
+                    <input data-sell-percent-input type="text" inputmode="decimal" placeholder="20" />
+                    <input data-sell-percent-input type="text" inputmode="decimal" placeholder="40" />
+                    <button
+                      class="amount-grid-remove"
+                      type="button"
+                      data-sell-percent-remove
+                      title="Remove the second row of quick-sell percentages"
+                      aria-label="Remove the second row of quick-sell percentages"
+                    >&times;</button>
+                  </div>
+                </div>
+              </label>
+              <div class="compact-grid compact-grid-2 route-row" data-route-row="preset-sell">
+                <label class="field">
+                  <span>Route</span>
+                  <select id="preset-modal-sell-provider" class="preset-route-select">
+                    <option value="helius-sender">Helius Sender</option>
+                    <option value="hellomoon">Hello Moon</option>
+                    <option value="standard-rpc" disabled hidden>Standard RPC</option>
+                    <option value="jito-bundle" disabled hidden>Jito Bundle</option>
+                  </select>
+                </label>
+                <label class="field mev-field">
+                  <span>MEV mode</span>
+                  <select id="preset-modal-sell-mev-mode">
+                    <option value="off">off</option>
+                    <option value="reduced">reduced</option>
+                    <option value="secure">secure</option>
+                  </select>
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-4">
+                <label class="field">
+                  <span>Slippage %</span>
+                  <input id="preset-modal-sell-slippage" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="priority" data-auto-fee-checkbox="preset-modal-sell-auto-fee">Priority fee</span>
+                  <input id="preset-modal-sell-fee" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="tip" data-auto-fee-checkbox="preset-modal-sell-auto-fee">Tip</span>
+                  <input id="preset-modal-sell-tip" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span>Max Auto Fee</span>
+                  <input id="preset-modal-sell-max-fee" type="text" inputmode="decimal" placeholder="cap" />
+                </label>
+              </div>
+              <input id="preset-modal-sell-endpoint-profile" type="hidden" />
+              <input id="preset-modal-sell-auto-tip" type="hidden" />
+            </section>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button id="preset-modal-cancel" class="secondary-button" type="button">Cancel</button>
+          <button id="preset-modal-save" class="primary-button" type="button">Save Preset</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="launchdeck-preset-modal" class="modal-overlay hidden">
+      <div class="modal-card launchdeck-preset-modal-card">
+        <div class="modal-header">
+          <div class="modal-brand-row">
+            <img class="modal-brand-mark" src="../../images/trench-tools-boot-logo.png" alt="Trench Tools" />
+            <div>
+              <h2 id="launchdeck-preset-modal-title">Edit LaunchDeck preset</h2>
+              <p class="muted">Edits the same LaunchDeck preset model used by the LaunchDeck settings modal.</p>
+            </div>
+          </div>
+          <button id="launchdeck-preset-modal-close" class="modal-close-button" type="button" aria-label="Close">×</button>
+        </div>
+
+        <div class="modal-body">
+          <section class="settings-panel modal-panel">
+            <label class="field">
+              <span>Preset name</span>
+              <input id="launchdeck-preset-label" type="text" placeholder="e.g. Sniper" />
+            </label>
+            <input id="launchdeck-preset-id" type="hidden" />
+          </section>
+
+          <div class="preset-modal-grid launchdeck-preset-modal-grid">
+            <section class="settings-panel modal-panel preset-section-panel">
+              <div class="panel-heading preset-section-heading">
+                <div class="preset-section-heading-copy">
+                  <h3>Creation</h3>
+                  <p class="muted">Launch route + fee defaults.</p>
+                </div>
+                <label class="preset-auto-fee-switch" title="Auto Fee: uses live route-aware fee estimates. Priority fee and tip are optional while it's on; if Auto Fee is unavailable, set values are used as fallbacks, otherwise 0.001 SOL is used for each required component. Max Auto Fee caps live auto estimates.">
+                  <input id="launchdeck-preset-creation-auto-fee" type="checkbox" />
+                  <span class="preset-auto-fee-switch-track" aria-hidden="true"></span>
+                  <span class="preset-auto-fee-switch-label">Auto fee</span>
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-2 route-row" data-route-row="launchdeck-creation">
+                <label class="field">
+                  <span>Route</span>
+                  <select id="launchdeck-preset-creation-provider" class="preset-route-select">
+                    <option value="helius-sender">Helius Sender</option>
+                    <option value="hellomoon">Hello Moon</option>
+                    <option value="standard-rpc" disabled hidden>Standard RPC</option>
+                    <option value="jito-bundle" disabled hidden>Jito Bundle</option>
+                  </select>
+                </label>
+                <label class="field mev-field">
+                  <span>MEV</span>
+                  <select id="launchdeck-preset-creation-mev">
+                    <option value="off">off</option>
+                    <option value="reduced">reduced</option>
+                    <option value="secure">secure</option>
+                  </select>
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-3">
+                <label class="field">
+                  <span data-auto-fee-label="priority" data-auto-fee-checkbox="launchdeck-preset-creation-auto-fee">Priority fee</span>
+                  <input id="launchdeck-preset-creation-fee" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="tip" data-auto-fee-checkbox="launchdeck-preset-creation-auto-fee">Tip</span>
+                  <input id="launchdeck-preset-creation-tip" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span>Max Auto Fee</span>
+                  <input id="launchdeck-preset-creation-max-fee" type="text" inputmode="decimal" placeholder="cap" />
+                </label>
+              </div>
+              <input id="launchdeck-preset-dev-buy" type="hidden" />
+            </section>
+
+            <section class="settings-panel modal-panel preset-section-panel">
+              <div class="panel-heading preset-section-heading">
+                <div class="preset-section-heading-copy">
+                  <h3>Buy</h3>
+                  <p class="muted">Sniper + post-launch buy defaults.</p>
+                </div>
+                <label class="preset-auto-fee-switch" title="Auto Fee: uses live route-aware fee estimates. Priority fee and tip are optional while it's on; if Auto Fee is unavailable, set values are used as fallbacks, otherwise 0.001 SOL is used for each required component. Max Auto Fee caps live auto estimates.">
+                  <input id="launchdeck-preset-buy-auto-fee" type="checkbox" />
+                  <span class="preset-auto-fee-switch-track" aria-hidden="true"></span>
+                  <span class="preset-auto-fee-switch-label">Auto fee</span>
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-2 route-row" data-route-row="launchdeck-buy">
+                <label class="field">
+                  <span>Route</span>
+                  <select id="launchdeck-preset-buy-provider" class="preset-route-select">
+                    <option value="helius-sender">Helius Sender</option>
+                    <option value="hellomoon">Hello Moon</option>
+                    <option value="standard-rpc" disabled hidden>Standard RPC</option>
+                    <option value="jito-bundle" disabled hidden>Jito Bundle</option>
+                  </select>
+                </label>
+                <label class="field mev-field">
+                  <span>MEV</span>
+                  <select id="launchdeck-preset-buy-mev">
+                    <option value="off">off</option>
+                    <option value="reduced">reduced</option>
+                    <option value="secure">secure</option>
+                  </select>
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-4">
+                <label class="field">
+                  <span>Slippage %</span>
+                  <input id="launchdeck-preset-buy-slippage" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="priority" data-auto-fee-checkbox="launchdeck-preset-buy-auto-fee">Priority fee</span>
+                  <input id="launchdeck-preset-buy-fee" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="tip" data-auto-fee-checkbox="launchdeck-preset-buy-auto-fee">Tip</span>
+                  <input id="launchdeck-preset-buy-tip" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span>Max Auto Fee</span>
+                  <input id="launchdeck-preset-buy-max-fee" type="text" inputmode="decimal" placeholder="cap" />
+                </label>
+              </div>
+              <input id="launchdeck-preset-snipe-buy" type="hidden" />
+            </section>
+
+            <section class="settings-panel modal-panel preset-section-panel">
+              <div class="panel-heading preset-section-heading">
+                <div class="preset-section-heading-copy">
+                  <h3>Sell</h3>
+                  <p class="muted">Sniper sell + dev auto-sell defaults.</p>
+                </div>
+                <label class="preset-auto-fee-switch" title="Auto Fee: uses live route-aware fee estimates. Priority fee and tip are optional while it's on; if Auto Fee is unavailable, set values are used as fallbacks, otherwise 0.001 SOL is used for each required component. Max Auto Fee caps live auto estimates.">
+                  <input id="launchdeck-preset-sell-auto-fee" type="checkbox" />
+                  <span class="preset-auto-fee-switch-track" aria-hidden="true"></span>
+                  <span class="preset-auto-fee-switch-label">Auto fee</span>
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-2 route-row" data-route-row="launchdeck-sell">
+                <label class="field">
+                  <span>Route</span>
+                  <select id="launchdeck-preset-sell-provider" class="preset-route-select">
+                    <option value="helius-sender">Helius Sender</option>
+                    <option value="hellomoon">Hello Moon</option>
+                    <option value="standard-rpc" disabled hidden>Standard RPC</option>
+                    <option value="jito-bundle" disabled hidden>Jito Bundle</option>
+                  </select>
+                </label>
+                <label class="field mev-field">
+                  <span>MEV</span>
+                  <select id="launchdeck-preset-sell-mev">
+                    <option value="off">off</option>
+                    <option value="reduced">reduced</option>
+                    <option value="secure">secure</option>
+                  </select>
+                </label>
+              </div>
+              <div class="compact-grid compact-grid-4">
+                <label class="field">
+                  <span>Slippage %</span>
+                  <input id="launchdeck-preset-sell-slippage" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="priority" data-auto-fee-checkbox="launchdeck-preset-sell-auto-fee">Priority fee</span>
+                  <input id="launchdeck-preset-sell-fee" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span data-auto-fee-label="tip" data-auto-fee-checkbox="launchdeck-preset-sell-auto-fee">Tip</span>
+                  <input id="launchdeck-preset-sell-tip" type="text" inputmode="decimal" />
+                </label>
+                <label class="field">
+                  <span>Max Auto Fee</span>
+                  <input id="launchdeck-preset-sell-max-fee" type="text" inputmode="decimal" placeholder="cap" />
+                </label>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button id="launchdeck-preset-modal-delete" class="danger-button" type="button">Delete preset</button>
+          <button id="launchdeck-preset-modal-cancel" class="secondary-button" type="button">Cancel</button>
+          <button id="launchdeck-preset-modal-save" class="primary-button" type="button">Save LaunchDeck Preset</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="options-toast-host" aria-live="polite" aria-atomic="false"></div>
+
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>
+
+

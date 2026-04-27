@@ -10,6 +10,7 @@ const reportsTerminalList = document.getElementById("reports-terminal-list");
 const reportsTerminalOutput = document.getElementById("reports-terminal-output");
 const reportsTerminalMeta = document.getElementById("reports-terminal-meta");
 const reportsTerminalResizeHandle = document.getElementById("reports-terminal-resize-handle");
+const launchdeckHostBanner = document.getElementById("launchdeck-host-banner");
 const benchmarksPopoutModal = document.getElementById("benchmarks-popout-modal");
 const benchmarksPopoutTitle = document.getElementById("benchmarks-popout-title");
 const benchmarksPopoutClose = document.getElementById("benchmarks-popout-close");
@@ -242,6 +243,7 @@ const sniperRefreshButton = document.getElementById("sniper-refresh-button");
 const sniperResetButton = document.getElementById("sniper-reset-button");
 const sniperEnabledToggle = document.getElementById("sniper-enabled-toggle");
 const sniperEnabledState = document.getElementById("sniper-enabled-state");
+const sniperHostBanner = document.getElementById("sniper-host-banner");
 const sniperWalletsSection = document.getElementById("sniper-wallets-section");
 const sniperWalletList = document.getElementById("sniper-wallet-list");
 const sniperSelectionSummary = document.getElementById("sniper-selection-summary");
@@ -279,15 +281,39 @@ const FEE_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.feeSplitDraft.v1";
 const AGENT_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.agentSplitDraft.v1";
 const AUTO_SELL_DRAFT_STORAGE_KEY = "launchdeck.autoSellDraft.v1";
 const AUTO_SELL_DRAFT_STORAGE_PREFIX = "launchdeck.autoSellDraft";
+const LAST_CUSTOM_DEV_BUY_SOL_STORAGE_KEY = "launchdeck.lastCustomDevBuySol";
 const TICKER_CAPS_STORAGE_KEY = "launchdeck.tickerCapsEnabled";
-const POPOUT_FORM_WIDTH = 532;
-const POPOUT_REPORTS_WIDTH = 560;
-const POPOUT_WORKSPACE_GAP = 12;
+const LaunchDeckLayout = globalThis.LaunchDeckLayout || {};
+const launchDeckLayoutTokens = LaunchDeckLayout.TOKENS || {};
+const popoutLayoutTokens = launchDeckLayoutTokens.popout || {};
+const createOverlayLayoutTokens = launchDeckLayoutTokens.createOverlay || {};
+const POPOUT_FORM_WIDTH = popoutLayoutTokens.formWidth || 532;
+const POPOUT_REPORTS_WIDTH = popoutLayoutTokens.reportsWidth || 560;
+const POPOUT_WORKSPACE_GAP = popoutLayoutTokens.workspaceGap || 12;
 const POPOUT_WINDOW_NAME = "launchdeck-popout";
+const CREATE_OVERLAY_STABLE_WIDTH = createOverlayLayoutTokens.width || 532;
+const CREATE_OVERLAY_STABLE_HEIGHT = createOverlayLayoutTokens.height || 717;
+const WEBAPP_POPOUT_STABLE_OUTER_WIDTH = popoutLayoutTokens.outerWidth || 552;
+const WEBAPP_POPOUT_STABLE_OUTER_HEIGHT = popoutLayoutTokens.outerHeight || 727;
 const pageSearchParams = new URLSearchParams(window.location.search);
 const hasLegacyPopoutQuery = pageSearchParams.get("popout") === "1";
 const isPopoutMode = window.name === POPOUT_WINDOW_NAME || hasLegacyPopoutQuery;
+const extensionShellConfig = window.__launchdeckExtensionShell || null;
+const isOverlayMode = Boolean(extensionShellConfig && extensionShellConfig.shell === "overlay");
+const isCreateOverlayMode = Boolean(
+  isOverlayMode
+  && extensionShellConfig
+  && String(extensionShellConfig.mode || "").trim().toLowerCase() === "create"
+);
 let popoutAutosizeFrame = 0;
+let popoutAutosizeTimeout = 0;
+let createOverlayAutosizeFrame = 0;
+let createOverlayResizeObserver = null;
+let createOverlayMutationObserver = null;
+let lastCreateOverlayPostedWidth = 0;
+let lastCreateOverlayPostedHeight = 0;
+const CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE = "trench-tools-launchdeck";
+const CREATE_OVERLAY_RESIZE_MESSAGE_TYPE = "resize-create-overlay";
 const LIVE_SYNC_SOURCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const RequestUtils = window.LaunchDeckRequestUtils || {};
 const RenderUtils = window.LaunchDeckRenderUtils || {};
@@ -336,11 +362,25 @@ if (isPopoutMode) {
   document.body.classList.add("popout-mode");
   document.title = "Trench.Tools - LaunchDeck Popout";
   window.addEventListener("load", () => {
-    schedulePopoutAutosize();
+    schedulePopoutAutosize({ immediate: true });
   });
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(() => {
-      schedulePopoutAutosize();
+      schedulePopoutAutosize({ immediate: true });
+    }).catch(() => {});
+  }
+}
+if (isCreateOverlayMode) {
+  document.documentElement.classList.add("overlay-create-mode");
+  document.documentElement.classList.remove("theme-light");
+  document.body.classList.add("overlay-create-mode");
+  document.title = "Trench.Tools - LaunchDeck Create";
+  window.addEventListener("load", () => {
+    scheduleCreateOverlayAutosize();
+  });
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => {
+      scheduleCreateOverlayAutosize();
     }).catch(() => {});
   }
 }
@@ -361,6 +401,7 @@ setOutputSectionVisible(
   getStoredOutputSectionVisible(),
 );
 setImageLayoutCompact(getStoredImageLayoutCompact(), { persist: false });
+initCreateOverlayAutosizeSync();
 
 if (!isPopoutMode) {
   if (output) output.textContent = "";
@@ -386,6 +427,16 @@ let appBootstrapState = {
   walletsLoaded: false,
   runtimeLoaded: false,
 };
+const LAUNCHDECK_SHARED_CONSTANTS = (typeof window !== "undefined" && window.__launchdeckShared) || {};
+const LAUNCHDECK_HOST_OFFLINE_BANNER_HTML = LAUNCHDECK_SHARED_CONSTANTS.HOST_OFFLINE_BANNER_HTML
+  || 'LaunchDeck host offline - start <code>launchdeck-engine</code> to use Launch, Snipe and Reports.';
+let launchdeckHostConnectionState = {
+  checked: !extensionShellConfig,
+  reachable: true,
+  error: "",
+};
+let launchdeckBootstrapPromise = null;
+let launchdeckHostRecoveryTimer = null;
 let startupWarmState = {
   started: false,
   ready: false,
@@ -400,6 +451,7 @@ const STARTUP_WARM_WAIT_TIMEOUT_MS = 1500;
 const STARTUP_WARM_CACHE_STORAGE_KEY = "launchdeck.startupWarmCache.v2";
 const LEGACY_STARTUP_WARM_CACHE_STORAGE_KEY = "launchdeck.startupWarmCache.v1";
 const STARTUP_WARM_CACHE_SCHEMA_VERSION = 2;
+const LAUNCHDECK_HOST_RECOVERY_RETRY_MS = 5000;
 const PREVIEW_INPUTS_STORAGE_KEY = "launchdeck.previewInputs.v1";
 const PREVIEW_INPUTS_SCHEMA_VERSION = 1;
 const WALLET_STATUS_LAST_REFRESH_STORAGE_KEY = "launchdeck.walletStatusLastRefreshAtMs";
@@ -407,6 +459,8 @@ let walletStatusRefreshIntervalMs = 30000;
 const RUNTIME_STATUS_REFRESH_INTERVAL_MS = 15000;
 const STARTUP_WARM_CACHE_MAX_AGE_MS = RUNTIME_STATUS_REFRESH_INTERVAL_MS;
 const WARM_ACTIVITY_DEBOUNCE_MS = 1000;
+const WARM_PRESENCE_IDLE_MS = 10 * 60 * 1000;
+const WARM_PRESENCE_HEARTBEAT_MS = 60 * 1000;
 let defaultsApplied = false;
 const requestStates = {
   bootstrap: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
@@ -445,8 +499,13 @@ let warmActivityState = {
   debounceTimer: null,
   inFlightPromise: null,
   lastSentAtMs: 0,
-  /** When true, run another flush after the current POST finishes (latest DOM/config). */
   pendingFlush: false,
+};
+let warmPresenceState = {
+  active: false,
+  idleTimer: null,
+  heartbeatTimer: null,
+  lastReason: "",
 };
 let imageLibraryState = {
   images: [],
@@ -558,7 +617,7 @@ const ROUTE_CAPABILITIES = {
 const PROVIDER_FEE_REQUIREMENTS = {
   "helius-sender": { minTipSol: 0.0002, priorityRequired: true },
   hellomoon: { minTipSol: 0.001, priorityRequired: true },
-  "jito-bundle": { minTipSol: 0.0002, priorityRequired: true },
+  "jito-bundle": { minTipSol: 0.000001, priorityRequired: true },
 };
 settingsDomain = SettingsDomainModule.create ? SettingsDomainModule.create({
   elements: {
@@ -1603,6 +1662,7 @@ reportsPresenters = window.LaunchDeckReportsPresenters.create({
   renderCache,
   setCachedHTML: RenderUtils.setCachedHTML,
   getState: () => reportsTerminalState,
+  getLaunchdeckHostConnectionState: () => launchdeckHostConnectionState,
   getFollowJobsState: () => followJobsState,
   getFollowStatusSnapshot: () => followStatusSnapshot(),
   syncFollowStatusChrome: () => syncFollowStatusChrome(),
@@ -2089,6 +2149,7 @@ const sniperFeature = window.SniperFeature.create({
     sniperResetButton,
     sniperEnabledToggle,
     sniperEnabledState,
+    sniperHostBanner,
     sniperWalletsSection,
     sniperWalletList,
     sniperSelectionSummary,
@@ -2097,6 +2158,7 @@ const sniperFeature = window.SniperFeature.create({
   },
   getLatestWalletStatus: () => latestWalletStatus,
   getAppBootstrapState: () => appBootstrapState,
+  getLaunchdeckHostConnectionState: () => launchdeckHostConnectionState,
   getSelectedWalletKey: () => selectedWalletKey(),
   getNamedValue,
   isNamedChecked,
@@ -2326,9 +2388,12 @@ liveSyncSupport = LiveSyncModule.createLiveSyncSupport({
 const runtimeActions = RuntimeActionsModule.createRuntimeActions({
   requestUtils: RequestUtils,
   requestStates,
+  isExtensionShell: Boolean(extensionShellConfig),
   markBootstrapState,
   setSettingsLoadingState,
   setBootOverlayMessage,
+  setLaunchdeckHostConnectionState,
+  launchdeckHostOfflineMessage,
   getStoredSelectedWalletKey,
   applyBootstrapFastPayload,
   beginStartupWarmup,
@@ -2629,6 +2694,10 @@ function validateOptionalAutoFeeCapField(value, provider) {
   return settingsDomain.validateOptionalAutoFeeCapField(value, provider);
 }
 
+function validateRequiredAutoFeeCapField(value, provider) {
+  return settingsDomain.validateRequiredAutoFeeCapField(value, provider);
+}
+
 function renderPlatformRuntimeIndicators() {
   walletRuntimeDomain.renderPlatformRuntimeIndicators();
 }
@@ -2644,6 +2713,36 @@ function renderPresetChips() {
 function setDevBuyHiddenState(mode, amount) {
   if (devBuyModeInput) devBuyModeInput.value = mode || "sol";
   if (devBuyAmountInput) devBuyAmountInput.value = amount || "";
+}
+
+function readStoredCustomDevBuySolAmount() {
+  try {
+    return normalizeDecimalInput(window.localStorage.getItem(LAST_CUSTOM_DEV_BUY_SOL_STORAGE_KEY) || "", 9);
+  } catch (_error) {
+    return "";
+  }
+}
+
+function writeStoredCustomDevBuySolAmount(amount) {
+  const normalized = normalizeDecimalInput(amount, 9);
+  if (!normalized) return;
+  try {
+    window.localStorage.setItem(LAST_CUSTOM_DEV_BUY_SOL_STORAGE_KEY, normalized);
+  } catch (_error) {
+    // Ignore storage failures and keep deployment controls functional.
+  }
+}
+
+function restoreStoredCustomDevBuySolAmount() {
+  const amount = readStoredCustomDevBuySolAmount();
+  if (!amount || !devBuySolInput) return;
+  if (String(getNamedValue("devBuyAmount") || "").trim()) return;
+  setDevBuyHiddenState("sol", amount);
+  syncingDevBuyInputs = true;
+  devBuySolInput.value = amount;
+  syncingDevBuyInputs = false;
+  lastDevBuyEditSource = "sol";
+  queueQuoteUpdate();
 }
 
 function setDevBuyPercentDisplay(value) {
@@ -3156,7 +3255,7 @@ async function updateDevBuyFromPercentInput(value) {
 async function triggerDeployWithDevBuy(mode, amount, source = "sol") {
   setDevBuyHiddenState(mode, amount);
   lastDevBuyEditSource = source;
-  if (source === "sol") {
+  if (source === "sol" || source === "custom-sol") {
     syncingDevBuyInputs = true;
     if (devBuySolInput) devBuySolInput.value = amount;
     syncingDevBuyInputs = false;
@@ -3167,6 +3266,9 @@ async function triggerDeployWithDevBuy(mode, amount, source = "sol") {
   const errors = validateForm();
   if (showValidationErrors(errors)) return;
   clearValidationErrors();
+  if (mode === "sol" && source === "custom-sol") {
+    writeStoredCustomDevBuySolAmount(amount);
+  }
   await run("deploy");
 }
 
@@ -3734,9 +3836,22 @@ function showVampModal() {
     vampStatus.hidden = true;
     vampStatus.textContent = "";
   }
-  if (vampContractInput) vampContractInput.value = "";
+  if (vampContractInput) {
+    const presetAddress = extensionShellConfig && extensionShellConfig.contractAddress
+      ? String(extensionShellConfig.contractAddress).trim()
+      : "";
+    vampContractInput.value = presetAddress;
+  }
   if (vampModal) vampModal.hidden = false;
   if (vampContractInput) queueMicrotask(() => vampContractInput.focus());
+  if (
+    extensionShellConfig
+    && String(extensionShellConfig.contractAddress || "").trim()
+    && vampContractInput
+    && looksLikeSolanaAddress(vampContractInput.value)
+  ) {
+    scheduleVampAutoImport();
+  }
 }
 
 function hideVampModal() {
@@ -3775,14 +3890,23 @@ function scheduleVampAutoImport() {
   }, 150);
 }
 
-async function importVampToken() {
-  const contractAddress = vampContractInput ? vampContractInput.value.trim() : "";
+async function importVampToken(contractAddressOverride = "") {
+  const contractAddress = String(
+    contractAddressOverride || (vampContractInput ? vampContractInput.value.trim() : ""),
+  ).trim();
   if (!contractAddress) {
     if (vampError) vampError.textContent = "Contract address is required.";
     return;
   }
+  if (vampContractInput && contractAddressOverride) {
+    vampContractInput.value = contractAddress;
+  }
   if (vampError) vampError.textContent = "";
-  setVampStatus("Importing token metadata...");
+  if (vampStatus) {
+    setVampStatus("Importing token metadata...");
+  } else if (imageStatus) {
+    imageStatus.textContent = "Importing token metadata...";
+  }
   vampInFlightAddress = contractAddress;
   if (vampImport) vampImport.disabled = true;
   if (vampCancel) vampCancel.disabled = true;
@@ -3831,10 +3955,14 @@ async function importVampToken() {
       detectionNotes.join(" "),
     ].filter(Boolean).join(" ");
     imagePath.textContent = "";
-    hideVampModal();
+    if (vampModal) hideVampModal();
   } catch (error) {
-    if (vampError) vampError.textContent = error.message;
-    setVampStatus("");
+    if (vampError) {
+      vampError.textContent = error.message;
+    } else if (imageStatus) {
+      imageStatus.textContent = error.message;
+    }
+    if (vampStatus) setVampStatus("");
   } finally {
     if (vampInFlightAddress === contractAddress) vampInFlightAddress = "";
     if (vampImport) vampImport.disabled = false;
@@ -3960,10 +4088,115 @@ function hasBootstrapConfig() {
 }
 
 function ensureInteractiveBootstrapReady(message = "App settings are still loading from the backend.") {
+  if (extensionShellConfig && launchdeckHostConnectionState.checked && !launchdeckHostConnectionState.reachable) {
+    setStatusLabel("LaunchDeck offline");
+    metaNode.textContent = launchdeckHostOfflineMessage();
+    return false;
+  }
   if (hasBootstrapConfig()) return true;
   setStatusLabel("Loading");
   metaNode.textContent = message;
   return false;
+}
+
+const LAUNCHDECK_HOST_OFFLINE_PLAIN_MESSAGE = LAUNCHDECK_SHARED_CONSTANTS.HOST_OFFLINE_PLAIN_MESSAGE
+  || "LaunchDeck host offline - start launchdeck-engine to use Launch, Snipe and Reports.";
+
+function launchdeckHostOfflineMessage() {
+  return LAUNCHDECK_HOST_OFFLINE_PLAIN_MESSAGE;
+}
+
+function clearLaunchdeckHostRecoveryTimer() {
+  if (!launchdeckHostRecoveryTimer) return;
+  window.clearTimeout(launchdeckHostRecoveryTimer);
+  launchdeckHostRecoveryTimer = null;
+}
+
+function resumeLaunchdeckRuntimeAfterRecovery(bootResult) {
+  if (bootResult && bootResult.offline) {
+    scheduleLaunchdeckHostRecovery();
+    return;
+  }
+  clearLaunchdeckHostRecoveryTimer();
+  startRuntimeStatusRefreshLoop();
+  enableLiveSync();
+  if (isReportsTerminalCurrentlyVisible()) {
+    refreshReportsTerminal({
+      preserveSelection: true,
+      preferId: reportsTerminalState.activeId,
+      showLoading: false,
+    }).catch(() => {});
+  }
+}
+
+function scheduleLaunchdeckHostRecovery() {
+  if (
+    !extensionShellConfig
+    || hasBootstrapConfig()
+    || launchdeckHostConnectionState.reachable
+    || launchdeckHostRecoveryTimer
+  ) {
+    return;
+  }
+  launchdeckHostRecoveryTimer = window.setTimeout(() => {
+    launchdeckHostRecoveryTimer = null;
+    attemptLaunchdeckHostRecovery();
+  }, LAUNCHDECK_HOST_RECOVERY_RETRY_MS);
+}
+
+function attemptLaunchdeckHostRecovery() {
+  if (
+    !extensionShellConfig
+    || hasBootstrapConfig()
+    || launchdeckBootstrapPromise
+  ) {
+    return;
+  }
+  clearLaunchdeckHostRecoveryTimer();
+  void bootstrapApp()
+    .then((bootResult) => {
+      resumeLaunchdeckRuntimeAfterRecovery(bootResult);
+    })
+    .catch(() => {
+      scheduleLaunchdeckHostRecovery();
+    });
+}
+
+function renderLaunchdeckHostBanner() {
+  if (!launchdeckHostBanner) return;
+  const visible = Boolean(
+    extensionShellConfig
+    && launchdeckHostConnectionState.checked
+    && !launchdeckHostConnectionState.reachable,
+  );
+  launchdeckHostBanner.hidden = !visible;
+  if (!visible) return;
+  launchdeckHostBanner.innerHTML = LAUNCHDECK_HOST_OFFLINE_BANNER_HTML;
+}
+
+function setLaunchdeckHostConnectionState(nextState = {}) {
+  launchdeckHostConnectionState = {
+    ...launchdeckHostConnectionState,
+    ...nextState,
+    reachable: Object.prototype.hasOwnProperty.call(nextState, "reachable")
+      ? nextState.reachable !== false
+      : launchdeckHostConnectionState.reachable,
+  };
+  if (extensionShellConfig) {
+    if (launchdeckHostConnectionState.reachable) {
+      clearLaunchdeckHostRecoveryTimer();
+      if (!hasBootstrapConfig()) {
+        attemptLaunchdeckHostRecovery();
+      }
+    } else if (!hasBootstrapConfig()) {
+      scheduleLaunchdeckHostRecovery();
+    }
+  }
+  renderLaunchdeckHostBanner();
+  renderSniperUI();
+  renderReportsTerminalOutput();
+  renderReportsTerminalList();
+  schedulePopoutAutosize();
 }
 
 function markBootstrapState(nextState = {}) {
@@ -4449,7 +4682,66 @@ async function flushWarmActivity() {
   return walletRuntimeDomain.flushWarmActivity();
 }
 
+function sendWarmPresence(active, reason) {
+  const payload = JSON.stringify({
+    active: Boolean(active),
+    reason: String(reason || ""),
+  });
+  fetch("/api/warm/presence", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: payload,
+    keepalive: !active,
+  }).catch(() => {});
+}
+
+function clearWarmPresenceIdleTimer() {
+  if (!warmPresenceState.idleTimer) return;
+  clearTimeout(warmPresenceState.idleTimer);
+  warmPresenceState.idleTimer = null;
+}
+
+function ensureWarmPresenceHeartbeat() {
+  if (warmPresenceState.heartbeatTimer) return;
+  warmPresenceState.heartbeatTimer = setInterval(() => {
+    if (!warmPresenceState.active) return;
+    sendWarmPresence(true, warmPresenceState.lastReason || "webapp-heartbeat");
+  }, WARM_PRESENCE_HEARTBEAT_MS);
+}
+
+function clearWarmPresenceHeartbeat() {
+  if (!warmPresenceState.heartbeatTimer) return;
+  clearInterval(warmPresenceState.heartbeatTimer);
+  warmPresenceState.heartbeatTimer = null;
+}
+
+function markLaunchdeckWarmPresence(reason = "webapp-activity") {
+  warmPresenceState.lastReason = reason;
+  clearWarmPresenceIdleTimer();
+  if (!warmPresenceState.active) {
+    warmPresenceState.active = true;
+    sendWarmPresence(true, reason);
+  }
+  ensureWarmPresenceHeartbeat();
+  warmPresenceState.idleTimer = setTimeout(() => {
+    warmPresenceState.idleTimer = null;
+    setLaunchdeckWarmInactive("webapp-idle");
+  }, WARM_PRESENCE_IDLE_MS);
+}
+
+function setLaunchdeckWarmInactive(reason = "webapp-inactive") {
+  clearWarmPresenceIdleTimer();
+  if (!warmPresenceState.active) return;
+  warmPresenceState.active = false;
+  warmPresenceState.lastReason = reason;
+  clearWarmPresenceHeartbeat();
+  sendWarmPresence(false, reason);
+}
+
 function queueWarmActivity({ immediate = false } = {}) {
+  markLaunchdeckWarmPresence("webapp-activity");
   walletRuntimeDomain.queueWarmActivity({ immediate });
 }
 
@@ -4494,7 +4786,13 @@ function applyWalletStatusPayload(payload) {
 }
 
 async function bootstrapApp() {
-  return runtimeActions.bootstrapApp();
+  if (!launchdeckBootstrapPromise) {
+    launchdeckBootstrapPromise = Promise.resolve(runtimeActions.bootstrapApp())
+      .finally(() => {
+        launchdeckBootstrapPromise = null;
+      });
+  }
+  return launchdeckBootstrapPromise;
 }
 
 async function refreshRuntimeStatus() {
@@ -4635,7 +4933,7 @@ const fieldValidators = {
   },
   creationMaxFeeSol(v) {
     return isNamedChecked("creationAutoFeeEnabled")
-      ? validateOptionalAutoFeeCapField(v, getProvider())
+      ? validateRequiredAutoFeeCapField(v, getProvider())
       : validateNonNegativeSolField(v);
   },
   buyPriorityFeeSol(v) {
@@ -4656,11 +4954,12 @@ const fieldValidators = {
     if (!v) return "";
     const n = Number(v);
     if (isNaN(n) || n < 0) return "Must be a valid number";
+    if (n >= 100) return "Must be less than 100% so minimum output stays above zero";
     return "";
   },
   buyMaxFeeSol(v) {
     return isNamedChecked("buyAutoFeeEnabled")
-      ? validateOptionalAutoFeeCapField(v, getBuyProvider())
+      ? validateRequiredAutoFeeCapField(v, getBuyProvider())
       : validateNonNegativeSolField(v);
   },
   sellPriorityFeeSol(v) {
@@ -4681,11 +4980,12 @@ const fieldValidators = {
     if (!v) return "";
     const n = Number(v);
     if (isNaN(n) || n < 0) return "Must be a valid number";
+    if (n >= 100) return "Must be less than 100% so minimum output stays above zero";
     return "";
   },
   sellMaxFeeSol(v) {
     return isNamedChecked("sellAutoFeeEnabled")
-      ? validateOptionalAutoFeeCapField(v, getSellProvider())
+      ? validateRequiredAutoFeeCapField(v, getSellProvider())
       : validateNonNegativeSolField(v);
   },
   automaticDevSellPercent(v) {
@@ -4736,7 +5036,11 @@ function setFieldError(name, msg) {
   const errorEl = document.querySelector(`.field-error[data-error-for="${name}"]`);
   const input = getNamedInput(name);
   if (errorEl) errorEl.textContent = msg || "";
-  if (input) input.classList.toggle("input-error", !!msg);
+  if (input) {
+    input.classList.toggle("input-error", !!msg);
+    const label = input.closest("label");
+    if (label) label.classList.toggle("is-field-error", !!msg);
+  }
 }
 
 function validateFieldByName(name) {
@@ -4905,12 +5209,12 @@ function buildDeployPreviewHTML() {
     },
     {
       label: "Buy Route",
-      value: `${PROVIDER_LABELS[f.buyProvider || "helius-sender"] || (f.buyProvider || "helius-sender")} | slip ${f.buySlippagePercent || "90"}%`,
+      value: `${PROVIDER_LABELS[f.buyProvider || "helius-sender"] || (f.buyProvider || "helius-sender")} | slip ${f.buySlippagePercent || "unset"}%`,
       cls: "secondary",
     },
     {
       label: "Sell Route",
-      value: `${PROVIDER_LABELS[f.sellProvider || "helius-sender"] || (f.sellProvider || "helius-sender")} | slip ${f.sellSlippagePercent || "90"}%`,
+      value: `${PROVIDER_LABELS[f.sellProvider || "helius-sender"] || (f.sellProvider || "helius-sender")} | slip ${f.sellSlippagePercent || "unset"}%`,
       cls: "secondary",
     },
     { label: "Mode", value: `${modeLabels[f.mode] || f.mode}${f.mayhemMode ? " + Mayhem" : ""}`, cls: "" },
@@ -5128,7 +5432,7 @@ function setOutputSectionVisible(isVisible) {
     // Ignore storage access failures and keep the UI functional.
   }
   syncReportsTerminalLayoutHeight();
-  schedulePopoutAutosize();
+  schedulePopoutAutosize({ delayMs: 140 });
   scheduleLiveSyncBroadcast({ immediate: true });
 }
 
@@ -5701,39 +6005,55 @@ function setThemeMode(mode, { persist = true } = {}) {
 
 function setBootOverlayMessage(title, note, { animate = true } = {}) {
   if (!bootOverlay) return;
-  if (title != null && title !== "") {
+  const shouldUseStableCreateOverlayCopy =
+    isCreateOverlayMode
+    && document.documentElement.classList.contains("boot-pending")
+    && title === "Loading LaunchDeck";
+  const nextTitle = shouldUseStableCreateOverlayCopy ? "Loading LaunchDeck" : title;
+  const nextNote = shouldUseStableCreateOverlayCopy ? "Preparing create workspace" : note;
+  const nextAnimate = shouldUseStableCreateOverlayCopy ? true : animate;
+  if (nextTitle != null && nextTitle !== "") {
     const titleNode = bootOverlay.querySelector(".boot-overlay-title");
-    if (titleNode) titleNode.textContent = title;
+    if (titleNode) titleNode.textContent = nextTitle;
   }
-  if (note != null) {
+  if (nextNote != null) {
     const noteNode = bootOverlay.querySelector(".boot-overlay-note");
     const noteTextNode = noteNode ? noteNode.querySelector(".boot-overlay-note-text") : null;
     if (noteTextNode) {
-      noteTextNode.textContent = note;
+      noteTextNode.textContent = nextNote;
     } else if (noteNode) {
-      noteNode.textContent = note;
+      noteNode.textContent = nextNote;
     }
     if (noteNode) {
-      noteNode.classList.toggle("is-animating", Boolean(note) && animate);
+      noteNode.classList.toggle("is-animating", Boolean(nextNote) && nextAnimate);
     }
   }
 }
 
-function completeInitialBoot() {
+function completeInitialBoot({ offline = false } = {}) {
   if (window.__launchdeckBootFallback) {
     window.clearTimeout(window.__launchdeckBootFallback);
     window.__launchdeckBootFallback = null;
   }
-  setBootOverlayMessage("LaunchDeck ready", "Opening workspace", { animate: false });
+  if (offline) {
+    setBootOverlayMessage(
+      "LaunchDeck offline",
+      "Trading and PnL stay available; launch and reports will recover automatically.",
+      { animate: false }
+    );
+  } else {
+    setBootOverlayMessage("LaunchDeck ready", "Opening workspace", { animate: false });
+  }
   if (isPopoutMode) {
     resizePopoutToVisibleLayout();
   }
   requestAnimationFrame(() => {
     document.documentElement.classList.remove("boot-pending");
-    schedulePopoutAutosize();
+    schedulePopoutAutosize({ immediate: true });
+    scheduleCreateOverlayAutosize();
     if (isPopoutMode) {
       window.setTimeout(() => {
-        schedulePopoutAutosize();
+        schedulePopoutAutosize({ immediate: true });
       }, 120);
     }
   });
@@ -5751,57 +6071,172 @@ function measureVisibleWorkspaceContent() {
   if (!workspaceShell) {
     return { width: 0, height: 0 };
   }
-  const visibleChildren = Array.from(workspaceShell.children).filter((node) => !node.hidden);
+  const visibleChildren = typeof LaunchDeckLayout.getVisibleChildElements === "function"
+    ? LaunchDeckLayout.getVisibleChildElements(workspaceShell)
+    : Array.from(workspaceShell.children).filter((node) => node instanceof HTMLElement && !node.hidden);
   if (!visibleChildren.length) {
     return { width: 0, height: 0 };
   }
   const workspaceStyles = window.getComputedStyle(workspaceShell);
   const gap = Number.parseFloat(workspaceStyles.columnGap || workspaceStyles.gap || "0") || 0;
   const width = visibleChildren.reduce((sum, node, index) => {
-    const rect = node.getBoundingClientRect();
-    return sum + Math.ceil(rect.width) + (index > 0 ? gap : 0);
+    const box = typeof LaunchDeckLayout.measureElementBox === "function"
+      ? LaunchDeckLayout.measureElementBox(node)
+      : { width: Math.ceil(node.getBoundingClientRect().width), height: Math.ceil(node.getBoundingClientRect().height) };
+    return sum + box.width + (index > 0 ? gap : 0);
   }, 0);
-  const workspaceRect = workspaceShell.getBoundingClientRect();
+  const workspaceRect = typeof LaunchDeckLayout.measureElementBox === "function"
+    ? LaunchDeckLayout.measureElementBox(workspaceShell)
+    : { width: Math.ceil(workspaceShell.getBoundingClientRect().width), height: Math.ceil(workspaceShell.getBoundingClientRect().height) };
   const height = Math.ceil(
     Math.max(
       workspaceRect ? workspaceRect.height : 0,
       ...visibleChildren.map((node) => {
-        const rect = node.getBoundingClientRect();
-        return rect.height;
+        const box = typeof LaunchDeckLayout.measureElementBox === "function"
+          ? LaunchDeckLayout.measureElementBox(node)
+          : { width: Math.ceil(node.getBoundingClientRect().width), height: Math.ceil(node.getBoundingClientRect().height) };
+        return box.height;
       }),
     ),
   );
   return { width, height };
 }
 
-function getPreferredPopoutContentWidth() {
-  const measuredWidth = measureVisibleWorkspaceContent().width;
+function measureVisibleBootOverlayContent() {
+  if (
+    !(bootOverlay instanceof HTMLElement)
+    || (typeof LaunchDeckLayout.isElementActuallyVisible === "function"
+      ? !LaunchDeckLayout.isElementActuallyVisible(bootOverlay)
+      : window.getComputedStyle(bootOverlay).display === "none")
+  ) {
+    return { width: 0, height: 0 };
+  }
+  const bootOverlayBrand = bootOverlay.querySelector(".boot-overlay-brand");
+  if (!(bootOverlayBrand instanceof HTMLElement)) {
+    return { width: 0, height: 0 };
+  }
+  return typeof LaunchDeckLayout.measureElementBox === "function"
+    ? LaunchDeckLayout.measureElementBox(bootOverlayBrand)
+    : {
+        width: Math.ceil(bootOverlayBrand.getBoundingClientRect().width),
+        height: Math.ceil(bootOverlayBrand.getBoundingClientRect().height),
+      };
+}
+
+function measureVisibleModalOverlayContent() {
+  if (typeof LaunchDeckLayout.measureVisibleModalOverlayContent === "function") {
+    return LaunchDeckLayout.measureVisibleModalOverlayContent(document);
+  }
+  return { width: 0, height: 0 };
+}
+
+function getPreferredCreateOverlayContentSize() {
+  const stableCreateOverlaySize = typeof LaunchDeckLayout.getCreateOverlayStableSize === "function"
+    ? LaunchDeckLayout.getCreateOverlayStableSize()
+    : { width: CREATE_OVERLAY_STABLE_WIDTH, height: CREATE_OVERLAY_STABLE_HEIGHT };
+  if (document.documentElement.classList.contains("boot-pending")) {
+    return stableCreateOverlaySize;
+  }
+  const workspace = measureVisibleWorkspaceContent();
+  const bootOverlayContent = measureVisibleBootOverlayContent();
+  const modalOverlayContent = measureVisibleModalOverlayContent();
+  const formRect = form ? form.getBoundingClientRect() : null;
   let preferredWidth = 0;
   if (form && !form.hidden) {
-    preferredWidth += POPOUT_FORM_WIDTH;
+    preferredWidth = stableCreateOverlaySize.width;
   }
-  if (reportsTerminalSection && !reportsTerminalSection.hidden) {
-    preferredWidth += preferredWidth > 0 ? POPOUT_WORKSPACE_GAP : 0;
-    preferredWidth += POPOUT_REPORTS_WIDTH;
+  return {
+    width: Math.max(
+      preferredWidth,
+      workspace.width,
+      bootOverlayContent.width,
+      modalOverlayContent.width,
+    ),
+    height: Math.max(
+      stableCreateOverlaySize.height,
+      Math.ceil(formRect ? formRect.height : 0),
+      workspace.height,
+      bootOverlayContent.height,
+      modalOverlayContent.height,
+    ),
+  };
+}
+
+function postCreateOverlayResize() {
+  if (!isCreateOverlayMode || window.parent === window) return;
+  const size = getPreferredCreateOverlayContentSize();
+  if (!size.width || !size.height) return;
+  if (
+    Math.abs(lastCreateOverlayPostedWidth - size.width) < 2
+    && Math.abs(lastCreateOverlayPostedHeight - size.height) < 2
+  ) {
+    return;
   }
-  return Math.max(measuredWidth, preferredWidth);
+  lastCreateOverlayPostedWidth = size.width;
+  lastCreateOverlayPostedHeight = size.height;
+  window.parent.postMessage({
+    source: CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE,
+    type: CREATE_OVERLAY_RESIZE_MESSAGE_TYPE,
+    width: size.width,
+    height: size.height,
+  }, "*");
+}
+
+function getPreferredPopoutLayoutMetrics() {
+  const formVisible = Boolean(
+    form
+    && (typeof LaunchDeckLayout.isElementActuallyVisible === "function"
+      ? LaunchDeckLayout.isElementActuallyVisible(form)
+      : !form.hidden),
+  );
+  const reportsVisible = isReportsTerminalCurrentlyVisible();
+  const base = typeof LaunchDeckLayout.getPopoutBaseContentSize === "function"
+    ? LaunchDeckLayout.getPopoutBaseContentSize({ formVisible, reportsVisible })
+    : {
+        width: (formVisible ? POPOUT_FORM_WIDTH : 0) + (reportsVisible ? POPOUT_WORKSPACE_GAP + POPOUT_REPORTS_WIDTH : 0),
+        height: WEBAPP_POPOUT_STABLE_OUTER_HEIGHT,
+      };
+  const workspace = measureVisibleWorkspaceContent();
+  const modalOverlayContent = measureVisibleModalOverlayContent();
+  return {
+    formVisible,
+    reportsVisible,
+    baseWidth: base.width,
+    baseHeight: base.height,
+    modalWidth: modalOverlayContent.width,
+    modalHeight: modalOverlayContent.height,
+    measuredContentHeight: Math.max(base.height, workspace.height, modalOverlayContent.height),
+  };
+}
+
+function getPreferredPopoutContentWidth() {
+  const metrics = getPreferredPopoutLayoutMetrics();
+  return Math.max(metrics.baseWidth, metrics.modalWidth);
 }
 
 function getPreferredPopoutContentHeight() {
-  return measureVisibleWorkspaceContent().height;
+  return getPreferredPopoutLayoutMetrics().measuredContentHeight;
 }
 
 function resizePopoutToVisibleLayout() {
   if (!isPopoutMode) return;
-  const contentWidth = getPreferredPopoutContentWidth();
-  const contentHeight = getPreferredPopoutContentHeight();
-  if (!contentWidth || !contentHeight) return;
+  const metrics = getPreferredPopoutLayoutMetrics();
   const chromeWidth = Math.max(0, window.outerWidth - window.innerWidth);
   const chromeHeight = Math.max(0, window.outerHeight - window.innerHeight);
-  const maxOuterWidth = Math.max(420, window.screen.availWidth - 24);
-  const maxOuterHeight = Math.max(560, window.screen.availHeight - 24);
-  const targetWidth = Math.min(Math.max(420, contentWidth + chromeWidth + 4), maxOuterWidth);
-  const targetHeight = Math.min(Math.max(560, contentHeight + chromeHeight + 4), maxOuterHeight);
+  const nextSize = typeof LaunchDeckLayout.computePopoutTargetOuterSize === "function"
+    ? LaunchDeckLayout.computePopoutTargetOuterSize({
+        chromeWidth,
+        chromeHeight,
+        formVisible: metrics.formVisible,
+        reportsVisible: metrics.reportsVisible,
+        measuredContentHeight: metrics.measuredContentHeight,
+        modalWidth: metrics.modalWidth,
+        modalHeight: metrics.modalHeight,
+        screenObj: window.screen,
+      })
+    : { width: window.outerWidth, height: window.outerHeight };
+  const targetWidth = nextSize.width;
+  const targetHeight = nextSize.height;
   if (Math.abs(window.outerWidth - targetWidth) < 4 && Math.abs(window.outerHeight - targetHeight) < 4) {
     return;
   }
@@ -5812,17 +6247,71 @@ function resizePopoutToVisibleLayout() {
   }
 }
 
-function schedulePopoutAutosize() {
+function schedulePopoutAutosize(options = {}) {
   if (!isPopoutMode) return;
+  const { delayMs = 90, immediate = false } = options || {};
+  if (popoutAutosizeTimeout) {
+    window.clearTimeout(popoutAutosizeTimeout);
+    popoutAutosizeTimeout = 0;
+  }
   if (popoutAutosizeFrame) {
     window.cancelAnimationFrame(popoutAutosizeFrame);
   }
-  popoutAutosizeFrame = window.requestAnimationFrame(() => {
-    popoutAutosizeFrame = 0;
+  const runAutosize = () => {
+    popoutAutosizeFrame = window.requestAnimationFrame(() => {
+      popoutAutosizeFrame = 0;
+      window.requestAnimationFrame(() => {
+        resizePopoutToVisibleLayout();
+      });
+    });
+  };
+  if (immediate || !delayMs) {
+    runAutosize();
+    return;
+  }
+  popoutAutosizeTimeout = window.setTimeout(() => {
+    popoutAutosizeTimeout = 0;
+    runAutosize();
+  }, delayMs);
+}
+
+function scheduleCreateOverlayAutosize() {
+  if (!isCreateOverlayMode) return;
+  if (createOverlayAutosizeFrame) {
+    window.cancelAnimationFrame(createOverlayAutosizeFrame);
+  }
+  createOverlayAutosizeFrame = window.requestAnimationFrame(() => {
+    createOverlayAutosizeFrame = 0;
     window.requestAnimationFrame(() => {
-      resizePopoutToVisibleLayout();
+      postCreateOverlayResize();
     });
   });
+}
+
+function initCreateOverlayAutosizeSync() {
+  if (!isCreateOverlayMode) return;
+  if (!createOverlayResizeObserver && typeof window.ResizeObserver === "function") {
+    createOverlayResizeObserver = new window.ResizeObserver(() => {
+      scheduleCreateOverlayAutosize();
+    });
+    if (document.body) createOverlayResizeObserver.observe(document.body);
+    if (workspaceShell) createOverlayResizeObserver.observe(workspaceShell);
+    if (form) createOverlayResizeObserver.observe(form);
+    if (bootOverlay) createOverlayResizeObserver.observe(bootOverlay);
+  }
+  if (!createOverlayMutationObserver && document.body) {
+    createOverlayMutationObserver = new window.MutationObserver(() => {
+      scheduleCreateOverlayAutosize();
+    });
+    createOverlayMutationObserver.observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["hidden", "class", "style", "aria-hidden"],
+    });
+  }
+  window.addEventListener("resize", scheduleCreateOverlayAutosize);
+  scheduleCreateOverlayAutosize();
 }
 
 function openPopoutWindow() {
@@ -5831,22 +6320,28 @@ function openPopoutWindow() {
   popoutUrl.searchParams.delete("output");
   popoutUrl.searchParams.delete("reports");
   dispatchLiveSyncPayload(buildLiveSyncPayload());
-  const contentWidth = getPreferredPopoutContentWidth();
-  const contentHeight = getPreferredPopoutContentHeight();
+  const metrics = getPreferredPopoutLayoutMetrics();
   const chromeWidth = Math.max(0, window.outerWidth - window.innerWidth);
   const chromeHeight = Math.max(0, window.outerHeight - window.innerHeight);
-  const width = Math.min(
-    Math.max(420, (contentWidth || 720) + chromeWidth + 4),
-    Math.max(420, window.screen.availWidth - 24),
-  );
-  const height = Math.min(
-    Math.max(560, (contentHeight || 760) + chromeHeight + 4),
-    Math.max(560, window.screen.availHeight - 24),
-  );
+  const nextSize = typeof LaunchDeckLayout.computePopoutTargetOuterSize === "function"
+    ? LaunchDeckLayout.computePopoutTargetOuterSize({
+        chromeWidth,
+        chromeHeight,
+        formVisible: metrics.formVisible,
+        reportsVisible: metrics.reportsVisible,
+        measuredContentHeight: metrics.measuredContentHeight,
+        modalWidth: metrics.modalWidth,
+        modalHeight: metrics.modalHeight,
+        screenObj: window.screen,
+      })
+    : { width: WEBAPP_POPOUT_STABLE_OUTER_WIDTH, height: WEBAPP_POPOUT_STABLE_OUTER_HEIGHT };
+  const popupPosition = typeof LaunchDeckLayout.computeCenteredPopupPosition === "function"
+    ? LaunchDeckLayout.computeCenteredPopupPosition(nextSize.width, nextSize.height, window.screen)
+    : { left: 0, top: 0 };
   window.open(
     popoutUrl.toString(),
     POPOUT_WINDOW_NAME,
-    `popup=yes,width=${width},height=${height},menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes`,
+    `popup=yes,width=${nextSize.width},height=${nextSize.height},left=${popupPosition.left},top=${popupPosition.top},menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes`,
   );
 }
 
@@ -6155,14 +6650,19 @@ setTickerCapsEnabled(getStoredTickerCapsEnabled());
 updateJitoVisibility();
 hydrateDevAutoSellState();
 hydrateModeActionState();
+window.setTimeout(() => {
+  restoreStoredCustomDevBuySolAmount();
+}, 0);
 updateTokenFieldCounts();
 updateDescriptionDisclosure();
 setSettingsLoadingState(true);
 renderBackendRegionSummary(null);
 renderSniperUI();
 renderReportsTerminalOutput();
+renderLaunchdeckHostBanner();
 Promise.resolve(bootstrapApp())
-  .then(() => {
+  .then((bootResult) => {
+    markLaunchdeckWarmPresence("webapp-open");
     const restoredLaunchpad = getStoredLaunchpad();
     if (restoredLaunchpad && getLaunchpad() !== restoredLaunchpad) {
       setLaunchpad(restoredLaunchpad, {
@@ -6171,16 +6671,32 @@ Promise.resolve(bootstrapApp())
         restoreScopedActions: true,
       });
     }
-    startRuntimeStatusRefreshLoop();
-    enableLiveSync();
-    if (isReportsTerminalCurrentlyVisible()) {
+    if (!bootResult || !bootResult.offline) {
+      startRuntimeStatusRefreshLoop();
+      enableLiveSync();
+    }
+    if ((!bootResult || !bootResult.offline) && isReportsTerminalCurrentlyVisible()) {
       refreshReportsTerminal({
         preserveSelection: true,
         preferId: reportsTerminalState.activeId,
         showLoading: false,
       }).catch(() => {});
     }
-    completeInitialBoot();
+    completeInitialBoot({ offline: Boolean(bootResult && bootResult.offline) });
+    if (
+      (!bootResult || !bootResult.offline)
+      && extensionShellConfig
+      && !isPopoutMode
+      && String(extensionShellConfig.contractAddress || "").trim()
+    ) {
+      window.requestAnimationFrame(() => {
+        importVampToken(String(extensionShellConfig.contractAddress || "").trim()).catch((error) => {
+          if (imageStatus) {
+            imageStatus.textContent = error && error.message ? error.message : "Failed to import token metadata.";
+          }
+        });
+      });
+    }
   })
   .catch((error) => {
     if (walletBalance) walletBalance.textContent = "-";
@@ -6226,13 +6742,22 @@ window.addEventListener("focus", () => {
 });
 
 window.addEventListener("pagehide", () => {
+  setLaunchdeckWarmInactive("webapp-closed");
   dispatchLiveSyncPayload(buildLiveSyncPayload());
+  clearLaunchdeckHostRecoveryTimer();
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
+  if (document.visibilityState !== "visible") {
+    markLaunchdeckWarmPresence("webapp-hidden");
+    clearLaunchdeckHostRecoveryTimer();
+    return;
+  }
   queueWarmActivity({ immediate: true });
   refreshRuntimeStatus().catch(() => {});
+  if (extensionShellConfig && !launchdeckHostConnectionState.reachable && !hasBootstrapConfig()) {
+    scheduleLaunchdeckHostRecovery();
+  }
 });
 
 liveSyncSupport.bindGlobalListeners();

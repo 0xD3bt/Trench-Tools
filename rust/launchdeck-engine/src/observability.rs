@@ -272,11 +272,11 @@ mod tests {
 
     #[test]
     fn persists_launch_report_with_trace_and_signatures() {
-        let _guard = env_lock().lock().expect("lock env");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp_dir = std::env::temp_dir().join(format!("launchdeck-send-log-{}", Uuid::new_v4()));
-        unsafe {
-            std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
-        }
+        crate::paths::set_test_reports_dir(Some(temp_dir.clone()));
         let plan = TransportPlan {
             requestedProvider: "helius-sender".to_string(),
             resolvedProvider: "helius-sender".to_string(),
@@ -320,20 +320,18 @@ mod tests {
         let raw = fs::read_to_string(&path).expect("read persisted log");
         assert!(raw.contains("\"traceId\": \"trace-123\""));
         assert!(raw.contains("\"signature\""));
-        unsafe {
-            std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
-        }
+        crate::paths::set_test_reports_dir(None);
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn updates_existing_launch_report_contents() {
-        let _guard = env_lock().lock().expect("lock env");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp_dir =
             std::env::temp_dir().join(format!("launchdeck-send-log-update-{}", Uuid::new_v4()));
-        unsafe {
-            std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
-        }
+        crate::paths::set_test_reports_dir(Some(temp_dir.clone()));
         let plan = TransportPlan {
             requestedProvider: "helius-sender".to_string(),
             resolvedProvider: "helius-sender".to_string(),
@@ -383,21 +381,19 @@ mod tests {
         let raw = fs::read_to_string(&path).expect("read updated log");
         assert!(raw.contains("\"benchmark\""));
         assert!(raw.contains("\"totalElapsedMs\": 42"));
-        unsafe {
-            std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
-        }
+        crate::paths::set_test_reports_dir(None);
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn updates_follow_daemon_snapshot_in_persisted_report() {
-        let _guard = env_lock().lock().expect("lock env");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp_dir =
             std::env::temp_dir().join(format!("launchdeck-follow-log-update-{}", Uuid::new_v4()));
         clear_report_summary_cache();
-        unsafe {
-            std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
-        }
+        crate::paths::set_test_reports_dir(Some(temp_dir.clone()));
         let plan = TransportPlan {
             requestedProvider: "helius-sender".to_string(),
             resolvedProvider: "helius-sender".to_string(),
@@ -446,23 +442,22 @@ mod tests {
         let raw = fs::read_to_string(&path).expect("read updated log");
         assert!(raw.contains("\"followDaemon\""));
         assert!(raw.contains("\"traceId\": \"trace-follow\""));
-        unsafe {
-            std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
-        }
+        crate::paths::set_test_reports_dir(None);
         let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn persist_launch_report_refreshes_reports_cache() {
-        let _guard = env_lock().lock().expect("lock env");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp_dir =
             std::env::temp_dir().join(format!("launchdeck-send-log-cache-{}", Uuid::new_v4()));
         clear_report_summary_cache();
-        unsafe {
-            std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
-        }
+        crate::paths::set_test_reports_dir(Some(temp_dir.clone()));
         let cached_before = list_persisted_reports("newest");
         assert!(cached_before.is_empty());
+        clear_report_summary_cache();
         let plan = TransportPlan {
             requestedProvider: "helius-sender".to_string(),
             resolvedProvider: "helius-sender".to_string(),
@@ -514,9 +509,7 @@ mod tests {
                 .any(|entry| { entry.fileName == file_name && entry.mint == "mint-cache-test" })
         );
 
-        unsafe {
-            std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
-        }
+        crate::paths::set_test_reports_dir(None);
         let _ = fs::remove_dir_all(temp_dir);
     }
 

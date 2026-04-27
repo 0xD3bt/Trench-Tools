@@ -1,12 +1,16 @@
+mod alt_diagnostics;
 mod app_logs;
 mod bags_native;
 mod bonk_native;
+mod compiled_transaction_signers;
 mod config;
 mod crypto;
 mod endpoint_profile;
+mod execution_engine_bridge;
 mod follow;
+#[path = "follow/controlplane.rs"]
+mod follow_controlplane;
 mod fs_utils;
-mod helper_worker;
 mod image_library;
 mod launchpad_dispatch;
 mod launchpad_runtime;
@@ -28,12 +32,12 @@ mod ui_config;
 mod vamp;
 mod wallet;
 mod warm_manager;
+mod wrapper_compile;
 
 use crate::{
     app_logs::{list_error_logs, list_live_logs, record_error, record_info, record_warn},
     bags_native::{
-        bags_runtime_status_payload,
-        compile_launch_transaction as compile_bags_launch_transaction,
+        bags_runtime_status_payload, compile_launch_transaction as compile_bags_launch_transaction,
         summarize_transactions as summarize_bags_transactions,
     },
     config::{
@@ -41,11 +45,20 @@ use crate::{
         configured_bags_setup_confirm_timeout_secs, configured_bags_setup_gate_commitment,
         normalize_raw_config,
     },
+    execution_engine_bridge::{
+        confirmed_trade_record_from_sent_result, record_confirmed_trades,
+        spawn_startup_outbox_flush_task,
+    },
     follow::{
-        FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
-        FollowJobRecord, FollowJobResponse, FollowJobState, FollowReserveRequest,
-        FollowStopAllRequest, build_action_records, should_use_post_setup_creator_vault_for_buy,
-        should_use_post_setup_creator_vault_for_sell,
+        FollowArmRequest, FollowCancelRequest, FollowDaemonClient, FollowJobResponse,
+        FollowReserveRequest, FollowStopAllRequest, build_action_records,
+        should_use_post_setup_creator_vault_for_buy,
+    },
+    follow_controlplane::{
+        attach_follow_daemon_report, cancel_follow_job_best_effort,
+        cancel_reserved_follow_job_on_launch_failure, configured_follow_daemon_base_url,
+        configured_follow_daemon_transport, follow_active_jobs_count, follow_daemon_browser_client,
+        follow_daemon_status_payload, spawn_follow_job_activity_refresh_task,
     },
     fs_utils::atomic_write,
     image_library::{
@@ -54,7 +67,8 @@ use crate::{
     launchpad_dispatch::{
         NativeLaunchArtifacts, compile_atomic_follow_buy_for_launchpad,
         derive_canonical_pool_id_for_launchpad, launchpad_action_backend,
-        launchpad_action_rollout_state, predict_dev_buy_token_amount_for_launchpad,
+        launchpad_action_rollout_state, maybe_wrap_launch_dev_buy_transaction,
+        predict_dev_buy_token_amount_for_launchpad,
     },
     launchpad_runtime::{
         FeeRecipientLookupRequest, LaunchQuoteRequest, NativeLaunchCompileRequest,
@@ -70,7 +84,7 @@ use crate::{
         record_outbound_provider_http_request, rpc_traffic_snapshot,
         update_persisted_launch_report,
     },
-    provider_tip::{provider_min_tip_sol_label, provider_required_tip_lamports},
+    provider_tip::pick_tip_account_for_provider,
     providers::{provider_availability_registry, provider_registry},
     pump_native::{warm_default_lookup_tables, warm_pump_global_state},
     report::{
@@ -81,8 +95,8 @@ use crate::{
     reports_browser::{list_persisted_reports, read_persisted_report_bundle},
     rpc::{
         CompiledTransaction, JitoWarmResult, SendTimingBreakdown, configured_warm_rpc_url,
-        confirm_submitted_transactions_for_transport, fetch_current_block_height,
-        derive_helius_transaction_subscribe_account_required,
+        confirm_submitted_transactions_for_transport,
+        derive_helius_transaction_subscribe_account_required, fetch_current_block_height,
         is_blockhash_valid, prewarm_helius_transaction_subscribe_endpoint,
         prewarm_hellomoon_bundle_endpoint, prewarm_hellomoon_quic_endpoint,
         prewarm_jito_bundle_endpoint, prewarm_rpc_endpoint, prewarm_watch_websocket_endpoint,
@@ -127,15 +141,30 @@ use axum::{
     body::Body,
     extract::{Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, Response, StatusCode, header},
+    middleware::{self, Next},
     routing::{get, post},
 };
-use futures_util::{SinkExt, StreamExt, future::join_all};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use shared_auth::AuthManager;
+use shared_extension_runtime::resource_mode::idle_suspension_enabled as global_idle_suspension_enabled;
+use shared_fee_market::{
+    AutoFeeActionReport, AutoFeeReport, DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL,
+    DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE, FeeMarketSnapshot, SharedFeeMarketConfig,
+    SharedFeeMarketRuntime, action_priority_estimate, action_tip_estimate,
+    apply_auto_fee_estimate_buffer, format_lamports_to_sol_decimal, format_priority_price_note,
+    helius_fee_estimate_options, lamports_to_priority_fee_micro_lamports,
+    normalize_helius_priority_level, normalize_jito_tip_percentile, parse_auto_fee_cap_lamports,
+    parse_helius_priority_estimate_result, parse_sol_decimal_to_lamports,
+    priority_price_micro_lamports_to_sol_equivalent, provider_uses_auto_fee_priority,
+    provider_uses_auto_fee_tip, resolve_auto_fee_components_with_total_cap,
+    shared_fee_market_status_payload,
+};
 use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
+    collections::HashSet,
     fs,
+    future::Future,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
@@ -144,7 +173,7 @@ use std::{
 
 #[derive(Clone)]
 struct AppState {
-    auth_token: Option<String>,
+    auth: Option<Arc<AuthManager>>,
     runtime: Arc<RuntimeRegistry>,
     warm: Arc<Mutex<WarmControlState>>,
 }
@@ -384,7 +413,11 @@ fn continuous_state_warm_probe_futures(
         None,
         "Fee Market",
         fee_market_target.clone(),
-        async move { fetch_fee_market_snapshot(&fee_market_target).await.map(|_| ()) },
+        async move {
+            fetch_fee_market_snapshot(&fee_market_target)
+                .await
+                .map(|_| ())
+        },
     ));
     futures
 }
@@ -408,8 +441,12 @@ fn endpoint_warm_probe_futures(
     }
     if routes.iter().any(|route| route.provider == "helius-sender") {
         let mut seen = HashSet::new();
-        for route in routes.iter().filter(|route| route.provider == "helius-sender") {
-            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile) {
+        for route in routes
+            .iter()
+            .filter(|route| route.provider == "helius-sender")
+        {
+            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile)
+            {
                 if !seen.insert(endpoint.clone()) {
                     continue;
                 }
@@ -462,7 +499,10 @@ fn endpoint_warm_probe_futures(
     }
     if routes.iter().any(|route| route.provider == "jito-bundle") {
         let mut seen = HashSet::new();
-        for route in routes.iter().filter(|route| route.provider == "jito-bundle") {
+        for route in routes
+            .iter()
+            .filter(|route| route.provider == "jito-bundle")
+        {
             for endpoint in configured_jito_bundle_endpoints_for_profile(&route.endpoint_profile) {
                 if !seen.insert(endpoint.send.clone()) {
                     continue;
@@ -794,6 +834,14 @@ struct RunRequest {
     prepare_request_payload_ms: Option<u64>,
 }
 
+#[derive(Deserialize, Default)]
+struct WarmPresenceRequest {
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    reason: String,
+}
+
 #[derive(Deserialize)]
 struct FollowCancelApiRequest {
     #[serde(rename = "traceId")]
@@ -952,7 +1000,6 @@ struct ImageDeleteRequest {
 }
 
 const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
-const DEFAULT_LOCAL_AUTH_TOKEN: &str = "4815927603149027";
 
 fn configured_engine_port() -> u16 {
     std::env::var("LAUNCHDECK_PORT")
@@ -961,40 +1008,49 @@ fn configured_engine_port() -> u16 {
         .unwrap_or(8789)
 }
 
-fn configured_auth_token() -> Option<String> {
-    let token = std::env::var("LAUNCHDECK_ENGINE_AUTH_TOKEN")
-        .unwrap_or_else(|_| DEFAULT_LOCAL_AUTH_TOKEN.to_string());
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        Some(DEFAULT_LOCAL_AUTH_TOKEN.to_string())
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 fn configured_runtime_state_path() -> std::path::PathBuf {
     paths::runtime_state_path()
 }
 
+fn extract_request_auth_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, Json<Value>)> {
-    let Some(expected) = &state.auth_token else {
+    let Some(auth) = &state.auth else {
         return Ok(());
     };
-    let actual = headers
-        .get("x-launchdeck-engine-auth")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    if actual == expected {
-        Ok(())
-    } else {
-        Err((
+    let token = extract_request_auth_token(headers).ok_or((
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "ok": false,
+            "error": "Missing bearer token.",
+        })),
+    ))?;
+    auth.verify_token(token).map_err(|error| {
+        (
             StatusCode::UNAUTHORIZED,
             Json(json!({
                 "ok": false,
-                "error": "Unauthorized engine request.",
+                "error": error,
             })),
-        ))
-    }
+        )
+    })?;
+    Ok(())
+}
+
+async fn require_authorized_api_request(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    authorize(request.headers(), &state)?;
+    Ok(next.run(request).await)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -1043,6 +1099,9 @@ fn configured_continuous_warm_enabled() -> bool {
 }
 
 fn configured_idle_warm_suspend_enabled() -> bool {
+    if !global_idle_suspension_enabled() {
+        return false;
+    }
     parse_env_bool_flag(
         &std::env::var("LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND").unwrap_or_default(),
         true,
@@ -1253,29 +1312,6 @@ fn warm_routes_from_normalized_config_value(value: &Value) -> Vec<WarmRouteSelec
     routes
 }
 
-fn sync_follow_job_warm_state(
-    warm: &mut WarmControlState,
-    active_jobs: usize,
-    jobs: &[FollowJobRecord],
-) {
-    warm.follow_jobs_active = active_jobs > 0;
-    let mut routes = Vec::new();
-    for job in jobs
-        .iter()
-        .filter(|job| matches!(job.state, FollowJobState::Armed | FollowJobState::Running))
-    {
-        for route in warm_routes_for_execution(&job.execution) {
-            push_unique_warm_route(
-                &mut routes,
-                &route.provider,
-                &route.endpoint_profile,
-                &route.hellomoon_mev_mode,
-            );
-        }
-    }
-    warm.follow_job_routes = routes;
-}
-
 fn effective_warm_routes(warm: &WarmControlState) -> Vec<WarmRouteSelection> {
     let mut routes = merged_warm_routes(&warm.selected_routes);
     for route in &warm.follow_job_routes {
@@ -1346,9 +1382,8 @@ fn configured_standard_rpc_warm_endpoints(main_rpc_url: &str) -> Vec<String> {
 }
 
 fn should_prewarm_primary_rpc_separately(main_rpc_url: &str, warm_rpc_url: &str) -> bool {
-    let main_trimmed = main_rpc_url.trim();
-    let warm_trimmed = warm_rpc_url.trim();
-    !main_trimmed.is_empty() && !warm_trimmed.is_empty() && main_trimmed != warm_trimmed
+    let _ = (main_rpc_url, warm_rpc_url);
+    false
 }
 
 fn configured_watch_warm_targets(routes: &[WarmRouteSelection]) -> Vec<WatchWarmTarget> {
@@ -1447,6 +1482,43 @@ fn mark_operator_activity(state: &Arc<AppState>, routes: Vec<WarmRouteSelection>
     should_trigger_immediate_rewarm
 }
 
+fn mark_browser_presence(state: &Arc<AppState>, active: bool, reason: &str) {
+    let now = current_time_ms();
+    let mut warm = state
+        .warm
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !active && !configured_idle_warm_suspend_enabled() {
+        warm.browser_active = true;
+        warm.continuous_active = true;
+        warm.current_reason = "active-always-on-resource-mode".to_string();
+        warm.last_resume_at_ms.get_or_insert(now);
+        warm.last_suspend_at_ms = None;
+        return;
+    }
+    if active {
+        warm.last_activity_at_ms = now;
+        warm.browser_active = true;
+        warm.current_reason = if reason.trim().is_empty() {
+            "active-browser-presence".to_string()
+        } else {
+            reason.trim().to_string()
+        };
+        warm.last_resume_at_ms = Some(now);
+        warm.last_suspend_at_ms = None;
+        return;
+    }
+    warm.browser_active = false;
+    warm.continuous_active = false;
+    warm.last_suspend_at_ms = Some(now);
+    warm.current_reason = if reason.trim().is_empty() {
+        "inactive-browser-presence".to_string()
+    } else {
+        reason.trim().to_string()
+    };
+    set_all_warm_targets_inactive(&mut warm);
+}
+
 fn mark_in_flight_engine_request(state: &Arc<AppState>) -> WarmInFlightGuard {
     let now = current_time_ms();
     let mut warm = state
@@ -1494,7 +1566,6 @@ fn warm_gate_state(
 }
 
 const IDLE_BACKGROUND_REQUEST_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const FOLLOW_JOB_ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const ENGINE_BLOCKHASH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 fn background_request_gate_active(warm: &WarmControlState, now_ms: u128) -> bool {
@@ -1579,37 +1650,6 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
     })
 }
 
-async fn follow_active_jobs_count() -> u64 {
-    let payload = follow_daemon_status_payload().await;
-    payload
-        .get("health")
-        .and_then(|value| value.get("activeJobs"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-}
-
-fn update_follow_job_warm_state(
-    state: &Arc<AppState>,
-    active_jobs: usize,
-    jobs: &[FollowJobRecord],
-) {
-    let mut warm = state
-        .warm
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    sync_follow_job_warm_state(&mut warm, active_jobs, jobs);
-}
-
-async fn refresh_follow_job_warm_state_from_daemon(state: &Arc<AppState>) {
-    let client = FollowDaemonClient::new(&configured_follow_daemon_base_url());
-    match client.list().await {
-        Ok(response) => {
-            update_follow_job_warm_state(state, response.health.activeJobs, &response.jobs)
-        }
-        Err(_error) => update_follow_job_warm_state(state, 0, &[]),
-    }
-}
-
 async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     let follow_active_jobs = follow_active_jobs_count().await;
     let (routes, attempt_started_at_ms) = {
@@ -1655,7 +1695,10 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     let main_rpc_url = configured_rpc_url();
     let warm_rpc_url = configured_warm_rpc_url(&main_rpc_url);
     let (state_outcomes, endpoint_outcomes, watch_outcomes_nested) = tokio::join!(
-        join_all(continuous_state_warm_probe_futures(&main_rpc_url, &warm_rpc_url)),
+        join_all(continuous_state_warm_probe_futures(
+            &main_rpc_url,
+            &warm_rpc_url
+        )),
         join_all(endpoint_warm_probe_futures(&routes, &main_rpc_url)),
         join_all(watch_warm_probe_futures(&routes)),
     );
@@ -1722,76 +1765,8 @@ fn spawn_continuous_warm_task(state: Arc<AppState>) {
     });
 }
 
-fn spawn_follow_job_activity_refresh_task(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        loop {
-            refresh_follow_job_warm_state_from_daemon(&state).await;
-            tokio::time::sleep(FOLLOW_JOB_ACTIVITY_REFRESH_INTERVAL).await;
-        }
-    });
-}
-
 fn configured_base_url() -> String {
     format!("http://127.0.0.1:{}", configured_engine_port())
-}
-
-fn configured_follow_daemon_port() -> u16 {
-    std::env::var("LAUNCHDECK_FOLLOW_DAEMON_PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(8790)
-}
-
-fn configured_follow_daemon_base_url() -> String {
-    std::env::var("LAUNCHDECK_FOLLOW_DAEMON_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", configured_follow_daemon_port()))
-}
-
-fn configured_follow_daemon_transport() -> Result<String, String> {
-    let transport = std::env::var("LAUNCHDECK_FOLLOW_DAEMON_TRANSPORT")
-        .unwrap_or_else(|_| "local-http".to_string())
-        .trim()
-        .to_lowercase();
-    match transport.as_str() {
-        "" | "local-http" => Ok("local-http".to_string()),
-        other => Err(format!(
-            "Unsupported follow daemon transport: {other}. Expected local-http."
-        )),
-    }
-}
-
-async fn follow_daemon_status_payload() -> Value {
-    let base_url = configured_follow_daemon_base_url();
-    match configured_follow_daemon_transport() {
-        Ok(transport) => {
-            let client = FollowDaemonClient::new(&base_url);
-            match client.health().await {
-                Ok(health) => json!({
-                    "configured": true,
-                    "reachable": true,
-                    "transport": transport,
-                    "url": base_url,
-                    "health": health,
-                }),
-                Err(error) => json!({
-                    "configured": true,
-                    "reachable": false,
-                    "transport": transport,
-                    "url": base_url,
-                    "error": error,
-                }),
-            }
-        }
-        Err(error) => json!({
-            "configured": false,
-            "reachable": false,
-            "url": base_url,
-            "error": error,
-        }),
-    }
 }
 
 fn resolve_signer_source(selected_wallet_key: &str) -> String {
@@ -1881,6 +1856,63 @@ fn file_response(path: std::path::PathBuf) -> Result<Response<Body>, (StatusCode
         })
 }
 
+fn launchdeck_index_response(
+    state: &AppState,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let path = paths::ui_dir().join("launchdeck").join("index.html");
+    let mut body = std::fs::read_to_string(&path).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": "Not found",
+            })),
+        )
+    })?;
+    if let Some(auth) = &state.auth {
+        let token = auth.default_token().map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })?;
+        let injected = format!(
+            "<script>window.__ldToken = {};</script>",
+            serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".to_string())
+        );
+        if let Some(index) = body.rfind("<script") {
+            body.insert_str(index, &injected);
+        } else if let Some(index) = body.rfind("</body>") {
+            body.insert_str(index, &injected);
+        } else {
+            body.push_str(&injected);
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, guess_content_type(&path))
+        .header(header::CACHE_CONTROL, cache_control_for_path(&path))
+        .body(Body::from(body))
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": error.to_string(),
+                })),
+            )
+        })
+}
+
+async fn serve_launchdeck_index(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    launchdeck_index_response(&state)
+}
+
 fn static_not_found() -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_FOUND,
@@ -1909,7 +1941,9 @@ fn safe_ui_relative_path(requested: &str) -> Option<std::path::PathBuf> {
     Some(relative)
 }
 
-fn try_file_response(path: std::path::PathBuf) -> Option<Result<Response<Body>, (StatusCode, Json<Value>)>> {
+fn try_file_response(
+    path: std::path::PathBuf,
+) -> Option<Result<Response<Body>, (StatusCode, Json<Value>)>> {
     if path.is_file() {
         return Some(file_response(path));
     }
@@ -2120,33 +2154,6 @@ fn refresh_report_benchmark(report: &mut Value) {
     });
 }
 
-fn attach_follow_daemon_report(
-    report: &mut Value,
-    transport: Option<&str>,
-    reserved: Option<&FollowJobResponse>,
-    armed: Option<&FollowJobResponse>,
-    latest: Option<&FollowJobResponse>,
-    original_follow_launch: Option<&NormalizedFollowLaunch>,
-) {
-    let latest_response = latest.or(armed).or(reserved);
-    let mut job = latest_response.and_then(|response| response.job.clone());
-    if let Some(job_record) = job.as_mut()
-        && let Some(original_follow_launch) = original_follow_launch
-    {
-        job_record.followLaunch = original_follow_launch.clone();
-    }
-    let health = latest_response.map(|response| response.health.clone());
-    report["followDaemon"] = json!({
-        "schemaVersion": FOLLOW_RESPONSE_SCHEMA_VERSION,
-        "enabled": reserved.is_some() || armed.is_some(),
-        "transport": transport,
-        "reserved": reserved,
-        "armed": armed,
-        "job": job,
-        "health": health,
-    });
-}
-
 fn split_same_time_snipes(
     follow_launch: &NormalizedFollowLaunch,
 ) -> (
@@ -2192,68 +2199,6 @@ fn has_same_time_snipes(follow_launch: &NormalizedFollowLaunch) -> bool {
         .snipes
         .iter()
         .any(|snipe| snipe.enabled && snipe.submitWithLaunch)
-}
-
-async fn cancel_reserved_follow_job_on_launch_failure(
-    client: Option<&FollowDaemonClient>,
-    reserve_task: &mut Option<tokio::task::JoinHandle<Result<(FollowJobResponse, u128), String>>>,
-    trace_id: &str,
-    note: &str,
-) {
-    if let Some(mut task) = reserve_task.take() {
-        match tokio::time::timeout(Duration::from_millis(1500), &mut task).await {
-            Ok(_) => {}
-            Err(_) => {
-                task.abort();
-            }
-        }
-    }
-    let _ = cancel_follow_job_best_effort(client, trace_id, note).await;
-}
-
-async fn cancel_follow_job_best_effort(
-    client: Option<&FollowDaemonClient>,
-    trace_id: &str,
-    note: &str,
-) -> bool {
-    if let Some(client) = client {
-        let mut last_error = None;
-        for attempt in 0..5 {
-            match client
-                .cancel(&FollowCancelRequest {
-                    traceId: trace_id.to_string(),
-                    actionId: None,
-                    note: Some(note.to_string()),
-                })
-                .await
-            {
-                Ok(_) => {
-                    return true;
-                }
-                Err(error) => {
-                    let retry_unknown_trace = error.contains("Unknown follow job traceId");
-                    last_error = Some(error);
-                    if retry_unknown_trace && attempt < 4 {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        continue;
-                    }
-                    break;
-                }
-            }
-        }
-        if let Some(error) = last_error {
-            record_warn(
-                "follow-client",
-                "Follow daemon cancellation after launch failure was not acknowledged.".to_string(),
-                Some(json!({
-                    "traceId": trace_id,
-                    "message": error,
-                    "note": note,
-                })),
-            );
-        }
-    }
-    false
 }
 
 async fn collect_bags_setup_transaction_diagnostics(
@@ -2369,7 +2314,8 @@ fn actual_helius_sender_endpoint(sent: &[crate::rpc::SentResult]) -> Option<Stri
         if entry.transportType != "helius-sender" {
             return None;
         }
-        entry.endpoint
+        entry
+            .endpoint
             .as_ref()
             .filter(|value| !value.is_empty())
             .cloned()
@@ -2522,240 +2468,84 @@ fn same_time_wallet_label(wallet_env_key: &str) -> String {
     }
 }
 
-fn parse_sol_decimal_to_lamports(value: &str) -> Option<u64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Some(0);
+fn launchdeck_coin_trade_records_from_sent_results(
+    sent: &[crate::rpc::SentResult],
+    wallet_keys: &[String],
+    mint: &str,
+    client_request_id: Option<&str>,
+) -> Result<Vec<execution_engine_bridge::ExecutionEngineConfirmedTradeRecord>, String> {
+    if sent.len() != wallet_keys.len() {
+        return Err(format!(
+            "LaunchDeck coin-trade wallet mapping mismatch: sent={} wallets={}",
+            sent.len(),
+            wallet_keys.len()
+        ));
     }
-    let normalized = trimmed.replace(',', ".");
-    let mut parts = normalized.split('.');
-    let whole = parts.next()?;
-    let fractional = parts.next().unwrap_or("");
-    if parts.next().is_some()
-        || !whole.chars().all(|char| char.is_ascii_digit())
-        || !fractional.chars().all(|char| char.is_ascii_digit())
-    {
-        return None;
-    }
-    let whole_value = whole.parse::<u64>().ok()?;
-    let mut fractional_text = fractional.to_string();
-    if fractional_text.len() > 9 {
-        fractional_text.truncate(9);
-    }
-    while fractional_text.len() < 9 {
-        fractional_text.push('0');
-    }
-    let fractional_value = if fractional_text.is_empty() {
-        0
-    } else {
-        fractional_text.parse::<u64>().ok()?
+    Ok(sent
+        .iter()
+        .zip(wallet_keys.iter())
+        .filter_map(|(result, wallet_key)| {
+            confirmed_trade_record_from_sent_result(
+                result,
+                wallet_key,
+                mint,
+                client_request_id,
+                Some(result.label.as_str()),
+            )
+        })
+        .collect())
+}
+
+async fn record_launchdeck_coin_trades_best_effort(
+    trace_id: &str,
+    sent: &[crate::rpc::SentResult],
+    wallet_keys: &[String],
+    mint: &str,
+    phase: &str,
+) {
+    let records = match launchdeck_coin_trade_records_from_sent_results(
+        sent,
+        wallet_keys,
+        mint,
+        Some(trace_id),
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            record_warn(
+                "execution-engine-bridge",
+                "Failed to map LaunchDeck confirmed trades for execution-engine.",
+                Some(json!({
+                    "traceId": trace_id,
+                    "phase": phase,
+                    "message": error,
+                })),
+            );
+            return;
+        }
     };
-    whole_value
-        .checked_mul(1_000_000_000)
-        .and_then(|base| base.checked_add(fractional_value))
+    if records.is_empty() {
+        return;
+    }
+    if let Err(error) = record_confirmed_trades(&records).await {
+        record_warn(
+            "execution-engine-bridge",
+            "Failed to hand LaunchDeck confirmed trades to execution-engine.",
+            Some(json!({
+                "traceId": trace_id,
+                "phase": phase,
+                "message": error,
+            })),
+        );
+    }
 }
 
-fn format_lamports_to_sol_decimal(value: u64) -> String {
-    let whole = value / 1_000_000_000;
-    let fractional = value % 1_000_000_000;
-    if fractional == 0 {
-        return whole.to_string();
-    }
-    let mut fractional_text = format!("{fractional:09}");
-    while fractional_text.ends_with('0') {
-        fractional_text.pop();
-    }
-    format!("{whole}.{fractional_text}")
-}
-
-const HELIUS_SENDER_TIP_ACCOUNTS: [&str; 10] = [
-    "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
-    "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
-    "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
-    "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
-    "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
-    "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
-    "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
-    "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
-    "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
-    "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
-];
-const JITO_TIP_ACCOUNTS: [&str; 8] = [
-    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
-    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
-    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
-    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
-    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
-];
-const HELLOMOON_TIP_ACCOUNTS: [&str; 10] = [
-    "moon17L6BgxXRX5uHKudAmqVF96xia9h8ygcmG2sL3F",
-    "moon26Sek222Md7ZydcAGxoKG832DK36CkLrS3PQY4c",
-    "moon7fwyajcVstMoBnVy7UBcTx87SBtNoGGAaH2Cb8V",
-    "moonBtH9HvLHjLqi9ivyrMVKgFUsSfrz9BwQ9khhn1u",
-    "moonCJg8476LNFLptX1qrK8PdRsA1HD1R6XWyu9MB93",
-    "moonF2sz7qwAtdETnrgxNbjonnhGGjd6r4W4UC9284s",
-    "moonKfftMiGSak3cezvhEqvkPSzwrmQxQHXuspC96yj",
-    "moonQBUKBpkifLcTd78bfxxt4PYLwmJ5admLW6cBBs8",
-    "moonXwpKwoVkMegt5Bc776cSW793X1irL5hHV1vJ3JA",
-    "moonZ6u9E2fgk6eWd82621eLPHt9zuJuYECXAYjMY1C",
-];
-const DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL: &str = "high";
-const DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE: &str = "p99";
-const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
-const DEFAULT_HELIUS_PRIORITY_REFRESH_INTERVAL_MS: u64 = 6_000;
+const DEFAULT_HELIUS_PRIORITY_REFRESH_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_WALLET_STATUS_REFRESH_INTERVAL_MS: u64 = 30_000;
-const FEE_MARKET_MAX_AGE: Duration = Duration::from_secs(15);
-const JITO_TIP_STREAM_ENDPOINT: &str = "wss://bundles.jito.wtf/api/v1/bundles/tip_stream";
-const JITO_TIP_STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
-const JITO_TIP_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
-
-#[derive(Debug, Default, Clone, Serialize)]
-struct FeeMarketSnapshot {
-    helius_priority_lamports: Option<u64>,
-    helius_launch_priority_lamports: Option<u64>,
-    helius_trade_priority_lamports: Option<u64>,
-    jito_tip_p99_lamports: Option<u64>,
-}
-
-impl FeeMarketSnapshot {
-    fn launch_priority_lamports(&self) -> Option<u64> {
-        self.helius_launch_priority_lamports
-            .or(self.helius_priority_lamports)
-    }
-
-    fn trade_priority_lamports(&self) -> Option<u64> {
-        self.helius_trade_priority_lamports
-            .or(self.helius_priority_lamports)
-    }
-}
-
-#[allow(non_snake_case)]
-#[derive(Debug, Clone, Serialize)]
-struct AutoFeeActionReport {
-    enabled: bool,
-    provider: String,
-    prioritySource: String,
-    priorityEstimateLamports: Option<u64>,
-    resolvedPriorityLamports: Option<u64>,
-    tipSource: String,
-    tipEstimateLamports: Option<u64>,
-    resolvedTipLamports: Option<u64>,
-    capLamports: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoFeeReport {
-    #[serde(rename = "jitoTipPercentile")]
-    jito_tip_percentile: String,
-    snapshot: FeeMarketSnapshot,
-    creation: AutoFeeActionReport,
-    buy: AutoFeeActionReport,
-    sell: AutoFeeActionReport,
-}
 
 #[derive(Debug, Clone)]
 struct AutoFeeResolutionSummary {
     notes: Vec<String>,
     report: AutoFeeReport,
-}
-
-fn action_priority_estimate(snapshot: &FeeMarketSnapshot, action: &str) -> (Option<u64>, String) {
-    match action {
-        "creation" | "buy" | "sell" | _ => snapshot
-            .helius_launch_priority_lamports
-            .map(|value| (Some(value), "launch-template".to_string()))
-            .unwrap_or((None, "missing".to_string())),
-    }
-}
-
-fn action_tip_estimate(snapshot: &FeeMarketSnapshot) -> (Option<u64>, String) {
-    let percentile = auto_fee_jito_tip_percentile();
-    if let Some(value) = snapshot.jito_tip_p99_lamports {
-        (Some(value), format!("jito-{percentile}"))
-    } else {
-        (None, "missing".to_string())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CachedFeeMarketSnapshot {
-    snapshot: FeeMarketSnapshot,
-    fetched_at: Instant,
-}
-
-fn fee_market_cache() -> &'static Mutex<HashMap<String, CachedFeeMarketSnapshot>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, CachedFeeMarketSnapshot>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn fee_market_cache_key(
-    primary_rpc_url: &str,
-    helius_priority_level: &str,
-    jito_tip_percentile: &str,
-) -> String {
-    let hel_priority_rpc = resolved_helius_priority_fee_rpc_url(primary_rpc_url);
-    format!("{primary_rpc_url}|{hel_priority_rpc}|{helius_priority_level}|{jito_tip_percentile}")
-}
-
-fn get_cached_fee_market_snapshot(
-    rpc_url: &str,
-    helius_priority_level: &str,
-    jito_tip_percentile: &str,
-) -> Option<FeeMarketSnapshot> {
-    let cache = fee_market_cache().lock().ok()?;
-    let entry = cache.get(&fee_market_cache_key(
-        rpc_url,
-        helius_priority_level,
-        jito_tip_percentile,
-    ))?;
-    if entry.fetched_at.elapsed() > FEE_MARKET_MAX_AGE {
-        return None;
-    }
-    Some(entry.snapshot.clone())
-}
-
-fn cache_fee_market_snapshot(
-    rpc_url: &str,
-    helius_priority_level: &str,
-    jito_tip_percentile: &str,
-    snapshot: &FeeMarketSnapshot,
-) {
-    if let Ok(mut cache) = fee_market_cache().lock() {
-        cache.insert(
-            fee_market_cache_key(rpc_url, helius_priority_level, jito_tip_percentile),
-            CachedFeeMarketSnapshot {
-                snapshot: snapshot.clone(),
-                fetched_at: Instant::now(),
-            },
-        );
-    }
-}
-
-fn update_cached_fee_market_snapshot<F>(
-    rpc_url: &str,
-    helius_priority_level: &str,
-    jito_tip_percentile: &str,
-    updater: F,
-) where
-    F: FnOnce(&mut FeeMarketSnapshot),
-{
-    if let Ok(mut cache) = fee_market_cache().lock() {
-        let entry = cache
-            .entry(fee_market_cache_key(
-                rpc_url,
-                helius_priority_level,
-                jito_tip_percentile,
-            ))
-            .or_insert_with(|| CachedFeeMarketSnapshot {
-                snapshot: FeeMarketSnapshot::default(),
-                fetched_at: Instant::now(),
-            });
-        updater(&mut entry.snapshot);
-        entry.fetched_at = Instant::now();
-    }
 }
 
 fn shared_fee_market_http_client() -> &'static reqwest::Client {
@@ -2769,38 +2559,26 @@ fn shared_fee_market_http_client() -> &'static reqwest::Client {
 }
 
 fn auto_fee_helius_priority_level() -> String {
-    let value = std::env::var("LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL")
+    let value = std::env::var("HELIUS_PRIORITY_LEVEL")
+        .or_else(|_| std::env::var("TRENCH_AUTO_FEE_HELIUS_PRIORITY_LEVEL"))
+        .or_else(|_| std::env::var("LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL"))
         .unwrap_or_else(|_| DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL.to_string());
-    let trimmed = value.trim().to_lowercase();
-    match trimmed.as_str() {
-        "none" => "Default".to_string(),
-        "low" => "Low".to_string(),
-        "medium" => "Medium".to_string(),
-        "high" => "High".to_string(),
-        "veryhigh" | "very_high" | "very-high" => "VeryHigh".to_string(),
-        "unsafemax" | "unsafe_max" | "unsafe-max" => "UnsafeMax".to_string(),
-        "recommended" => "recommended".to_string(),
-        _ => "VeryHigh".to_string(),
-    }
+    normalize_helius_priority_level(&value)
 }
 
 fn auto_fee_jito_tip_percentile() -> String {
-    let value = std::env::var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE")
+    let value = std::env::var("JITO_TIP_PERCENTILE")
+        .or_else(|_| std::env::var("TRENCH_AUTO_FEE_JITO_TIP_PERCENTILE"))
+        .or_else(|_| std::env::var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE"))
         .unwrap_or_else(|_| DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE.to_string());
-    let trimmed = value.trim().to_lowercase();
-    match trimmed.as_str() {
-        "p25" | "25" | "25th" => "p25".to_string(),
-        "p50" | "50" | "50th" | "median" => "p50".to_string(),
-        "p75" | "75" | "75th" => "p75".to_string(),
-        "p95" | "95" | "95th" => "p95".to_string(),
-        "p99" | "99" | "99th" => "p99".to_string(),
-        _ => DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE.to_string(),
-    }
+    normalize_jito_tip_percentile(&value)
 }
 
 fn configured_helius_priority_refresh_interval() -> Duration {
     Duration::from_millis(
-        std::env::var("LAUNCHDECK_HELIUS_PRIORITY_REFRESH_INTERVAL_MS")
+        std::env::var("HELIUS_PRIORITY_REFRESH_INTERVAL_MS")
+            .or_else(|_| std::env::var("TRENCH_HELIUS_PRIORITY_REFRESH_INTERVAL_MS"))
+            .or_else(|_| std::env::var("LAUNCHDECK_HELIUS_PRIORITY_REFRESH_INTERVAL_MS"))
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|value| *value > 0)
@@ -2816,252 +2594,6 @@ fn configured_wallet_status_refresh_interval_ms() -> u64 {
         .unwrap_or(DEFAULT_WALLET_STATUS_REFRESH_INTERVAL_MS)
 }
 
-fn lamports_to_priority_fee_micro_lamports(priority_fee_lamports: u64) -> u64 {
-    if priority_fee_lamports == 0 {
-        0
-    } else {
-        priority_fee_lamports
-    }
-}
-
-fn provider_uses_auto_fee_priority(provider: &str, execution_class: &str, action: &str) -> bool {
-    match provider.trim() {
-        "standard-rpc" | "helius-sender" | "hellomoon" => true,
-        "jito-bundle" => action != "creation" || execution_class != "bundle",
-        _ => true,
-    }
-}
-
-fn provider_uses_auto_fee_tip(provider: &str, action: &str) -> bool {
-    let _ = action;
-    matches!(
-        provider.trim(),
-        "helius-sender" | "hellomoon" | "jito-bundle"
-    )
-}
-
-fn pick_tip_account_for_provider(provider: &str) -> String {
-    match provider.trim() {
-        "helius-sender" => HELIUS_SENDER_TIP_ACCOUNTS[0].to_string(),
-        "hellomoon" => HELLOMOON_TIP_ACCOUNTS[0].to_string(),
-        "jito-bundle" => JITO_TIP_ACCOUNTS[0].to_string(),
-        _ => String::new(),
-    }
-}
-
-fn normalize_estimate_to_lamports(value: Option<&Value>) -> Option<u64> {
-    let numeric = match value {
-        Some(Value::Number(raw)) => raw.as_f64()?,
-        Some(Value::String(raw)) => raw.trim().parse::<f64>().ok()?,
-        _ => return None,
-    };
-    if !numeric.is_finite() || numeric <= 0.0 {
-        return None;
-    }
-    let lamports = if numeric < 1.0 {
-        (numeric * 1_000_000_000.0).round()
-    } else {
-        numeric.round()
-    };
-    if lamports <= 0.0 {
-        None
-    } else {
-        Some(lamports as u64)
-    }
-}
-
-fn jito_tip_percentile_value<'a>(
-    sample: &'a Value,
-    jito_tip_percentile: &str,
-) -> Option<&'a Value> {
-    match jito_tip_percentile {
-        "p25" => sample
-            .get("p25")
-            .or_else(|| sample.get("percentile25"))
-            .or_else(|| sample.get("tipFloor25"))
-            .or_else(|| sample.get("landed_tips_25th_percentile")),
-        "p50" => sample
-            .get("p50")
-            .or_else(|| sample.get("percentile50"))
-            .or_else(|| sample.get("tipFloor50"))
-            .or_else(|| sample.get("landed_tips_50th_percentile")),
-        "p75" => sample
-            .get("p75")
-            .or_else(|| sample.get("percentile75"))
-            .or_else(|| sample.get("tipFloor75"))
-            .or_else(|| sample.get("landed_tips_75th_percentile")),
-        "p95" => sample
-            .get("p95")
-            .or_else(|| sample.get("percentile95"))
-            .or_else(|| sample.get("tipFloor95"))
-            .or_else(|| sample.get("landed_tips_95th_percentile")),
-        _ => sample
-            .get("p99")
-            .or_else(|| sample.get("percentile99"))
-            .or_else(|| sample.get("tipFloor99"))
-            .or_else(|| sample.get("landed_tips_99th_percentile")),
-    }
-}
-
-fn extract_jito_tip_floor_lamports(payload: &Value, jito_tip_percentile: &str) -> Option<u64> {
-    if let Some(value) =
-        normalize_estimate_to_lamports(jito_tip_percentile_value(payload, jito_tip_percentile))
-    {
-        return Some(value);
-    }
-    if let Some(value) = payload
-        .get("params")
-        .and_then(|params| params.get("result"))
-        .and_then(|result| extract_jito_tip_floor_lamports(result, jito_tip_percentile))
-    {
-        return Some(value);
-    }
-    for key in ["data", "result", "value"] {
-        if let Some(value) = payload
-            .get(key)
-            .and_then(|child| extract_jito_tip_floor_lamports(child, jito_tip_percentile))
-        {
-            return Some(value);
-        }
-    }
-    payload.as_array().and_then(|entries| {
-        entries
-            .iter()
-            .find_map(|entry| extract_jito_tip_floor_lamports(entry, jito_tip_percentile))
-    })
-}
-
-fn parse_auto_fee_cap_lamports(value: &str) -> Option<u64> {
-    parse_sol_decimal_to_lamports(value).filter(|lamports| *lamports > 0)
-}
-
-fn cap_auto_fee_lamports(estimate_lamports: u64, cap_lamports: Option<u64>) -> u64 {
-    match cap_lamports {
-        Some(cap) if cap > 0 => estimate_lamports.min(cap),
-        _ => estimate_lamports,
-    }
-}
-
-const AUTO_FEE_TOTAL_CAP_TIP_BPS: u64 = 7_000;
-const AUTO_FEE_TOTAL_CAP_BPS_DENOMINATOR: u64 = 10_000;
-
-fn resolve_auto_fee_components_with_total_cap(
-    priority_estimate: Option<u64>,
-    tip_estimate: Option<u64>,
-    cap_lamports: Option<u64>,
-    provider: &str,
-    action_label: &str,
-) -> Result<(Option<u64>, Option<u64>), String> {
-    let priority_estimate = priority_estimate.map(|value| value.max(1));
-    let has_priority = priority_estimate.is_some();
-    let has_tip = tip_estimate.is_some();
-    let minimum_tip_lamports = provider_required_tip_lamports(provider).unwrap_or(0);
-
-    if let Some(cap) = cap_lamports {
-        if has_priority && has_tip && minimum_tip_lamports > 0 && cap <= minimum_tip_lamports {
-            return Err(format!(
-                "{} max auto fee must be above the {} minimum tip of {} SOL.",
-                action_label,
-                provider,
-                provider_min_tip_sol_label(provider)
-            ));
-        }
-    }
-
-    let resolved_priority = match priority_estimate {
-        Some(estimate) if !has_tip => Some(cap_auto_fee_lamports(estimate, cap_lamports)),
-        Some(estimate) => Some(estimate),
-        None => None,
-    };
-
-    let resolved_tip = match tip_estimate {
-        Some(estimate) if !has_priority => Some(clamp_auto_fee_tip_to_provider_minimum(
-            cap_auto_fee_lamports(estimate, cap_lamports),
-            provider,
-            cap_lamports,
-            action_label,
-        )?),
-        Some(estimate) => Some(estimate.max(minimum_tip_lamports)),
-        None => None,
-    };
-
-    match (resolved_priority, resolved_tip, cap_lamports) {
-        (Some(priority), Some(tip), Some(cap)) => {
-            if u128::from(priority) + u128::from(tip) <= u128::from(cap) {
-                return Ok((Some(priority), Some(tip)));
-            }
-
-            let ratio_tip_budget =
-                cap.saturating_mul(AUTO_FEE_TOTAL_CAP_TIP_BPS) / AUTO_FEE_TOTAL_CAP_BPS_DENOMINATOR;
-            let target_tip_budget = ratio_tip_budget
-                .max(minimum_tip_lamports)
-                .min(cap.saturating_sub(1));
-            let target_priority_budget = cap.saturating_sub(target_tip_budget);
-
-            let mut resolved_priority = priority.min(target_priority_budget);
-            let mut resolved_tip = tip.min(target_tip_budget);
-            let remaining_budget = cap
-                .saturating_sub(resolved_priority)
-                .saturating_sub(resolved_tip);
-
-            if remaining_budget > 0 {
-                if resolved_tip < target_tip_budget {
-                    let extra_priority =
-                        (priority.saturating_sub(resolved_priority)).min(remaining_budget);
-                    resolved_priority = resolved_priority.saturating_add(extra_priority);
-                } else if resolved_priority < target_priority_budget {
-                    let extra_tip = (tip.saturating_sub(resolved_tip)).min(remaining_budget);
-                    resolved_tip = resolved_tip.saturating_add(extra_tip);
-                }
-            }
-
-            Ok((Some(resolved_priority), Some(resolved_tip)))
-        }
-        (priority, tip, _) => Ok((priority, tip)),
-    }
-}
-
-fn clamp_auto_fee_tip_to_provider_minimum(
-    resolved: u64,
-    provider: &str,
-    cap_lamports: Option<u64>,
-    action_label: &str,
-) -> Result<u64, String> {
-    let Some(minimum_tip_lamports) = provider_required_tip_lamports(provider) else {
-        return Ok(resolved);
-    };
-    if resolved >= minimum_tip_lamports {
-        return Ok(resolved);
-    }
-    if cap_lamports.is_some() && cap_lamports.unwrap_or_default() < minimum_tip_lamports {
-        return Err(format!(
-            "{} max auto fee is below the {} minimum tip of {} SOL.",
-            action_label,
-            provider,
-            provider_min_tip_sol_label(provider)
-        ));
-    }
-    Ok(minimum_tip_lamports)
-}
-
-fn priority_price_micro_lamports_to_sol_equivalent(
-    compute_unit_price_micro_lamports: u64,
-) -> String {
-    let total_lamports = (u128::from(compute_unit_price_micro_lamports)
-        * u128::from(PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT))
-        / 1_000_000;
-    format_lamports_to_sol_decimal(total_lamports.min(u128::from(u64::MAX)) as u64)
-}
-
-fn format_priority_price_note(compute_unit_price_micro_lamports: u64) -> String {
-    format!(
-        "{} micro-lamports/CU (~{} SOL at {} CU)",
-        compute_unit_price_micro_lamports,
-        priority_price_micro_lamports_to_sol_equivalent(compute_unit_price_micro_lamports),
-        PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT
-    )
-}
-
 const FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS: [&str; 8] = [
     "ComputeBudget111111111111111111111111111111",
     "11111111111111111111111111111111",
@@ -3073,71 +2605,21 @@ const FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS: [&str; 8] = [
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
 ];
 
-fn helius_fee_estimate_options(helius_priority_level: &str) -> Value {
-    if helius_priority_level == "recommended" {
-        json!({
-            "priorityLevel": "Medium",
-            "recommended": true
-        })
-    } else {
-        json!({
-            "priorityLevel": helius_priority_level,
-            "includeAllPriorityFeeLevels": true
-        })
-    }
-}
-
-fn helius_priority_level_value<'a>(
-    result: &'a Value,
-    helius_priority_level: &str,
-) -> Option<&'a Value> {
-    let levels = result.get("priorityFeeLevels")?;
-    match helius_priority_level.trim().to_ascii_lowercase().as_str() {
-        "default" => levels
-            .get("medium")
-            .or_else(|| levels.get("Medium"))
-            .or_else(|| result.get("priorityFeeEstimate"))
-            .or_else(|| result.get("recommended")),
-        "low" => levels.get("low").or_else(|| levels.get("Low")),
-        "medium" => levels.get("medium").or_else(|| levels.get("Medium")),
-        "high" => levels.get("high").or_else(|| levels.get("High")),
-        "veryhigh" | "very_high" | "very-high" => levels
-            .get("veryHigh")
-            .or_else(|| levels.get("VeryHigh"))
-            .or_else(|| levels.get("veryhigh")),
-        "unsafemax" | "unsafe_max" | "unsafe-max" => levels
-            .get("unsafeMax")
-            .or_else(|| levels.get("UnsafeMax"))
-            .or_else(|| levels.get("unsafemax")),
-        "recommended" => result
-            .get("priorityFeeEstimate")
-            .or_else(|| result.get("recommended")),
-        selected_level => levels.get(selected_level),
-    }
-}
-
-fn parse_helius_priority_estimate_result(
-    result: &Value,
-    helius_priority_level: &str,
-) -> Option<u64> {
-    normalize_estimate_to_lamports(
-        helius_priority_level_value(result, helius_priority_level)
-            .or_else(|| {
-                result
-                    .get("priorityFeeLevels")
-                    .and_then(|levels| levels.get("veryHigh"))
-            })
-            .or_else(|| {
-                result
-                    .get("priorityFeeEstimate")
-                    .or_else(|| result.get("recommended"))
-            })
-            .or_else(|| {
-                result
-                    .get("priorityFeeLevels")
-                    .and_then(|levels| levels.get("high"))
-            }),
-    )
+fn shared_fee_market_runtime(rpc_url: &str) -> SharedFeeMarketRuntime {
+    let mut config = SharedFeeMarketConfig::new(
+        paths::shared_fee_market_cache_path(),
+        rpc_url.to_string(),
+        resolved_helius_priority_fee_rpc_url(rpc_url),
+        format!("launchdeck-engine-{}", std::process::id()),
+        FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+    );
+    config.helius_priority_level = auto_fee_helius_priority_level();
+    config.jito_tip_percentile = auto_fee_jito_tip_percentile();
+    config.helius_refresh_interval = configured_helius_priority_refresh_interval();
+    SharedFeeMarketRuntime::new(config)
 }
 
 fn sanitized_serialized_priority_probe_config(config: &NormalizedConfig) -> NormalizedConfig {
@@ -3154,49 +2636,7 @@ fn sanitized_serialized_priority_probe_config(config: &NormalizedConfig) -> Norm
     probe_config
 }
 
-async fn fetch_helius_priority_estimate(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    helius_priority_level: &str,
-    request_id: &str,
-    account_keys: Option<&[&str]>,
-) -> Result<Option<u64>, String> {
-    let mut params = json!({
-        "options": helius_fee_estimate_options(helius_priority_level)
-    });
-    if let Some(account_keys) = account_keys {
-        params["accountKeys"] = Value::Array(
-            account_keys
-                .iter()
-                .map(|value| Value::String((*value).to_string()))
-                .collect(),
-        );
-    }
-    record_outbound_provider_http_request();
-    let payload = client
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "getPriorityFeeEstimate",
-            "params": [params]
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("Helius priority estimate request failed: {error}"))?
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Failed to decode Helius fee estimate: {error}"))?;
-    if let Some(error) = payload.get("error") {
-        return Err(format!("Helius priority estimate failed: {error}"));
-    }
-    let result = payload.get("result").unwrap_or(&payload);
-    Ok(parse_helius_priority_estimate_result(
-        result,
-        helius_priority_level,
-    ))
-}
-
+#[allow(dead_code)]
 fn compiled_transaction_serialized_base58(
     transaction: &CompiledTransaction,
 ) -> Result<String, String> {
@@ -3208,6 +2648,7 @@ fn compiled_transaction_serialized_base58(
     Ok(bs58::encode(bytes).into_string())
 }
 
+#[allow(dead_code)]
 async fn fetch_helius_priority_estimate_for_serialized_transaction(
     client: &reqwest::Client,
     rpc_url: &str,
@@ -3245,6 +2686,7 @@ async fn fetch_helius_priority_estimate_for_serialized_transaction(
     ))
 }
 
+#[allow(dead_code)]
 async fn estimate_serialized_launch_priority_fee(
     rpc_url: &str,
     config: &NormalizedConfig,
@@ -3329,166 +2771,10 @@ async fn prewarm_helius_sender_endpoint(rpc_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn fetch_helius_priority_snapshot_live(
-    primary_rpc_url: &str,
-) -> Result<FeeMarketSnapshot, String> {
-    let helius_priority_level = auto_fee_helius_priority_level();
-    let client = shared_fee_market_http_client();
-    let hel_priority_rpc = resolved_helius_priority_fee_rpc_url(primary_rpc_url);
-    let helius_launch_priority_lamports = fetch_helius_priority_estimate(
-        &client,
-        &hel_priority_rpc,
-        &helius_priority_level,
-        "launchdeck-helius-priority-estimate-launch-template",
-        Some(&FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS),
-    )
-    .await
-    .unwrap_or(None);
-    Ok(FeeMarketSnapshot {
-        helius_priority_lamports: None,
-        helius_launch_priority_lamports,
-        helius_trade_priority_lamports: None,
-        jito_tip_p99_lamports: None,
-    })
-}
-
-async fn fetch_jito_tip_floor_live() -> Result<Option<u64>, String> {
-    let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    let response = shared_fee_market_http_client()
-        .get("https://bundles.jito.wtf/api/v1/bundles/tip_floor")
-        .send()
-        .await
-        .map_err(|error| format!("Jito tip floor request failed: {error}"))?;
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Failed to decode Jito tip floor: {error}"))?;
-    Ok(extract_jito_tip_floor_lamports(
-        &payload,
-        &jito_tip_percentile,
-    ))
-}
-
-async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
-    let helius_priority_level = auto_fee_helius_priority_level();
-    let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    let (helius_snapshot, jito_tip_p99_lamports) = tokio::join!(
-        fetch_helius_priority_snapshot_live(rpc_url),
-        fetch_jito_tip_floor_live()
-    );
-    let helius_snapshot = helius_snapshot?;
-    let snapshot = FeeMarketSnapshot {
-        helius_priority_lamports: helius_snapshot.helius_priority_lamports,
-        helius_launch_priority_lamports: helius_snapshot.helius_launch_priority_lamports,
-        helius_trade_priority_lamports: helius_snapshot.helius_trade_priority_lamports,
-        jito_tip_p99_lamports: jito_tip_p99_lamports.unwrap_or(None),
-    };
-    cache_fee_market_snapshot(
-        rpc_url,
-        &helius_priority_level,
-        &jito_tip_percentile,
-        &snapshot,
-    );
-    Ok(snapshot)
-}
-
 async fn fetch_fee_market_snapshot(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
-    let helius_priority_level = auto_fee_helius_priority_level();
-    let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    if let Some(snapshot) =
-        get_cached_fee_market_snapshot(rpc_url, &helius_priority_level, &jito_tip_percentile)
-    {
-        return Ok(snapshot);
-    }
-    fetch_fee_market_snapshot_live(rpc_url).await
-}
-
-fn update_cached_jito_tip_snapshot(rpc_url: &str, jito_tip_lamports: Option<u64>) {
-    let helius_priority_level = auto_fee_helius_priority_level();
-    let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    update_cached_fee_market_snapshot(
-        rpc_url,
-        &helius_priority_level,
-        &jito_tip_percentile,
-        |cached| {
-            cached.jito_tip_p99_lamports = jito_tip_lamports;
-        },
-    );
-}
-
-async fn open_jito_tip_stream_socket() -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    String,
-> {
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio_tungstenite::connect_async(JITO_TIP_STREAM_ENDPOINT),
-    )
-    .await
-    .map_err(|_| "Timed out connecting to Jito tip stream.".to_string())?
-    .map(|(stream, _)| stream)
-    .map_err(|error| format!("Failed to connect to Jito tip stream: {error}"))
-}
-
-async fn consume_jito_tip_stream_updates(
-    state: &Arc<AppState>,
-    rpc_url: &str,
-) -> Result<(), String> {
-    let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    let mut ws = open_jito_tip_stream_socket().await?;
-    let idle_timeout = JITO_TIP_STREAM_IDLE_TIMEOUT;
-    let mut last_message_at = Instant::now();
-    loop {
-        if !engine_background_requests_active(state) {
-            return Ok(());
-        }
-        let message = tokio::select! {
-            message = ws.next() => message,
-            _ = tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL) => {
-                if last_message_at.elapsed() >= idle_timeout {
-                    return Err("Timed out waiting for Jito tip stream update.".to_string());
-                }
-                continue;
-            }
-        };
-        let Some(message) = message else {
-            return Err("Jito tip stream closed.".to_string());
-        };
-        let message = message.map_err(|error| format!("Jito tip stream read failed: {error}"))?;
-        last_message_at = Instant::now();
-        match message {
-            tokio_tungstenite::tungstenite::protocol::Message::Text(text) => {
-                if let Ok(payload) = serde_json::from_str::<Value>(&text) {
-                    if let Some(value) =
-                        extract_jito_tip_floor_lamports(&payload, &jito_tip_percentile)
-                    {
-                        update_cached_jito_tip_snapshot(rpc_url, Some(value));
-                    }
-                }
-            }
-            tokio_tungstenite::tungstenite::protocol::Message::Binary(bytes) => {
-                if let Ok(payload) = serde_json::from_slice::<Value>(&bytes) {
-                    if let Some(value) =
-                        extract_jito_tip_floor_lamports(&payload, &jito_tip_percentile)
-                    {
-                        update_cached_jito_tip_snapshot(rpc_url, Some(value));
-                    }
-                }
-            }
-            tokio_tungstenite::tungstenite::protocol::Message::Ping(payload) => {
-                ws.send(tokio_tungstenite::tungstenite::protocol::Message::Pong(
-                    payload,
-                ))
-                .await
-                .map_err(|error| format!("Jito tip stream pong failed: {error}"))?;
-            }
-            tokio_tungstenite::tungstenite::protocol::Message::Pong(_) => {}
-            tokio_tungstenite::tungstenite::protocol::Message::Frame(_) => {}
-            tokio_tungstenite::tungstenite::protocol::Message::Close(_) => {
-                return Err("Jito tip stream closed.".to_string());
-            }
-        }
-    }
+    shared_fee_market_runtime(rpc_url)
+        .fetch_fee_market_snapshot()
+        .await
 }
 
 fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String) {
@@ -3497,21 +2783,9 @@ fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String)
     tokio::spawn(async move {
         loop {
             if engine_background_requests_active(&helius_state) {
-                let helius_priority_level = auto_fee_helius_priority_level();
-                let jito_tip_percentile = auto_fee_jito_tip_percentile();
-                if let Ok(snapshot) = fetch_helius_priority_snapshot_live(&primary_rpc_url).await {
-                    update_cached_fee_market_snapshot(
-                        &primary_rpc_url,
-                        &helius_priority_level,
-                        &jito_tip_percentile,
-                        |cached| {
-                            cached.helius_priority_lamports = snapshot.helius_priority_lamports;
-                            cached.helius_launch_priority_lamports =
-                                snapshot.helius_launch_priority_lamports;
-                            cached.helius_trade_priority_lamports = None;
-                        },
-                    );
-                }
+                shared_fee_market_runtime(&primary_rpc_url)
+                    .refresh_helius_if_leased()
+                    .await;
                 tokio::time::sleep(configured_helius_priority_refresh_interval()).await;
             } else {
                 tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL).await;
@@ -3522,11 +2796,9 @@ fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String)
     tokio::spawn(async move {
         loop {
             if engine_background_requests_active(&jito_state) {
-                if let Ok(jito_tip_p99_lamports) = fetch_jito_tip_floor_live().await {
-                    update_cached_jito_tip_snapshot(&rpc_url, jito_tip_p99_lamports);
-                }
-                let _ = consume_jito_tip_stream_updates(&jito_state, &rpc_url).await;
-                tokio::time::sleep(JITO_TIP_STREAM_RECONNECT_DELAY).await;
+                let runtime = shared_fee_market_runtime(&rpc_url);
+                runtime.refresh_jito_if_leased().await;
+                tokio::time::sleep(runtime.config().jito_reconnect_delay).await;
             } else {
                 tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL).await;
             }
@@ -3555,18 +2827,19 @@ async fn resolve_auto_execution_fees(
     rpc_url: &str,
     normalized: &mut NormalizedConfig,
     transport_plan: &crate::transport::TransportPlan,
-    wallet_secret: &[u8],
-    creator_public_key: &str,
+    _wallet_secret: &[u8],
+    _creator_public_key: &str,
 ) -> Result<AutoFeeResolutionSummary, String> {
     let needs_auto = normalized.execution.autoGas
         || normalized.execution.buyAutoGas
         || normalized.execution.sellAutoGas;
     let mut notes = Vec::new();
+    let jito_tip_percentile = auto_fee_jito_tip_percentile();
     if !needs_auto {
         return Ok(AutoFeeResolutionSummary {
             notes,
             report: AutoFeeReport {
-                jito_tip_percentile: auto_fee_jito_tip_percentile(),
+                jito_tip_percentile: jito_tip_percentile.clone(),
                 snapshot: FeeMarketSnapshot::default(),
                 creation: AutoFeeActionReport {
                     enabled: normalized.execution.autoGas,
@@ -3605,7 +2878,11 @@ async fn resolve_auto_execution_fees(
         });
     }
 
-    let market = fetch_fee_market_snapshot(rpc_url).await?;
+    let market_status = shared_fee_market_runtime(rpc_url).read_snapshot_status();
+    let market = market_status
+        .as_ref()
+        .map(|status| status.snapshot.clone())
+        .unwrap_or_default();
     let mut creation_report = AutoFeeActionReport {
         enabled: normalized.execution.autoGas,
         provider: normalized.execution.provider.clone(),
@@ -3640,42 +2917,26 @@ async fn resolve_auto_execution_fees(
         capLamports: None,
     };
 
-    let serialized_launch_priority_estimate = if normalized.execution.autoGas
-        || normalized.execution.buyAutoGas
-        || normalized.execution.sellAutoGas
-    {
-        match estimate_serialized_launch_priority_fee(
-            rpc_url,
-            normalized,
-            transport_plan,
-            wallet_secret,
-            creator_public_key,
-        )
-        .await
-        {
-            Ok(Some(estimate)) => {
-                notes.push(format!(
-                    "Priority auto-fee uses Helius serialized launch estimation and applies the launch-derived compute-unit price across creation, buy, and sell ({}).",
-                    format_priority_price_note(estimate)
-                ));
-                Some(estimate)
-            }
-            Ok(None) => None,
-            Err(error) => {
-                notes.push(format!(
-                    "Serialized launch priority estimation was unavailable; auto-fee fell back to cached Helius account-pattern estimates: {error}"
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
     let priority_estimate_for_action = |action: &str| -> (Option<u64>, String) {
-        if let Some(estimate) = serialized_launch_priority_estimate {
-            (Some(estimate), "serialized-launch".to_string())
+        if !market_status
+            .as_ref()
+            .map(|status| status.helius_fresh)
+            .unwrap_or(false)
+        {
+            (None, "stale".to_string())
         } else {
             action_priority_estimate(&market, action)
+        }
+    };
+    let tip_estimate_for_action = || -> (Option<u64>, String) {
+        if !market_status
+            .as_ref()
+            .map(|status| status.jito_fresh)
+            .unwrap_or(false)
+        {
+            (None, "stale".to_string())
+        } else {
+            action_tip_estimate(&market, &jito_tip_percentile)
         }
     };
 
@@ -3692,33 +2953,36 @@ async fn resolve_auto_execution_fees(
         let uses_priority =
             provider_uses_auto_fee_priority(provider, &transport_plan.executionClass, "creation");
         let uses_tip = provider_uses_auto_fee_tip(provider, "creation");
-        let (resolved_priority, resolved_tip) = resolve_auto_fee_components_with_total_cap(
-            if uses_priority {
-                let (estimated, source) = priority_estimate_for_action("creation");
-                creation_report.prioritySource = source;
-                creation_report.priorityEstimateLamports = estimated;
-                Some(estimated.ok_or_else(|| {
+        let (resolved_priority, resolved_tip) =
+            resolve_auto_fee_components_with_total_cap(
+                if uses_priority {
+                    let (estimated, source) = priority_estimate_for_action("creation");
+                    creation_report.prioritySource = source;
+                    creation_report.priorityEstimateLamports = estimated;
+                    Some(apply_auto_fee_estimate_buffer(estimated.ok_or_else(|| {
                     "Creation auto fee is enabled but no Helius priority estimate was returned."
                         .to_string()
-                })?)
-            } else {
-                None
-            },
-            if uses_tip {
-                let (estimated, source) = action_tip_estimate(&market);
-                creation_report.tipSource = source;
-                creation_report.tipEstimateLamports = estimated;
-                Some(estimated.ok_or_else(|| {
-                    "Creation auto fee is enabled but no Jito tip estimate was returned."
-                        .to_string()
-                })?)
-            } else {
-                None
-            },
-            cap_lamports,
-            provider,
-            "Creation",
-        )?;
+                })?))
+                } else {
+                    None
+                },
+                if uses_tip {
+                    let (estimated, source) = tip_estimate_for_action();
+                    creation_report.tipSource = source;
+                    creation_report.tipEstimateLamports = estimated;
+                    Some(apply_auto_fee_estimate_buffer(estimated.ok_or_else(
+                        || {
+                            "Creation auto fee is enabled but no Jito tip estimate was returned."
+                                .to_string()
+                        },
+                    )?))
+                } else {
+                    None
+                },
+                cap_lamports,
+                provider,
+                "Creation",
+            )?;
 
         if let Some(resolved) = resolved_priority {
             normalized.execution.priorityFeeSol =
@@ -3780,20 +3044,22 @@ async fn resolve_auto_execution_fees(
                 let (estimated, source) = priority_estimate_for_action("buy");
                 buy_report.prioritySource = source;
                 buy_report.priorityEstimateLamports = estimated;
-                Some(estimated.ok_or_else(|| {
-                    "Buy auto fee is enabled but no Helius priority estimate was returned."
-                        .to_string()
-                })?)
+                Some(apply_auto_fee_estimate_buffer(estimated.ok_or_else(
+                    || {
+                        "Buy auto fee is enabled but no Helius priority estimate was returned."
+                            .to_string()
+                    },
+                )?))
             } else {
                 None
             },
             if uses_tip {
-                let (estimated, source) = action_tip_estimate(&market);
+                let (estimated, source) = tip_estimate_for_action();
                 buy_report.tipSource = source;
                 buy_report.tipEstimateLamports = estimated;
-                Some(estimated.ok_or_else(|| {
-                    "Buy auto fee is enabled but no Jito tip estimate was returned.".to_string()
-                })?)
+                Some(apply_auto_fee_estimate_buffer(estimated.ok_or_else(
+                    || "Buy auto fee is enabled but no Jito tip estimate was returned.".to_string(),
+                )?))
             } else {
                 None
             },
@@ -3853,20 +3119,25 @@ async fn resolve_auto_execution_fees(
                 let (estimated, source) = priority_estimate_for_action("sell");
                 sell_report.prioritySource = source;
                 sell_report.priorityEstimateLamports = estimated;
-                Some(estimated.ok_or_else(|| {
-                    "Sell auto fee is enabled but no Helius priority estimate was returned."
-                        .to_string()
-                })?)
+                Some(apply_auto_fee_estimate_buffer(estimated.ok_or_else(
+                    || {
+                        "Sell auto fee is enabled but no Helius priority estimate was returned."
+                            .to_string()
+                    },
+                )?))
             } else {
                 None
             },
             if uses_tip {
-                let (estimated, source) = action_tip_estimate(&market);
+                let (estimated, source) = tip_estimate_for_action();
                 sell_report.tipSource = source;
                 sell_report.tipEstimateLamports = estimated;
-                Some(estimated.ok_or_else(|| {
-                    "Sell auto fee is enabled but no Jito tip estimate was returned.".to_string()
-                })?)
+                Some(apply_auto_fee_estimate_buffer(estimated.ok_or_else(
+                    || {
+                        "Sell auto fee is enabled but no Jito tip estimate was returned."
+                            .to_string()
+                    },
+                )?))
             } else {
                 None
             },
@@ -3911,7 +3182,7 @@ async fn resolve_auto_execution_fees(
     Ok(AutoFeeResolutionSummary {
         notes,
         report: AutoFeeReport {
-            jito_tip_percentile: auto_fee_jito_tip_percentile(),
+            jito_tip_percentile,
             snapshot: market,
             creation: creation_report,
             buy: buy_report,
@@ -4018,6 +3289,7 @@ async fn compile_same_time_snipes(
                 predicted_dev_buy_tokens,
                 predicted_dev_buy_quote_amount,
                 pump_cashback_enabled,
+                normalized.wrapperDefaultFeeBps,
             )
             .await?;
             tx.label = format!(
@@ -4067,10 +3339,7 @@ fn launch_prefers_post_setup_creator_vault_for_follow(
     has_fee_recipients: bool,
 ) -> bool {
     matches!(mode, "agent-custom" | "agent-locked")
-        || (launchpad == "pump"
-            && mode == "regular"
-            && generate_later_setup
-            && has_fee_recipients)
+        || (launchpad == "pump" && mode == "regular" && generate_later_setup && has_fee_recipients)
 }
 
 fn prefers_post_setup_creator_vault_for_follow(normalized: &NormalizedConfig) -> bool {
@@ -4091,12 +3360,15 @@ async fn compile_presigned_follow_actions(
 ) -> Result<Vec<crate::follow::FollowActionRecord>, String> {
     let mut actions = build_action_records(&normalized.followLaunch);
     let buy_tip_account = pick_tip_account_for_provider(&normalized.execution.buyProvider);
-    let sell_tip_account = pick_tip_account_for_provider(&normalized.execution.sellProvider);
     let mut predicted_dev_buy_effect: Option<(Option<u64>, Option<u64>, Option<bool>)> = None;
-    let mut predicted_bonk_dev_buy_tokens: Option<Option<u64>> = None;
     let bonk_pool_id = if normalized.launchpad == "bonk" {
-        derive_canonical_pool_id_for_launchpad(&normalized.launchpad, &normalized.quoteAsset, mint)
-            .await?
+        derive_canonical_pool_id_for_launchpad(
+            rpc_url,
+            &normalized.launchpad,
+            &normalized.quoteAsset,
+            mint,
+        )
+        .await?
     } else {
         None
     };
@@ -4124,16 +3396,19 @@ async fn compile_presigned_follow_actions(
                 {
                     continue;
                 }
-                let (predicted_dev_buy_tokens, predicted_dev_buy_quote_amount, pump_cashback_enabled) =
-                    match predicted_dev_buy_effect {
-                        Some(value) => value,
-                        None => {
-                            let value =
-                                resolve_predicted_creator_dev_buy_effect(rpc_url, normalized).await?;
-                            predicted_dev_buy_effect = Some(value);
-                            value
-                        }
-                    };
+                let (
+                    predicted_dev_buy_tokens,
+                    predicted_dev_buy_quote_amount,
+                    pump_cashback_enabled,
+                ) = match predicted_dev_buy_effect {
+                    Some(value) => value,
+                    None => {
+                        let value =
+                            resolve_predicted_creator_dev_buy_effect(rpc_url, normalized).await?;
+                        predicted_dev_buy_effect = Some(value);
+                        value
+                    }
+                };
                 let mut tx = compile_atomic_follow_buy_for_launchpad(
                     &normalized.launchpad,
                     &normalized.mode,
@@ -4150,105 +3425,11 @@ async fn compile_presigned_follow_actions(
                     predicted_dev_buy_tokens,
                     predicted_dev_buy_quote_amount,
                     pump_cashback_enabled,
+                    normalized.wrapperDefaultFeeBps,
                 )
                 .await?;
                 tx.label = action.actionId.clone();
                 action.preSignedTransactions = vec![tx];
-            }
-            crate::follow::FollowActionKind::DevAutoSell
-                if normalized.launchpad == "pump"
-                    && action.walletEnvKey == normalized.selectedWalletKey
-                    && follow_action_is_immediate_presign_candidate(action) =>
-            {
-                let use_post_setup_creator_vault_for_sell =
-                    should_use_post_setup_creator_vault_for_sell(
-                        prefers_post_setup_creator_vault_for_follow(normalized),
-                        action,
-                        &normalized.execution.sellMevMode,
-                    );
-                let predicted_tokens = match predicted_dev_buy_effect {
-                    Some((value, _, _)) => value,
-                    None => {
-                        let value =
-                            resolve_predicted_creator_dev_buy_effect(rpc_url, normalized).await?;
-                        let predicted_tokens = value.0;
-                        predicted_dev_buy_effect = Some(value);
-                        predicted_tokens
-                    }
-                };
-                let Some(predicted_tokens) = predicted_tokens else {
-                    continue;
-                };
-                let Some(sell_percent) = action.sellPercent else {
-                    continue;
-                };
-                let Some(mut tx) =
-                    crate::pump_native::compile_follow_sell_transaction_with_token_amount(
-                        rpc_url,
-                        &normalized.execution,
-                        normalized.token.mayhemMode,
-                        &sell_tip_account,
-                        &wallet_secret,
-                        mint,
-                        launch_creator,
-                        sell_percent,
-                        use_post_setup_creator_vault_for_sell,
-                        Some(predicted_tokens),
-                        Some(normalized.mode == "cashback"),
-                    )
-                    .await?
-                else {
-                    continue;
-                };
-                tx.label = action.actionId.clone();
-                action.preSignedTransactions = vec![tx];
-            }
-            crate::follow::FollowActionKind::DevAutoSell
-                if normalized.launchpad == "bonk"
-                    && action.walletEnvKey == normalized.selectedWalletKey
-                    && follow_action_is_immediate_presign_candidate(action) =>
-            {
-                let predicted_tokens = match predicted_bonk_dev_buy_tokens {
-                    Some(value) => value,
-                    None => {
-                        let value =
-                            predict_dev_buy_token_amount_for_launchpad(rpc_url, normalized).await?;
-                        predicted_bonk_dev_buy_tokens = Some(value);
-                        value
-                    }
-                };
-                let Some(predicted_tokens) = predicted_tokens else {
-                    continue;
-                };
-                let Some(sell_percent) = action.sellPercent else {
-                    continue;
-                };
-                match crate::bonk_native::compile_follow_sell_transaction_with_token_amount(
-                    rpc_url,
-                    &normalized.quoteAsset,
-                    &normalized.execution,
-                    &sell_tip_account,
-                    &wallet_secret,
-                    mint,
-                    sell_percent,
-                    Some(predicted_tokens),
-                    bonk_pool_id.as_deref(),
-                    Some(&normalized.mode),
-                    Some(launch_creator),
-                )
-                .await
-                {
-                    Ok(Some(mut tx)) => {
-                        tx.label = action.actionId.clone();
-                        action.preSignedTransactions = vec![tx];
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        action.lastError = Some(format!(
-                            "Bonk dev-auto-sell pre-sign unavailable; daemon will compile live after launch: {error}"
-                        ));
-                    }
-                }
             }
             _ => {}
         }
@@ -4256,7 +3437,10 @@ async fn compile_presigned_follow_actions(
     Ok(actions)
 }
 
-fn follow_action_is_immediate_presign_candidate(action: &crate::follow::FollowActionRecord) -> bool {
+#[cfg(test)]
+fn follow_action_is_immediate_presign_candidate(
+    action: &crate::follow::FollowActionRecord,
+) -> bool {
     action.marketCap.is_none()
         && action.delayMs.unwrap_or_default() == 0
         && action.submitDelayMs.unwrap_or_default() == 0
@@ -4488,6 +3672,7 @@ async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
             "bagsapp": bags_runtime_status_payload(),
         },
         "warm": warm_state_payload(state, follow_active_jobs),
+        "autoFee": shared_fee_market_status_payload(shared_fee_market_runtime(&configured_rpc_url()).config()),
         "runtimeWorkers": runtime_workers,
         "rpcTraffic": rpc_traffic_snapshot(),
     })
@@ -4971,6 +4156,10 @@ async fn execute_engine_action_payload(
         launch_creator: compiled_launch_creator,
         bags_fee_estimate: _,
     } = native;
+    let mut compiled_transaction_wallet_keys =
+        vec![selected_wallet_key.clone(); compiled_transactions.len()];
+    let creation_transaction_wallet_keys =
+        vec![selected_wallet_key.clone(); creation_transactions.len()];
     let mut report_value = report;
     let text_value = Value::String(text);
     let assembly_executor = "rust-native".to_string();
@@ -5011,9 +4200,14 @@ async fn execute_engine_action_payload(
         warm_report.blockhash_fetch_ms,
     );
     if let Some(exec) = report_value.get_mut("execution") {
-        exec["launchpadBackend"] = json!(launchpad_action_backend(&normalized.launchpad, "build-launch"));
-        exec["launchpadRolloutState"] =
-            json!(launchpad_action_rollout_state(&normalized.launchpad, "build-launch"));
+        exec["launchpadBackend"] = json!(launchpad_action_backend(
+            &normalized.launchpad,
+            "build-launch"
+        ));
+        exec["launchpadRolloutState"] = json!(launchpad_action_rollout_state(
+            &normalized.launchpad,
+            "build-launch"
+        ));
         exec["launchpadWarmContextEnabled"] = json!(warm_report.warm_context_enabled);
         exec["launchpadWarmParallelFetchEnabled"] = json!(warm_report.parallel_enabled);
         exec["launchpadWarmMaxParallelFetches"] = json!(warm_report.max_parallel_warm_fetches);
@@ -5103,12 +4297,29 @@ async fn execute_engine_action_payload(
                     })),
                 )
             })?;
+            let launch_transaction = maybe_wrap_launch_dev_buy_transaction(
+                &configured_rpc_url(),
+                &normalized,
+                &wallet_secret,
+                launch_compiled.compiled_transaction,
+            )
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Bags launch wrapper failed: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
             if let Some(transactions) = report_value
                 .get_mut("transactions")
                 .and_then(Value::as_array_mut)
             {
                 let mut launch_summaries = serde_json::to_value(summarize_bags_transactions(
-                    std::slice::from_ref(&launch_compiled.compiled_transaction),
+                    std::slice::from_ref(&launch_transaction),
                     normalized.tx.dumpBase64,
                 ))
                 .unwrap_or_else(|_| Value::Array(vec![]));
@@ -5116,7 +4327,7 @@ async fn execute_engine_action_payload(
                     transactions.append(items);
                 }
             }
-            simulation_transactions.push(launch_compiled.compiled_transaction);
+            simulation_transactions.push(launch_transaction);
         }
         let simulate_started_ms = current_time_ms();
         let (simulation, warnings) = simulate_transactions(
@@ -5358,6 +4569,7 @@ async fn execute_engine_action_payload(
         let mut armed_follow_job: Option<FollowJobResponse> = None;
         let mut same_time_sniper_compile_ms = 0u128;
         let mut same_time_independent_compiled: Vec<CompiledTransaction> = Vec::new();
+        let mut same_time_independent_wallet_keys: Vec<String> = Vec::new();
         let mut same_time_transport_plan: Option<TransportPlan> = None;
         let mut same_time_sent: Vec<crate::rpc::SentResult> = Vec::new();
         let mut post_send_warnings: Vec<String> = Vec::new();
@@ -5445,6 +4657,7 @@ async fn execute_engine_action_payload(
                         sellTipAccount: sell_tip_account,
                         preferPostSetupCreatorVaultForSell:
                             prefer_post_setup_creator_vault_for_sell,
+                        wrapperDefaultFeeBps: normalized.wrapperDefaultFeeBps,
                         bagsLaunch: bags_launch,
                         prebuiltActions: prebuilt_actions,
                         deferredSetupTransactions: deferred_setup_transactions,
@@ -5458,8 +4671,7 @@ async fn execute_engine_action_payload(
         if normalized.launchpad == "bagsapp"
             && (!setup_bundles.is_empty() || !setup_transactions.is_empty())
         {
-            let bags_submit_transport_plan =
-                standard_rpc_transport_plan(&transport_plan, &rpc_url);
+            let bags_submit_transport_plan = standard_rpc_transport_plan(&transport_plan, &rpc_url);
             for bundle in &setup_bundles {
                 let (mut bundle_sent, bundle_warnings, bundle_timing) =
                     match send_transactions_sequential_for_transport(
@@ -5666,7 +4878,36 @@ async fn execute_engine_action_payload(
                 }
             };
             bags_launch_build_ms = launch_compiled.launch_build_ms.unwrap_or_default();
-            compiled_transactions = vec![launch_compiled.compiled_transaction];
+            let launch_transaction = match maybe_wrap_launch_dev_buy_transaction(
+                &rpc_url,
+                &normalized,
+                &wallet_secret,
+                launch_compiled.compiled_transaction,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    cancel_reserved_follow_job_on_launch_failure(
+                        follow_daemon_client.as_ref(),
+                        &mut reserve_follow_job_task,
+                        &trace.traceId,
+                        &format!("Bags launch wrapper failed: {error}"),
+                    )
+                    .await;
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Bags launch wrapper failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    ));
+                }
+            };
+            compiled_transactions = vec![launch_transaction];
+            compiled_transaction_wallet_keys =
+                vec![selected_wallet_key.clone(); compiled_transactions.len()];
             if let Some(transactions) = report_value
                 .get_mut("transactions")
                 .and_then(Value::as_array_mut)
@@ -5709,14 +4950,24 @@ async fn execute_engine_action_payload(
             if transport_plan.transportType == "jito-bundle"
                 && same_time_plan.transportType == "jito-bundle"
             {
+                compiled_transaction_wallet_keys.extend(
+                    same_time_snipes
+                        .iter()
+                        .map(|snipe| snipe.walletEnvKey.clone()),
+                );
                 compiled_transactions.extend(same_time_compiled);
             } else {
                 same_time_transport_plan = Some(same_time_plan);
+                same_time_independent_wallet_keys = same_time_snipes
+                    .iter()
+                    .map(|snipe| snipe.walletEnvKey.clone())
+                    .collect();
                 same_time_independent_compiled = same_time_compiled;
             }
         }
         if use_phased_follow_pipeline && !secure_hellomoon_bundle_transport {
             compiled_transactions = creation_transactions.clone();
+            compiled_transaction_wallet_keys = creation_transaction_wallet_keys.clone();
         }
         if must_complete_follow_reserve_before_send {
             if let Some(task) = reserve_follow_job_task.take() {
@@ -6062,13 +5313,13 @@ async fn execute_engine_action_payload(
                 .await
             {
                 Ok(response) => {
-                    follow_arm_ms = follow_arm_ms
-                        .saturating_add(follow_arm_started.elapsed().as_millis());
+                    follow_arm_ms =
+                        follow_arm_ms.saturating_add(follow_arm_started.elapsed().as_millis());
                     armed_follow_job = Some(response);
                 }
                 Err(error) => {
-                    follow_arm_ms = follow_arm_ms
-                        .saturating_add(follow_arm_started.elapsed().as_millis());
+                    follow_arm_ms =
+                        follow_arm_ms.saturating_add(follow_arm_started.elapsed().as_millis());
                     let warning = format!(
                         "Follow daemon early arm failed after launch submit; retrying after confirmation: {error}"
                     );
@@ -6099,6 +5350,11 @@ async fn execute_engine_action_payload(
                 Ok(same_time_compiled) => {
                     let same_time_plan =
                         build_buy_transport_plan(&normalized.execution, same_time_compiled.len());
+                    same_time_transport_plan = Some(same_time_plan.clone());
+                    same_time_independent_wallet_keys = same_time_snipes
+                        .iter()
+                        .map(|snipe| snipe.walletEnvKey.clone())
+                        .collect();
                     same_time_sniper_compile_ms = same_time_sniper_compile_ms.saturating_add(
                         current_time_ms().saturating_sub(same_time_compile_started_ms),
                     );
@@ -6241,11 +5497,7 @@ async fn execute_engine_action_payload(
                 .saturating_add(submit_ms),
         );
         set_report_timing(&mut report, "sendTransportSubmitMs", submit_ms);
-        set_report_timing(
-            &mut report,
-            "sendConfirmMs",
-            launch_transport_confirm_ms,
-        );
+        set_report_timing(&mut report, "sendConfirmMs", launch_transport_confirm_ms);
         set_report_timing(
             &mut report,
             "sendTransportConfirmMs",
@@ -6366,15 +5618,16 @@ async fn execute_engine_action_payload(
                     .await
                 {
                     Ok(response) => {
-                        follow_arm_ms = follow_arm_ms
-                            .saturating_add(follow_arm_started.elapsed().as_millis());
+                        follow_arm_ms =
+                            follow_arm_ms.saturating_add(follow_arm_started.elapsed().as_millis());
                         armed_follow_job = Some(response);
                     }
                     Err(error) => {
-                        follow_arm_ms = follow_arm_ms
-                            .saturating_add(follow_arm_started.elapsed().as_millis());
-                        let warning =
-                            format!("Follow daemon confirm-slot update failed after launch confirmation: {error}");
+                        follow_arm_ms =
+                            follow_arm_ms.saturating_add(follow_arm_started.elapsed().as_millis());
+                        let warning = format!(
+                            "Follow daemon confirm-slot update failed after launch confirmation: {error}"
+                        );
                         record_warn(
                             "follow-client",
                             "Follow daemon post-confirm arm update failed.",
@@ -6412,7 +5665,7 @@ async fn execute_engine_action_payload(
         if !same_time_sent.is_empty() {
             match confirm_submitted_transactions_for_transport(
                 &rpc_url,
-                &transport_plan,
+                same_time_transport_plan.as_ref().unwrap_or(&transport_plan),
                 &mut same_time_sent,
                 &normalized.execution.commitment,
                 normalized.execution.trackSendBlockHeight,
@@ -6447,6 +5700,22 @@ async fn execute_engine_action_payload(
                 }
             }
         }
+        record_launchdeck_coin_trades_best_effort(
+            &trace.traceId,
+            &launch_sent,
+            &compiled_transaction_wallet_keys,
+            &compiled_mint,
+            "launch-send",
+        )
+        .await;
+        record_launchdeck_coin_trades_best_effort(
+            &trace.traceId,
+            &same_time_sent,
+            &same_time_independent_wallet_keys,
+            &compiled_mint,
+            "same-time-send",
+        )
+        .await;
         let mut sent = bags_setup_sent;
         sent.append(&mut launch_sent);
         sent.append(&mut same_time_sent);
@@ -6469,11 +5738,7 @@ async fn execute_engine_action_payload(
                 .saturating_add(submit_ms),
         );
         set_report_timing(&mut report, "sendTransportSubmitMs", submit_ms);
-        set_report_timing(
-            &mut report,
-            "sendConfirmMs",
-            confirm_ms,
-        );
+        set_report_timing(&mut report, "sendConfirmMs", confirm_ms);
         set_report_timing(&mut report, "sendTransportConfirmMs", confirm_ms);
         set_report_timing(&mut report, "sendCreationSubmitMs", submit_ms);
         set_report_timing(&mut report, "sendCreationConfirmMs", confirm_ms);
@@ -7204,19 +6469,18 @@ async fn api_bags_fee_recipient_lookup(
         username: &username,
         github_user_id: &github_user_id,
     })
-        .await
-        .and_then(|value| {
-            value.ok_or_else(|| {
-                "Launchpad runtime did not return a Bags fee recipient lookup response."
-                    .to_string()
-            })
+    .await
+    .and_then(|value| {
+        value.ok_or_else(|| {
+            "Launchpad runtime did not return a Bags fee recipient lookup response.".to_string()
         })
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "ok": false, "error": error })),
-            )
-        })?;
+    })
+    .map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": error })),
+        )
+    })?;
     Ok(Json(attach_timing(
         json!({
             "ok": true,
@@ -7334,7 +6598,7 @@ async fn api_startup_warm(
         ));
     }
     let main_rpc_url = configured_rpc_url();
-    // Read-heavy startup targets (LUTs, pump global, bonk) may use LAUNCHDECK_WARM_RPC_URL to spare
+    // Read-heavy startup targets (LUTs, pump global, bonk) may use WARM_RPC_URL to spare
     // the primary endpoint. Per-launch blockhash priming uses `main_rpc_url` only so the blockhash
     // cache matches `try_compile_native_launchpad` / Bags (see `launchpad_warm`).
     let rpc_url = configured_warm_rpc_url(&main_rpc_url);
@@ -7763,9 +7027,20 @@ async fn api_warm_activity(
     ))
 }
 
-fn follow_daemon_browser_client() -> Result<FollowDaemonClient, String> {
-    configured_follow_daemon_transport().map(|_| ())?;
-    Ok(FollowDaemonClient::new(&configured_follow_daemon_base_url()))
+async fn api_warm_presence(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<WarmPresenceRequest>,
+) -> Json<Value> {
+    let started_at_ms = current_time_ms();
+    mark_browser_presence(&state, payload.active, &payload.reason);
+    let follow_active_jobs = follow_active_jobs_count().await;
+    Json(attach_timing(
+        json!({
+            "ok": true,
+            "warm": warm_state_payload(&state, follow_active_jobs),
+        }),
+        started_at_ms,
+    ))
 }
 
 fn follow_jobs_payload(response: FollowJobResponse, started_at_ms: u128) -> Json<Value> {
@@ -7925,7 +7200,7 @@ async fn api_run(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let mut response = execute_engine_action_payload(
+    let mut response = match execute_engine_action_payload(
         &state,
         EngineRequest {
             action: Some(action.clone()),
@@ -7934,7 +7209,26 @@ async fn api_run(
             prepare_request_payload_ms: payload.prepare_request_payload_ms,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err((status, Json(error_payload))) => {
+            record_warn(
+                "launchdeck-engine",
+                format!(
+                    "LaunchDeck /api/run rejected action {} with status {}: {}",
+                    action,
+                    status,
+                    error_payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error")
+                ),
+                Some(error_payload.clone()),
+            );
+            return Err((status, Json(error_payload)));
+        }
+    };
     let persisted_path = response
         .get("sendLogPath")
         .and_then(Value::as_str)
@@ -8539,14 +7833,15 @@ async fn api_vanity_validate(
 }
 
 async fn static_handler(
+    State(state): State<Arc<AppState>>,
     AxumPath(requested): AxumPath<String>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
     let normalized = requested.trim().trim_matches('/').to_string();
     if normalized.is_empty() || normalized == "index.html" {
-        return file_response(paths::ui_dir().join("launchdeck").join("index.html"));
+        return launchdeck_index_response(&state);
     }
     if normalized == "launchdeck" || normalized == "launchdeck/index.html" {
-        return file_response(paths::ui_dir().join("launchdeck").join("index.html"));
+        return launchdeck_index_response(&state);
     }
     if normalized == "legacy" || normalized.starts_with("legacy/") {
         return Err(static_not_found());
@@ -8667,12 +7962,14 @@ async fn runtime_fail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::follow::{FOLLOW_RESPONSE_SCHEMA_VERSION, FollowJobRecord, FollowJobState};
     use crate::report::FollowActionTimings;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     fn test_state(warm: WarmControlState) -> Arc<AppState> {
         Arc::new(AppState {
-            auth_token: None,
+            auth: None,
             runtime: Arc::new(RuntimeRegistry::new(
                 "/tmp/launchdeck-test-runtime.json".into(),
             )),
@@ -8759,7 +8056,8 @@ mod tests {
     fn standard_rpc_transport_plan_overrides_only_bags_setup_route() {
         let execution = sample_execution();
         let launch_plan = build_transport_plan(&execution, 1);
-        let setup_plan = standard_rpc_transport_plan(&launch_plan, "https://mainnet.helius-rpc.com");
+        let setup_plan =
+            standard_rpc_transport_plan(&launch_plan, "https://mainnet.helius-rpc.com");
 
         assert_eq!(launch_plan.transportType, "helius-sender");
         assert_eq!(setup_plan.transportType, "standard-rpc-fanout");
@@ -8780,6 +8078,7 @@ mod tests {
             selectedWalletKey: "wallet".to_string(),
             execution: sample_execution(),
             tokenMayhemMode: false,
+            wrapperDefaultFeeBps: 10,
             jitoTipAccount: String::new(),
             buyTipAccount: String::new(),
             sellTipAccount: String::new(),
@@ -8816,10 +8115,7 @@ mod tests {
         }
     }
 
-    fn sample_sent_result(
-        transport_type: &str,
-        endpoint: Option<&str>,
-    ) -> crate::rpc::SentResult {
+    fn sample_sent_result(transport_type: &str, endpoint: Option<&str>) -> crate::rpc::SentResult {
         crate::rpc::SentResult {
             label: "launch".to_string(),
             format: "legacy".to_string(),
@@ -8876,7 +8172,10 @@ mod tests {
         });
         refresh_report_benchmark(&mut report);
         assert!(report["execution"]["timings"].is_null());
-        assert_eq!(report["benchmark"]["mode"], Value::String("off".to_string()));
+        assert_eq!(
+            report["benchmark"]["mode"],
+            Value::String("off".to_string())
+        );
         assert_eq!(report["benchmark"]["timingGroups"], Value::Array(vec![]));
         assert_eq!(report["benchmark"]["sent"], Value::Array(vec![]));
     }
@@ -8947,6 +8246,7 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         assert!(follow_action_is_immediate_presign_candidate(&base));
@@ -9561,7 +8861,11 @@ mod tests {
     #[test]
     fn sync_follow_job_warm_state_collects_active_job_routes() {
         let mut warm = WarmControlState::default();
-        sync_follow_job_warm_state(&mut warm, 1, &[sample_follow_job(FollowJobState::Running)]);
+        crate::follow_controlplane::sync_follow_job_warm_state(
+            &mut warm,
+            1,
+            &[sample_follow_job(FollowJobState::Running)],
+        );
         assert!(warm.follow_jobs_active);
         assert_eq!(warm.follow_job_routes.len(), 3);
         assert!(
@@ -9698,11 +9002,18 @@ mod tests {
     #[test]
     fn clamp_auto_fee_tip_raises_zero_estimate_to_provider_minimum() {
         assert_eq!(
-            clamp_auto_fee_tip_to_provider_minimum(0, "hellomoon", None, "Buy").unwrap(),
+            shared_fee_market::clamp_auto_fee_tip_to_provider_minimum(0, "hellomoon", None, "Buy",)
+                .unwrap(),
             1_000_000
         );
         assert_eq!(
-            clamp_auto_fee_tip_to_provider_minimum(0, "helius-sender", None, "Buy").unwrap(),
+            shared_fee_market::clamp_auto_fee_tip_to_provider_minimum(
+                0,
+                "helius-sender",
+                None,
+                "Buy",
+            )
+            .unwrap(),
             200_000
         );
     }
@@ -9710,7 +9021,13 @@ mod tests {
     #[test]
     fn clamp_auto_fee_tip_raises_subminimum_to_provider_floor() {
         assert_eq!(
-            clamp_auto_fee_tip_to_provider_minimum(50_000, "hellomoon", None, "Sell").unwrap(),
+            shared_fee_market::clamp_auto_fee_tip_to_provider_minimum(
+                50_000,
+                "hellomoon",
+                None,
+                "Sell",
+            )
+            .unwrap(),
             1_000_000
         );
     }
@@ -9718,16 +9035,26 @@ mod tests {
     #[test]
     fn clamp_auto_fee_tip_leaves_at_or_above_minimum_unchanged() {
         assert_eq!(
-            clamp_auto_fee_tip_to_provider_minimum(2_000_000, "hellomoon", None, "Creation")
-                .unwrap(),
+            shared_fee_market::clamp_auto_fee_tip_to_provider_minimum(
+                2_000_000,
+                "hellomoon",
+                None,
+                "Creation",
+            )
+            .unwrap(),
             2_000_000
         );
     }
 
     #[test]
     fn clamp_auto_fee_tip_errors_when_cap_below_minimum() {
-        let err = clamp_auto_fee_tip_to_provider_minimum(50_000, "hellomoon", Some(100_000), "Buy")
-            .expect_err("cap below minimum");
+        let err = shared_fee_market::clamp_auto_fee_tip_to_provider_minimum(
+            50_000,
+            "hellomoon",
+            Some(100_000),
+            "Buy",
+        )
+        .expect_err("cap below minimum");
         assert!(err.contains("max auto fee is below"));
         assert!(err.contains("hellomoon"));
     }
@@ -9735,7 +9062,13 @@ mod tests {
     #[test]
     fn clamp_auto_fee_tip_no_provider_minimum_passes_through() {
         assert_eq!(
-            clamp_auto_fee_tip_to_provider_minimum(0, "standard-rpc", None, "Buy").unwrap(),
+            shared_fee_market::clamp_auto_fee_tip_to_provider_minimum(
+                0,
+                "standard-rpc",
+                None,
+                "Buy",
+            )
+            .unwrap(),
             0
         );
     }
@@ -9792,7 +9125,7 @@ mod tests {
             "Creation",
         )
         .expect_err("cap should leave room above provider minimum tip");
-        assert!(err.contains("must be above"));
+        assert!(err.contains("must be greater than"));
         assert!(err.contains("hellomoon"));
     }
 
@@ -9841,10 +9174,20 @@ mod tests {
 async fn main() {
     let _ = dotenvy::dotenv();
     crypto::install_rustls_crypto_provider();
+    shared_transaction_submit::observability::configure_outbound_provider_http_request_hook(
+        record_outbound_provider_http_request,
+    );
     clear_bags_session_credentials();
     let rpc_url = configured_rpc_url();
+    let auth = match AuthManager::new() {
+        Ok(manager) => Some(Arc::new(manager)),
+        Err(error) => {
+            eprintln!("launchdeck-engine startup failed: {error}");
+            std::process::exit(1);
+        }
+    };
     let state = Arc::new(AppState {
-        auth_token: configured_auth_token(),
+        auth,
         runtime: Arc::new(RuntimeRegistry::new(configured_runtime_state_path())),
         warm: Arc::new(Mutex::new(WarmControlState {
             selected_routes: configured_active_warm_routes(),
@@ -9856,17 +9199,9 @@ async fn main() {
     spawn_engine_blockhash_refresh_task(state.clone(), rpc_url, "confirmed");
     spawn_follow_job_activity_refresh_task(state.clone());
     spawn_continuous_warm_task(state.clone());
+    spawn_startup_outbox_flush_task("launchdeck-engine");
     let restored_workers = restore_workers(&state.runtime).await;
-    let app = Router::new()
-        .route("/health", get(health))
-        .route(
-            "/",
-            get(|| async { file_response(paths::ui_dir().join("launchdeck").join("index.html")) }),
-        )
-        .route(
-            "/index.html",
-            get(|| async { file_response(paths::ui_dir().join("launchdeck").join("index.html")) }),
-        )
+    let protected_api = Router::new()
         .route("/api/bootstrap-fast", get(api_bootstrap_fast))
         .route("/api/bootstrap", get(api_bootstrap))
         .route("/api/startup-warm", post(api_startup_warm))
@@ -9875,6 +9210,7 @@ async fn main() {
         .route("/api/wallet-status", get(api_wallet_status))
         .route("/api/runtime-status", get(api_runtime_status))
         .route("/api/warm/activity", post(api_warm_activity))
+        .route("/api/warm/presence", post(api_warm_presence))
         .route("/api/follow/jobs", get(api_follow_jobs))
         .route("/api/follow/cancel", post(api_follow_cancel))
         .route("/api/follow/stop-all", post(api_follow_stop_all))
@@ -9906,6 +9242,11 @@ async fn main() {
         .route("/api/images/delete", post(api_image_delete))
         .route("/api/vamp", post(api_vamp_import))
         .route("/api/vanity/validate", post(api_vanity_validate))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_authorized_api_request,
+        ));
+    let protected_engine = Router::new()
         .route("/engine/status", post(engine_status))
         .route("/engine/quote", post(engine_action))
         .route("/engine/build", post(engine_action))
@@ -9916,6 +9257,16 @@ async fn main() {
         .route("/engine/runtime/status", post(runtime_status))
         .route("/engine/runtime/heartbeat", post(runtime_heartbeat))
         .route("/engine/runtime/fail", post(runtime_fail))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_authorized_api_request,
+        ));
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/", get(serve_launchdeck_index))
+        .route("/index.html", get(serve_launchdeck_index))
+        .merge(protected_api)
+        .merge(protected_engine)
         .route("/{*path}", get(static_handler))
         .with_state(state);
 

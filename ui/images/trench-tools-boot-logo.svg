@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 180">
+  <rect width="480" height="180" rx="28" fill="#0b0b0b"/>
+  <rect x="24" y="24" width="132" height="132" rx="24" fill="#151515" stroke="#2f2f2f"/>
+  <path d="M56 58h68v16H98v52H82V74H56z" fill="#ffffff"/>
+  <text x="186" y="82" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="34" font-weight="700">Trench.Tools</text>
+  <text x="186" y="116" fill="#a3a3a3" font-family="Segoe UI, Arial, sans-serif" font-size="18">LaunchDeck Shell</text>
+</svg>

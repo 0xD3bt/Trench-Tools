@@ -1,19 +1,21 @@
+#[path = "../alt_diagnostics.rs"]
+mod alt_diagnostics;
 #[path = "../app_logs.rs"]
 mod app_logs;
 #[path = "../bags_native.rs"]
 mod bags_native;
 #[path = "../bonk_native.rs"]
 mod bonk_native;
+#[path = "../compiled_transaction_signers.rs"]
+mod compiled_transaction_signers;
 #[path = "../config.rs"]
 mod config;
 #[path = "../endpoint_profile.rs"]
 mod endpoint_profile;
-#[path = "../follow.rs"]
+#[path = "../follow/mod.rs"]
 mod follow;
 #[path = "../fs_utils.rs"]
 mod fs_utils;
-#[path = "../helper_worker.rs"]
-mod helper_worker;
 #[path = "../launchpad_dispatch.rs"]
 mod launchpad_dispatch;
 #[path = "../launchpad_runtime.rs"]
@@ -38,15 +40,16 @@ mod rpc;
 mod transport;
 #[path = "../wallet.rs"]
 mod wallet;
+#[path = "../wrapper_compile.rs"]
+mod wrapper_compile;
 
 use bags_native::{
     compile_launch_transaction as compile_bags_launch_transaction,
     summarize_transactions as summarize_bags_transactions,
 };
 use clap::{Parser, Subcommand};
-use config::{
-    RawConfig, configured_bags_setup_gate_commitment, normalize_raw_config,
-};
+use config::{RawConfig, configured_bags_setup_gate_commitment, normalize_raw_config};
+use launchpad_dispatch::maybe_wrap_launch_dev_buy_transaction;
 use launchpad_runtime::{NativeLaunchCompileRequest, compile_native_launch};
 use observability::{new_trace_context, persist_launch_report};
 use rpc::{
@@ -356,12 +359,19 @@ async fn run_cli() -> Result<(), String> {
                 &bags_metadata_uri,
             )
             .await?;
+            let launch_transaction = maybe_wrap_launch_dev_buy_transaction(
+                &rpc_url,
+                &normalized,
+                &wallet_secret,
+                launch_compiled.compiled_transaction,
+            )
+            .await?;
             append_bags_launch_transaction_summary(
                 &mut report,
-                &launch_compiled.compiled_transaction,
+                &launch_transaction,
                 normalized.tx.dumpBase64,
             );
-            simulation_transactions.push(launch_compiled.compiled_transaction);
+            simulation_transactions.push(launch_transaction);
         }
         compiled_transactions = simulation_transactions.clone();
         let (simulation, warnings) = simulate_transactions(
@@ -398,14 +408,18 @@ async fn run_cli() -> Result<(), String> {
                         .await?;
                     all_sent.append(&mut bundle_sent);
                     all_warnings.append(&mut bundle_warnings);
-                    bags_setup_timing.submit_ms =
-                        bags_setup_timing.submit_ms.saturating_add(bundle_timing.submit_ms);
-                    bags_setup_timing.confirm_ms =
-                        bags_setup_timing.confirm_ms.saturating_add(bundle_timing.confirm_ms);
-                    total_timing.submit_ms =
-                        total_timing.submit_ms.saturating_add(bundle_timing.submit_ms);
-                    total_timing.confirm_ms =
-                        total_timing.confirm_ms.saturating_add(bundle_timing.confirm_ms);
+                    bags_setup_timing.submit_ms = bags_setup_timing
+                        .submit_ms
+                        .saturating_add(bundle_timing.submit_ms);
+                    bags_setup_timing.confirm_ms = bags_setup_timing
+                        .confirm_ms
+                        .saturating_add(bundle_timing.confirm_ms);
+                    total_timing.submit_ms = total_timing
+                        .submit_ms
+                        .saturating_add(bundle_timing.submit_ms);
+                    total_timing.confirm_ms = total_timing
+                        .confirm_ms
+                        .saturating_add(bundle_timing.confirm_ms);
                 }
                 if !setup_transactions.is_empty() {
                     let (mut setup_sent, mut setup_warnings, setup_timing) =
@@ -420,14 +434,18 @@ async fn run_cli() -> Result<(), String> {
                         .await?;
                     all_sent.append(&mut setup_sent);
                     all_warnings.append(&mut setup_warnings);
-                    bags_setup_timing.submit_ms =
-                        bags_setup_timing.submit_ms.saturating_add(setup_timing.submit_ms);
-                    bags_setup_timing.confirm_ms =
-                        bags_setup_timing.confirm_ms.saturating_add(setup_timing.confirm_ms);
-                    total_timing.submit_ms =
-                        total_timing.submit_ms.saturating_add(setup_timing.submit_ms);
-                    total_timing.confirm_ms =
-                        total_timing.confirm_ms.saturating_add(setup_timing.confirm_ms);
+                    bags_setup_timing.submit_ms = bags_setup_timing
+                        .submit_ms
+                        .saturating_add(setup_timing.submit_ms);
+                    bags_setup_timing.confirm_ms = bags_setup_timing
+                        .confirm_ms
+                        .saturating_add(setup_timing.confirm_ms);
+                    total_timing.submit_ms = total_timing
+                        .submit_ms
+                        .saturating_add(setup_timing.submit_ms);
+                    total_timing.confirm_ms = total_timing
+                        .confirm_ms
+                        .saturating_add(setup_timing.confirm_ms);
                 }
                 let launch_compiled = compile_bags_launch_transaction(
                     &rpc_url,
@@ -438,17 +456,24 @@ async fn run_cli() -> Result<(), String> {
                     &bags_metadata_uri,
                 )
                 .await?;
+                let launch_transaction = maybe_wrap_launch_dev_buy_transaction(
+                    &rpc_url,
+                    &normalized,
+                    &wallet_secret,
+                    launch_compiled.compiled_transaction,
+                )
+                .await?;
                 append_bags_launch_transaction_summary(
                     &mut report,
-                    &launch_compiled.compiled_transaction,
+                    &launch_transaction,
                     normalized.tx.dumpBase64,
                 );
-                compiled_transactions.push(launch_compiled.compiled_transaction.clone());
+                compiled_transactions.push(launch_transaction.clone());
                 let (mut launch_sent, mut launch_warnings, launch_timing) =
                     send_transactions_sequential_for_transport(
                         &rpc_url,
                         &transport_plan,
-                        std::slice::from_ref(&launch_compiled.compiled_transaction),
+                        std::slice::from_ref(&launch_transaction),
                         &normalized.execution.commitment,
                         false,
                         normalized.execution.trackSendBlockHeight,
@@ -456,15 +481,17 @@ async fn run_cli() -> Result<(), String> {
                     .await?;
                 all_sent.append(&mut launch_sent);
                 all_warnings.append(&mut launch_warnings);
-                total_timing.submit_ms =
-                    total_timing.submit_ms.saturating_add(launch_timing.submit_ms);
-                total_timing.confirm_ms =
-                    total_timing.confirm_ms.saturating_add(launch_timing.confirm_ms);
+                total_timing.submit_ms = total_timing
+                    .submit_ms
+                    .saturating_add(launch_timing.submit_ms);
+                total_timing.confirm_ms = total_timing
+                    .confirm_ms
+                    .saturating_add(launch_timing.confirm_ms);
             } else {
                 let (mut launch_sent, mut launch_warnings, launch_timing) =
                     send_transactions_sequential_for_transport(
                         &rpc_url,
-                    &transport_plan,
+                        &transport_plan,
                         &compiled_transactions,
                         &normalized.execution.commitment,
                         false,
@@ -473,10 +500,12 @@ async fn run_cli() -> Result<(), String> {
                     .await?;
                 all_sent.append(&mut launch_sent);
                 all_warnings.append(&mut launch_warnings);
-                total_timing.submit_ms =
-                    total_timing.submit_ms.saturating_add(launch_timing.submit_ms);
-                total_timing.confirm_ms =
-                    total_timing.confirm_ms.saturating_add(launch_timing.confirm_ms);
+                total_timing.submit_ms = total_timing
+                    .submit_ms
+                    .saturating_add(launch_timing.submit_ms);
+                total_timing.confirm_ms = total_timing
+                    .confirm_ms
+                    .saturating_add(launch_timing.confirm_ms);
             }
             (all_sent, all_warnings, total_timing)
         } else {
@@ -498,8 +527,16 @@ async fn run_cli() -> Result<(), String> {
         set_report_timing(&mut report, "sendSubmitMs", send_timing.submit_ms);
         set_report_timing(&mut report, "sendConfirmMs", send_timing.confirm_ms);
         if normalized.launchpad == "bagsapp" && bags_requires_prelaunch_setup {
-            set_report_timing(&mut report, "bagsSetupSubmitMs", bags_setup_timing.submit_ms);
-            set_report_timing(&mut report, "bagsSetupConfirmMs", bags_setup_timing.confirm_ms);
+            set_report_timing(
+                &mut report,
+                "bagsSetupSubmitMs",
+                bags_setup_timing.submit_ms,
+            );
+            set_report_timing(
+                &mut report,
+                "bagsSetupConfirmMs",
+                bags_setup_timing.confirm_ms,
+            );
             set_report_timing(&mut report, "bagsSetupGateMs", bags_setup_timing.confirm_ms);
         }
         if let Some(execution) = report.get_mut("execution") {

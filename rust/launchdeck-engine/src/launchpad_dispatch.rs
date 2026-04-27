@@ -2,17 +2,20 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use solana_sdk::pubkey::Pubkey;
+#[allow(unused_imports)]
+pub use shared_extension_runtime::catalog::{
+    LaunchpadRuntimeCapabilities, launchpad_runtime_capabilities,
+};
+use solana_sdk::{pubkey::Pubkey, signature::Keypair};
 use std::str::FromStr;
 
 use crate::{
     bags_native::{
         BagsFeeEstimateSnapshot, BagsFeeRecipientLookupResponse, BagsFollowBuyContext,
-        BagsImportContext,
-        BagsMarketSnapshot, NativeBagsArtifacts,
+        BagsImportContext, BagsMarketSnapshot, NativeBagsArtifacts,
+        compile_atomic_follow_buy_transaction as compile_atomic_bags_follow_buy,
         compile_follow_buy_transaction as compile_bags_follow_buy,
         compile_follow_sell_transaction as compile_bags_follow_sell,
-        compile_atomic_follow_buy_transaction as compile_atomic_bags_follow_buy,
         derive_follow_owner_token_account as derive_bags_follow_owner_token_account,
         detect_bags_import_context, fetch_bags_market_snapshot, lookup_bags_fee_recipient,
         quote_launch as quote_bags_launch, try_compile_native_bags, warm_bags_helper_ping,
@@ -20,23 +23,26 @@ use crate::{
     bonk_native::{
         BonkImportContext, BonkMarketSnapshot, BonkUsd1RouteSetup, NativeBonkArtifacts,
         NativeBonkPoolContext,
-        compile_follow_buy_transaction as compile_bonk_follow_buy,
-        compile_follow_sell_transaction_with_token_amount as compile_bonk_follow_sell_with_token_amount,
         compile_atomic_follow_buy_transaction as compile_atomic_bonk_follow_buy,
+        compile_follow_buy_transaction_with_metadata as compile_bonk_follow_buy_with_metadata,
+        compile_follow_sell_transaction_with_token_amount_and_settlement as compile_bonk_follow_sell_with_token_amount_and_settlement,
+        derive_canonical_pool_id as derive_bonk_canonical_pool_id,
         derive_follow_owner_token_account as derive_bonk_follow_owner_token_account,
-        derive_canonical_pool_id as derive_bonk_canonical_pool_id, detect_bonk_import_context,
-        detect_bonk_import_context_with_quote_asset,
-        fetch_bonk_market_snapshot, predict_dev_buy_token_amount as predict_bonk_dev_buy_token_amount,
+        detect_bonk_import_context, detect_bonk_import_context_with_quote_asset,
+        fetch_bonk_market_snapshot,
+        predict_dev_buy_token_amount as predict_bonk_dev_buy_token_amount,
         quote_launch as quote_bonk_launch, try_compile_native_bonk, warm_bonk_state,
     },
-    config::{LaunchpadActionBackendMode, NormalizedConfig, NormalizedExecution, configured_launchpad_action_backend_mode},
+    config::{
+        LaunchpadActionBackendMode, NormalizedConfig, NormalizedExecution,
+        configured_launchpad_action_backend_mode,
+    },
     follow::BagsLaunchMetadata,
     pump_native::{
         LaunchQuote, NativeCompileTimings, NativePumpArtifacts, PumpMarketSnapshot,
-        PumpPreviewBasis,
+        PumpPreviewBasis, compile_atomic_follow_buy_transaction as compile_atomic_pump_follow_buy,
         compile_follow_buy_transaction as compile_pump_follow_buy,
         compile_follow_sell_transaction_with_token_amount as compile_pump_follow_sell_with_token_amount,
-        compile_atomic_follow_buy_transaction as compile_atomic_pump_follow_buy,
         derive_follow_owner_token_account as derive_pump_follow_owner_token_account,
         fetch_pump_market_snapshot,
         predict_dev_buy_token_amount as predict_pump_dev_buy_token_amount,
@@ -45,6 +51,10 @@ use crate::{
     },
     rpc::CompiledTransaction,
     transport::TransportPlan,
+    wrapper_compile::{
+        LaunchdeckWrapRequest, WrapperRouteKind, estimate_sol_in_fee_lamports,
+        load_shared_lookup_tables, parse_sol_amount_to_lamports, wrap_compiled_transaction,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -74,92 +84,6 @@ pub struct NativeLaunchArtifacts {
 impl NativeLaunchArtifacts {
     pub fn bags_needs_prelaunch_setup(&self) -> bool {
         !self.setup_bundles.is_empty() || !self.setup_transactions.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LaunchpadRuntimeCapabilities {
-    pub compileLaunch: bool,
-    pub quote: bool,
-    pub startupWarm: bool,
-    pub marketSnapshot: bool,
-    pub importContext: bool,
-    pub followBuy: bool,
-    pub followSell: bool,
-    pub atomicFollowBuy: bool,
-    pub prelaunchSetup: bool,
-    pub requestWarmBlockhashPrime: bool,
-    pub helperBackedCompile: bool,
-    pub helperBackedQuote: bool,
-    pub helperBackedWarm: bool,
-    pub helperBackedMarketSnapshot: bool,
-    pub helperBackedImportContext: bool,
-    pub helperBackedFollow: bool,
-    pub supportsQuoteAssets: Vec<&'static str>,
-}
-
-pub fn launchpad_runtime_capabilities(
-    launchpad: &str,
-) -> Option<LaunchpadRuntimeCapabilities> {
-    match launchpad.trim().to_ascii_lowercase().as_str() {
-        "pump" => Some(LaunchpadRuntimeCapabilities {
-            compileLaunch: true,
-            quote: true,
-            startupWarm: true,
-            marketSnapshot: true,
-            importContext: false,
-            followBuy: true,
-            followSell: true,
-            atomicFollowBuy: true,
-            prelaunchSetup: false,
-            requestWarmBlockhashPrime: true,
-            helperBackedCompile: false,
-            helperBackedQuote: false,
-            helperBackedWarm: false,
-            helperBackedMarketSnapshot: false,
-            helperBackedImportContext: false,
-            helperBackedFollow: false,
-            supportsQuoteAssets: vec!["sol"],
-        }),
-        "bonk" => Some(LaunchpadRuntimeCapabilities {
-            compileLaunch: true,
-            quote: true,
-            startupWarm: true,
-            marketSnapshot: true,
-            importContext: true,
-            followBuy: true,
-            followSell: true,
-            atomicFollowBuy: true,
-            prelaunchSetup: false,
-            requestWarmBlockhashPrime: false,
-            helperBackedCompile: false,
-            helperBackedQuote: false,
-            helperBackedWarm: false,
-            helperBackedMarketSnapshot: false,
-            helperBackedImportContext: false,
-            helperBackedFollow: false,
-            supportsQuoteAssets: vec!["sol", "usd1"],
-        }),
-        "bagsapp" => Some(LaunchpadRuntimeCapabilities {
-            compileLaunch: true,
-            quote: true,
-            startupWarm: true,
-            marketSnapshot: true,
-            importContext: true,
-            followBuy: true,
-            followSell: true,
-            atomicFollowBuy: true,
-            prelaunchSetup: true,
-            requestWarmBlockhashPrime: true,
-            helperBackedCompile: false,
-            helperBackedQuote: false,
-            helperBackedWarm: false,
-            helperBackedMarketSnapshot: false,
-            helperBackedImportContext: false,
-            helperBackedFollow: false,
-            supportsQuoteAssets: vec!["sol"],
-        }),
-        _ => None,
     }
 }
 
@@ -210,9 +134,18 @@ pub struct FollowBuyCompileRequest<'a> {
     pub allow_ata_creation: bool,
     pub prefer_post_setup_creator_vault: bool,
     pub bonk_pool_context: Option<&'a NativeBonkPoolContext>,
+    pub bonk_pool_id: Option<&'a str>,
     pub bonk_usd1_route_setup: Option<&'a BonkUsd1RouteSetup>,
     pub bags_follow_buy_context: Option<&'a BagsFollowBuyContext>,
     pub bags_launch: Option<&'a BagsLaunchMetadata>,
+    pub wrapper_fee_bps: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct FollowBuyCompiledTransactions {
+    pub transactions: Vec<CompiledTransaction>,
+    pub primary_tx_index: usize,
+    pub requires_ordered_execution: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +167,7 @@ pub struct FollowSellCompileRequest<'a> {
     pub bonk_launch_creator: Option<&'a str>,
     pub pump_cashback_enabled_override: Option<bool>,
     pub bags_launch: Option<&'a BagsLaunchMetadata>,
+    pub wrapper_fee_bps: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -370,6 +304,7 @@ impl From<NativeBagsArtifacts> for NativeLaunchArtifacts {
             expectedDammConfigKey: value.expected_damm_config_key.clone(),
             expectedDammDerivationMode: value.expected_damm_derivation_mode.clone(),
             preMigrationDbcPoolAddress: value.pre_migration_dbc_pool_address.clone(),
+            postMigrationDammPoolAddress: String::new(),
         });
         Self {
             creation_transactions: value.compiled_transactions,
@@ -407,7 +342,7 @@ pub async fn try_compile_native_launchpad(
     // Blockhash from request-scoped warm prime (`LaunchpadWarmContext`); same `rpc_url` + commitment as compile.
     launch_blockhash_prime: Option<(String, u64)>,
 ) -> Result<Option<NativeLaunchArtifacts>, String> {
-    match config.launchpad.as_str() {
+    let artifacts = match config.launchpad.as_str() {
         "pump" => try_compile_native_pump(
             rpc_url,
             config,
@@ -446,7 +381,8 @@ pub async fn try_compile_native_launchpad(
         .await
         .map(|result| result.map(Into::into)),
         _ => Ok(None),
-    }
+    }?;
+    maybe_wrap_launch_dev_buy_artifacts(rpc_url, config, wallet_secret, artifacts).await
 }
 
 pub async fn quote_launch_for_launchpad(
@@ -465,12 +401,230 @@ pub async fn quote_launch_for_launchpad(
     }
 }
 
+async fn maybe_wrap_launch_dev_buy_artifacts(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+    wallet_secret: &[u8],
+    artifacts: Option<NativeLaunchArtifacts>,
+) -> Result<Option<NativeLaunchArtifacts>, String> {
+    let Some(mut artifacts) = artifacts else {
+        return Ok(None);
+    };
+    let Some(dev_buy) = config.devBuy.as_ref() else {
+        return Ok(Some(artifacts));
+    };
+    if config.launchpad == "pump" {
+        return Ok(Some(artifacts));
+    }
+    if config.launchpad == "bagsapp" {
+        return Ok(Some(artifacts));
+    }
+    let request = launch_dev_buy_wrap_request(config, dev_buy)?;
+    artifacts.compiled_transactions = maybe_wrap_follow_transactions(
+        rpc_url,
+        wallet_secret,
+        &config.launchpad,
+        artifacts.compiled_transactions,
+        request,
+    )
+    .await?;
+    artifacts.creation_transactions = maybe_wrap_follow_transactions(
+        rpc_url,
+        wallet_secret,
+        &config.launchpad,
+        artifacts.creation_transactions,
+        request,
+    )
+    .await?;
+    artifacts.deferred_setup_transactions = maybe_wrap_follow_transactions(
+        rpc_url,
+        wallet_secret,
+        &config.launchpad,
+        artifacts.deferred_setup_transactions,
+        request,
+    )
+    .await?;
+    Ok(Some(artifacts))
+}
+
+pub async fn maybe_wrap_launch_dev_buy_transaction(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+    wallet_secret: &[u8],
+    source: CompiledTransaction,
+) -> Result<CompiledTransaction, String> {
+    let Some(dev_buy) = config.devBuy.as_ref() else {
+        return Ok(source);
+    };
+    if config.launchpad == "pump" {
+        return Ok(source);
+    }
+    let request = launch_dev_buy_wrap_request(config, dev_buy)?;
+    maybe_wrap_follow_transaction(rpc_url, wallet_secret, &config.launchpad, source, request).await
+}
+
+fn launch_dev_buy_wrap_request(
+    config: &NormalizedConfig,
+    dev_buy: &crate::config::NormalizedDevBuy,
+) -> Result<LaunchdeckWrapRequest, String> {
+    let gross_sol_in_lamports = match dev_buy.mode.trim().to_ascii_lowercase().as_str() {
+        "sol" => match parse_sol_amount_to_lamports(&dev_buy.amount) {
+            Ok(value) if value > 0 => value,
+            Ok(_) => {
+                return Err(
+                    "LaunchDeck wrapper dev-buy amount must be greater than zero".to_string(),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "LaunchDeck wrapper dev-buy amount parse failed for launchpad={}: {}",
+                    config.launchpad, error
+                ));
+            }
+        },
+        "tokens" if config.launchpad != "bagsapp" => 0,
+        "tokens" => {
+            return Err(
+                "Bags creation dev-buy token mode is not atomic-safe in the native API path; Bags currently requires initialBuyLamports."
+                    .to_string(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "LaunchDeck wrapper dev-buy mode {other} is not supported for launchpad={}",
+                config.launchpad
+            ));
+        }
+    };
+    Ok(LaunchdeckWrapRequest {
+        route_kind: WrapperRouteKind::SolIn,
+        fee_bps: config.wrapperDefaultFeeBps,
+        gross_sol_in_lamports,
+        infer_gross_sol_in_from_inner: dev_buy.mode.trim().eq_ignore_ascii_case("tokens"),
+        min_net_output: 0,
+        select_first_allowlisted_venue_instruction: false,
+        select_last_allowlisted_venue_instruction: true,
+    })
+}
+
+async fn maybe_wrap_follow_transaction(
+    rpc_url: &str,
+    wallet_secret: &[u8],
+    launchpad: &str,
+    source: CompiledTransaction,
+    request: LaunchdeckWrapRequest,
+) -> Result<CompiledTransaction, String> {
+    let payer = match Keypair::try_from(wallet_secret) {
+        Ok(payer) => payer,
+        Err(error) => {
+            return Err(format!(
+                "LaunchDeck wrapper wallet decode failed for launchpad={} label={}: {}",
+                launchpad, source.label, error
+            ));
+        }
+    };
+    let lookup_tables = match load_shared_lookup_tables(rpc_url).await {
+        Ok(tables) => tables,
+        Err(error) => {
+            return Err(format!(
+                "LaunchDeck wrapper ALT load failed for launchpad={} label={}: {}",
+                launchpad, source.label, error
+            ));
+        }
+    };
+    match wrap_compiled_transaction(&source, &payer, &lookup_tables, request) {
+        Ok(wrapped) => {
+            let gross_label = if request.infer_gross_sol_in_from_inner {
+                "inferred".to_string()
+            } else {
+                request.gross_sol_in_lamports.to_string()
+            };
+            let fee_estimate_label = if request.infer_gross_sol_in_from_inner {
+                "inferred".to_string()
+            } else {
+                estimate_sol_in_fee_lamports(request.gross_sol_in_lamports, request.fee_bps)
+                    .to_string()
+            };
+            eprintln!(
+                "[launchdeck-engine][wrapper-wrap] launchpad={} label={} route={:?} gross_sol_in={} fee_bps={} fee_estimate={} format={}",
+                launchpad,
+                wrapped.label,
+                request.route_kind,
+                gross_label,
+                request.fee_bps,
+                fee_estimate_label,
+                wrapped.format
+            );
+            Ok(wrapped)
+        }
+        Err(error) => {
+            if let Some(reason) = wrapper_passthrough_reason(launchpad, &error) {
+                eprintln!(
+                    "[launchdeck-engine][wrapper-wrap] passthrough=native launchpad={} label={} reason={}",
+                    launchpad, source.label, reason
+                );
+                return Ok(source);
+            }
+            eprintln!(
+                "[launchdeck-engine][wrapper-wrap] fail_closed launchpad={} label={} route={:?} reason=wrap_failed error={}",
+                launchpad, source.label, request.route_kind, error
+            );
+            Err(format!(
+                "LaunchDeck wrapper failed for launchpad={} label={}: {}",
+                launchpad, source.label, error
+            ))
+        }
+    }
+}
+
+fn wrapper_passthrough_reason<'a>(launchpad: &str, error: &str) -> Option<&'a str> {
+    if launchpad == "bagsapp"
+        && error.contains("Failed to sign LaunchDeck wrapper tx: not enough signers")
+    {
+        return Some("provider_signed_transaction");
+    }
+    if error.contains("selected venue instruction does not consume SOL") {
+        return Some("no_sol_input");
+    }
+    if error.contains("no allowlisted venue instruction found") {
+        return Some("no_venue_instruction");
+    }
+    None
+}
+
+async fn maybe_wrap_follow_transactions(
+    rpc_url: &str,
+    wallet_secret: &[u8],
+    launchpad: &str,
+    sources: Vec<CompiledTransaction>,
+    request: LaunchdeckWrapRequest,
+) -> Result<Vec<CompiledTransaction>, String> {
+    let mut wrapped = Vec::with_capacity(sources.len());
+    for source in sources {
+        wrapped.push(
+            maybe_wrap_follow_transaction(rpc_url, wallet_secret, launchpad, source, request)
+                .await?,
+        );
+    }
+    Ok(wrapped)
+}
+
 pub async fn compile_follow_buy_for_launchpad(
     request: FollowBuyCompileRequest<'_>,
-) -> Result<CompiledTransaction, String> {
+) -> Result<FollowBuyCompiledTransactions, String> {
+    let buy_gross_lamports = parse_sol_amount_to_lamports(request.buy_amount_sol)?;
+    let wrap_request = LaunchdeckWrapRequest {
+        route_kind: WrapperRouteKind::SolIn,
+        fee_bps: request.wrapper_fee_bps,
+        gross_sol_in_lamports: buy_gross_lamports,
+        infer_gross_sol_in_from_inner: false,
+        min_net_output: 0,
+        select_first_allowlisted_venue_instruction: false,
+        select_last_allowlisted_venue_instruction: false,
+    };
     match request.launchpad {
         "pump" => {
-            compile_pump_follow_buy(
+            let tx = compile_pump_follow_buy(
                 request.rpc_url,
                 request.execution,
                 request.token_mayhem_mode,
@@ -481,27 +635,52 @@ pub async fn compile_follow_buy_for_launchpad(
                 request.buy_amount_sol,
                 request.prefer_post_setup_creator_vault,
             )
-            .await
+            .await?;
+            Ok(FollowBuyCompiledTransactions {
+                transactions: vec![
+                    maybe_wrap_follow_transaction(
+                        request.rpc_url,
+                        request.wallet_secret,
+                        request.launchpad,
+                        tx,
+                        wrap_request,
+                    )
+                    .await?,
+                ],
+                primary_tx_index: 0,
+                requires_ordered_execution: false,
+            })
         }
         "bonk" => {
-            compile_bonk_follow_buy(
+            let compiled = compile_bonk_follow_buy_with_metadata(
                 request.rpc_url,
                 request.quote_asset,
                 request.execution,
-                request.token_mayhem_mode,
                 request.jito_tip_account,
                 request.wallet_secret,
                 request.mint,
-                request.launch_creator,
                 request.buy_amount_sol,
                 request.allow_ata_creation,
                 request.bonk_pool_context,
+                request.bonk_pool_id,
                 request.bonk_usd1_route_setup,
             )
-            .await
+            .await?;
+            Ok(FollowBuyCompiledTransactions {
+                transactions: maybe_wrap_follow_transactions(
+                    request.rpc_url,
+                    request.wallet_secret,
+                    request.launchpad,
+                    compiled.transactions,
+                    wrap_request,
+                )
+                .await?,
+                primary_tx_index: compiled.primary_tx_index,
+                requires_ordered_execution: compiled.requires_ordered_execution,
+            })
         }
         "bagsapp" => {
-            compile_bags_follow_buy(
+            let tx = compile_bags_follow_buy(
                 request.rpc_url,
                 request.execution,
                 request.token_mayhem_mode,
@@ -513,7 +692,21 @@ pub async fn compile_follow_buy_for_launchpad(
                 request.bags_launch,
                 request.bags_follow_buy_context,
             )
-            .await
+            .await?;
+            Ok(FollowBuyCompiledTransactions {
+                transactions: vec![
+                    maybe_wrap_follow_transaction(
+                        request.rpc_url,
+                        request.wallet_secret,
+                        request.launchpad,
+                        tx,
+                        wrap_request,
+                    )
+                    .await?,
+                ],
+                primary_tx_index: 0,
+                requires_ordered_execution: false,
+            })
         }
         other => Err(format!(
             "Unsupported launchpad for follow buy compilation: {other}"
@@ -537,8 +730,10 @@ pub async fn compile_atomic_follow_buy_for_launchpad(
     predicted_creator_dev_buy_token_amount: Option<u64>,
     predicted_creator_dev_buy_quote_amount: Option<u64>,
     pump_cashback_enabled_override: Option<bool>,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
-    match launchpad {
+    let buy_gross_lamports = parse_sol_amount_to_lamports(buy_amount_sol)?;
+    let compiled = match launchpad {
         "pump" => {
             compile_atomic_pump_follow_buy(
                 rpc_url,
@@ -589,13 +784,29 @@ pub async fn compile_atomic_follow_buy_for_launchpad(
         other => Err(format!(
             "Unsupported launchpad for same-time sniper buys: {other}"
         )),
-    }
+    }?;
+    Ok(maybe_wrap_follow_transaction(
+        rpc_url,
+        wallet_secret,
+        launchpad,
+        compiled,
+        LaunchdeckWrapRequest {
+            route_kind: WrapperRouteKind::SolIn,
+            fee_bps: wrapper_fee_bps,
+            gross_sol_in_lamports: buy_gross_lamports,
+            infer_gross_sol_in_from_inner: false,
+            min_net_output: 0,
+            select_first_allowlisted_venue_instruction: matches!(launchpad, "bonk" | "bagsapp"),
+            select_last_allowlisted_venue_instruction: false,
+        },
+    )
+    .await?)
 }
 
 pub async fn compile_follow_sell_for_launchpad(
     request: FollowSellCompileRequest<'_>,
 ) -> Result<Option<CompiledTransaction>, String> {
-    match request.launchpad {
+    let compiled = match request.launchpad {
         "pump" => {
             compile_pump_follow_sell_with_token_amount(
                 request.rpc_url,
@@ -613,7 +824,7 @@ pub async fn compile_follow_sell_for_launchpad(
             .await
         }
         "bonk" => {
-            compile_bonk_follow_sell_with_token_amount(
+            compile_bonk_follow_sell_with_token_amount_and_settlement(
                 request.rpc_url,
                 request.quote_asset,
                 request.execution,
@@ -625,6 +836,7 @@ pub async fn compile_follow_sell_for_launchpad(
                 request.bonk_pool_id,
                 request.bonk_launch_mode,
                 request.bonk_launch_creator,
+                &request.execution.sellSettlementAsset,
             )
             .await
         }
@@ -646,7 +858,28 @@ pub async fn compile_follow_sell_for_launchpad(
         other => Err(format!(
             "Unsupported launchpad for follow sell compilation: {other}"
         )),
-    }
+    }?;
+    Ok(match compiled {
+        Some(tx) => Some(
+            maybe_wrap_follow_transaction(
+                request.rpc_url,
+                request.wallet_secret,
+                request.launchpad,
+                tx,
+                LaunchdeckWrapRequest {
+                    route_kind: WrapperRouteKind::SolOut,
+                    fee_bps: request.wrapper_fee_bps,
+                    gross_sol_in_lamports: 0,
+                    infer_gross_sol_in_from_inner: false,
+                    min_net_output: 0,
+                    select_first_allowlisted_venue_instruction: false,
+                    select_last_allowlisted_venue_instruction: matches!(request.launchpad, "bonk"),
+                },
+            )
+            .await?,
+        ),
+        None => None,
+    })
 }
 
 pub fn derive_follow_owner_token_account_for_launchpad(
@@ -659,9 +892,15 @@ pub fn derive_follow_owner_token_account_for_launchpad(
     let mint_pubkey =
         Pubkey::from_str(mint).map_err(|error| format!("Invalid mint public key: {error}"))?;
     match launchpad {
-        "pump" => Ok(derive_pump_follow_owner_token_account(&owner_pubkey, &mint_pubkey)?.to_string()),
-        "bonk" => Ok(derive_bonk_follow_owner_token_account(&owner_pubkey, &mint_pubkey).to_string()),
-        "bagsapp" => Ok(derive_bags_follow_owner_token_account(&owner_pubkey, &mint_pubkey)?.to_string()),
+        "pump" => {
+            Ok(derive_pump_follow_owner_token_account(&owner_pubkey, &mint_pubkey)?.to_string())
+        }
+        "bonk" => {
+            Ok(derive_bonk_follow_owner_token_account(&owner_pubkey, &mint_pubkey).to_string())
+        }
+        "bagsapp" => {
+            Ok(derive_bags_follow_owner_token_account(&owner_pubkey, &mint_pubkey)?.to_string())
+        }
         other => Err(format!(
             "Unsupported launchpad for follow owner token account derivation: {other}"
         )),
@@ -697,11 +936,12 @@ pub async fn detect_import_context_for_launchpad(
 ) -> Result<Option<LaunchpadImportContext>, String> {
     match launchpad {
         "bonk" => {
-            let context = if let Some(quote_asset) = quote_asset.filter(|value| !value.trim().is_empty()) {
-                detect_bonk_import_context_with_quote_asset(rpc_url, mint, quote_asset).await?
-            } else {
-                detect_bonk_import_context(rpc_url, mint).await?
-            };
+            let context =
+                if let Some(quote_asset) = quote_asset.filter(|value| !value.trim().is_empty()) {
+                    detect_bonk_import_context_with_quote_asset(rpc_url, mint, quote_asset).await?
+                } else {
+                    detect_bonk_import_context(rpc_url, mint).await?
+                };
             Ok(context.map(LaunchpadImportContext::Bonk))
         }
         "bagsapp" => detect_bags_import_context(rpc_url, mint)
@@ -747,12 +987,15 @@ pub async fn predict_dev_buy_token_amount_for_launchpad(
 }
 
 pub async fn derive_canonical_pool_id_for_launchpad(
+    _rpc_url: &str,
     launchpad: &str,
     quote_asset: &str,
     mint: &str,
 ) -> Result<Option<String>, String> {
     match launchpad {
-        "bonk" => derive_bonk_canonical_pool_id(quote_asset, mint).await.map(Some),
+        "bonk" => derive_bonk_canonical_pool_id(quote_asset, mint)
+            .await
+            .map(Some),
         "pump" | "bagsapp" => Ok(None),
         other => Err(format!(
             "Unsupported launchpad for canonical pool derivation: {other}"
@@ -763,12 +1006,184 @@ pub async fn derive_canonical_pool_id_for_launchpad(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{RawConfig, normalize_raw_config};
     use serde_json::json;
+
+    fn dummy_compiled_transaction(label: &str, format: &str) -> CompiledTransaction {
+        CompiledTransaction {
+            label: label.to_string(),
+            format: format.to_string(),
+            blockhash: "11111111111111111111111111111111".to_string(),
+            lastValidBlockHeight: 0,
+            serializedBase64: String::new(),
+            signature: None,
+            lookupTablesUsed: vec![],
+            computeUnitLimit: None,
+            computeUnitPriceMicroLamports: None,
+            inlineTipLamports: None,
+            inlineTipAccount: None,
+        }
+    }
+
+    fn dummy_native_launch_artifacts() -> NativeLaunchArtifacts {
+        NativeLaunchArtifacts {
+            compiled_transactions: vec![dummy_compiled_transaction("launch", "v0-alt")],
+            creation_transactions: vec![dummy_compiled_transaction("launch", "v0-alt")],
+            deferred_setup_transactions: vec![dummy_compiled_transaction("setup", "v0-alt")],
+            setup_bundles: vec![],
+            setup_transactions: vec![],
+            bags_launch_follow: None,
+            bags_config_key: String::new(),
+            bags_metadata_uri: String::new(),
+            bags_fee_estimate: None,
+            bags_prepare_launch_ms: None,
+            bags_metadata_upload_ms: None,
+            bags_fee_recipient_resolve_ms: None,
+            report: json!({}),
+            text: String::new(),
+            compile_timings: NativeCompileTimings::default(),
+            mint: "mint".to_string(),
+            launch_creator: "creator".to_string(),
+        }
+    }
+
+    fn pump_config_with_dev_buy() -> crate::config::NormalizedConfig {
+        let mut raw = RawConfig {
+            mode: "regular".to_string(),
+            launchpad: "pump".to_string(),
+            ..RawConfig::default()
+        };
+        raw.token.name = "LaunchDeck".to_string();
+        raw.token.symbol = "LDECK".to_string();
+        raw.token.uri = "ipfs://fixture".to_string();
+        raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
+        raw.tx.jitoTipLamports = Some(json!(200_000));
+        raw.tx.jitoTipAccount = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE".to_string();
+        raw.devBuy = Some(crate::config::RawDevBuy {
+            mode: "sol".to_string(),
+            amount: "0.1".to_string(),
+        });
+        normalize_raw_config(raw).expect("normalized pump config")
+    }
+
+    fn bags_config_with_dev_buy() -> crate::config::NormalizedConfig {
+        let mut raw = RawConfig {
+            mode: "bags-2-2".to_string(),
+            launchpad: "bagsapp".to_string(),
+            ..RawConfig::default()
+        };
+        raw.token.name = "LaunchDeck".to_string();
+        raw.token.symbol = "LDECK".to_string();
+        raw.token.uri = "ipfs://fixture".to_string();
+        raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
+        raw.tx.jitoTipLamports = Some(json!(200_000));
+        raw.tx.jitoTipAccount = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE".to_string();
+        raw.devBuy = Some(crate::config::RawDevBuy {
+            mode: "sol".to_string(),
+            amount: "0.1".to_string(),
+        });
+        normalize_raw_config(raw).expect("normalized bags config")
+    }
+
+    #[tokio::test]
+    async fn pump_launch_dev_buy_artifacts_are_not_wrapper_wrapped() {
+        let artifacts = dummy_native_launch_artifacts();
+        let normalized = pump_config_with_dev_buy();
+
+        let wrapped = maybe_wrap_launch_dev_buy_artifacts(
+            "http://127.0.0.1:1",
+            &normalized,
+            &[],
+            Some(artifacts),
+        )
+        .await
+        .expect("pump passthrough")
+        .expect("artifacts");
+
+        assert_eq!(wrapped.compiled_transactions[0].format, "v0-alt");
+        assert_eq!(wrapped.creation_transactions[0].format, "v0-alt");
+        assert_eq!(wrapped.deferred_setup_transactions[0].format, "v0-alt");
+    }
+
+    #[tokio::test]
+    async fn bags_prelaunch_setup_artifacts_are_not_wrapper_wrapped() {
+        let mut artifacts = dummy_native_launch_artifacts();
+        artifacts.compiled_transactions =
+            vec![dummy_compiled_transaction("bags-config-direct-1", "v0-alt")];
+        artifacts.creation_transactions = artifacts.compiled_transactions.clone();
+        artifacts.setup_transactions = artifacts.compiled_transactions.clone();
+        let normalized = bags_config_with_dev_buy();
+
+        let wrapped = maybe_wrap_launch_dev_buy_artifacts(
+            "http://127.0.0.1:1",
+            &normalized,
+            &[],
+            Some(artifacts),
+        )
+        .await
+        .expect("bags setup passthrough")
+        .expect("artifacts");
+
+        assert_eq!(
+            wrapped.compiled_transactions[0].label,
+            "bags-config-direct-1"
+        );
+        assert_eq!(wrapped.compiled_transactions[0].format, "v0-alt");
+        assert_eq!(wrapped.setup_transactions[0].format, "v0-alt");
+    }
+
+    #[tokio::test]
+    async fn pump_launch_dev_buy_single_transaction_is_not_wrapper_wrapped() {
+        let normalized = pump_config_with_dev_buy();
+        let source = dummy_compiled_transaction("launch", "v0-alt");
+
+        let wrapped =
+            maybe_wrap_launch_dev_buy_transaction("http://127.0.0.1:1", &normalized, &[], source)
+                .await
+                .expect("pump passthrough");
+
+        assert_eq!(wrapped.format, "v0-alt");
+    }
+
+    #[test]
+    fn bags_provider_signed_launch_wrapper_signing_failure_passthroughs_native() {
+        assert_eq!(
+            wrapper_passthrough_reason(
+                "bagsapp",
+                "Failed to sign LaunchDeck wrapper tx: not enough signers"
+            ),
+            Some("provider_signed_transaction")
+        );
+        assert_eq!(
+            wrapper_passthrough_reason(
+                "bonk",
+                "Failed to sign LaunchDeck wrapper tx: not enough signers"
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn bonk_canonical_pool_helper_ignores_live_import_context() {
+        let canonical = derive_canonical_pool_id_for_launchpad(
+            "http://127.0.0.1:1",
+            "bonk",
+            "sol",
+            "So11111111111111111111111111111111111111112",
+        )
+        .await
+        .expect("canonical pool id");
+        let direct =
+            derive_bonk_canonical_pool_id("sol", "So11111111111111111111111111111111111111112")
+                .await
+                .expect("direct canonical pool id");
+
+        assert_eq!(canonical, Some(direct));
+    }
 
     #[test]
     fn capabilities_report_bags_helper_reachability() {
-        let caps =
-            launchpad_runtime_capabilities("bagsapp").expect("bagsapp runtime capabilities");
+        let caps = launchpad_runtime_capabilities("bagsapp").expect("bagsapp runtime capabilities");
         assert!(caps.startupWarm);
         assert!(!caps.helperBackedWarm);
         assert!(!caps.helperBackedFollow);
@@ -917,10 +1332,7 @@ mod tests {
             quoteAsset: "sol".to_string(),
             quoteAssetLabel: "SOL".to_string(),
         });
-        assert_eq!(
-            bonk.market_cap_lamports_u64().expect("bonk market cap"),
-            42
-        );
+        assert_eq!(bonk.market_cap_lamports_u64().expect("bonk market cap"), 42);
 
         let bags = LaunchpadMarketSnapshot::Bags(BagsMarketSnapshot {
             mint: "mint".to_string(),
@@ -936,9 +1348,6 @@ mod tests {
             marketCapLamports: "84".to_string(),
             marketCapSol: "0.000000084".to_string(),
         });
-        assert_eq!(
-            bags.market_cap_lamports_u64().expect("bags market cap"),
-            84
-        );
+        assert_eq!(bags.market_cap_lamports_u64().expect("bags market cap"), 84);
     }
 }

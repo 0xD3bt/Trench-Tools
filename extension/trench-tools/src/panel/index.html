@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trench Tools Panel</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="panel-shell">
+      <header id="drag-handle" class="modal-topbar">
+        <div class="header-row">
+          <div class="header-main">
+            <img class="brand-logo" src="../../images/trench-tools-boot-logo.png" alt="Trench Tools" />
+            <div class="brand-copy">
+              <strong>Trench.Tools</strong>
+              <span id="version-text" class="version-text is-waiting">…</span>
+            </div>
+          </div>
+          <div class="window-actions">
+            <button
+              id="wallet-button"
+              class="window-button"
+              type="button"
+              aria-label="Wallets"
+              data-tooltip="Wallets"
+              data-tooltip-position="bottom"
+            >
+              <img class="wallet-button-icon" src="../../assets/wallet-icon.png" alt="" aria-hidden="true" />
+            </button>
+            <button
+              id="settings-button"
+              class="window-button"
+              type="button"
+              aria-label="Coin actions"
+              data-tooltip="Coin actions"
+              data-tooltip-position="bottom"
+            >
+              <img class="settings-button-icon" src="../../assets/panel-settings-icon.png" alt="" aria-hidden="true" />
+            </button>
+            <button
+              id="minimize-button"
+              class="window-button"
+              type="button"
+              aria-label="Minimize"
+              data-tooltip="Minimize"
+              data-tooltip-position="bottom"
+            >
+              <img class="minimize-button-icon" src="../../assets/minimize-icon.png" alt="" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+        <div id="settings-menu" class="panel-settings-menu hidden">
+          <button id="toggle-fees-button" class="panel-settings-menu-item" type="button">Toggle PnL mode</button>
+          <button id="resync-coin-button" class="panel-settings-menu-item" type="button">Resync this coin</button>
+          <button id="reset-coin-button" class="panel-settings-menu-item" type="button">Reset PnL for this coin</button>
+          <button id="open-global-settings-button" class="panel-settings-menu-item" type="button">Open global settings</button>
+          <div class="panel-settings-menu-separator" aria-hidden="true"></div>
+          <div class="panel-settings-menu-flyout-host" data-flyout="wallet-groups">
+            <button id="toggle-wallet-groups-button" class="panel-settings-menu-item panel-settings-menu-item--with-arrow" type="button">
+              <span class="panel-settings-menu-item-arrow" aria-hidden="true">‹</span>
+              <span class="panel-settings-menu-item-label">Hide wallet groups</span>
+            </button>
+          </div>
+          <div class="panel-settings-menu-flyout-host" data-flyout="preset-row">
+            <button id="toggle-preset-row-button" class="panel-settings-menu-item panel-settings-menu-item--with-arrow" type="button">
+              <span class="panel-settings-menu-item-arrow" aria-hidden="true">‹</span>
+              <span class="panel-settings-menu-item-label">Hide preset row</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div class="panel-flow">
+        <div id="engine-status-row" class="engine-status-row hidden" role="status">
+          <div class="engine-status-copy">
+            <strong id="engine-status-title">Execution engine unavailable</strong>
+            <span id="engine-status-message">Start the execution engine, then try again.</span>
+          </div>
+          <button id="engine-status-retry" class="engine-status-retry" type="button">Retry</button>
+        </div>
+
+        <div id="preset-chip-row" class="compact-chip-row"></div>
+
+        <div class="section-divider" data-section-divider="preset-chip-row" aria-hidden="true"></div>
+
+        <div id="wallet-group-chips" class="compact-chip-row"></div>
+
+        <div class="section-divider" data-section-divider="wallet-group-chips" aria-hidden="true"></div>
+
+        <div id="quick-buy-presets" class="quick-grid"></div>
+        <div class="custom-action-row">
+          <label class="compact-input-shell">
+            <span class="input-lead-icon" aria-hidden="true">
+              <img src="../../assets/sol-icon-white.png" alt="" />
+            </span>
+            <input
+              id="custom-buy-input"
+              class="compact-input has-lead-icon"
+              type="text"
+              inputmode="decimal"
+              placeholder=" "
+              aria-label="Enter custom SOL amount"
+            />
+            <span class="input-placeholder-with-icon" aria-hidden="true">
+              <span>Enter custom</span>
+              <img class="inline-placeholder-icon" src="../../assets/sol-icon-white.png" alt="" />
+              <span>amount</span>
+            </span>
+          </label>
+          <button id="custom-buy-button" class="primary-button compact-button" type="button">Buy</button>
+        </div>
+        <div id="buy-option-row" class="option-row"></div>
+
+        <div class="section-divider" aria-hidden="true"></div>
+
+        <div id="quick-sell-shortcuts" class="quick-grid"></div>
+        <div class="sell-combo-row">
+          <label class="compact-input-shell">
+            <span class="input-lead-icon input-lead-icon-text" aria-hidden="true">%</span>
+            <input
+              id="custom-sell-percent-input"
+              class="compact-input has-lead-icon"
+              type="text"
+              inputmode="decimal"
+              placeholder="Sell %"
+              aria-label="Enter custom percent sell"
+            />
+          </label>
+          <button id="custom-sell-percent-button" class="secondary-button compact-button" type="button">Sell</button>
+          <label class="compact-input-shell">
+            <span class="input-lead-icon" aria-hidden="true">
+              <img src="../../assets/sol-icon-white.png" alt="" />
+            </span>
+            <input
+              id="custom-sell-sol-input"
+              class="compact-input has-lead-icon"
+              type="text"
+              inputmode="decimal"
+              placeholder="Sell SOL"
+              aria-label="Enter custom SOL sell"
+            />
+          </label>
+          <button id="custom-sell-sol-button" class="secondary-button compact-button" type="button">Sell</button>
+        </div>
+        <div id="sell-option-row" class="option-row"></div>
+
+        <div class="balance-stats-row">
+          <div class="balance-stat balance-stat-buy">
+            <div class="balance-stat-meta">
+              <div class="balance-stat-icon" aria-hidden="true"></div>
+              <div class="balance-stat-label">Bought</div>
+            </div>
+            <div id="balance-buy" class="balance-stat-value">0.000</div>
+          </div>
+          <div class="balance-stat balance-stat-sell">
+            <div class="balance-stat-meta">
+              <div class="balance-stat-icon" aria-hidden="true"></div>
+              <div class="balance-stat-label">Sold</div>
+            </div>
+            <div id="balance-sell" class="balance-stat-value">0.000</div>
+          </div>
+          <div class="balance-stat balance-stat-hold">
+            <div class="balance-stat-meta">
+              <div class="balance-stat-icon" aria-hidden="true"></div>
+              <div class="balance-stat-label">Balance</div>
+            </div>
+            <div id="balance-hold" class="balance-stat-value">0.000</div>
+          </div>
+          <div class="balance-stat balance-stat-pnl">
+            <div class="balance-stat-meta">
+              <div class="balance-stat-icon" aria-hidden="true"></div>
+              <div class="balance-stat-label">PNL</div>
+            </div>
+            <div id="balance-pnl" class="balance-stat-value">0.000</div>
+            <div id="balance-pnl-detail" class="balance-stat-detail">--%</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="wallet-modal" class="wallet-modal hidden">
+        <div class="wallet-modal-card">
+          <section id="wallet-holders-section" class="wallet-section is-hidden">
+            <div class="wallet-modal-actions">
+              <button id="wallet-holders-select-all" class="wallet-modal-action" type="button">Select All</button>
+              <button id="wallet-consolidate" class="wallet-modal-action" type="button">
+                <img class="wallet-action-icon" src="../../assets/consolidate-icon.png" alt="" aria-hidden="true" />
+                Consolidate
+              </button>
+              <button id="wallet-split" class="wallet-modal-action" type="button">
+                <img class="wallet-action-icon" src="../../assets/split-icon.png" alt="" aria-hidden="true" />
+                Split Tokens
+              </button>
+              <button class="wallet-modal-close wallet-modal-close--inline" type="button" data-wallet-modal-close aria-label="Close">
+                <img class="close-button-icon" src="../../assets/close-button.png" alt="" aria-hidden="true" />
+              </button>
+            </div>
+            <div id="wallet-holders-list" class="wallet-picker-list"></div>
+          </section>
+
+          <section class="wallet-section">
+            <div class="wallet-modal-actions">
+              <button id="wallet-select-all" class="wallet-modal-action" type="button">Select All</button>
+              <button id="wallet-select-balance" class="wallet-modal-action" type="button">Select All with Balance</button>
+              <button class="wallet-modal-close wallet-modal-close--inline" type="button" data-wallet-modal-close aria-label="Close">
+                <img class="close-button-icon" src="../../assets/close-button.png" alt="" aria-hidden="true" />
+              </button>
+            </div>
+            <div id="wallet-picker-list" class="wallet-picker-list"></div>
+          </section>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>

@@ -17,3 +17,39 @@ Thumbs.db
 .idea/
 .cache/
 target/
+
+# Local smoke/debug helpers and generated test artifacts
+scripts/debug-*.js
+scripts/debug-*.mjs
+scripts/smoke-*.js
+scripts/smoke-*.mjs
+scripts/attach-live-*.js
+scripts/attach-live-*.mjs
+scripts/attach-live-*.ps1
+extension/trench-tools/scripts/debug-*.js
+extension/trench-tools/scripts/debug-*.mjs
+extension/trench-tools/scripts/smoke-*.js
+extension/trench-tools/scripts/smoke-*.mjs
+extension/trench-tools/scripts/attach-live-*.js
+extension/trench-tools/scripts/attach-live-*.mjs
+extension/trench-tools/scripts/attach-live-*.ps1
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+**/*.trace.zip
+**/*.webm
+**/*.har
+
+# Local harvesting/research helpers
+scripts/harvest-*.js
+scripts/harvest-*.mjs
+scripts/shared-super-alt.js
+scripts/shared-*-alt.js
+harvest-output/
+.harvest/
+
+# Scratch diff/audit artifacts
+_audit_*
+*.diff
+.deploy.json

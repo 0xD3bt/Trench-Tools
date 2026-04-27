@@ -5,79 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Trench.Tools - LaunchDeck</title>
     <link rel="icon" type="image/png" href="/images/trench-tools-favicon.png">
-    <script>
-      try {
-        document.documentElement.classList.add("boot-pending");
-        const EARLY_BOOT_STORAGE_KEY = "launchdeck.earlyBootSnapshot.v1";
-        const EARLY_BOOT_SESSION_STORAGE_KEY = "launchdeck.earlyBootSnapshot.session.v1";
-        const LIVE_SYNC_STORAGE_KEY = "launchdeck.liveSyncEvent.v1";
-        const LIVE_SYNC_SESSION_STORAGE_KEY = "launchdeck.liveSyncSnapshot.v1";
-        const LIVE_SYNC_MAX_AGE_MS = 5 * 60 * 1000;
-        const isFreshLiveSyncPayload = (payload) => {
-          if (!payload || typeof payload !== "object") return false;
-          const timestampMs = Number(payload.timestampMs);
-          return Number.isFinite(timestampMs) && (Date.now() - timestampMs) <= LIVE_SYNC_MAX_AGE_MS;
-        };
-        const readFreshLiveSyncPayload = () => {
-          try {
-            const sessionRaw = window.sessionStorage.getItem(EARLY_BOOT_SESSION_STORAGE_KEY);
-            if (sessionRaw) {
-              const sessionPayload = JSON.parse(sessionRaw);
-              if (isFreshLiveSyncPayload(sessionPayload)) return sessionPayload;
-            }
-          } catch (_error) {
-            // Ignore session storage failures and continue with other fallbacks.
-          }
-          try {
-            const localRaw = window.localStorage.getItem(EARLY_BOOT_STORAGE_KEY);
-            if (localRaw) {
-              const localPayload = JSON.parse(localRaw);
-              if (isFreshLiveSyncPayload(localPayload)) return localPayload;
-            }
-          } catch (_error) {
-            // Ignore storage access failures and continue with live sync fallback.
-          }
-          try {
-            const sessionRaw = window.sessionStorage.getItem(LIVE_SYNC_SESSION_STORAGE_KEY);
-            if (sessionRaw) {
-              const sessionPayload = JSON.parse(sessionRaw);
-              if (isFreshLiveSyncPayload(sessionPayload)) return sessionPayload;
-            }
-          } catch (_error) {
-            // Ignore session storage failures and continue with localStorage fallback.
-          }
-          try {
-            const localRaw = window.localStorage.getItem(LIVE_SYNC_STORAGE_KEY);
-            if (localRaw) {
-              const localPayload = JSON.parse(localRaw);
-              if (isFreshLiveSyncPayload(localPayload)) return localPayload;
-            }
-          } catch (_error) {
-            // Ignore storage access failures and keep boot functional.
-          }
-          return null;
-        };
-        const earlyLiveSyncSnapshot = readFreshLiveSyncPayload();
-        if (earlyLiveSyncSnapshot) {
-          window.__launchdeckEarlyLiveSyncSnapshot = earlyLiveSyncSnapshot;
-        }
-        if (window.localStorage.getItem("launchdeck.themeMode") === "light") {
-          document.documentElement.classList.add("theme-light");
-        }
-        if (window.localStorage.getItem("launchdeck.outputSectionVisible") === "false") {
-          document.documentElement.classList.add("output-hidden");
-        }
-        window.__launchdeckBootFallback = window.setTimeout(() => {
-          document.documentElement.classList.add("boot-stalled");
-        }, 4000);
-      } catch (_error) {
-        // Ignore storage access failures before app boot.
-      }
-    </script>
+    <script src="/launchdeck/boot.js"></script>
     <link rel="preload" as="image" href="/images/solana-mark.png">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Public+Sans:wght@400;500;600;700;800&display=swap">
     <link rel="stylesheet" href="/launchdeck/styles.css">
   </head>
   <body>
@@ -168,6 +97,12 @@
               <select id="wallet-select" hidden aria-hidden="true" tabindex="-1"></select>
             </div>
           </div>
+
+          <div
+            id="launchdeck-host-banner"
+            class="launch-surface-section reports-callout is-bad launchdeck-host-banner"
+            hidden
+          ></div>
 
           <div class="launch-surface-section launch-surface-platform">
             <div class="section-head">
@@ -586,7 +521,7 @@
                     <span>Tip</span>
                     <span class="settings-fee-input-wrap">
                       <span class="settings-input-prefix" aria-hidden="true"><img src="/images/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
-                      <input name="creationTipSol" id="creation-tip-input" type="text" placeholder="0.01">
+                      <input name="creationTipSol" id="creation-tip-input" type="text" placeholder="0.001">
                     </span>
                     <div class="field-error" data-error-for="creationTipSol"></div>
                   </label>
@@ -633,14 +568,14 @@
                   </label>
                   <label>
                     <span>Slippage (%)</span>
-                    <input name="buySlippagePercent" id="buy-slippage-input" type="text" placeholder="90">
+                    <input name="buySlippagePercent" id="buy-slippage-input" type="text" placeholder="20">
                     <div class="field-error" data-error-for="buySlippagePercent"></div>
                   </label>
                   <label class="settings-fee-field">
                     <span>Priority Fee</span>
                     <span class="settings-fee-input-wrap">
                       <span class="settings-input-prefix" aria-hidden="true"><img src="/images/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
-                      <input name="buyPriorityFeeSol" id="buy-priority-fee-input" type="text" placeholder="0.009">
+                      <input name="buyPriorityFeeSol" id="buy-priority-fee-input" type="text" placeholder="0.001">
                     </span>
                     <div class="field-error" data-error-for="buyPriorityFeeSol"></div>
                   </label>
@@ -648,7 +583,7 @@
                     <span>Tip</span>
                     <span class="settings-fee-input-wrap">
                       <span class="settings-input-prefix" aria-hidden="true"><img src="/images/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
-                      <input name="buyTipSol" id="buy-tip-input" type="text" placeholder="0.01">
+                      <input name="buyTipSol" id="buy-tip-input" type="text" placeholder="0.001">
                     </span>
                     <div class="field-error" data-error-for="buyTipSol"></div>
                   </label>
@@ -697,14 +632,14 @@
                   </label>
                   <label>
                     <span>Slippage (%)</span>
-                    <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="90">
+                    <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="20">
                     <div class="field-error" data-error-for="sellSlippagePercent"></div>
                   </label>
                   <label class="settings-fee-field">
                     <span>Priority Fee</span>
                     <span class="settings-fee-input-wrap">
                       <span class="settings-input-prefix" aria-hidden="true"><img src="/images/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
-                      <input name="sellPriorityFeeSol" id="sell-priority-fee-input" type="text" placeholder="0.009">
+                      <input name="sellPriorityFeeSol" id="sell-priority-fee-input" type="text" placeholder="0.001">
                     </span>
                     <div class="field-error" data-error-for="sellPriorityFeeSol"></div>
                   </label>
@@ -712,7 +647,7 @@
                     <span>Tip</span>
                     <span class="settings-fee-input-wrap">
                       <span class="settings-input-prefix" aria-hidden="true"><img src="/images/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
-                      <input name="sellTipSol" id="sell-tip-input" type="text" placeholder="0.01">
+                      <input name="sellTipSol" id="sell-tip-input" type="text" placeholder="0.001">
                     </span>
                     <div class="field-error" data-error-for="sellTipSol"></div>
                   </label>
@@ -1007,6 +942,7 @@
                 </label>
               </div>
             </div>
+            <div id="sniper-host-banner" class="reports-callout is-bad sniper-host-banner" hidden></div>
             <div id="sniper-wallets-section" class="sniper-wallets-section" hidden>
               <div id="sniper-wallet-list" class="sniper-wallet-list"></div>
               <div id="sniper-modal-error" class="field-error sniper-modal-error"></div>
@@ -1139,26 +1075,20 @@
 
     <div id="vamp-modal" class="modal-overlay" hidden>
       <div class="modal vamp-modal">
-        <div class="modal-header">
-          <div>
-            <h3>Vamp</h3>
-            <div class="muted small">Paste a contract address to copy the token image, metadata, ticker, and links into the form.</div>
-          </div>
+        <div class="modal-header vamp-modal-header">
+          <h3>Vamp</h3>
           <button type="button" id="vamp-close" class="modal-close" aria-label="Close modal">
             <img class="modal-close-icon" src="/images/modal-close.png" alt="">
           </button>
         </div>
-        <div class="modal-body">
+        <div class="modal-body vamp-modal-body">
           <div class="stack">
-            <label>
-              <span>Contract Address</span>
-              <input id="vamp-contract-input" type="text" inputmode="text" spellcheck="false" placeholder="Paste Solana mint / contract address">
-            </label>
+            <input id="vamp-contract-input" type="text" inputmode="text" spellcheck="false" placeholder="Paste Solana mint / contract address">
             <div id="vamp-status" class="quote muted" hidden></div>
             <div id="vamp-error" class="field-error"></div>
           </div>
         </div>
-        <div class="modal-footer">
+        <div class="modal-footer vamp-modal-footer">
           <button type="button" id="vamp-cancel" class="button">Cancel</button>
           <button type="button" id="vamp-import" class="button deploy">Import</button>
         </div>
@@ -1267,8 +1197,11 @@
       </div>
     </div>
 
+    <script src="/launchdeck/extension-bootstrap.js"></script>
+    <script src="/launchdeck/shared-constants.js"></script>
     <script src="/launchdeck/request-utils.js"></script>
     <script src="/launchdeck/render-utils.js"></script>
+    <script src="/launchdeck/layout.js"></script>
     <script src="/launchdeck/reports-feature.js"></script>
     <script src="/launchdeck/images-feature.js"></script>
     <script src="/launchdeck/auto-sell-feature.js"></script>

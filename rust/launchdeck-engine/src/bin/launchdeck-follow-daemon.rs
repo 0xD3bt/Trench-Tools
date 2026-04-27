@@ -12,10 +12,14 @@ use launchdeck_engine::{
     app_logs::{record_error, record_info, record_warn},
     bags_native::{BagsFollowBuyContext, BagsMarketSnapshot, load_follow_buy_context},
     bonk_native::{
-        BonkUsd1RouteSetup, NativeBonkPoolContext, load_live_follow_buy_pool_context,
+        BonkUsd1RouteSetup, detect_bonk_import_context_with_quote_asset,
         load_live_follow_buy_usd1_route_setup,
     },
     crypto::install_rustls_crypto_provider,
+    execution_engine_bridge::{
+        confirmed_trade_record_from_sent_result, record_confirmed_trades,
+        spawn_startup_outbox_flush_task,
+    },
     follow::{
         DeferredSetupState, FOLLOW_RESPONSE_SCHEMA_VERSION, FollowActionKind, FollowActionRecord,
         FollowActionState, FollowArmRequest, FollowCancelRequest, FollowDaemonHealth,
@@ -27,10 +31,11 @@ use launchdeck_engine::{
     launchpad_dispatch::{
         FollowBuyCompileRequest, FollowSellCompileRequest, LaunchpadMarketSnapshot,
         compile_follow_buy_for_launchpad, compile_follow_sell_for_launchpad,
-        derive_follow_owner_token_account_for_launchpad,
-        fetch_market_snapshot_for_launchpad,
+        derive_follow_owner_token_account_for_launchpad, fetch_market_snapshot_for_launchpad,
     },
-    observability::update_persisted_follow_daemon_snapshot,
+    observability::{
+        record_outbound_provider_http_request, update_persisted_follow_daemon_snapshot,
+    },
     paths,
     pump_native::{
         PreparedFollowBuyRuntime, PreparedFollowBuyStatic, compile_follow_sell_transaction,
@@ -42,13 +47,13 @@ use launchdeck_engine::{
         CompiledTransaction, confirm_submitted_transactions_for_transport,
         fetch_current_block_height, fetch_current_block_height_fresh, fetch_current_slot,
         fetch_current_slot_fresh, fetch_latest_blockhash_fresh_or_recent,
-        prewarm_watch_websocket_endpoint, spawn_blockhash_refresh_task, submit_transactions_for_transport,
+        prewarm_watch_websocket_endpoint, spawn_blockhash_refresh_task,
+        submit_transactions_for_transport,
     },
     transport::{
         TransportPlan, build_transport_plan, configured_enable_helius_transaction_subscribe,
         configured_helius_rpc_url_trimmed, configured_watch_endpoints_for_provider,
-        prefers_helius_transaction_subscribe_path,
-        resolved_helius_transaction_subscribe_ws_url,
+        prefers_helius_transaction_subscribe_path, resolved_helius_transaction_subscribe_ws_url,
     },
     wallet::{
         fetch_balance_lamports, fetch_token_balance, load_solana_wallet_by_env_key,
@@ -57,6 +62,7 @@ use launchdeck_engine::{
 };
 use reqwest::Client;
 use serde_json::{Value, json};
+use shared_auth::AuthManager;
 use solana_sdk::{
     hash::Hash,
     message::VersionedMessage,
@@ -280,7 +286,7 @@ async fn quote_units_to_usd_micros(
 
 #[derive(Clone)]
 struct AppState {
-    auth_token: Option<String>,
+    auth: Option<Arc<AuthManager>>,
     rpc_url: String,
     store: FollowDaemonStore,
     max_active_jobs: Option<usize>,
@@ -316,7 +322,7 @@ struct CachedFollowBuyRuntime {
 
 #[derive(Clone)]
 struct CachedBonkFollowBuyContext {
-    context: NativeBonkPoolContext,
+    pool_id: String,
     refreshed_at_ms: u128,
 }
 
@@ -412,7 +418,6 @@ enum FollowReportSyncMode {
 const WATCHER_MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const WATCHER_BACKOFF_BASE_MS: u64 = 200;
 const FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS: u64 = 2_000_000;
-const DEFAULT_LOCAL_AUTH_TOKEN: &str = "4815927603149027";
 const HOT_FOLLOW_BUY_REFRESH_MS: u64 = 250;
 const HOT_FOLLOW_BUY_MAX_AGE_MS: u128 = 900;
 const FOLLOW_REPORT_SYNC_DEBOUNCE_MS: u64 = 150;
@@ -421,7 +426,8 @@ const FOLLOW_READY_WATCH_TTL_MS: u128 = 10_000;
 const FOLLOW_READY_PRECHECK_TTL_MS: u128 = 5_000;
 const FOLLOW_READY_PRECHECK_REFRESH_MS: u64 = 3_000;
 const FOLLOW_WATCHER_RPC_POLL_INTERVAL_MS: u64 = 400;
-const BAGS_MARKET_SNAPSHOT_CACHE_TTL_MS: u128 = 900;
+const FOLLOW_SIGNATURE_WATCHER_WEBSOCKET_TIMEOUT_SECS: u64 = 60;
+const BAGS_MARKET_SNAPSHOT_CACHE_TTL_MS: u128 = 300;
 #[allow(dead_code)]
 const DEFAULT_FOLLOW_OFFSET_POLL_INTERVAL_MS: u64 = 400;
 #[allow(dead_code)]
@@ -441,6 +447,27 @@ fn now_ms() -> u128 {
 fn shared_http_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(Client::new)
+}
+
+async fn record_execution_engine_coin_trades_best_effort(
+    trace_id: &str,
+    phase: &str,
+    trades: Vec<launchdeck_engine::execution_engine_bridge::ExecutionEngineConfirmedTradeRecord>,
+) {
+    if trades.is_empty() {
+        return;
+    }
+    if let Err(error) = record_confirmed_trades(&trades).await {
+        record_warn(
+            "execution-engine-bridge",
+            "Failed to hand confirmed LaunchDeck follow trades to execution-engine.",
+            Some(json!({
+                "traceId": trace_id,
+                "phase": phase,
+                "message": error,
+            })),
+        );
+    }
 }
 
 fn configured_follow_daemon_port() -> u16 {
@@ -534,17 +561,6 @@ fn configured_enable_pump_sell_creator_vault_auto_retry() -> bool {
     )
 }
 
-fn configured_auth_token() -> Option<String> {
-    let token = env::var("LAUNCHDECK_FOLLOW_DAEMON_AUTH_TOKEN")
-        .unwrap_or_else(|_| DEFAULT_LOCAL_AUTH_TOKEN.to_string());
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        Some(DEFAULT_LOCAL_AUTH_TOKEN.to_string())
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 fn configured_startup_watch_endpoint() -> Option<String> {
     env::var("SOLANA_WS_URL")
         .ok()
@@ -591,25 +607,36 @@ fn configured_rpc_url() -> String {
 }
 
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, Json<Value>)> {
-    let Some(expected) = &state.auth_token else {
+    let Some(auth) = &state.auth else {
         return Ok(());
     };
     let actual = headers
-        .get("x-launchdeck-engine-auth")
+        .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    if actual == expected {
-        Ok(())
-    } else {
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            record_warn("follow-daemon", "Missing follow daemon bearer token.", None);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "ok": false,
+                    "error": "Missing bearer token.",
+                })),
+            )
+        })?;
+    auth.verify_token(actual).map_err(|error| {
         record_warn("follow-daemon", "Unauthorized follow daemon request.", None);
-        Err((
+        (
             StatusCode::UNAUTHORIZED,
             Json(json!({
                 "ok": false,
-                "error": "Unauthorized follow daemon request.",
+                "error": error,
             })),
-        ))
-    }
+        )
+    })?;
+    Ok(())
 }
 
 fn watch_endpoint_cache_key(endpoint: &str) -> String {
@@ -760,9 +787,27 @@ fn shared_trigger_buy_compile_context_key(
     launchpad: &str,
     quote_asset: &str,
     launch_mode: &str,
+    route_policy: &str,
 ) -> String {
+    format!("{trace_id}:{observed_slot}:{launchpad}:{quote_asset}:{launch_mode}:{route_policy}")
+}
+
+fn follow_buy_route_policy_label(
+    execution: &launchdeck_engine::config::NormalizedExecution,
+) -> String {
+    let funding_policy = execution
+        .buyFundingPolicy
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_");
     format!(
-        "{trace_id}:{observed_slot}:{launchpad}:{quote_asset}:{launch_mode}"
+        "buy:{}",
+        if funding_policy.is_empty() {
+            "sol_only"
+        } else {
+            &funding_policy
+        }
     )
 }
 
@@ -822,26 +867,18 @@ async fn cache_shared_hot_follow_buy_runtime(
     );
 }
 
-async fn cache_bonk_follow_buy_context(
-    state: &Arc<AppState>,
-    key: &str,
-    context: NativeBonkPoolContext,
-) {
+async fn cache_bonk_follow_buy_context(state: &Arc<AppState>, key: &str, pool_id: String) {
     let mut cache = state.bonk_follow_buy_contexts.lock().await;
     cache.insert(
         key.to_string(),
         CachedBonkFollowBuyContext {
-            context,
+            pool_id,
             refreshed_at_ms: now_ms(),
         },
     );
 }
 
-async fn cache_bonk_usd1_route_setup(
-    state: &Arc<AppState>,
-    key: &str,
-    setup: BonkUsd1RouteSetup,
-) {
+async fn cache_bonk_usd1_route_setup(state: &Arc<AppState>, key: &str, setup: BonkUsd1RouteSetup) {
     let mut cache = state.bonk_usd1_route_setups.lock().await;
     cache.insert(
         key.to_string(),
@@ -1227,6 +1264,7 @@ async fn resolve_hot_follow_buy_runtime_for_job(
             &job.launchpad,
             &job.quoteAsset,
             &job.launchMode,
+            &follow_buy_route_policy_label(&job.execution),
         );
         if let Some(cached) = get_shared_hot_follow_buy_runtime(
             state,
@@ -1266,11 +1304,11 @@ async fn resolve_hot_follow_buy_runtime_for_job(
     Ok(prepared)
 }
 
-async fn resolve_shared_bonk_follow_buy_context_for_job(
+async fn resolve_shared_bonk_follow_buy_pool_id_for_job(
     state: &Arc<AppState>,
     job: &FollowJobRecord,
     action: &FollowActionRecord,
-) -> Option<NativeBonkPoolContext> {
+) -> Option<String> {
     let observed_slot = action.eligibilityObservedSlot?;
     let key = shared_trigger_buy_compile_context_key(
         &job.traceId,
@@ -1278,12 +1316,32 @@ async fn resolve_shared_bonk_follow_buy_context_for_job(
         &job.launchpad,
         &job.quoteAsset,
         &job.launchMode,
+        &follow_buy_route_policy_label(&job.execution),
     );
     let cached = get_bonk_follow_buy_context(state, &key).await?;
     if now_ms().saturating_sub(cached.refreshed_at_ms) > HOT_FOLLOW_BUY_MAX_AGE_MS {
         return None;
     }
-    Some(cached.context)
+    if let Some(locked_pool_id) = action
+        .poolId
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        && locked_pool_id.trim() != cached.pool_id.trim()
+    {
+        return None;
+    }
+    Some(cached.pool_id)
+}
+
+fn preferred_bonk_follow_buy_pool_id<'a>(
+    action: &'a FollowActionRecord,
+    shared_pool_id: Option<&'a str>,
+) -> Option<&'a str> {
+    action
+        .poolId
+        .as_deref()
+        .filter(|pool_id| !pool_id.trim().is_empty())
+        .or_else(|| shared_pool_id.filter(|pool_id| !pool_id.trim().is_empty()))
 }
 
 async fn resolve_shared_bonk_usd1_route_setup_for_job(
@@ -1298,6 +1356,7 @@ async fn resolve_shared_bonk_usd1_route_setup_for_job(
         &job.launchpad,
         &job.quoteAsset,
         &job.launchMode,
+        &follow_buy_route_policy_label(&job.execution),
     );
     let cached = get_bonk_usd1_route_setup(state, &key).await?;
     if now_ms().saturating_sub(cached.refreshed_at_ms) > HOT_FOLLOW_BUY_MAX_AGE_MS {
@@ -1318,6 +1377,7 @@ async fn resolve_shared_bags_follow_buy_context_for_job(
         &job.launchpad,
         &job.quoteAsset,
         &job.launchMode,
+        &follow_buy_route_policy_label(&job.execution),
     );
     let cached = get_bags_follow_buy_context(state, &key).await?;
     if now_ms().saturating_sub(cached.refreshed_at_ms) > HOT_FOLLOW_BUY_MAX_AGE_MS {
@@ -1352,6 +1412,7 @@ async fn prepare_trigger_time_buy_compile_batch(
         &job.launchpad,
         &job.quoteAsset,
         &job.launchMode,
+        &follow_buy_route_policy_label(&job.execution),
     );
     if let Err(error) = fetch_latest_blockhash_fresh_or_recent(
         &state.rpc_url,
@@ -1401,20 +1462,17 @@ async fn prepare_trigger_time_buy_compile_batch(
             let Some(mint) = job.mint.as_deref() else {
                 return;
             };
-            match load_live_follow_buy_pool_context(
-                &state.rpc_url,
-                mint,
-                &job.quoteAsset,
-                &job.execution.commitment,
-            )
-            .await
+            match detect_bonk_import_context_with_quote_asset(&state.rpc_url, mint, &job.quoteAsset)
+                .await
             {
-                Ok(context) => {
-                    cache_bonk_follow_buy_context(state, &compile_context_key, context).await;
+                Ok(Some(context)) => {
+                    cache_bonk_follow_buy_context(state, &compile_context_key, context.poolId)
+                        .await;
                     if job.quoteAsset.eq_ignore_ascii_case("usd1") {
                         match load_live_follow_buy_usd1_route_setup(&state.rpc_url).await {
                             Ok(setup) => {
-                                cache_bonk_usd1_route_setup(state, &compile_context_key, setup).await;
+                                cache_bonk_usd1_route_setup(state, &compile_context_key, setup)
+                                    .await;
                             }
                             Err(error) => {
                                 record_warn(
@@ -1430,6 +1488,7 @@ async fn prepare_trigger_time_buy_compile_batch(
                         }
                     }
                 }
+                Ok(None) => {}
                 Err(error) => {
                     record_warn(
                         "follow-daemon",
@@ -1630,6 +1689,7 @@ fn build_follow_buy_precheck_action(
         orderIndex: 0,
         preSignedTransactions: vec![],
         poolId: None,
+        primaryTxIndex: None,
         timings: FollowActionTimings::default(),
     }
 }
@@ -1805,7 +1865,11 @@ fn sniper_autosell_requested(follow: &launchdeck_engine::config::NormalizedFollo
 }
 
 fn sniper_autosell_rollout_enabled() -> bool {
-    opt_out_flag_enabled(std::env::var("LAUNCHDECK_ENABLE_SNIPER_AUTOSELL").ok().as_deref())
+    opt_out_flag_enabled(
+        std::env::var("LAUNCHDECK_ENABLE_SNIPER_AUTOSELL")
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn resolve_watch_endpoint(request: &FollowReadyRequest) -> Option<String> {
@@ -2688,18 +2752,22 @@ async fn spawn_job_if_needed(state: Arc<AppState>, trace_id: String) {
 }
 
 async fn restore_jobs(state: Arc<AppState>) {
-    match state.store.clear_jobs_for_restart().await {
-        Ok(removed) if removed > 0 => {
+    match state.store.recover_jobs_for_restart().await {
+        Ok(recovered) if !recovered.is_empty() => {
+            let recovered_count = recovered.len();
+            for job in recovered {
+                spawn_job_if_needed(state.clone(), job.traceId.clone()).await;
+            }
             record_info(
                 "follow-daemon",
                 format!(
-                    "Cleared {} persisted follow job{} on startup",
-                    removed,
-                    if removed == 1 { "" } else { "s" }
+                    "Recovered {} persisted follow job{} on startup",
+                    recovered_count,
+                    if recovered_count == 1 { "" } else { "s" }
                 ),
                 Some(json!({
-                    "removedJobs": removed,
-                    "reason": "startup-reset",
+                    "recoveredJobs": recovered_count,
+                    "reason": "startup-recovery",
                 })),
             );
         }
@@ -2707,7 +2775,7 @@ async fn restore_jobs(state: Arc<AppState>) {
         Err(error) => {
             record_error(
                 "follow-daemon",
-                "Failed to clear persisted follow jobs on startup".to_string(),
+                "Failed to recover persisted follow jobs on startup".to_string(),
                 Some(json!({
                     "message": error,
                 })),
@@ -2934,7 +3002,11 @@ fn terminal_action_state_label(state: &FollowActionState) -> &'static str {
     }
 }
 
-fn sniper_sell_blocked_notice(sell_action_id: &str, buy_action_id: &str, state: &FollowActionState) -> String {
+fn sniper_sell_blocked_notice(
+    sell_action_id: &str,
+    buy_action_id: &str,
+    state: &FollowActionState,
+) -> String {
     format!(
         "__stopped__ sniper autosell {sell_action_id} stopped because matching sniper buy {buy_action_id} ended as {}.",
         terminal_action_state_label(state)
@@ -2946,7 +3018,9 @@ async fn wait_for_matching_sniper_buy_confirmation(
     job: &FollowJobRecord,
     action: &FollowActionRecord,
 ) -> Result<u64, String> {
-    let Some(buy_action_id) = matching_sniper_buy_action(job, action).map(|buy| buy.actionId.clone()) else {
+    let Some(buy_action_id) =
+        matching_sniper_buy_action(job, action).map(|buy| buy.actionId.clone())
+    else {
         return Err(format!(
             "Matching sniper buy was missing for autosell {}.",
             action.actionId
@@ -2955,7 +3029,9 @@ async fn wait_for_matching_sniper_buy_confirmation(
     loop {
         ensure_action_not_cancelled(&state, &job.traceId, &action.actionId).await?;
         let Some(current_job) = get_job(&state, &job.traceId).await else {
-            return Err("Follow job disappeared while waiting for matching sniper buy.".to_string());
+            return Err(
+                "Follow job disappeared while waiting for matching sniper buy.".to_string(),
+            );
         };
         let Some(current_buy) = current_job
             .actions
@@ -2989,6 +3065,58 @@ async fn wait_for_matching_sniper_buy_confirmation(
             }
             _ => sleep(Duration::from_millis(50)).await,
         }
+    }
+}
+
+async fn wait_for_slot_or_market_cap_trigger(
+    state: Arc<AppState>,
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+    confirmed_launch_slot: Option<u64>,
+    target_offset: u64,
+) -> Result<Option<u64>, String> {
+    let slot_future = wait_for_slot_offset(
+        state.clone(),
+        job,
+        &action.actionId,
+        confirmed_launch_slot,
+        target_offset,
+    );
+    tokio::pin!(slot_future);
+    let market_future = wait_for_market_cap_trigger(state, job, action, &action.actionId);
+    tokio::pin!(market_future);
+    tokio::select! {
+        result = &mut slot_future => Ok(Some(result?)),
+        result = &mut market_future => match result {
+            Ok(()) => Ok(None),
+            Err(error) if is_market_cap_scan_stopped_error(&error) => Ok(Some(slot_future.await?)),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+async fn wait_for_time_or_market_cap_trigger(
+    state: Arc<AppState>,
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+    scheduled_for_ms: u128,
+) -> Result<(), String> {
+    let time_future = wait_until_ms(
+        state.clone(),
+        &job.traceId,
+        Some(&action.actionId),
+        scheduled_for_ms,
+    );
+    tokio::pin!(time_future);
+    let market_future = wait_for_market_cap_trigger(state, job, action, &action.actionId);
+    tokio::pin!(market_future);
+    tokio::select! {
+        result = &mut time_future => result,
+        result = &mut market_future => match result {
+            Ok(()) => Ok(()),
+            Err(error) if is_market_cap_scan_stopped_error(&error) => time_future.await,
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -3130,6 +3258,7 @@ async fn execute_action_with_retry(
                     .store
                     .update_action(&trace_id, &action.actionId, |record| {
                         record.state = FollowActionState::Armed;
+                        record.attemptCount = record.attemptCount.saturating_add(1);
                         record.lastError = Some(format!(
                             "Retrying after attempt {} in {}ms: {}",
                             latest_action.attemptCount, retry_delay_ms, error
@@ -3166,15 +3295,16 @@ async fn run_action_batch_task(
     }
     actions.sort_by_key(action_group_sort_key);
     let lead_action = actions[0].clone();
-    let eligibility_timing = match wait_for_action_eligibility(state.clone(), &job, &lead_action).await {
-        Ok(timing) => timing,
-        Err(error) => {
-            for action in &actions {
-                record_action_failure(&state, &job, action, &error).await;
+    let eligibility_timing =
+        match wait_for_action_eligibility(state.clone(), &job, &lead_action).await {
+            Ok(timing) => timing,
+            Err(error) => {
+                for action in &actions {
+                    record_action_failure(&state, &job, action, &error).await;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     let eligible_at_ms = now_ms();
     for action in &actions {
         let transport_plan = follow_action_transport_plan(&job, action);
@@ -3367,6 +3497,15 @@ fn is_pump_custom_6003_slippage(error: &str) -> bool {
             || normalized.contains("custom: 6003"))
 }
 
+fn is_pump_custom_6023_not_enough_tokens(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("notenoughtokenstosell")
+        || (normalized.contains("instructionerror")
+            && (normalized.contains("\"custom\":6023")
+                || normalized.contains("custom:6023")
+                || normalized.contains("custom: 6023")))
+}
+
 fn should_rebuild_presigned_pump_sell_onchain_slippage(
     job: &FollowJobRecord,
     action: &FollowActionRecord,
@@ -3387,7 +3526,7 @@ fn should_rebuild_presigned_pump_sell_onchain_slippage(
     if action.preSignedTransactions.is_empty() {
         return false;
     }
-    is_pump_custom_6003_slippage(error)
+    is_pump_custom_6003_slippage(error) || is_pump_custom_6023_not_enough_tokens(error)
 }
 
 fn is_retryable_action_error(error: &str) -> bool {
@@ -3428,6 +3567,13 @@ fn market_cap_scan_stopped_notice(action_id: &str, scan_timeout_seconds: u64) ->
     format!(
         "__stopped__ market-cap scan stopped for {action_id} after {scan_timeout_seconds} second(s)."
     )
+}
+
+fn is_market_cap_scan_stopped_error(error: &str) -> bool {
+    error
+        .trim_start_matches("__stopped__")
+        .trim_start()
+        .starts_with("market-cap scan stopped")
 }
 
 fn is_stopped_action_error(error: &str) -> bool {
@@ -3596,22 +3742,27 @@ async fn execute_action(
         .await;
         sync_follow_job_report(&state, &trace_id).await;
     }
-    let wallet_key = selected_wallet_key_or_default(&effective_action.walletEnvKey)
-        .ok_or_else(|| format!("Wallet env key not found: {}", effective_action.walletEnvKey))?;
+    let wallet_key =
+        selected_wallet_key_or_default(&effective_action.walletEnvKey).ok_or_else(|| {
+            format!(
+                "Wallet env key not found: {}",
+                effective_action.walletEnvKey
+            )
+        })?;
     let wallet_secret = load_solana_wallet_by_env_key(&wallet_key)?;
     let wallet_owner_pubkey = public_key_from_secret(&wallet_secret)?;
-    let sell_token_amount_override = if matches!(effective_action.kind, FollowActionKind::SniperSell)
-    {
-        get_job(&state, &trace_id)
-            .await
-            .as_ref()
-            .and_then(|current_job| {
-                matching_sniper_buy_token_amount_override(current_job, &effective_action)
-            })
-            .or_else(|| matching_sniper_buy_token_amount_override(job, &effective_action))
-    } else {
-        None
-    };
+    let sell_token_amount_override =
+        if matches!(effective_action.kind, FollowActionKind::SniperSell) {
+            get_job(&state, &trace_id)
+                .await
+                .as_ref()
+                .and_then(|current_job| {
+                    matching_sniper_buy_token_amount_override(current_job, &effective_action)
+                })
+                .or_else(|| matching_sniper_buy_token_amount_override(job, &effective_action))
+        } else {
+            None
+        };
     if effective_action.precheckRequired {
         required_action_precheck(&state.rpc_url, &job.quoteAsset, &effective_action).await?;
     }
@@ -3667,17 +3818,24 @@ async fn execute_action(
         ),
         FollowActionKind::SniperBuy => None,
     };
+    let action_execution = follow_action_execution(job, &effective_action);
     let compiled_from_presign = !effective_action.preSignedTransactions.is_empty();
-    let compiled = if let Some(tx) = effective_action.preSignedTransactions.first().cloned() {
+    let compiled = if !effective_action.preSignedTransactions.is_empty() {
         let presigned_expiry_started = Instant::now();
         let current_block_height = current_shared_block_height(state.clone(), &trace_id).await?;
-        if current_block_height > tx.lastValidBlockHeight {
+        let earliest_expiry = effective_action
+            .preSignedTransactions
+            .iter()
+            .map(|tx| tx.lastValidBlockHeight)
+            .min()
+            .ok_or_else(|| "Pre-signed follow action was missing transactions.".to_string())?;
+        if current_block_height > earliest_expiry {
             let fresh_block_height =
                 fetch_current_block_height_fresh(&state.rpc_url, "confirmed").await?;
-            if fresh_block_height > tx.lastValidBlockHeight {
+            if fresh_block_height > earliest_expiry {
                 return Err(format!(
                     "__expired__ pre-signed payload for {} expired at block height {} before send.",
-                    effective_action.actionId, tx.lastValidBlockHeight
+                    effective_action.actionId, earliest_expiry
                 ));
             }
         }
@@ -3685,7 +3843,12 @@ async fn execute_action(
             timings.preSignedExpiryCheckMs = Some(presigned_expiry_started.elapsed().as_millis());
         })
         .await;
-        Some(tx)
+        let primary_tx_index = presigned_primary_tx_index(&effective_action)?;
+        Some(CompiledFollowActionBatch {
+            primary_tx_index,
+            requires_ordered_execution: effective_action.preSignedTransactions.len() > 1,
+            transactions: effective_action.preSignedTransactions.clone(),
+        })
     } else {
         let _compile_permit = acquire_capacity_slot(
             state.compile_slots.clone(),
@@ -3700,17 +3863,26 @@ async fn execute_action(
                     .as_deref()
                     .ok_or_else(|| "Follow buy missing amount.".to_string())?;
                 if job.launchpad == "bonk" {
-                    let shared_bonk_pool_context =
-                        resolve_shared_bonk_follow_buy_context_for_job(&state, job, &effective_action).await;
+                    let shared_bonk_pool_id = resolve_shared_bonk_follow_buy_pool_id_for_job(
+                        &state,
+                        job,
+                        &effective_action,
+                    )
+                    .await;
                     let shared_bonk_usd1_route_setup =
-                        resolve_shared_bonk_usd1_route_setup_for_job(&state, job, &effective_action).await;
-                    Some(
-                        compile_follow_buy_for_launchpad(FollowBuyCompileRequest {
+                        resolve_shared_bonk_usd1_route_setup_for_job(
+                            &state,
+                            job,
+                            &effective_action,
+                        )
+                        .await;
+                    Some({
+                        let compiled = compile_follow_buy_for_launchpad(FollowBuyCompileRequest {
                             launchpad: &job.launchpad,
                             launch_mode: &job.launchMode,
                             quote_asset: &job.quoteAsset,
                             rpc_url: &state.rpc_url,
-                            execution: &job.execution,
+                            execution: &action_execution,
                             token_mayhem_mode: job.tokenMayhemMode,
                             jito_tip_account: &job.buyTipAccount,
                             wallet_secret: &wallet_secret,
@@ -3718,24 +3890,40 @@ async fn execute_action(
                             launch_creator,
                             buy_amount_sol: amount,
                             allow_ata_creation: true,
-                            prefer_post_setup_creator_vault: prefer_post_setup_creator_vault_for_buy,
-                            bonk_pool_context: shared_bonk_pool_context.as_ref(),
+                            prefer_post_setup_creator_vault:
+                                prefer_post_setup_creator_vault_for_buy,
+                            bonk_pool_context: None,
+                            bonk_pool_id: preferred_bonk_follow_buy_pool_id(
+                                &effective_action,
+                                shared_bonk_pool_id.as_deref(),
+                            ),
                             bonk_usd1_route_setup: shared_bonk_usd1_route_setup.as_ref(),
                             bags_follow_buy_context: None,
                             bags_launch: job.bagsLaunch.as_ref(),
+                            wrapper_fee_bps: job.wrapperDefaultFeeBps,
                         })
-                        .await?,
-                    )
+                        .await?;
+                        CompiledFollowActionBatch {
+                            transactions: compiled.transactions,
+                            primary_tx_index: compiled.primary_tx_index,
+                            requires_ordered_execution: compiled.requires_ordered_execution,
+                        }
+                    })
                 } else if job.launchpad == "bagsapp" {
                     let shared_bags_follow_buy_context =
-                        resolve_shared_bags_follow_buy_context_for_job(&state, job, &effective_action).await;
-                    Some(
-                        compile_follow_buy_for_launchpad(FollowBuyCompileRequest {
+                        resolve_shared_bags_follow_buy_context_for_job(
+                            &state,
+                            job,
+                            &effective_action,
+                        )
+                        .await;
+                    Some({
+                        let compiled = compile_follow_buy_for_launchpad(FollowBuyCompileRequest {
                             launchpad: &job.launchpad,
                             launch_mode: &job.launchMode,
                             quote_asset: &job.quoteAsset,
                             rpc_url: &state.rpc_url,
-                            execution: &job.execution,
+                            execution: &action_execution,
                             token_mayhem_mode: job.tokenMayhemMode,
                             jito_tip_account: &job.buyTipAccount,
                             wallet_secret: &wallet_secret,
@@ -3743,14 +3931,22 @@ async fn execute_action(
                             launch_creator,
                             buy_amount_sol: amount,
                             allow_ata_creation: true,
-                            prefer_post_setup_creator_vault: prefer_post_setup_creator_vault_for_buy,
+                            prefer_post_setup_creator_vault:
+                                prefer_post_setup_creator_vault_for_buy,
                             bonk_pool_context: None,
+                            bonk_pool_id: None,
                             bonk_usd1_route_setup: None,
                             bags_follow_buy_context: shared_bags_follow_buy_context.as_ref(),
                             bags_launch: job.bagsLaunch.as_ref(),
+                            wrapper_fee_bps: job.wrapperDefaultFeeBps,
                         })
-                        .await?,
-                    )
+                        .await?;
+                        CompiledFollowActionBatch {
+                            transactions: compiled.transactions,
+                            primary_tx_index: compiled.primary_tx_index,
+                            requires_ordered_execution: compiled.requires_ordered_execution,
+                        }
+                    })
                 } else {
                     let prepared = resolve_prepared_follow_buy(
                         &state,
@@ -3769,26 +3965,35 @@ async fn execute_action(
                         prefer_post_setup_creator_vault_for_buy,
                     )
                     .await?;
-                    Some(
-                        finalize_follow_buy_transaction(
-                            &state.rpc_url,
-                            &job.execution,
-                            job.tokenMayhemMode,
-                            &wallet_secret,
-                            &prepared,
-                            &runtime,
-                        )
-                        .await?,
-                    )
+                    Some(CompiledFollowActionBatch {
+                        transactions: vec![
+                            finalize_follow_buy_transaction(
+                                &state.rpc_url,
+                                &job.execution,
+                                job.tokenMayhemMode,
+                                &wallet_secret,
+                                &prepared,
+                                &runtime,
+                            )
+                            .await?,
+                        ],
+                        primary_tx_index: 0,
+                        requires_ordered_execution: false,
+                    })
                 }
             }
             FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
                 if matches!(job.launchpad.as_str(), "pump" | "bonk" | "bagsapp") {
+                    let pump_cashback_enabled_override = if job.launchpad == "pump" {
+                        Some(job.launchMode.as_str() == "cashback")
+                    } else {
+                        None
+                    };
                     compile_follow_sell_for_launchpad(FollowSellCompileRequest {
                         launchpad: &job.launchpad,
                         quote_asset: &job.quoteAsset,
                         rpc_url: &state.rpc_url,
-                        execution: &job.execution,
+                        execution: &action_execution,
                         token_mayhem_mode: job.tokenMayhemMode,
                         jito_tip_account: &job.sellTipAccount,
                         wallet_secret: &wallet_secret,
@@ -3800,10 +4005,16 @@ async fn execute_action(
                         bonk_pool_id: effective_action.poolId.as_deref(),
                         bonk_launch_mode: None,
                         bonk_launch_creator: None,
-                        pump_cashback_enabled_override: None,
+                        pump_cashback_enabled_override,
                         bags_launch: job.bagsLaunch.as_ref(),
+                        wrapper_fee_bps: job.wrapperDefaultFeeBps,
                     })
                     .await?
+                    .map(|transaction| CompiledFollowActionBatch {
+                        transactions: vec![transaction],
+                        primary_tx_index: 0,
+                        requires_ordered_execution: false,
+                    })
                 } else {
                     compile_follow_sell_transaction(
                         &state.rpc_url,
@@ -3817,18 +4028,50 @@ async fn execute_action(
                         prefer_post_setup_creator_vault_for_sell,
                     )
                     .await?
+                    .map(|transaction| CompiledFollowActionBatch {
+                        transactions: vec![transaction],
+                        primary_tx_index: 0,
+                        requires_ordered_execution: false,
+                    })
                 }
             }
         }
     };
-    let Some(mut compiled) = compiled else {
+    let Some(compiled) = compiled else {
         return Err("Action had nothing to send for the current wallet state.".to_string());
     };
+    let mut compiled_transactions = compiled.transactions;
+    if compiled_transactions.is_empty() {
+        return Err("Action had nothing to send for the current wallet state.".to_string());
+    }
+    let primary_tx_index = compiled.primary_tx_index;
+    let requires_ordered_execution = compiled.requires_ordered_execution;
+    let transport_plan = follow_action_transport_plan_for_transaction_count(
+        job,
+        &effective_action,
+        compiled_transactions.len(),
+    );
+    validate_follow_transport_for_batch(
+        &transport_plan,
+        requires_ordered_execution,
+        compiled_transactions.len(),
+    )?;
     let compile_ms = compile_started.elapsed().as_millis();
     update_action_timings(&state, &trace_id, &effective_action.actionId, |timings| {
         timings.compileMs = Some(if compiled_from_presign { 0 } else { compile_ms });
     })
     .await;
+    state
+        .store
+        .update_action(&trace_id, &effective_action.actionId, |record| {
+            record.provider = Some(transport_plan.resolvedProvider.clone());
+            record.endpointProfile = Some(transport_plan.resolvedEndpointProfile.clone());
+            record.transportType = Some(transport_plan.transportType.clone());
+        })
+        .await?;
+    effective_action.provider = Some(transport_plan.resolvedProvider.clone());
+    effective_action.endpointProfile = Some(transport_plan.resolvedEndpointProfile.clone());
+    effective_action.transportType = Some(transport_plan.transportType.clone());
     ensure_action_not_cancelled(&state, &trace_id, &effective_action.actionId).await?;
     let _send_permit =
         acquire_capacity_slot(state.send_slots.clone(), state.capacity_wait_ms, "send").await?;
@@ -3838,7 +4081,7 @@ async fn execute_action(
         match submit_transactions_for_transport(
             &state.rpc_url,
             &transport_plan,
-            &[compiled.clone()],
+            &compiled_transactions,
             &job.execution.commitment,
             job.execution.skipPreflight,
             job.execution.trackSendBlockHeight,
@@ -3856,25 +4099,31 @@ async fn execute_action(
             Err(error)
                 if !retried_creator_vault
                     && sell_percent.is_some()
-                    && should_retry_pump_sell_creator_vault_mismatch(job, &effective_action, &error) =>
+                    && should_retry_pump_sell_creator_vault_mismatch(
+                        job,
+                        &effective_action,
+                        &error,
+                    ) =>
             {
                 retried_creator_vault = true;
                 sleep(Duration::from_millis(200)).await;
-                compiled = compile_follow_sell_transaction(
-                    &state.rpc_url,
-                    &job.execution,
-                    job.tokenMayhemMode,
-                    &job.sellTipAccount,
-                    &wallet_secret,
-                    mint,
-                    launch_creator,
-                    sell_percent.unwrap_or_default(),
-                    prefer_post_setup_creator_vault_for_sell,
-                )
-                .await?
-                .ok_or_else(|| {
-                    "Action had nothing to send after creator vault retry.".to_string()
-                })?;
+                compiled_transactions = vec![
+                    compile_follow_sell_transaction(
+                        &state.rpc_url,
+                        &job.execution,
+                        job.tokenMayhemMode,
+                        &job.sellTipAccount,
+                        &wallet_secret,
+                        mint,
+                        launch_creator,
+                        sell_percent.unwrap_or_default(),
+                        prefer_post_setup_creator_vault_for_sell,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        "Action had nothing to send after creator vault retry.".to_string()
+                    })?,
+                ];
             }
             Err(error) => return Err(error),
         }
@@ -3885,9 +4134,7 @@ async fn execute_action(
                 .to_string(),
         );
     }
-    let mut sent = submitted
-        .pop()
-        .ok_or_else(|| "Follow daemon submit returned no transactions.".to_string())?;
+    let sent = primary_follow_submission(&mut submitted, primary_tx_index)?;
     sent.capturePostTokenBalances = has_matching_sniper_sell(job, &effective_action);
     sent.requestFullTransactionDetails = should_request_full_transaction_details(&effective_action);
     sent.balanceWatchAccount = if sent.capturePostTokenBalances
@@ -3905,6 +4152,7 @@ async fn execute_action(
         timings.submitMs = Some(submit_latency.max(submit_ms));
     })
     .await;
+    let sent = sent.clone();
     state
         .store
         .update_action(&trace_id, &effective_action.actionId, |record| {
@@ -3923,7 +4171,7 @@ async fn execute_action(
         })
         .await?;
     sync_follow_job_report(&state, &trace_id).await;
-    let mut confirm_input = vec![sent.clone()];
+    let mut confirm_input = submitted.clone();
     let (_, confirm_ms) = confirm_submitted_transactions_for_transport(
         &state.rpc_url,
         &transport_plan,
@@ -3946,19 +4194,45 @@ async fn execute_action(
         );
     })
     .await;
-    let confirmed = confirm_input.pop().unwrap_or(sent);
-    let confirmed_action_slot = confirmed.confirmedSlot.or(confirmed.confirmedObservedSlot);
-    let confirmed_post_token_balance_raw = if matches!(effective_action.kind, FollowActionKind::SniperBuy) {
-        confirmed.confirmedTokenBalanceRaw.clone().or_else(|| {
-            matching_confirmed_post_token_balance_raw(
-                &confirmed.postTokenBalances,
-                &wallet_owner_pubkey,
-                mint,
-            )
-        })
+    let confirmed = confirm_input.get(primary_tx_index).cloned().unwrap_or(sent);
+    let confirmations_to_validate = if requires_ordered_execution {
+        confirm_input.as_slice()
     } else {
-        None
+        std::slice::from_ref(&confirmed)
     };
+    for result in confirmations_to_validate {
+        let signature = result
+            .signature
+            .clone()
+            .unwrap_or_else(|| result.label.clone());
+        if matches!(result.confirmationStatus.as_deref(), Some("failed")) {
+            return Err(format!(
+                "Transaction {signature} failed during confirmation."
+            ));
+        }
+        if !matches!(
+            result.confirmationStatus.as_deref(),
+            Some("confirmed" | "finalized")
+        ) {
+            return Err(format!(
+                "Transport submitted transaction {signature}, but {} confirmation was not observed.",
+                job.execution.commitment
+            ));
+        }
+    }
+    let confirmed_action_slot = confirmed.confirmedSlot.or(confirmed.confirmedObservedSlot);
+    let confirmed_post_token_balance_raw =
+        if matches!(effective_action.kind, FollowActionKind::SniperBuy) {
+            confirmed.confirmedTokenBalanceRaw.clone().or_else(|| {
+                matching_confirmed_post_token_balance_raw(
+                    &confirmed.postTokenBalances,
+                    &wallet_owner_pubkey,
+                    mint,
+                )
+            })
+        } else {
+            None
+        };
     state
         .store
         .update_action(&trace_id, &effective_action.actionId, |record| {
@@ -3986,6 +4260,16 @@ async fn execute_action(
             }
         })
         .await?;
+    if let Some(trade) = confirmed_trade_record_from_sent_result(
+        &confirmed,
+        &effective_action.walletEnvKey,
+        mint,
+        Some(&trace_id),
+        Some(&effective_action.actionId),
+    ) {
+        record_execution_engine_coin_trades_best_effort(&trace_id, "follow-action", vec![trade])
+            .await;
+    }
     sync_follow_job_report(&state, &trace_id).await;
     Ok(())
 }
@@ -4059,9 +4343,12 @@ async fn execute_deferred_setup(state: Arc<AppState>, job: &FollowJobRecord) -> 
                     Ok(Err(error)) if attempt < 2 => {
                         attempt = attempt.saturating_add(1);
                         let retry_error = if is_terminal_onchain_confirmation_error(&error) {
-                            let refreshed =
-                                refresh_deferred_setup_transactions(&state, job, &setup_transactions)
-                                    .await?;
+                            let refreshed = refresh_deferred_setup_transactions(
+                                &state,
+                                job,
+                                &setup_transactions,
+                            )
+                            .await?;
                             setup_transactions = refreshed.clone();
                             format!(
                                 "Deferred setup confirmation failed after send; rebuilt and requeued attempt {}: {}",
@@ -4217,7 +4504,69 @@ fn follow_action_transport_plan(
     job: &FollowJobRecord,
     action: &FollowActionRecord,
 ) -> TransportPlan {
-    build_transport_plan(&follow_action_execution(job, action), 1)
+    follow_action_transport_plan_for_transaction_count(job, action, 1)
+}
+
+fn follow_action_transport_plan_for_transaction_count(
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+    transaction_count: usize,
+) -> TransportPlan {
+    build_transport_plan(&follow_action_execution(job, action), transaction_count)
+}
+
+#[derive(Debug, Clone)]
+struct CompiledFollowActionBatch {
+    transactions: Vec<CompiledTransaction>,
+    primary_tx_index: usize,
+    requires_ordered_execution: bool,
+}
+
+fn validate_follow_transport_for_batch(
+    transport_plan: &TransportPlan,
+    requires_ordered_execution: bool,
+    transaction_count: usize,
+) -> Result<(), String> {
+    if !requires_ordered_execution || transaction_count <= 1 {
+        return Ok(());
+    }
+    if transport_plan.executionClass == "bundle" || transport_plan.ordering == "bundle" {
+        return Ok(());
+    }
+    Err(format!(
+        "Dependent follow action execution requires bundle transport, but {} resolved to {} (class={}, ordering={}).",
+        transport_plan.requestedProvider,
+        transport_plan.transportType,
+        transport_plan.executionClass,
+        transport_plan.ordering
+    ))
+}
+
+fn primary_follow_submission<T>(
+    submitted: &mut [T],
+    primary_tx_index: usize,
+) -> Result<&mut T, String> {
+    submitted
+        .get_mut(primary_tx_index)
+        .ok_or_else(|| "Follow daemon primary transaction was missing.".to_string())
+}
+
+fn presigned_primary_tx_index(action: &FollowActionRecord) -> Result<usize, String> {
+    if action.preSignedTransactions.is_empty() {
+        return Err("Pre-signed follow action was missing transactions.".to_string());
+    }
+    let primary_tx_index = action
+        .primaryTxIndex
+        .unwrap_or_else(|| action.preSignedTransactions.len().saturating_sub(1));
+    if primary_tx_index >= action.preSignedTransactions.len() {
+        return Err(format!(
+            "Pre-signed follow action {} declared primaryTxIndex {} for only {} transactions.",
+            action.actionId,
+            primary_tx_index,
+            action.preSignedTransactions.len()
+        ));
+    }
+    Ok(primary_tx_index)
 }
 
 fn is_creator_vault_seed_mismatch(error: &str) -> bool {
@@ -4262,7 +4611,8 @@ async fn wait_for_action_eligibility(
         None
     } else if action.requireConfirmation || action.targetBlockOffset.is_some() {
         let wait_started = Instant::now();
-        let confirmed = wait_for_signature_confirmation(state.clone(), job, &action.actionId).await?;
+        let confirmed =
+            wait_for_signature_confirmation(state.clone(), job, &action.actionId).await?;
         watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
         Some(confirmed)
     } else {
@@ -4281,15 +4631,18 @@ async fn wait_for_action_eligibility(
             }
             if action.targetBlockOffset.unwrap_or_default() > 0 {
                 let wait_started = Instant::now();
-                observed_slot = Some(wait_for_slot_offset(
-                    state.clone(),
-                    job,
-                    &action.actionId,
-                    confirmed_launch_slot,
-                    u64::from(action.targetBlockOffset.unwrap()),
-                )
-                .await?);
-                watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
+                observed_slot = Some(
+                    wait_for_slot_offset(
+                        state.clone(),
+                        job,
+                        &action.actionId,
+                        confirmed_launch_slot,
+                        u64::from(action.targetBlockOffset.unwrap()),
+                    )
+                    .await?,
+                );
+                watcher_wait_ms =
+                    watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             }
         }
         FollowActionKind::DevAutoSell => {
@@ -4298,18 +4651,14 @@ async fn wait_for_action_eligibility(
             let has_slot = action.targetBlockOffset.unwrap_or_default() > 0;
             if has_slot && has_market {
                 let wait_started = Instant::now();
-                tokio::select! {
-                    result = wait_for_slot_offset(
-                        state.clone(),
-                        job,
-                        &action.actionId,
-                        confirmed_launch_slot,
-                        u64::from(action.targetBlockOffset.unwrap()),
-                    ) => {
-                        let _ = result?;
-                    },
-                    result = wait_for_market_cap_trigger(state.clone(), job, action, &action.actionId) => result?,
-                }
+                observed_slot = wait_for_slot_or_market_cap_trigger(
+                    state.clone(),
+                    job,
+                    action,
+                    confirmed_launch_slot,
+                    u64::from(action.targetBlockOffset.unwrap()),
+                )
+                .await?;
                 watcher_wait_ms =
                     watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             } else if has_slot {
@@ -4326,10 +4675,13 @@ async fn wait_for_action_eligibility(
                     watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             } else if has_time && has_market {
                 let wait_started = Instant::now();
-                tokio::select! {
-                    result = wait_until_ms(state.clone(), &job.traceId, Some(&action.actionId), action.scheduledForMs.unwrap()) => result?,
-                    result = wait_for_market_cap_trigger(state.clone(), job, action, &action.actionId) => result?,
-                }
+                wait_for_time_or_market_cap_trigger(
+                    state.clone(),
+                    job,
+                    action,
+                    action.scheduledForMs.unwrap(),
+                )
+                .await?;
                 watcher_wait_ms =
                     watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             } else if let Some(schedule_ms) = action.scheduledForMs {
@@ -4371,10 +4723,13 @@ async fn wait_for_action_eligibility(
                     watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             } else if has_time && has_market {
                 let wait_started = Instant::now();
-                tokio::select! {
-                    result = wait_until_ms(state.clone(), &job.traceId, Some(&action.actionId), action.scheduledForMs.unwrap()) => result?,
-                    result = wait_for_market_cap_trigger(state.clone(), job, action, &action.actionId) => result?,
-                }
+                wait_for_time_or_market_cap_trigger(
+                    state.clone(),
+                    job,
+                    action,
+                    action.scheduledForMs.unwrap(),
+                )
+                .await?;
                 watcher_wait_ms =
                     watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             } else if let Some(schedule_ms) = action.scheduledForMs {
@@ -4392,6 +4747,9 @@ async fn wait_for_action_eligibility(
                     watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             }
         }
+    }
+    if observed_slot.is_none() {
+        observed_slot = confirmed_launch_slot;
     }
     if job.deferredSetup.is_some() && !action_runs_before_deferred_setup(action) {
         let wait_started = Instant::now();
@@ -5045,14 +5403,15 @@ async fn recompute_market_cap_for_job(
                 snapshot
             }
         } else {
-            let Some(LaunchpadMarketSnapshot::Bags(snapshot)) = fetch_market_snapshot_for_launchpad(
-                &job.launchpad,
-                &state.rpc_url,
-                mint,
-                &job.quoteAsset,
-                job.bagsLaunch.as_ref(),
-            )
-            .await?
+            let Some(LaunchpadMarketSnapshot::Bags(snapshot)) =
+                fetch_market_snapshot_for_launchpad(
+                    &job.launchpad,
+                    &state.rpc_url,
+                    mint,
+                    &job.quoteAsset,
+                    job.bagsLaunch.as_ref(),
+                )
+                .await?
             else {
                 return Err("Bags market snapshot was unavailable.".to_string());
             };
@@ -5095,7 +5454,7 @@ fn market_watch_account(job: &FollowJobRecord, mint: &str) -> Result<String, Str
 }
 
 fn market_watcher_uses_slot_subscription(job: &FollowJobRecord) -> bool {
-    matches!(job.launchpad.as_str(), "pump" | "bagsapp")
+    matches!(job.launchpad.as_str(), "pump" | "bonk" | "bagsapp")
 }
 
 async fn run_slot_driven_market_watcher_session(
@@ -5350,6 +5709,23 @@ fn extract_transaction_notification_slot(message: &Value) -> Option<u64> {
     .find_map(Value::as_u64)
 }
 
+fn extract_transaction_notification_error(message: &Value) -> Option<Value> {
+    [
+        message.pointer("/params/result/err"),
+        message.pointer("/params/result/status/Err"),
+        message.pointer("/params/result/meta/err"),
+        message.pointer("/params/result/meta/status/Err"),
+        message.pointer("/params/result/transaction/meta/err"),
+        message.pointer("/params/result/transaction/meta/status/Err"),
+        message.pointer("/params/result/transaction/transaction/meta/err"),
+        message.pointer("/params/result/transaction/transaction/meta/status/Err"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.is_null())
+    .cloned()
+}
+
 async fn run_helius_transaction_signature_watcher_session(
     state: &Arc<AppState>,
     trace_id: &str,
@@ -5366,7 +5742,6 @@ async fn run_helius_transaction_signature_watcher_session(
                 {
                     "signature": signature,
                     "accountRequired": account_required,
-                    "failed": false,
                     "vote": false
                 },
                 {
@@ -5385,6 +5760,11 @@ async fn run_helius_transaction_signature_watcher_session(
             if message.get("params").is_none() {
                 continue;
             }
+            if let Some(err) = extract_transaction_notification_error(&message) {
+                return Err(format!(
+                    "Helius transactionSubscribe launch signature notification reported error: {err}"
+                ));
+            }
             let confirmed_slot = match extract_transaction_notification_slot(&message) {
                 Some(slot) => slot,
                 None => fetch_current_slot(&state.rpc_url, "confirmed").await?,
@@ -5401,7 +5781,16 @@ async fn run_helius_transaction_signature_watcher_session(
             return Ok(confirmed_slot);
         }
     };
-    session.await
+    timeout(
+        Duration::from_secs(FOLLOW_SIGNATURE_WATCHER_WEBSOCKET_TIMEOUT_SECS),
+        session,
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out waiting for Helius transactionSubscribe launch signature confirmation for transaction {signature}."
+        )
+    })?
 }
 
 async fn run_standard_signature_watcher_session(
@@ -5410,49 +5799,61 @@ async fn run_standard_signature_watcher_session(
     endpoint: &str,
     signature: &str,
 ) -> Result<u64, String> {
-    let mut ws = open_subscription_socket(endpoint).await?;
-    subscribe(
-        &mut ws,
-        "signatureSubscribe",
-        json!([
-            signature,
-            {
-                "commitment": "confirmed"
+    let session = async {
+        let mut ws = open_subscription_socket(endpoint).await?;
+        subscribe(
+            &mut ws,
+            "signatureSubscribe",
+            json!([
+                signature,
+                {
+                    "commitment": "confirmed"
+                }
+            ]),
+        )
+        .await?;
+        loop {
+            ensure_job_not_cancelled(state, trace_id).await?;
+            let message = next_json_message(&mut ws).await?;
+            if let Some(params) = message.get("params") {
+                let value = params
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let err = value.get("err").cloned().unwrap_or(Value::Null);
+                if !err.is_null() {
+                    return Err(format!(
+                        "Launch signature notification reported error: {err}"
+                    ));
+                }
+                set_watcher_health(
+                    state,
+                    WatcherKind::Signature,
+                    FollowWatcherHealth::Healthy,
+                    Some("standard-ws".to_string()),
+                    Some(endpoint.to_string()),
+                    None,
+                )
+                .await;
+                let confirmed_slot = match extract_signature_notification_slot(&message) {
+                    Some(slot) => slot,
+                    None => fetch_current_slot(&state.rpc_url, "confirmed").await?,
+                };
+                return Ok(confirmed_slot);
             }
-        ]),
-    )
-    .await?;
-    loop {
-        ensure_job_not_cancelled(state, trace_id).await?;
-        let message = next_json_message(&mut ws).await?;
-        if let Some(params) = message.get("params") {
-            let value = params
-                .get("result")
-                .and_then(|result| result.get("value"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let err = value.get("err").cloned().unwrap_or(Value::Null);
-            if !err.is_null() {
-                return Err(format!(
-                    "Launch signature notification reported error: {err}"
-                ));
-            }
-            set_watcher_health(
-                state,
-                WatcherKind::Signature,
-                FollowWatcherHealth::Healthy,
-                Some("standard-ws".to_string()),
-                Some(endpoint.to_string()),
-                None,
-            )
-            .await;
-            let confirmed_slot = match extract_signature_notification_slot(&message) {
-                Some(slot) => slot,
-                None => fetch_current_slot(&state.rpc_url, "confirmed").await?,
-            };
-            return Ok(confirmed_slot);
         }
-    }
+    };
+    timeout(
+        Duration::from_secs(FOLLOW_SIGNATURE_WATCHER_WEBSOCKET_TIMEOUT_SECS),
+        session,
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out waiting for standard websocket launch signature confirmation for transaction {signature}."
+        )
+    })?
 }
 
 async fn run_signature_watcher(
@@ -5930,10 +6331,9 @@ async fn wait_for_deferred_setup_confirmation(
         match setup.state {
             DeferredSetupState::Confirmed => return Ok(()),
             DeferredSetupState::Failed => {
-                return Err(setup
-                    .lastError
-                    .clone()
-                    .unwrap_or_else(|| "Deferred setup failed before follow action could run.".to_string()));
+                return Err(setup.lastError.clone().unwrap_or_else(|| {
+                    "Deferred setup failed before follow action could run.".to_string()
+                }));
             }
             DeferredSetupState::Queued | DeferredSetupState::Running | DeferredSetupState::Sent => {
                 sleep(Duration::from_millis(50)).await;
@@ -5999,19 +6399,25 @@ fn refresh_owner_signed_compiled_transaction(
         VersionedMessage::Legacy(message) => message.recent_blockhash = fresh_hash,
         VersionedMessage::V0(message) => message.recent_blockhash = fresh_hash,
         VersionedMessage::V1(_) => {
-            return Err("Deferred setup retry does not yet support v1 versioned messages.".to_string());
+            return Err(
+                "Deferred setup retry does not yet support v1 versioned messages.".to_string(),
+            );
         }
     }
     let rebuilt = VersionedTransaction::try_new(versioned.message.clone(), &[owner])
         .map_err(|error| format!("Failed to re-sign deferred setup transaction: {error}"))?;
-    let serialized = bincode::serialize(&rebuilt)
-        .map_err(|error| format!("Failed to serialize deferred setup retry transaction: {error}"))?;
+    let serialized = bincode::serialize(&rebuilt).map_err(|error| {
+        format!("Failed to serialize deferred setup retry transaction: {error}")
+    })?;
     let serialized_base64 = BASE64.encode(serialized);
     Ok(CompiledTransaction {
         blockhash: blockhash.to_string(),
         lastValidBlockHeight: last_valid_block_height,
         serializedBase64: serialized_base64,
-        signature: rebuilt.signatures.first().map(|signature| signature.to_string()),
+        signature: rebuilt
+            .signatures
+            .first()
+            .map(|signature| signature.to_string()),
         ..transaction.clone()
     })
 }
@@ -6102,7 +6508,8 @@ async fn wait_for_slot_offset_from_anchor(
         if let Some(result) = current {
             match result {
                 Ok(observed_slot) if observed_slot >= target_slot => {
-                    capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Slot).await;
+                    capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Slot)
+                        .await;
                     return Ok(observed_slot);
                 }
                 Ok(_) => {}
@@ -6335,7 +6742,8 @@ async fn run_signature_watcher_polling_session(
 ) -> Result<u64, String> {
     loop {
         ensure_job_not_cancelled(state, &job.traceId).await?;
-        if let Some(confirmed_slot) = poll_signature_confirmation_once(&state.rpc_url, signature).await?
+        if let Some(confirmed_slot) =
+            poll_signature_confirmation_once(&state.rpc_url, signature).await?
         {
             set_watcher_health(
                 state,
@@ -6385,13 +6793,22 @@ async fn next_json_message(ws: &mut WsStream) -> Result<Value, String> {
 async fn main() {
     let _ = dotenvy::dotenv();
     install_rustls_crypto_provider();
+    shared_transaction_submit::observability::configure_outbound_provider_http_request_hook(
+        record_outbound_provider_http_request,
+    );
     let base_url = configured_follow_daemon_base_url();
     let max_active_jobs = configured_limit("LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS");
     let max_concurrent_compiles = configured_limit("LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES");
     let max_concurrent_sends = configured_limit("LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS");
     let capacity_wait_ms = configured_capacity_wait_ms();
     let state = Arc::new(AppState {
-        auth_token: configured_auth_token(),
+        auth: match AuthManager::new() {
+            Ok(manager) => Some(Arc::new(manager)),
+            Err(error) => {
+                eprintln!("launchdeck-follow-daemon startup failed: {error}");
+                std::process::exit(1);
+            }
+        },
         rpc_url: configured_rpc_url(),
         store: FollowDaemonStore::load_or_default(paths::follow_daemon_state_path()),
         max_active_jobs,
@@ -6432,6 +6849,7 @@ async fn main() {
     spawn_watch_endpoint_health_monitor(state.clone());
     spawn_wallet_precheck_monitor(state.clone());
     spawn_blockhash_refresh_task(state.rpc_url.clone(), "confirmed");
+    spawn_startup_outbox_flush_task("launchdeck-follow-daemon");
     let _ = state
         .store
         .update_supervision(
@@ -6590,7 +7008,7 @@ mod tests {
 
     fn test_app_state(rpc_url: String, state_path: PathBuf) -> Arc<AppState> {
         Arc::new(AppState {
-            auth_token: None,
+            auth: None,
             rpc_url,
             store: FollowDaemonStore::load_or_default(state_path),
             max_active_jobs: None,
@@ -6624,7 +7042,10 @@ mod tests {
     }
 
     async fn start_slot_jsonrpc_server(slot: u64) -> std::net::SocketAddr {
-        async fn handler(State(slot): State<u64>, Json(payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
+        async fn handler(
+            State(slot): State<u64>,
+            Json(payload): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
             let method = payload
                 .get("method")
                 .and_then(serde_json::Value::as_str)
@@ -6742,6 +7163,22 @@ mod tests {
         LOCK.get_or_init(|| StdMutex::new(()))
     }
 
+    // Strip `WARM_RPC_URL` once per test process so slot-sensitive
+    // tests don't bypass the mock RPC and hit live Solana. Serialize the
+    // removal under the shared env mutex so other tests mutating process env
+    // aren't racing against POSIX `unsetenv`.
+    fn ensure_hermetic_test_env() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let _guard = env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            unsafe {
+                std::env::remove_var("WARM_RPC_URL");
+            }
+        });
+    }
+
     #[test]
     fn resolved_helius_sol_price_rpc_url_prefers_override_then_helius_primary() {
         let _guard = env_lock().lock().expect("env lock");
@@ -6757,7 +7194,10 @@ mod tests {
             None
         );
         unsafe {
-            std::env::set_var("HELIUS_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=override");
+            std::env::set_var(
+                "HELIUS_RPC_URL",
+                "https://mainnet.helius-rpc.com/?api-key=override",
+            );
         }
         assert_eq!(
             resolved_helius_sol_price_rpc_url("https://rpc.shyft.to?api_key=test"),
@@ -6790,6 +7230,7 @@ mod tests {
             selectedWalletKey: "SOLANA_PRIVATE_KEY".to_string(),
             execution: sample_execution(),
             tokenMayhemMode: false,
+            wrapperDefaultFeeBps: 10,
             jitoTipAccount: "tip".to_string(),
             buyTipAccount: "buy-tip".to_string(),
             sellTipAccount: "sell-tip".to_string(),
@@ -6833,7 +7274,11 @@ mod tests {
         sample_job().followLaunch
     }
 
-    fn sample_sniper_buy_action(action_id: &str, wallet_env_key: &str, order_index: u32) -> FollowActionRecord {
+    fn sample_sniper_buy_action(
+        action_id: &str,
+        wallet_env_key: &str,
+        order_index: u32,
+    ) -> FollowActionRecord {
         FollowActionRecord {
             actionId: action_id.to_string(),
             kind: FollowActionKind::SniperBuy,
@@ -6875,11 +7320,16 @@ mod tests {
             orderIndex: order_index,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         }
     }
 
-    fn sample_sniper_sell_action(action_id: &str, wallet_env_key: &str, order_index: u32) -> FollowActionRecord {
+    fn sample_sniper_sell_action(
+        action_id: &str,
+        wallet_env_key: &str,
+        order_index: u32,
+    ) -> FollowActionRecord {
         FollowActionRecord {
             actionId: action_id.to_string(),
             kind: FollowActionKind::SniperSell,
@@ -6921,6 +7371,7 @@ mod tests {
             orderIndex: order_index,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         }
     }
@@ -6965,6 +7416,7 @@ mod tests {
                 followLaunch: sample_follow_launch(),
                 execution: sample_execution(),
                 tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
                 jitoTipAccount: String::new(),
                 buyTipAccount: String::new(),
                 sellTipAccount: String::new(),
@@ -7023,6 +7475,7 @@ mod tests {
                 followLaunch: sample_follow_launch(),
                 execution: sample_execution(),
                 tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
                 jitoTipAccount: String::new(),
                 buyTipAccount: String::new(),
                 sellTipAccount: String::new(),
@@ -7081,6 +7534,7 @@ mod tests {
                 followLaunch: sample_follow_launch(),
                 execution: sample_execution(),
                 tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
                 jitoTipAccount: String::new(),
                 buyTipAccount: String::new(),
                 sellTipAccount: String::new(),
@@ -7133,6 +7587,7 @@ mod tests {
                 followLaunch: sample_follow_launch(),
                 execution: sample_execution(),
                 tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
                 jitoTipAccount: String::new(),
                 buyTipAccount: String::new(),
                 sellTipAccount: String::new(),
@@ -7177,6 +7632,7 @@ mod tests {
 
     #[tokio::test]
     async fn sniper_sell_slot_offset_uses_matching_buy_confirmation_as_anchor() {
+        ensure_hermetic_test_env();
         let state_path = test_state_path();
         let state = test_app_state("http://127.0.0.1:9/".to_string(), state_path.clone());
         let trace_id = "trace-sniper-sell-buy-anchor".to_string();
@@ -7193,6 +7649,7 @@ mod tests {
                 followLaunch: sample_follow_launch(),
                 execution: sample_execution(),
                 tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
                 jitoTipAccount: String::new(),
                 buyTipAccount: String::new(),
                 sellTipAccount: String::new(),
@@ -7250,8 +7707,10 @@ mod tests {
         let mut job = sample_job();
         job.actions = vec![buy_a, sell_a.clone(), buy_b, sell_b.clone()];
 
-        let matched_a = matching_sniper_buy_action(&job, &sell_a).expect("sell a should match buy a");
-        let matched_b = matching_sniper_buy_action(&job, &sell_b).expect("sell b should match buy b");
+        let matched_a =
+            matching_sniper_buy_action(&job, &sell_a).expect("sell a should match buy a");
+        let matched_b =
+            matching_sniper_buy_action(&job, &sell_b).expect("sell b should match buy b");
 
         assert_eq!(matched_a.actionId, "buy-a");
         assert_eq!(matched_a.confirmedObservedSlot, Some(700));
@@ -7259,8 +7718,32 @@ mod tests {
         assert_eq!(matched_b.confirmedObservedSlot, Some(500));
     }
 
+    #[test]
+    fn helius_signature_watcher_detects_transaction_notification_errors() {
+        let message = json!({
+            "params": {
+                "result": {
+                    "transaction": {
+                        "meta": {
+                            "err": {
+                                "InstructionError": [10, "ProgramFailedToComplete"]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            extract_transaction_notification_error(&message),
+            Some(json!({
+                "InstructionError": [10, "ProgramFailedToComplete"]
+            }))
+        );
+    }
+
     #[tokio::test]
     async fn signature_polling_requires_real_slot_anchor() {
+        ensure_hermetic_test_env();
         let addr = start_signature_status_jsonrpc_server(
             json!({
                 "confirmationStatus": "confirmed",
@@ -7289,7 +7772,9 @@ mod tests {
             )
         );
         assert_eq!(
-            normalized_stopped_action_reason(Some("market-cap scan stopped for sell-a after 30 second(s).")),
+            normalized_stopped_action_reason(Some(
+                "market-cap scan stopped for sell-a after 30 second(s)."
+            )),
             Some("market-cap scan stopped for sell-a after 30 second(s).".to_string())
         );
     }
@@ -7305,7 +7790,7 @@ mod tests {
 
         let mut bonk = sample_job();
         bonk.launchpad = "bonk".to_string();
-        assert!(!market_watcher_uses_slot_subscription(&bonk));
+        assert!(market_watcher_uses_slot_subscription(&bonk));
     }
 
     #[tokio::test]
@@ -7324,12 +7809,17 @@ mod tests {
                 followLaunch: sample_follow_launch(),
                 execution: sample_execution(),
                 tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
                 jitoTipAccount: String::new(),
                 buyTipAccount: String::new(),
                 sellTipAccount: String::new(),
                 preferPostSetupCreatorVaultForSell: false,
                 bagsLaunch: None,
-                prebuiltActions: vec![sample_sniper_sell_action("sell-a", "SOLANA_PRIVATE_KEY2", 0)],
+                prebuiltActions: vec![sample_sniper_sell_action(
+                    "sell-a",
+                    "SOLANA_PRIVATE_KEY2",
+                    0,
+                )],
                 deferredSetupTransactions: vec![],
             })
             .await
@@ -7359,13 +7849,16 @@ mod tests {
         assert_eq!(updated_action.state, FollowActionState::Stopped);
         assert_eq!(
             updated_action.lastError.as_deref(),
-            Some("sniper autosell sell-a stopped because matching sniper buy buy-a ended as failed.")
+            Some(
+                "sniper autosell sell-a stopped because matching sniper buy buy-a ended as failed."
+            )
         );
         let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]
     async fn wait_for_slot_offset_returns_immediately_when_current_slot_already_reached() {
+        ensure_hermetic_test_env();
         let slot_addr = start_slot_jsonrpc_server(105).await;
         let state_path = test_state_path();
         let state = test_app_state(format!("http://{slot_addr}/"), state_path.clone());
@@ -7406,6 +7899,7 @@ mod tests {
                 followLaunch: follow_launch,
                 execution: sample_execution(),
                 tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
                 jitoTipAccount: String::new(),
                 buyTipAccount: String::new(),
                 sellTipAccount: String::new(),
@@ -7432,10 +7926,9 @@ mod tests {
             })
             .await
             .expect("arm");
-        let observed_slot =
-            wait_for_slot_offset(state.clone(), &armed, "snipe-a", Some(100), 1)
-                .await
-                .expect("slot wait should complete immediately");
+        let observed_slot = wait_for_slot_offset(state.clone(), &armed, "snipe-a", Some(100), 1)
+            .await
+            .expect("slot wait should complete immediately");
         assert_eq!(observed_slot, 105);
         let _ = std::fs::remove_file(state_path);
     }
@@ -7484,11 +7977,126 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         let plan = follow_action_transport_plan(&job, &action);
         assert_eq!(plan.resolvedProvider, "standard-rpc");
         assert_eq!(plan.transportType, "standard-rpc-fanout");
+    }
+
+    #[test]
+    fn dependent_follow_transport_requires_bundle_capability() {
+        let action = FollowActionRecord {
+            actionId: "buy".to_string(),
+            kind: FollowActionKind::SniperBuy,
+            walletEnvKey: "SOLANA_PRIVATE_KEY2".to_string(),
+            state: FollowActionState::Armed,
+            buyAmountSol: Some("1".to_string()),
+            sellPercent: None,
+            submitDelayMs: Some(0),
+            targetBlockOffset: None,
+            delayMs: None,
+            marketCap: None,
+            jitterMs: Some(0),
+            feeJitterBps: Some(0),
+            precheckRequired: false,
+            requireConfirmation: false,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            eligibleAtMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedSlot: None,
+            confirmedObservedSlot: None,
+            confirmedTokenBalanceRaw: None,
+            eligibilityObservedSlot: None,
+            slotsToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            primaryTxIndex: None,
+            timings: FollowActionTimings::default(),
+        };
+        let error = validate_follow_transport_for_batch(
+            &follow_action_transport_plan_for_transaction_count(&sample_job(), &action, 2),
+            true,
+            2,
+        )
+        .expect_err("standard rpc should be rejected for dependent batches");
+
+        assert!(error.contains("requires bundle transport"));
+    }
+
+    #[test]
+    fn primary_follow_submission_uses_explicit_primary_index() {
+        let mut submitted = vec![1u8, 2u8, 3u8];
+        let primary = primary_follow_submission(&mut submitted, 1).expect("primary tx");
+        assert_eq!(*primary, 2);
+    }
+
+    #[test]
+    fn presigned_primary_index_prefers_explicit_action_field() {
+        let mut action = sample_sniper_buy_action("buy", "SOLANA_PRIVATE_KEY2", 0);
+        action.preSignedTransactions = vec![
+            CompiledTransaction {
+                label: "topup".to_string(),
+                format: "v0".to_string(),
+                blockhash: "hash-1".to_string(),
+                lastValidBlockHeight: 10,
+                serializedBase64: "base64-1".to_string(),
+                signature: None,
+                lookupTablesUsed: vec![],
+                computeUnitLimit: None,
+                computeUnitPriceMicroLamports: None,
+                inlineTipLamports: None,
+                inlineTipAccount: None,
+            },
+            CompiledTransaction {
+                label: "action".to_string(),
+                format: "v0".to_string(),
+                blockhash: "hash-2".to_string(),
+                lastValidBlockHeight: 10,
+                serializedBase64: "base64-2".to_string(),
+                signature: None,
+                lookupTablesUsed: vec![],
+                computeUnitLimit: None,
+                computeUnitPriceMicroLamports: None,
+                inlineTipLamports: None,
+                inlineTipAccount: None,
+            },
+        ];
+        action.primaryTxIndex = Some(0);
+
+        assert_eq!(presigned_primary_tx_index(&action).expect("primary"), 0);
+    }
+
+    #[test]
+    fn reserved_action_pool_id_beats_shared_bonk_follow_buy_pool_id() {
+        let mut action = sample_sniper_buy_action("buy", "SOLANA_PRIVATE_KEY2", 0);
+        action.poolId = Some("reserved-pool".to_string());
+
+        assert_eq!(
+            preferred_bonk_follow_buy_pool_id(&action, Some("trigger-pool")),
+            Some("reserved-pool")
+        );
+        assert_eq!(
+            preferred_bonk_follow_buy_pool_id(&action, None),
+            Some("reserved-pool")
+        );
     }
 
     #[test]
@@ -7535,6 +8143,7 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         let plan = follow_action_transport_plan(&job, &action);
@@ -7544,6 +8153,10 @@ mod tests {
 
     #[test]
     fn pump_sell_creator_vault_retry_detects_onchain_custom_2006() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            env::remove_var("LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY");
+        }
         let mut job = sample_job();
         job.followLaunch.constraints.retryBudget = 1;
         let action = FollowActionRecord {
@@ -7587,6 +8200,7 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         assert!(should_retry_pump_sell_creator_vault_mismatch(
@@ -7598,6 +8212,10 @@ mod tests {
 
     #[test]
     fn pump_sell_creator_vault_retry_does_not_match_buys() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            env::remove_var("LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY");
+        }
         let mut job = sample_job();
         job.followLaunch.constraints.retryBudget = 1;
         let action = FollowActionRecord {
@@ -7641,6 +8259,7 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         assert!(!should_retry_pump_sell_creator_vault_mismatch(
@@ -7652,6 +8271,10 @@ mod tests {
 
     #[test]
     fn pump_sell_creator_vault_retry_ignores_retry_budget() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            env::remove_var("LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY");
+        }
         let mut job = sample_job();
         job.followLaunch.constraints.retryBudget = 0;
         let action = FollowActionRecord {
@@ -7695,6 +8318,7 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         assert!(should_retry_pump_sell_creator_vault_mismatch(
@@ -7706,6 +8330,7 @@ mod tests {
 
     #[test]
     fn pump_sell_creator_vault_retry_respects_env_opt_out() {
+        let _guard = env_lock().lock().expect("env lock");
         let mut job = sample_job();
         job.followLaunch.constraints.retryBudget = 1;
         let action = FollowActionRecord {
@@ -7749,10 +8374,14 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         unsafe {
-            env::set_var("LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY", "false");
+            env::set_var(
+                "LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY",
+                "false",
+            );
         }
         assert!(!should_retry_pump_sell_creator_vault_mismatch(
             &job,
@@ -7766,6 +8395,10 @@ mod tests {
 
     #[test]
     fn presigned_pump_buy_creator_vault_retry_detects_onchain_custom_2006() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            env::remove_var("LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY");
+        }
         let mut job = sample_job();
         job.followLaunch.constraints.retryBudget = 1;
         let action = FollowActionRecord {
@@ -7821,6 +8454,7 @@ mod tests {
                 inlineTipAccount: None,
             }],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         assert!(should_rebuild_presigned_pump_buy_creator_vault_mismatch(
@@ -7832,6 +8466,7 @@ mod tests {
 
     #[test]
     fn presigned_pump_buy_creator_vault_retry_respects_env_opt_out() {
+        let _guard = env_lock().lock().expect("env lock");
         let mut job = sample_job();
         job.followLaunch.constraints.retryBudget = 1;
         let action = FollowActionRecord {
@@ -7887,10 +8522,14 @@ mod tests {
                 inlineTipAccount: None,
             }],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         unsafe {
-            env::set_var("LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY", "false");
+            env::set_var(
+                "LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY",
+                "false",
+            );
         }
         assert!(!should_rebuild_presigned_pump_buy_creator_vault_mismatch(
             &job,
@@ -7903,7 +8542,7 @@ mod tests {
     }
 
     #[test]
-    fn presigned_pump_sell_slippage_retry_detects_onchain_custom_6003() {
+    fn presigned_pump_sell_retry_detects_onchain_custom_6003_and_6023() {
         let mut job = sample_job();
         job.followLaunch.constraints.retryBudget = 1;
         let action = FollowActionRecord {
@@ -7959,12 +8598,23 @@ mod tests {
                 inlineTipAccount: None,
             }],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         assert!(should_rebuild_presigned_pump_sell_onchain_slippage(
             &job,
             &action,
             r#"on-chain failure | Transaction abc failed on-chain: {"InstructionError":[2,{"Custom":6003}]}"#,
+        ));
+        assert!(should_rebuild_presigned_pump_sell_onchain_slippage(
+            &job,
+            &action,
+            r#"on-chain failure | Launch transaction notification reported error: {"InstructionError":[2,{"Custom":6023}]}"#,
+        ));
+        assert!(should_rebuild_presigned_pump_sell_onchain_slippage(
+            &job,
+            &action,
+            "Program log: Error Code: NotEnoughTokensToSell. Error Number: 6023.",
         ));
     }
 
@@ -8013,6 +8663,7 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         assert!(!should_block_deferred_setup_for_action(&action, 0));
@@ -8076,6 +8727,7 @@ mod tests {
             orderIndex: 0,
             preSignedTransactions: vec![],
             poolId: None,
+            primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
         assert!(!should_use_post_setup_creator_vault_for_sell(
@@ -8285,7 +8937,7 @@ mod tests {
                 &bonk,
                 Some("wss://mainnet.helius-rpc.com/?api-key=test"),
             ),
-            "helius-transaction-subscribe"
+            "helius-slot-subscribe"
         );
         unsafe {
             env::remove_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE");
@@ -8359,7 +9011,10 @@ mod tests {
             blockhash: original_hash.to_string(),
             lastValidBlockHeight: 10,
             serializedBase64: serialized_base64,
-            signature: transaction.signatures.first().map(|signature| signature.to_string()),
+            signature: transaction
+                .signatures
+                .first()
+                .map(|signature| signature.to_string()),
             lookupTablesUsed: vec![],
             computeUnitLimit: None,
             computeUnitPriceMicroLamports: None,
@@ -8411,7 +9066,10 @@ mod tests {
             blockhash: original_hash.to_string(),
             lastValidBlockHeight: 10,
             serializedBase64: BASE64.encode(bincode::serialize(&transaction).unwrap()),
-            signature: transaction.signatures.first().map(|signature| signature.to_string()),
+            signature: transaction
+                .signatures
+                .first()
+                .map(|signature| signature.to_string()),
             lookupTablesUsed: vec![],
             computeUnitLimit: None,
             computeUnitPriceMicroLamports: None,

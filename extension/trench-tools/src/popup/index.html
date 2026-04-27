@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trench Tools</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, Arial, sans-serif;
+      }
+      body {
+        margin: 0;
+        width: 380px;
+        padding: 16px;
+        box-sizing: border-box;
+        background: #020202;
+        color: #f5f5f5;
+        font: 14px/1.5 Inter, Arial, sans-serif;
+      }
+      p {
+        margin: 0;
+      }
+      .shell {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .hero,
+      .section-head,
+      .footer-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+      .mark {
+        width: 26px;
+        height: 26px;
+        object-fit: contain;
+      }
+      .brand-title {
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1.1;
+        letter-spacing: -0.005em;
+      }
+      .muted {
+        color: #a1a1aa;
+      }
+      .hidden {
+        display: none !important;
+      }
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border-radius: 999px;
+        padding: 3px 9px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        color: #a1a1aa;
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+        white-space: nowrap;
+      }
+      .status-pill::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #52525b;
+      }
+      .status-pill[data-state="offline"]::before {
+        background: #f87171;
+      }
+      .status-pill[data-state="online"]::before {
+        background: #4ade80;
+      }
+      .section {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .section-copy {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .section-kicker {
+        color: #b7c7e8;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .section-title {
+        font-size: 13px;
+        font-weight: 600;
+        line-height: 1.2;
+      }
+      .section-divider {
+        width: 100%;
+        height: 1px;
+        background: linear-gradient(
+          90deg,
+          rgba(255, 255, 255, 0),
+          rgba(255, 255, 255, 0.14),
+          rgba(255, 255, 255, 0)
+        );
+      }
+      .main-view {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .auth-gate {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .auth-input-shell {
+        position: relative;
+      }
+      .auth-input-shell .field-input {
+        padding-right: 38px;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 12px;
+        letter-spacing: 0.02em;
+      }
+      .auth-input-shell .field-input[aria-invalid="true"] {
+        border-color: rgba(248, 113, 113, 0.55);
+        background: rgba(127, 29, 29, 0.18);
+      }
+      .auth-input-shell .field-input[aria-invalid="true"]:focus {
+        border-color: rgba(248, 113, 113, 0.8);
+      }
+      .auth-input-toggle {
+        position: absolute;
+        right: 6px;
+        top: 50%;
+        transform: translateY(-50%);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: #71717a;
+        cursor: pointer;
+      }
+      .auth-input-toggle:hover {
+        background: rgba(255, 255, 255, 0.06);
+        color: #f5f5f5;
+      }
+      .auth-submit {
+        width: 100%;
+        background: #ffffff;
+        color: #000000;
+      }
+      .auth-submit:hover {
+        transform: translateY(-1px);
+        background: #f5f5f5;
+      }
+      .auth-submit:disabled {
+        cursor: wait;
+        opacity: 0.72;
+        transform: none;
+      }
+      .auth-hint {
+        color: #71717a;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .auth-hint code {
+        color: #d4d4d8;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 11px;
+      }
+      .auth-status {
+        min-height: 14px;
+        font-size: 11px;
+        line-height: 1.35;
+      }
+      .auth-status:empty {
+        display: none;
+      }
+      .auth-status[data-tone="error"] {
+        color: #fca5a5;
+      }
+      .auth-status[data-tone="info"] {
+        color: #71717a;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0;
+      }
+      .stat {
+        padding: 0 12px 0 0;
+      }
+      .stat + .stat {
+        padding-left: 14px;
+        border-left: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .stat span {
+        display: block;
+        color: #a1a1aa;
+        font-size: 10px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .stat strong {
+        display: block;
+        margin-top: 1px;
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+      .field-input {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: #0d0d0d;
+        color: #f5f5f5;
+        padding: 11px 12px;
+        font: inherit;
+        transition:
+          border-color 0.16s ease,
+          background-color 0.16s ease;
+      }
+      .field-input:focus {
+        outline: none;
+        border-color: rgba(255, 255, 255, 0.16);
+        background: #101010;
+      }
+      .input-shell {
+        position: relative;
+      }
+      .input-icon {
+        position: absolute;
+        left: 12px;
+        top: 50%;
+        width: 16px;
+        height: 16px;
+        transform: translateY(-50%);
+        object-fit: contain;
+        pointer-events: none;
+        opacity: 0.9;
+      }
+      .input-shell .field-input {
+        padding-left: 38px;
+      }
+      .field-help {
+        color: #71717a;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      button {
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 11px 14px;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+        text-align: center;
+        transition:
+          transform 0.16s ease,
+          opacity 0.16s ease,
+          background-color 0.16s ease;
+      }
+      .button-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 10px;
+      }
+      button.primary {
+        background: #ffffff;
+        color: #000000;
+      }
+      button.secondary {
+        background: #111111;
+        color: #f5f5f5;
+      }
+      button.primary:hover {
+        transform: translateY(-1px);
+        opacity: 0.96;
+      }
+      button.secondary:hover {
+        transform: translateY(-1px);
+        background: #151515;
+      }
+      button.primary:active {
+        transform: translateY(0);
+      }
+      button.secondary:active {
+        transform: translateY(0);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="hero">
+        <div class="brand">
+          <img class="mark" src="../../images/trench-tools-boot-logo.png" alt="Trench Tools" />
+          <div class="brand-title">Trench Tools</div>
+        </div>
+        <div id="status-pill" class="status-pill">Checking host...</div>
+      </div>
+
+      <div class="section-divider"></div>
+
+      <section id="auth-gate" class="auth-gate hidden" aria-label="Authentication">
+        <form id="auth-token-form" class="section">
+          <div class="section-copy">
+            <div class="section-kicker">Auth token</div>
+          </div>
+          <div class="auth-input-shell">
+            <input
+              id="auth-token-input"
+              class="field-input"
+              type="password"
+              placeholder="Paste auth token"
+              autocomplete="off"
+              spellcheck="false"
+              aria-describedby="auth-token-status"
+            />
+            <button
+              id="auth-token-toggle"
+              class="auth-input-toggle"
+              type="button"
+              aria-label="Show auth token"
+              aria-pressed="false"
+            >
+              <svg
+                data-icon="eye"
+                xmlns="http://www.w3.org/2000/svg"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+              <svg
+                data-icon="eye-off"
+                xmlns="http://www.w3.org/2000/svg"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="hidden"
+                aria-hidden="true"
+              >
+                <path d="M9.88 5.09A10.94 10.94 0 0 1 12 5c6.5 0 10 7 10 7a18.5 18.5 0 0 1-3.17 4.19" />
+                <path d="M6.61 6.61A18.5 18.5 0 0 0 2 12s3.5 7 10 7a10.94 10.94 0 0 0 5.94-1.74" />
+                <path d="M9.9 9.9A3 3 0 0 0 14.1 14.1" />
+                <line x1="3" y1="3" x2="21" y2="21" />
+              </svg>
+            </button>
+          </div>
+          <button id="auth-token-submit" class="auth-submit" type="submit">Connect</button>
+          <p class="auth-hint">
+            Find your token in <code>.local/trench-tools/default-engine-token.txt</code>.
+          </p>
+          <p
+            id="auth-token-status"
+            class="auth-status"
+            data-tone="info"
+            role="status"
+            aria-live="polite"
+          ></p>
+        </form>
+      </section>
+
+      <div id="main-view" class="main-view hidden">
+        <section class="section" aria-label="Overview">
+          <div class="stats">
+            <div class="stat">
+              <span>Presets</span>
+              <strong id="preset-count">0</strong>
+            </div>
+            <div class="stat">
+              <span>Wallets</span>
+              <strong id="wallet-count">0</strong>
+            </div>
+            <div class="stat">
+              <span>Groups</span>
+              <strong id="group-count">0</strong>
+            </div>
+          </div>
+        </section>
+
+        <div class="section-divider"></div>
+
+        <section class="section" aria-label="Quick Buy">
+          <div class="section-copy">
+            <div class="section-kicker">Global quick-buy amount</div>
+          </div>
+          <div class="input-shell">
+            <img class="input-icon" src="../../assets/sol-icon-white.png" alt="" aria-hidden="true" />
+            <input
+              id="quick-buy-amount"
+              class="field-input"
+              type="text"
+              inputmode="decimal"
+              placeholder="Leave blank"
+            />
+          </div>
+        </section>
+
+        <div class="section-divider"></div>
+
+        <section class="section" aria-label="Settings">
+          <div class="button-row">
+            <button id="open-options-button" class="primary" type="button">Open app</button>
+            <button id="connection-button" class="secondary" type="button">Disconnect</button>
+          </div>
+        </section>
+      </div>
+    </div>
+    <script type="module" src="./index.js"></script>
+  </body>
+</html>

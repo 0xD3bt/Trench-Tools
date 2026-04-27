@@ -3,7 +3,9 @@
 use futures_util::{SinkExt, StreamExt, future::join_all, stream::FuturesUnordered};
 use lunar_lander_quic_client::{ClientOptions, LunarLanderQuicClient};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "shared-transaction-submit-internal")]
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{Value, json};
 use solana_sdk::transaction::VersionedTransaction;
 use std::{
@@ -15,6 +17,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
+use crate::provider_tip::HELIUS_SENDER_TIP_ACCOUNTS;
 use crate::transport::{
     JitoBundleEndpoint, TransportPlan, configured_enable_helius_transaction_subscribe,
     configured_hellomoon_api_key, configured_watch_endpoints_for_provider,
@@ -25,7 +28,9 @@ const SIGNATURE_CONFIRMATION_RPC_POLL_INTERVAL_MS: u64 = 400;
 const HELIUS_SIGNATURE_STATUS_RECONCILE_INTERVAL_MS: u64 = 550;
 const SYSTEM_PROGRAM_ID_STR: &str = "11111111111111111111111111111111";
 pub const COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS: u64 = 20;
+const HELLOMOON_QUIC_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg(feature = "shared-transaction-submit-internal")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledTransaction {
     pub label: String,
@@ -47,6 +52,9 @@ pub struct CompiledTransaction {
     pub inlineTipAccount: Option<String>,
 }
 
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub use shared_transaction_submit::CompiledTransaction;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SimulationResult {
     pub label: String,
@@ -56,7 +64,8 @@ pub struct SimulationResult {
     pub logs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg(feature = "shared-transaction-submit-internal")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentResult {
     pub label: String,
     pub format: String,
@@ -99,6 +108,10 @@ pub struct SentResult {
     pub requestFullTransactionDetails: bool,
 }
 
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub use shared_transaction_submit::SentResult;
+
+#[cfg(feature = "shared-transaction-submit-internal")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransactionTokenBalance {
     pub mint: String,
@@ -107,11 +120,18 @@ pub struct TransactionTokenBalance {
     pub owner: Option<String>,
 }
 
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub use shared_transaction_submit::TransactionTokenBalance;
+
+#[cfg(feature = "shared-transaction-submit-internal")]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct SendTimingBreakdown {
     pub submit_ms: u128,
     pub confirm_ms: u128,
 }
+
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub use shared_transaction_submit::SendTimingBreakdown;
 
 struct ConfirmationDetails {
     status: Value,
@@ -287,7 +307,7 @@ fn blockhash_cache_key(rpc_url: &str, commitment: &str) -> String {
 }
 
 pub fn configured_warm_rpc_url(primary_rpc_url: &str) -> String {
-    std::env::var("LAUNCHDECK_WARM_RPC_URL")
+    std::env::var("WARM_RPC_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -563,10 +583,16 @@ async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value
     Ok(payload.get("result").cloned().unwrap_or(Value::Null))
 }
 
+#[cfg(feature = "shared-transaction-submit-internal")]
 pub async fn prewarm_rpc_endpoint(rpc_url: &str) -> Result<(), String> {
     rpc_request(rpc_url, "getVersion", json!([]))
         .await
         .map(|_| ())
+}
+
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub async fn prewarm_rpc_endpoint(rpc_url: &str) -> Result<(), String> {
+    shared_transaction_submit::prewarm_rpc_endpoint(rpc_url).await
 }
 
 pub async fn fetch_current_block_height_fresh(
@@ -776,6 +802,45 @@ pub async fn fetch_account_data(
         .ok_or_else(|| format!("RPC getAccountInfo returned invalid base64 data for {account}."))?;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     BASE64.decode(data).map_err(|error| error.to_string())
+}
+
+pub async fn fetch_account_data_with_owner(
+    rpc_url: &str,
+    account: &str,
+    commitment: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let result = rpc_request(
+        rpc_url,
+        "getAccountInfo",
+        json!([
+            account,
+            {
+                "encoding": "base64",
+                "commitment": commitment,
+            }
+        ]),
+    )
+    .await?;
+    let value = result
+        .get("value")
+        .ok_or_else(|| format!("RPC getAccountInfo did not return a value for {account}."))?;
+    if value.is_null() {
+        return Err(format!("Account {account} was not found."));
+    }
+    let owner = value
+        .get("owner")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("RPC getAccountInfo did not return an owner for {account}."))?
+        .to_string();
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("RPC getAccountInfo returned invalid base64 data for {account}."))?;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    let decoded = BASE64.decode(data).map_err(|error| error.to_string())?;
+    Ok((decoded, owner))
 }
 
 pub async fn fetch_multiple_account_data(
@@ -1172,11 +1237,23 @@ async fn wait_for_confirmation(
                 }
             }
         } else if prefer_helius_transaction_subscribe {
-            let warning = missing_helius_account_required_warning(&[format!(
-                "transaction {}",
-                signature
-            )]);
+            let warning =
+                missing_helius_account_required_warning(&[format!("transaction {}", signature)]);
             eprintln!("{warning}");
+            if let Some(standard_endpoint) = standard_endpoint.as_deref() {
+                if let Ok(confirmation) = wait_for_confirmation_websocket(
+                    standard_endpoint,
+                    rpc_url,
+                    signature,
+                    &[],
+                    commitment,
+                    track_confirmed_block_height,
+                )
+                .await
+                {
+                    return Ok(confirmation);
+                }
+            }
         } else if let Ok(confirmation) = wait_for_confirmation_websocket(
             &endpoint,
             rpc_url,
@@ -1263,9 +1340,7 @@ async fn wait_for_confirmation_polling(
             }
             if commitment_satisfied(actual_commitment, commitment) {
                 let sampled_confirmed_slot = if track_confirmed_block_height {
-                    fetch_sampled_slot_snapshot(rpc_url, commitment)
-                        .await
-                        .ok()
+                    fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
                 } else {
                     None
                 };
@@ -1292,7 +1367,10 @@ async fn wait_for_confirmation_polling(
     ))
 }
 
-async fn fetch_signature_status_once(rpc_url: &str, signature: &str) -> Result<Option<Value>, String> {
+async fn fetch_signature_status_once(
+    rpc_url: &str,
+    signature: &str,
+) -> Result<Option<Value>, String> {
     let result = rpc_request(
         rpc_url,
         "getSignatureStatuses",
@@ -1362,6 +1440,7 @@ fn jsonrpc_subscription_id(payload: &Value, method: &str) -> Result<i64, String>
         .ok_or_else(|| format!("{method} ack missing subscription id: {payload}"))
 }
 
+#[cfg(feature = "shared-transaction-submit-internal")]
 pub async fn prewarm_watch_websocket_endpoint(endpoint: &str) -> Result<(), String> {
     let mut ws = open_subscription_socket(endpoint).await?;
     let subscribe_payload =
@@ -1372,6 +1451,12 @@ pub async fn prewarm_watch_websocket_endpoint(endpoint: &str) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub async fn prewarm_watch_websocket_endpoint(endpoint: &str) -> Result<(), String> {
+    shared_transaction_submit::prewarm_watch_websocket_endpoint(endpoint).await
+}
+
+#[cfg(feature = "shared-transaction-submit-internal")]
 pub async fn prewarm_helius_transaction_subscribe_endpoint(endpoint: &str) -> Result<(), String> {
     let mut ws = open_subscription_socket(endpoint).await?;
     let subscribe_payload = send_jsonrpc_request(
@@ -1402,6 +1487,11 @@ pub async fn prewarm_helius_transaction_subscribe_endpoint(endpoint: &str) -> Re
     )
     .await;
     Ok(())
+}
+
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub async fn prewarm_helius_transaction_subscribe_endpoint(endpoint: &str) -> Result<(), String> {
+    shared_transaction_submit::prewarm_helius_transaction_subscribe_endpoint(endpoint).await
 }
 
 async fn next_json_message(ws: &mut WsStream) -> Result<Value, String> {
@@ -1524,11 +1614,10 @@ fn extract_transaction_notification_log_error(result: &Value) -> Option<Value> {
     }
 
     let normalized = logs.join("\n").to_ascii_lowercase();
-    let looks_like_pump_creator_vault_seed_mismatch =
-        normalized.contains("creator_vault")
-            && normalized.contains("constraintseeds")
-            && (normalized.contains("error number: 2006")
-                || normalized.contains("custom program error: 0x7d6"));
+    let looks_like_pump_creator_vault_seed_mismatch = normalized.contains("creator_vault")
+        && normalized.contains("constraintseeds")
+        && (normalized.contains("error number: 2006")
+            || normalized.contains("custom program error: 0x7d6"));
     if !looks_like_pump_creator_vault_seed_mismatch {
         return None;
     }
@@ -1611,7 +1700,11 @@ fn extract_transaction_notification_post_token_balances(
         .into_iter()
         .flatten()
         .filter_map(|entry| {
-            let mint = entry.get("mint").and_then(Value::as_str)?.trim().to_string();
+            let mint = entry
+                .get("mint")
+                .and_then(Value::as_str)?
+                .trim()
+                .to_string();
             if mint.is_empty() {
                 return None;
             }
@@ -1653,9 +1746,7 @@ async fn confirmation_details_from_signature_notification(
         ));
     }
     let sampled_confirmed_slot = if track_confirmed_block_height {
-        fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok()
+        fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
     } else {
         None
     };
@@ -1679,25 +1770,26 @@ async fn confirmation_details_from_signature_notification(
 
 async fn confirmation_details_from_account_notification(
     rpc_url: &str,
+    commitment: &str,
     track_confirmed_block_height: bool,
     context_slot: Option<u64>,
     amount_raw: String,
 ) -> Result<ConfirmationDetails, String> {
     let sampled_confirmed_slot = if track_confirmed_block_height {
-        fetch_sampled_slot_snapshot(rpc_url, "processed").await.ok()
+        fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
     } else {
         None
     };
     let observed_at_ms = current_time_ms();
     Ok(ConfirmationDetails {
         status: json!({
-            "confirmationStatus": "processed",
+            "confirmationStatus": commitment,
             "slot": context_slot,
         }),
         confirmed_observed_slot: context_slot.or(sampled_confirmed_slot),
         confirmed_slot: context_slot,
         confirmation_source: "websocket-account-balance",
-        first_observed_status: Some("processed".to_string()),
+        first_observed_status: Some(commitment.to_string()),
         first_observed_slot: context_slot,
         first_observed_at_ms: Some(observed_at_ms),
         confirmed_at_ms: Some(observed_at_ms),
@@ -1720,6 +1812,16 @@ async fn confirmation_details_from_transaction_notification(
         ));
     }
     if let Some(status) = fetch_signature_status_once(rpc_url, signature).await? {
+        if status.is_null() {
+            return confirmation_details_from_transaction_notification_without_status(
+                rpc_url,
+                commitment,
+                track_confirmed_block_height,
+                slot,
+                result,
+            )
+            .await;
+        }
         let err = status.get("err").cloned().unwrap_or(Value::Null);
         if !err.is_null() {
             return Err(terminal_confirmation_error(signature, err));
@@ -1729,10 +1831,7 @@ async fn confirmation_details_from_transaction_notification(
             .and_then(Value::as_str)
             .unwrap_or(commitment)
             .to_string();
-        let confirmed_slot = status
-            .get("slot")
-            .and_then(Value::as_u64)
-            .or(slot);
+        let confirmed_slot = status.get("slot").and_then(Value::as_u64).or(slot);
         let sampled_confirmed_slot = if track_confirmed_block_height {
             fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
         } else {
@@ -1752,6 +1851,23 @@ async fn confirmation_details_from_transaction_notification(
             confirmed_token_balance_raw: None,
         });
     }
+    confirmation_details_from_transaction_notification_without_status(
+        rpc_url,
+        commitment,
+        track_confirmed_block_height,
+        slot,
+        result,
+    )
+    .await
+}
+
+async fn confirmation_details_from_transaction_notification_without_status(
+    rpc_url: &str,
+    commitment: &str,
+    track_confirmed_block_height: bool,
+    slot: Option<u64>,
+    result: Value,
+) -> Result<ConfirmationDetails, String> {
     let sampled_confirmed_slot = if track_confirmed_block_height {
         fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
     } else {
@@ -1873,11 +1989,7 @@ async fn wait_for_confirmation_helius_transaction_subscribe(
                 Err(_) => {
                     let reconciled = reconcile_signature_statuses_once(
                         rpc_url,
-                        &[(
-                            0usize,
-                            signature.to_string(),
-                            capture_post_token_balances,
-                        )],
+                        &[(0usize, signature.to_string(), capture_post_token_balances)],
                         commitment,
                     )
                     .await?;
@@ -1888,7 +2000,17 @@ async fn wait_for_confirmation_helius_transaction_subscribe(
             }
         }
     };
-    session.await
+    timeout(
+        Duration::from_secs(WEBSOCKET_CONFIRMATION_TIMEOUT_SECS),
+        session,
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out waiting for Helius transactionSubscribe confirmation for transaction {}.",
+            signature
+        )
+    })?
 }
 
 async fn wait_for_confirmations_polling_batch(
@@ -2091,6 +2213,7 @@ async fn subscribe_helius_transaction_batch(
 async fn subscribe_account_batch(
     ws: &mut WsStream,
     requests: &[StandardTokenAccountWatchRequest],
+    commitment: &str,
 ) -> Result<(HashMap<u64, usize>, VecDeque<Value>), String> {
     let mut subscription_map = HashMap::new();
     let mut buffered_notifications = VecDeque::new();
@@ -2105,7 +2228,7 @@ async fn subscribe_account_batch(
                     request.account,
                     {
                         "encoding": "base64",
-                        "commitment": "processed"
+                        "commitment": commitment
                     }
                 ],
             })
@@ -2148,10 +2271,12 @@ async fn wait_for_confirmations_websocket_batch(
         let (subscription_map, mut buffered_notifications) =
             subscribe_signature_batch(&mut ws, signatures, commitment).await?;
         let mut warnings = Vec::new();
-        let (account_subscription_map, account_buffered_notifications) = if token_account_watches.is_empty() {
+        let (account_subscription_map, account_buffered_notifications) = if token_account_watches
+            .is_empty()
+        {
             (HashMap::new(), VecDeque::new())
         } else {
-            match subscribe_account_batch(&mut ws, token_account_watches).await {
+            match subscribe_account_batch(&mut ws, token_account_watches, commitment).await {
                 Ok(result) => result,
                 Err(error) => {
                     warnings.push(format!(
@@ -2181,11 +2306,12 @@ async fn wait_for_confirmations_websocket_batch(
             } else {
                 next_json_message(&mut ws).await?
             };
-            if let Some((subscription_id, context_slot, value)) = extract_account_notification(&message)
+            if let Some((subscription_id, context_slot, value)) =
+                extract_account_notification(&message)
             {
-                if let Some(index) = account_subscription_map.get(&subscription_id).copied()
-                {
-                    let Some(amount) = extract_account_notification_token_balance_raw(&value)? else {
+                if let Some(index) = account_subscription_map.get(&subscription_id).copied() {
+                    let Some(amount) = extract_account_notification_token_balance_raw(&value)?
+                    else {
                         continue;
                     };
                     let parsed_amount = amount.parse::<u64>().unwrap_or_default();
@@ -2195,6 +2321,7 @@ async fn wait_for_confirmations_websocket_batch(
                             index,
                             confirmation_details_from_account_notification(
                                 rpc_url,
+                                commitment,
                                 track_confirmed_block_height,
                                 context_slot,
                                 amount,
@@ -2240,10 +2367,7 @@ async fn wait_for_confirmations_websocket_batch(
                         None
                     };
             }
-            confirmations.push((
-                index,
-                confirmation,
-            ));
+            confirmations.push((index, confirmation));
         }
         Ok((confirmations, warnings))
     };
@@ -2344,7 +2468,17 @@ async fn wait_for_confirmations_helius_transaction_subscribe_batch(
         }
         Ok(confirmations)
     };
-    session.await
+    timeout(
+        Duration::from_secs(WEBSOCKET_CONFIRMATION_TIMEOUT_SECS),
+        session,
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out waiting for Helius transactionSubscribe confirmation for {} transaction(s).",
+            requests.len()
+        )
+    })?
 }
 
 fn default_confirmation_watch_endpoint() -> Option<String> {
@@ -2586,9 +2720,7 @@ pub async fn confirm_transactions_with_websocket_fallback(
         .await?
     };
     let sampled_confirmed_slot = if track_send_block_height {
-        fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok()
+        fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
     } else {
         None
     };
@@ -2647,9 +2779,7 @@ pub async fn submit_transactions_sequential(
         .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
         .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
         let send_observed_slot = if track_send_block_height {
-            fetch_sampled_slot_snapshot(rpc_url, commitment)
-                .await
-                .ok()
+            fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
         } else {
             None
         };
@@ -2719,9 +2849,7 @@ async fn submit_single_transaction_rpc(
     .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
     .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
     let send_observed_slot = if track_send_block_height {
-        fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok()
+        fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
     } else {
         None
     };
@@ -2751,8 +2879,9 @@ async fn submit_single_transaction_rpc(
         inlineTipAccount: transaction.inlineTipAccount.clone(),
         bundleId: None,
         attemptedBundleIds: vec![],
-        transactionSubscribeAccountRequired:
-            derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+        transactionSubscribeAccountRequired: derive_helius_transaction_subscribe_account_required(
+            &transaction.serializedBase64,
+        ),
         postTokenBalances: vec![],
         confirmedTokenBalanceRaw: None,
         balanceWatchAccount: None,
@@ -2968,8 +3097,8 @@ pub async fn submit_transactions_standard_rpc_fanout(
     };
     if track_send_block_height {
         let send_observed_slot = fetch_sampled_slot_snapshot(primary_rpc_url, commitment)
-                .await
-                .ok();
+            .await
+            .ok();
         for result in &mut results {
             result.sendObservedSlot = send_observed_slot;
         }
@@ -3059,9 +3188,7 @@ pub async fn submit_transactions_helius_sender(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok();
+        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok();
         for result in &mut results {
             result.sendObservedSlot = send_observed_slot;
         }
@@ -3208,9 +3335,7 @@ pub async fn submit_transactions_helius_sender_parallel(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok();
+        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok();
         for result in &mut sent {
             result.sendObservedSlot = send_observed_slot;
         }
@@ -3301,9 +3426,7 @@ pub async fn submit_transactions_bundle(
         .map(|(_, attempt_bundle_id)| attempt_bundle_id.clone())
         .collect::<Vec<_>>();
     let send_observed_slot = if track_send_block_height {
-        fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok()
+        fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
     } else {
         None
     };
@@ -3386,6 +3509,7 @@ pub async fn confirm_transactions_bundle(
     for _ in 0..20 {
         let mut observed_errors = Vec::new();
         let mut observed_bundle_statuses = Vec::new();
+        let mut terminal_bundle_errors = 0usize;
         for (endpoint, bundle_id) in &attempts {
             let status_payload = match jito_request(
                 &endpoint.status,
@@ -3422,6 +3546,7 @@ pub async fn confirm_transactions_bundle(
                         observed_errors.push(format!("{}:{}={}", endpoint.name, bundle_id, err));
                         observed_bundle_statuses
                             .push(format!("{}:{}=err:{}", endpoint.name, bundle_id, err));
+                        terminal_bundle_errors = terminal_bundle_errors.saturating_add(1);
                         continue;
                     }
                 }
@@ -3440,9 +3565,7 @@ pub async fn confirm_transactions_bundle(
                     .cloned()
                     .unwrap_or_default();
                 let sampled_confirmed_slot = if track_send_block_height {
-                    fetch_sampled_slot_snapshot(rpc_url, commitment)
-                        .await
-                        .ok()
+                    fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
                 } else {
                     None
                 };
@@ -3487,6 +3610,15 @@ pub async fn confirm_transactions_bundle(
         }
         if !observed_bundle_statuses.is_empty() {
             last_observed_bundle_statuses = observed_bundle_statuses;
+        }
+        if terminal_bundle_errors == attempts.len() && !attempts.is_empty() {
+            return Err(format!(
+                "All accepted Jito bundle submissions failed before reaching {}. Accepted endpoints: {}. Bundle ids: {}. Last observed bundle statuses: {}",
+                commitment,
+                accepted_attempts.join(" | "),
+                attempted_bundle_ids.join(", "),
+                last_observed_bundle_statuses.join(" | ")
+            ));
         }
         sleep(Duration::from_millis(1500)).await;
     }
@@ -3544,6 +3676,17 @@ fn validate_helius_sender_transaction(transaction: &CompiledTransaction) -> Resu
     if transaction.inlineTipLamports.unwrap_or(0) < 200_000 {
         return Err(format!(
             "Transaction {} is missing the required inline Helius Sender tip.",
+            transaction.label
+        ));
+    }
+    let tip_account = transaction
+        .inlineTipAccount
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if !HELIUS_SENDER_TIP_ACCOUNTS.contains(&tip_account) {
+        return Err(format!(
+            "Transaction {} is missing an accepted inline Helius Sender tip account.",
             transaction.label
         ));
     }
@@ -3756,9 +3899,7 @@ pub async fn submit_transactions_hellomoon_bundle(
         ));
     }
     let send_observed_slot = if track_send_block_height {
-        fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok()
+        fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
     } else {
         None
     };
@@ -3800,7 +3941,9 @@ pub async fn submit_transactions_hellomoon_bundle(
                 bundleId: None,
                 attemptedBundleIds: vec![],
                 transactionSubscribeAccountRequired:
-                    derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+                    derive_helius_transaction_subscribe_account_required(
+                        &transaction.serializedBase64,
+                    ),
                 postTokenBalances: vec![],
                 confirmedTokenBalanceRaw: None,
                 balanceWatchAccount: None,
@@ -3812,6 +3955,7 @@ pub async fn submit_transactions_hellomoon_bundle(
     Ok((results, warnings, submit_started.elapsed().as_millis()))
 }
 
+#[cfg(feature = "shared-transaction-submit-internal")]
 pub async fn prewarm_hellomoon_quic_endpoint(
     endpoint: &str,
     mev_protect: bool,
@@ -3825,6 +3969,17 @@ pub async fn prewarm_hellomoon_quic_endpoint(
         .map(|_| ())
 }
 
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub async fn prewarm_hellomoon_quic_endpoint(
+    endpoint: &str,
+    mev_protect: bool,
+) -> Result<(), String> {
+    let environment = crate::transport::transport_environment_snapshot();
+    shared_transaction_submit::prewarm_hellomoon_quic_endpoint(endpoint, mev_protect, &environment)
+        .await
+}
+
+#[cfg(feature = "shared-transaction-submit-internal")]
 pub async fn prewarm_hellomoon_bundle_endpoint(endpoint: &str) -> Result<(), String> {
     let api_key = configured_hellomoon_api_key();
     if api_key.trim().is_empty() {
@@ -3849,19 +4004,44 @@ pub async fn prewarm_hellomoon_bundle_endpoint(endpoint: &str) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub async fn prewarm_hellomoon_bundle_endpoint(endpoint: &str) -> Result<(), String> {
+    let environment = crate::transport::transport_environment_snapshot();
+    shared_transaction_submit::prewarm_hellomoon_bundle_endpoint(endpoint, &environment).await
+}
+
 async fn send_transaction_hellomoon_quic_endpoint(
     endpoint: &str,
     api_key: &str,
     mev_protect: bool,
     payload: &[u8],
 ) -> Result<(), String> {
+    async fn send_once(
+        client: &LunarLanderQuicClient,
+        endpoint: &str,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        timeout(
+            HELLOMOON_QUIC_SEND_TIMEOUT,
+            client.send_transaction(payload),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "Hello Moon QUIC send timed out after {}s on {endpoint}",
+                HELLOMOON_QUIC_SEND_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|error| error.to_string())
+    }
+
     let client = cached_hellomoon_quic_client(endpoint, api_key, mev_protect).await?;
-    match client.send_transaction(payload).await {
+    match send_once(&client, endpoint, payload).await {
         Ok(()) => Ok(()),
         Err(first_error) => {
             invalidate_hellomoon_quic_client(endpoint, api_key, mev_protect).await;
             let client = cached_hellomoon_quic_client(endpoint, api_key, mev_protect).await?;
-            client.send_transaction(payload).await.map_err(|second_error| {
+            send_once(&client, endpoint, payload).await.map_err(|second_error| {
                 format!(
                     "Hello Moon QUIC send failed on {endpoint}: {first_error}; reconnect retry failed: {second_error}"
                 )
@@ -3911,20 +4091,17 @@ async fn submit_single_transaction_hellomoon_quic(
         })
         .collect::<FuturesUnordered<_>>();
     let mut first_successful_endpoint = None;
-    let mut successful_endpoints = Vec::new();
     let mut errors = Vec::new();
     while let Some((endpoint, result)) = endpoint_results.next().await {
         match result {
             Ok(()) => {
-                if first_successful_endpoint.is_none() {
-                    first_successful_endpoint = Some(endpoint.clone());
-                }
-                successful_endpoints.push(endpoint);
+                first_successful_endpoint = Some(endpoint);
+                break;
             }
             Err(error) => errors.push(format!("{endpoint}: {error}")),
         }
     }
-    if successful_endpoints.is_empty() {
+    if first_successful_endpoint.is_none() {
         return Err(format!(
             "Hello Moon QUIC failed for transaction {} on all attempted endpoints: {}",
             transaction.label,
@@ -4009,9 +4186,7 @@ pub async fn submit_transactions_hellomoon_quic(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok();
+        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok();
         for result in &mut results {
             result.sendObservedSlot = send_observed_slot;
         }
@@ -4043,9 +4218,7 @@ pub async fn submit_transactions_hellomoon_quic_parallel(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment)
-            .await
-            .ok();
+        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok();
         for result in &mut sent {
             result.sendObservedSlot = send_observed_slot;
         }
@@ -4073,10 +4246,7 @@ pub async fn send_transactions_hellomoon_quic(
                 submit_single_transaction_hellomoon_quic(endpoints, transaction, mev_protect)
                     .await?;
             if track_send_block_height {
-                sent.sendObservedSlot =
-                    fetch_sampled_slot_snapshot(rpc_url, commitment)
-                        .await
-                        .ok();
+                sent.sendObservedSlot = fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok();
             }
             submit_ms += submit_started.elapsed().as_millis();
             warnings.extend(entry_warnings);
@@ -4157,10 +4327,7 @@ pub async fn send_transactions_helius_sender(
             let (mut sent, entry_warnings) =
                 submit_single_transaction_helius_sender(endpoints, transaction).await?;
             if track_send_block_height {
-                sent.sendObservedSlot =
-                    fetch_sampled_slot_snapshot(rpc_url, commitment)
-                        .await
-                        .ok();
+                sent.sendObservedSlot = fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok();
             }
             submit_ms += submit_started.elapsed().as_millis();
             warnings.extend(entry_warnings);
@@ -4266,11 +4433,15 @@ fn jito_tip_accounts_endpoint(endpoint: &JitoBundleEndpoint) -> String {
     format!("{base}/api/v1/getTipAccounts")
 }
 
+#[cfg(feature = "shared-transaction-submit-internal")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JitoWarmResult {
     Warmed,
     RateLimited(String),
 }
+
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub use shared_transaction_submit::JitoWarmResult;
 
 fn jito_error_message_from_body(body: &str, fallback: &str) -> String {
     serde_json::from_str::<Value>(body)
@@ -4301,6 +4472,7 @@ fn jito_error_is_rate_limited(status: StatusCode, body: &str) -> bool {
     lower.contains("rate limit") || lower.contains("rate-limited")
 }
 
+#[cfg(feature = "shared-transaction-submit-internal")]
 pub async fn prewarm_jito_bundle_endpoint(
     endpoint: &JitoBundleEndpoint,
 ) -> Result<JitoWarmResult, String> {
@@ -4343,6 +4515,13 @@ pub async fn prewarm_jito_bundle_endpoint(
         return Err(message);
     }
     Ok(JitoWarmResult::Warmed)
+}
+
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub async fn prewarm_jito_bundle_endpoint(
+    endpoint: &JitoBundleEndpoint,
+) -> Result<JitoWarmResult, String> {
+    shared_transaction_submit::prewarm_jito_bundle_endpoint(endpoint).await
 }
 
 pub async fn send_transactions_bundle(
@@ -4588,6 +4767,7 @@ pub async fn submit_transactions_for_transport(
     }
 }
 
+#[cfg(feature = "shared-transaction-submit-internal")]
 pub async fn submit_independent_transactions_for_transport(
     rpc_url: &str,
     transport_plan: &TransportPlan,
@@ -4654,6 +4834,30 @@ pub async fn submit_independent_transactions_for_transport(
     }
 }
 
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub async fn submit_independent_transactions_for_transport(
+    rpc_url: &str,
+    transport_plan: &TransportPlan,
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    skip_preflight: bool,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    let environment = crate::transport::transport_environment_snapshot();
+    let shared_plan = crate::transport::shared_transport_plan(transport_plan);
+    shared_transaction_submit::submit_independent_transactions_for_transport(
+        rpc_url,
+        &shared_plan,
+        transactions,
+        commitment,
+        skip_preflight,
+        track_send_block_height,
+        &environment,
+    )
+    .await
+}
+
+#[cfg(feature = "shared-transaction-submit-internal")]
 pub async fn confirm_submitted_transactions_for_transport(
     rpc_url: &str,
     transport_plan: &TransportPlan,
@@ -4723,13 +4927,58 @@ pub async fn confirm_submitted_transactions_for_transport(
     }
 }
 
+#[cfg(not(feature = "shared-transaction-submit-internal"))]
+pub async fn confirm_submitted_transactions_for_transport(
+    rpc_url: &str,
+    transport_plan: &TransportPlan,
+    submitted: &mut [SentResult],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(Vec<String>, u128), String> {
+    let environment = crate::transport::transport_environment_snapshot();
+    let shared_plan = crate::transport::shared_transport_plan(transport_plan);
+    shared_transaction_submit::confirm_submitted_transactions_for_transport(
+        rpc_url,
+        &shared_plan,
+        submitted,
+        commitment,
+        track_send_block_height,
+        &environment,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
     use serde_json::json;
-    use std::{net::SocketAddr, sync::Arc};
+    use std::sync::Mutex as StdMutex;
+    use std::{net::SocketAddr, sync::Arc, sync::OnceLock};
     use tokio::sync::Mutex;
+
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    // Strip live RPC/WS env once per test process so confirmation tests don't
+    // bypass the mock RPC or open real websocket connections.
+    fn ensure_hermetic_test_env() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let _guard = env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            unsafe {
+                std::env::remove_var("WARM_RPC_URL");
+                std::env::remove_var("SOLANA_RPC_URL");
+                std::env::remove_var("HELIUS_RPC_URL");
+                std::env::remove_var("SOLANA_WS_URL");
+                std::env::remove_var("HELIUS_WS_URL");
+            }
+        });
+    }
 
     fn compiled_tx(label: &str) -> CompiledTransaction {
         CompiledTransaction {
@@ -4743,7 +4992,7 @@ mod tests {
             computeUnitLimit: Some(1_000_000),
             computeUnitPriceMicroLamports: Some(1),
             inlineTipLamports: Some(200_000),
-            inlineTipAccount: Some("tip-account".to_string()),
+            inlineTipAccount: Some(HELIUS_SENDER_TIP_ACCOUNTS[0].to_string()),
         }
     }
 
@@ -5008,6 +5257,7 @@ mod tests {
 
     #[tokio::test]
     async fn simulates_transactions_via_rpc() {
+        ensure_hermetic_test_env();
         let addr = start_jsonrpc_server().await;
         let rpc_url = format!("http://{addr}/");
         let (results, warnings) =
@@ -5023,6 +5273,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_transactions_sequentially_via_rpc() {
+        ensure_hermetic_test_env();
         let addr = start_jsonrpc_server().await;
         let rpc_url = format!("http://{addr}/");
         let (results, warnings, timing) = send_transactions_sequential(
@@ -5052,6 +5303,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_bundle_transactions_via_jito_endpoints() {
+        ensure_hermetic_test_env();
         let send_calls_one = Arc::new(Mutex::new(Vec::new()));
         let status_calls_one = Arc::new(Mutex::new(Vec::new()));
         let send_calls_two = Arc::new(Mutex::new(Vec::new()));
@@ -5118,6 +5370,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_transactions_via_helius_sender_with_required_flags() {
+        ensure_hermetic_test_env();
         let rpc_addr = start_jsonrpc_server().await;
         let calls_one = Arc::new(Mutex::new(Vec::new()));
         let calls_two = Arc::new(Mutex::new(Vec::new()));
@@ -5557,6 +5810,7 @@ mod tests {
 
     #[tokio::test]
     async fn helius_sender_rejects_transactions_without_inline_tip() {
+        ensure_hermetic_test_env();
         let rpc_addr = start_jsonrpc_server().await;
         let calls = Arc::new(Mutex::new(Vec::new()));
         let sender_addr = start_sender_server(calls).await;
@@ -5574,5 +5828,28 @@ mod tests {
         .await
         .expect_err("sender should reject missing inline tip");
         assert!(error.contains("required inline Helius Sender tip"));
+    }
+
+    #[tokio::test]
+    async fn helius_sender_rejects_unaccepted_tip_account() {
+        ensure_hermetic_test_env();
+        let rpc_addr = start_jsonrpc_server().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_addr = start_sender_server(calls).await;
+        let rpc_url = format!("http://{rpc_addr}/");
+        let endpoint = format!("http://{sender_addr}/");
+        let mut transaction = compiled_tx("launch");
+        transaction.inlineTipAccount =
+            Some("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5".to_string());
+        let error = send_transactions_helius_sender(
+            &rpc_url,
+            &[endpoint.clone()],
+            &[transaction],
+            "confirmed",
+            false,
+        )
+        .await
+        .expect_err("sender should reject unaccepted tip account");
+        assert!(error.contains("accepted inline Helius Sender tip account"));
     }
 }

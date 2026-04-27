@@ -91,6 +91,7 @@
     let lastTopPresetMarkup = "";
     let lastSettingsPresetMarkup = "";
     let lastQuickDevBuyMarkup = "";
+    const DEFAULT_MANUAL_FEE_SOL = "0.001";
 
     function cloneConfig(value) {
       return value ? JSON.parse(JSON.stringify(value)) : null;
@@ -103,28 +104,29 @@
           mode: "regular",
           activePresetId: defaultPresetId,
           presetEditing: false,
+          quickDevBuyAmounts: [...defaultQuickDevBuyAmounts],
           misc: {
             trackSendBlockHeight: false,
           },
         },
         presets: {
-          items: defaultQuickDevBuyAmounts.map((amount, index) => ({
+          items: defaultQuickDevBuyAmounts.map((_, index) => ({
             id: `preset${index + 1}`,
             label: `P${index + 1}`,
             creationSettings: {
               provider: "helius-sender",
-              tipSol: "0.01",
-              priorityFeeSol: "0.001",
+              tipSol: DEFAULT_MANUAL_FEE_SOL,
+              priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
               mevMode: "off",
               autoFee: false,
               maxFeeSol: "",
-              devBuySol: amount,
+              devBuySol: "",
             },
             buySettings: {
               provider: "helius-sender",
-              priorityFeeSol: "0.009",
-              tipSol: "0.01",
-              slippagePercent: "90",
+              priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
+              tipSol: DEFAULT_MANUAL_FEE_SOL,
+              slippagePercent: "",
               mevMode: "off",
               autoFee: false,
               maxFeeSol: "",
@@ -132,9 +134,9 @@
             },
             sellSettings: {
               provider: "helius-sender",
-              priorityFeeSol: "0.009",
-              tipSol: "0.01",
-              slippagePercent: "90",
+              priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
+              tipSol: DEFAULT_MANUAL_FEE_SOL,
+              slippagePercent: "",
               mevMode: "off",
               autoFee: false,
               maxFeeSol: "",
@@ -297,6 +299,20 @@
       return requirements ? Number(requirements.minTipSol || 0) : 0;
     }
 
+    function formatSolAmount(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric) || numeric <= 0) return "";
+      return numeric.toFixed(9).replace(/0+$/, "").replace(/\.$/, "");
+    }
+
+    function providerTipPlaceholder(provider) {
+      return DEFAULT_MANUAL_FEE_SOL;
+    }
+
+    function providerPriorityFeePlaceholder(provider) {
+      return providerRequiresPriorityFee(provider) ? DEFAULT_MANUAL_FEE_SOL : "";
+    }
+
     function providerRequiresPriorityFee(provider) {
       const requirements = providerFeeRequirementsFor(provider);
       return Boolean(requirements && requirements.priorityRequired);
@@ -331,7 +347,7 @@
       const numeric = Number(value);
       if (Number.isNaN(numeric) || numeric < 0) return "Must be a valid number";
       if (minimumTipSol > 0 && numeric < minimumTipSol) {
-        return `Tip must be at least ${minimumTipSol.toFixed(4)} SOL for ${label}.`;
+        return `Tip must be at least ${formatSolAmount(minimumTipSol)} SOL for ${label}.`;
       }
       return "";
     }
@@ -342,9 +358,14 @@
       if (Number.isNaN(numeric) || numeric <= 0) return "Must be greater than 0";
       const minimumTipSol = providerMinimumTipSol(provider);
       if (minimumTipSol > 0 && numeric < minimumTipSol) {
-        return `Max auto fee must be at least ${minimumTipSol.toFixed(4)} SOL for ${providerRequirementLabel(provider)}.`;
+        return `Max auto fee must be at least ${formatSolAmount(minimumTipSol)} SOL for ${providerRequirementLabel(provider)}.`;
       }
       return "";
+    }
+
+    function validateRequiredAutoFeeCapField(value, provider) {
+      if (!value) return "Max auto fee is required when Auto Fee is on.";
+      return validateOptionalAutoFeeCapField(value, provider);
     }
 
     function setFieldEnabled(input, enabled) {
@@ -365,6 +386,46 @@
       syncAutoFeeButtonState(creationAutoFeeButton, creationAutoFeeInput);
       syncAutoFeeButtonState(buyAutoFeeButton, buyAutoFeeInput);
       syncAutoFeeButtonState(sellAutoFeeButton, sellAutoFeeInput);
+    }
+
+    function syncFeeInputValue(input, supported) {
+      if (!input) return;
+      if (!supported) {
+        input.value = "";
+        return;
+      }
+      if (!String(input.value || "").trim()) {
+        input.value = DEFAULT_MANUAL_FEE_SOL;
+      }
+    }
+
+    function syncProviderFeeValues() {
+      const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
+      const buyCapabilities = getRouteCapabilities(getBuyProvider(), "buy");
+      const sellCapabilities = getRouteCapabilities(getSellProvider(), "sell");
+      syncFeeInputValue(creationTipInput, creationCapabilities.tip);
+      syncFeeInputValue(creationPriorityInput, creationCapabilities.priority);
+      syncFeeInputValue(buyTipInput, buyCapabilities.tip);
+      syncFeeInputValue(buyPriorityFeeInput, buyCapabilities.priority);
+      syncFeeInputValue(sellTipInput, sellCapabilities.tip);
+      syncFeeInputValue(sellPriorityFeeInput, sellCapabilities.priority);
+    }
+
+    function syncProviderPlaceholders() {
+      if (creationTipInput) creationTipInput.placeholder = providerTipPlaceholder(getProvider());
+      if (buyTipInput) buyTipInput.placeholder = providerTipPlaceholder(getBuyProvider());
+      if (sellTipInput) sellTipInput.placeholder = providerTipPlaceholder(getSellProvider());
+      if (creationPriorityInput) {
+        creationPriorityInput.placeholder = providerPriorityFeePlaceholder(getProvider());
+      }
+      if (buyPriorityFeeInput) {
+        buyPriorityFeeInput.placeholder = providerPriorityFeePlaceholder(getBuyProvider());
+      }
+      if (sellPriorityFeeInput) {
+        sellPriorityFeeInput.placeholder = providerPriorityFeePlaceholder(getSellProvider());
+      }
+      if (buySlippageInput) buySlippageInput.placeholder = "20";
+      if (sellSlippageInput) sellSlippageInput.placeholder = "20";
     }
 
     function isHelloMoonProvider(provider) {
@@ -541,6 +602,8 @@
       setFieldEnabled(sellMevModeSelect, editing && isHelloMoonProvider(sellProvider));
       setFieldEnabled(buySlippageInput, editing && buyCapabilities.slippage);
       setFieldEnabled(sellSlippageInput, editing && sellCapabilities.slippage);
+      syncProviderPlaceholders();
+      syncProviderFeeValues();
       syncAutoFeeControls();
       syncStandardRpcWarnings();
       syncHelloMoonMevWarnings();
@@ -655,10 +718,17 @@
     }
 
     function getQuickDevBuyPresetAmounts(configValue = getLatestWalletStatus() && getLatestWalletStatus().config) {
+      const globalAmounts = configValue && configValue.defaults && Array.isArray(configValue.defaults.quickDevBuyAmounts)
+        ? configValue.defaults.quickDevBuyAmounts
+        : [];
       const presetItems = configValue && configValue.presets && Array.isArray(configValue.presets.items)
         ? configValue.presets.items
         : [];
       return defaultQuickDevBuyAmounts.map((fallback, index) => {
+        const globalValue = typeof globalAmounts[index] === "string"
+          ? globalAmounts[index].trim()
+          : "";
+        if (globalValue) return globalValue;
         const preset = presetItems[index];
         const value = preset && preset.creationSettings && typeof preset.creationSettings.devBuySol === "string"
           ? preset.creationSettings.devBuySol.trim()
@@ -669,9 +739,8 @@
 
     function renderQuickDevBuyButtons(configValue = getLatestWalletStatus() && getLatestWalletStatus().config) {
       if (!devBuyQuickButtons) return;
-      const presetItems = getPresetItems(configValue);
-      const markup = presetItems.map((preset, index) => {
-        const amount = preset.creationSettings.devBuySol || defaultQuickDevBuyAmounts[index];
+      const amounts = getQuickDevBuyPresetAmounts(configValue);
+      const markup = amounts.map((amount, index) => {
         if (devBuyPresetEditorOpen) {
           return `
         <label class="dev-buy-quick-button dev-buy-quick-button-editing" data-quick-buy-index="${index}">
@@ -689,7 +758,7 @@
       `;
         }
         return `
-      <button type="button" class="dev-buy-quick-button" data-quick-buy-index="${index}" data-quick-buy-preset-id="${escapeHTML(preset.id)}" data-quick-buy-amount="${escapeHTML(amount)}">
+      <button type="button" class="dev-buy-quick-button" data-quick-buy-index="${index}" data-quick-buy-amount="${escapeHTML(amount)}">
         <span class="dev-buy-quick-content">
           <img src="/images/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo quick-buy-sol-logo">
           <strong class="dev-buy-quick-value">${escapeHTML(amount)}</strong>
@@ -732,19 +801,11 @@
 
     function buildConfigWithUpdatedDevBuyPresets() {
       const configValue = cloneConfig(getConfig()) || createFallbackConfig();
-      const presetItems = getPresetItems(configValue);
       const editorInputs = getDevBuyPresetEditorInputs();
-      configValue.presets = configValue.presets || {};
-      configValue.presets.items = presetItems.map((preset, index) => {
+      configValue.defaults = configValue.defaults || {};
+      configValue.defaults.quickDevBuyAmounts = defaultQuickDevBuyAmounts.map((fallback, index) => {
         const input = editorInputs[index];
-        const nextValue = input ? String(input.value || "").trim() : "";
-        return {
-          ...preset,
-          creationSettings: {
-            ...(preset.creationSettings || {}),
-            devBuySol: nextValue,
-          },
-        };
+        return input ? String(input.value || "").trim() : fallback;
       });
       return configValue;
     }
@@ -837,7 +898,7 @@
 
       syncDevAutoSellUI();
       syncSettingsCapabilities();
-      if (standardizedDefaultsApplied && syncToMainForm) {
+      if (syncToMainForm || standardizedDefaultsApplied) {
         syncActivePresetFromInputs();
       }
       renderPresetChips();
@@ -849,6 +910,7 @@
       const configValue = cloneConfig(getConfig());
       const activePreset = getActivePreset(configValue);
       if (!activePreset) return;
+      syncProviderFeeValues();
       activePreset.creationSettings = {
         ...activePreset.creationSettings,
         provider: getProvider(),
@@ -1060,6 +1122,7 @@
       setActivePreset,
       validateNonNegativeSolField,
       validateOptionalAutoFeeCapField,
+      validateRequiredAutoFeeCapField,
       validateProviderFeeFields,
       validateRequiredPriorityFeeField,
       validateRequiredTipField,

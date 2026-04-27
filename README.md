@@ -1,501 +1,211 @@
-# LaunchDeck by Trench.tools
+# Trench.Tools - Arming the Solana trenches with open-source tooling.
 
-LaunchDeck is a self-hosted Solana launch and snipe tool built under the broader `Trench.tools` project.
+<p align="center">
+  <img src="assets/trench-tools-hero.png" alt="Trench Tools - the open-source trading stack for the trenches" width="100%">
+</p>
 
-[![Website](https://img.shields.io/badge/Website-trench.tools-2563eb?style=flat-square&logo=googlechrome&logoColor=white)](https://trench.tools/)
-[![Trench.tools on X](https://img.shields.io/badge/X-@TrenchDotTools-111111?style=flat-square&logo=x&logoColor=white)](https://x.com/TrenchDotTools)
-[![0xd3bt on X](https://img.shields.io/badge/X-@0xd3bt-111111?style=flat-square&logo=x&logoColor=white)](https://x.com/0xd3bt)
-[![Trench.tools Community](https://img.shields.io/badge/X-Community-111111?style=flat-square&logo=x&logoColor=white)](https://x.com/i/communities/2038790841418838419)
+<div align="center">
+  <table>
+    <tr>
+      <td align="center"><a href="https://trench.tools/"><strong>Website</strong></a></td>
+      <td align="center"><a href="https://x.com/TrenchDotTools"><strong>@TrenchDotTools</strong></a></td>
+      <td align="center"><a href="https://x.com/0xd3bt"><strong>@0xd3bt</strong></a></td>
+      <td align="center"><a href="https://x.com/i/communities/2038790841418838419"><strong>Community</strong></a></td>
+    </tr>
+  </table>
+</div>
 
-> ### Contract Address
-> `L73w5odyo5ZdJ1fPp319nfjqaFfHDdKifRmM8Kxpump`
+<div align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <strong>Contract Address</strong><br>
+        <code>L73w5odyo5ZdJ1fPp319nfjqaFfHDdKifRmM8Kxpump</code>
+      </td>
+    </tr>
+  </table>
+</div>
 
-LaunchDeck lets you run launches locally, use your own wallets and provider keys, and control how creation, buy, sell, and follow actions are built and sent.
+Trench Tools is a self-hosted Solana trading stack. You run it, you choose the RPCs and senders, and your wallets stay on your own machine or VPS.
 
-This repo is under active development. The README reflects the setup and features we consider usable today.
+The browser extension plugs into the terminals you already use, so you can trade with your own presets and wallet groups instead of routing everything through another platform account. LaunchDeck is the launch side: deploy, snipe, dev-buy, dev-sell, follow flows, reports, and automation.
 
-LaunchDeck is open-source tooling provided as-is. Running it, configuring it, modifying it, deploying it, or using it in any way is entirely the user's own responsibility. By using this software, you accept full responsibility for your environment, infrastructure, wallets, keys, dependencies, third-party packages, and any outcomes that result from its use.
+No mandatory accounts. No required platform fees. Clone it, run it, own what gets built, signed, and sent.
 
-![LaunchDeck product screenshot](docs/images/product-dashboard.png)
+This repo is under active development. The docs reflect the setup and features we consider usable today. The software is provided as-is; by using it, you accept responsibility for your machine, VPS, wallets, keys, dependencies, provider accounts, and any trading outcome.
+
+## What Trench Tools Is
+
+Trench Tools has three main pieces:
+
+- `execution engine` (`execution-engine`, port `8788`) - the local Rust trading host. It owns wallets, presets, fee and route resolution, transaction build/sign/send, confirmations, the balance/PnL event stream, and the voluntary Trench Tools fee setting. Anything that submits a trade goes through here. The browser extension talks to this for every trade.
+- `Trench Tools extension` - the Chrome/Edge extension that injects Trench Tools into supported trading terminals so you can trade with your presets and wallet groups from inside those sites. It talks to the local hosts over loopback by default and uses a shared bearer token.
+- `LaunchDeck` (`launchdeck-engine`, port `8789`, plus `launchdeck-follow-daemon` on port `8790`) - the launchpad feature inside Trench Tools. It handles deploy, snipe, dev-buy, dev-sell, and follow flows for Pump, Bonk, and Bagsapp. It has its own standalone UI on `http://127.0.0.1:8789` and is also available through the extension popout.
 
 ## Start Here
 
-Choose the path that matches how you plan to run LaunchDeck:
+For most users:
 
-- local Windows machine: go to `Quick Start` and expand `Windows Local Setup`
-- local Linux machine: go to `Quick Start` and expand `Linux Local Setup`
-- fresh VPS: use `docs/VPS_SETUP.md`
+1. Read [docs/QUICKSTART.md](docs/QUICKSTART.md) for local Windows/Linux setup.
+2. If you are using a fresh server, use [docs/VPS_SETUP.md](docs/VPS_SETUP.md) instead.
+3. Install the browser extension with [docs/EXTENSION.md](docs/EXTENSION.md). Get `extension/trench-tools` by pulling the repo with git, or download the full repository to your PC and load that extension folder.
+4. Keep [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) nearby for connection/auth issues.
 
-Practical recommendation:
+VPS is still the recommended real trading setup because it is cheap, private by default, and closer to the latency profile you actually care about. With a fresh VPS, the bootstrap startup script, and a Helius Developer tier plan, most users can get the stack up from scratch in about 5 minutes. Local setup is fine when you are editing, testing, or learning the tool.
 
-- even for testing, a VPS is the recommended path because it is cheap, usually more secure, and gives you the latency profile you actually care about
-- local machine setup is still supported when you intentionally want to experiment or edit from your own workstation
-- if you want a straightforward VPS provider, [Vultr](https://www.vultr.com/?ref=9589308) is the worked example used in `docs/VPS_SETUP.md`
-- Vultr is recommended here because it is easy to deploy quickly across a very wide range of regions, supports normal card/fiat-style payments as well as crypto, and has been reliable in long-term use
-- if you use Vultr, please use [my referral link](https://www.vultr.com/?ref=9589308)
-- any other VPS provider is also completely fine as long as you place it close to the provider endpoints and RPCs you actually plan to use
+If you get stuck during setup, use an AI coding assistant to walk through the steps with you. Cursor, Codex, Claude, and similar tools are all fine for checking install commands, editing `.env`, reading logs, and following the VPS guide. Do not paste real private keys, API keys, or auth tokens into any AI/chat tool.
 
-Personal note:
+## Which Mode Should I Run?
 
-- I have used Vultr for 5+ years and have not had issues with it
+Set the mode in `.env` first:
 
-AI setup help:
+- `TRENCH_TOOLS_MODE=` or `TRENCH_TOOLS_MODE=both` - normal full stack. Starts `execution-engine`, `launchdeck-engine`, and `launchdeck-follow-daemon`.
+- `TRENCH_TOOLS_MODE=ee` - extension trading only. Starts only `execution-engine` on `8788`.
+- `TRENCH_TOOLS_MODE=ld` - LaunchDeck only. Starts LaunchDeck and the follow daemon, but not extension trading.
 
-- if you use Cursor or Codex, you can have it help walk you through the setup steps, install commands, `.env` editing, and VPS bootstrapping
+Then use the simple repo-root commands:
+
+```bash
+npm start
+npm stop
+npm restart
+```
+
+You can still override the mode for a one-off run:
+
+- Windows: `.\trench-tools-start.ps1 --mode both`
+- Linux: `./trench-tools-start.sh --mode both`
+
+The launcher exits after the selected services pass their health checks. `npm stop` stops the running Trench Tools processes.
 
 ## Recommended Stack
 
-For most operators today, the best-supported testing and production setup is:
+For most operators today:
 
-- run LaunchDeck on a VPS rather than on your everyday local workstation
-- place the VPS close to the provider endpoints and RPCs you actually plan to use
+- run on a VPS near the provider endpoints and RPCs you actually use
 - EU VPS location: Frankfurt or Amsterdam
 - US VPS location: New York / Newark area or Salt Lake City area
 - Asia VPS location: Singapore or Tokyo
-- [Helius dev tier](https://www.helius.dev/pricing) for your main infrastructure
-- `Helius Gatekeeper HTTP` for `SOLANA_RPC_URL`
-- `Helius standard websocket` for `SOLANA_WS_URL`
-- a separate [Shyft](https://shyft.to/) free-tier RPC for `LAUNCHDECK_WARM_RPC_URL`
-- `Helius Sender` or `Hello Moon` as the execution provider
+- [Helius Developer tier](https://www.helius.dev/pricing), about $50/month, or better for the main infrastructure
+- `SOLANA_RPC_URL`: Helius Gatekeeper HTTP, `https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`
+- `SOLANA_WS_URL`: Helius standard websocket, `wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`
+- `WARM_RPC_URL`: separate [Shyft](https://shyft.to/) RPC if you want warm/cache traffic off your main Helius budget
+- execution provider: `Helius Sender` or `Hello Moon`
 
-Practical routing note:
+Why this split: Helius Gatekeeper HTTP has been the best Helius HTTP path in our testing, while Helius standard websocket has been the better watcher websocket path. Shyft is a good low-priority warm RPC because its free tier is useful for warmup, cache, and block-height traffic.
 
-- for EU, the default `eu` routing profile is already centered on Amsterdam + Frankfurt
-- for US, the practical target is New York / Newark area or Salt Lake City area; if you want to stay pinned to a Helius metro, use `ewr` or `slc`
-- for Asia, keep the VPS close to the Asian endpoints you actually plan to use, which usually means Singapore or Tokyo
-- if you are provisioning a fresh VPS, start with `docs/VPS_SETUP.md`
+Hello Moon is the recommended alternate low-latency provider. It requires Lunar Lander access from [Hello Moon docs](https://docs.hellomoon.io/reference/lunar-lander) or the [Hello Moon Discord](https://discord.com/invite/HelloMoon).
 
-Why this is the default recommendation:
+Do not treat any shared latency numbers as universal. Test from the VPS and region you actually run.
 
-- a nearby VPS usually matters more than workstation convenience once you care about live execution quality
-- Helius Gatekeeper HTTP benchmarked best for the main HTTP RPC path
-- Helius standard websocket benchmarked best for the watcher websocket path
-- [Helius dev tier](https://www.helius.dev/pricing) gives a noticeable improvement in watcher quality and execution consistency, especially when you run multiple snipes or watcher-heavy follow automation
-- Shyft is a good fit for `LAUNCHDECK_WARM_RPC_URL` because its free tier offers unlimited calls at `10 RPS`, and it is well-suited to warm/cache/block-height traffic
+### VPS Note
 
-### Benchmarked baseline
+[Vultr](https://www.vultr.com/?ref=9589308) is the worked example in [docs/VPS_SETUP.md](docs/VPS_SETUP.md). It is easy to deploy quickly across many regions, supports standard card/fiat payments as well as crypto, and has been reliable for long-term use. If you use Vultr, please use [my referral link](https://www.vultr.com/?ref=9589308). Any other VPS provider is fine as long as you place it close to the provider endpoints and RPCs you plan to use.
 
-This is the current baseline we are recommending from our own testing on a Frankfurt VPS:
+Personal note: I have used Vultr for 5+ years and have not had issues with it.
 
-- Shyft free tier
-- Helius Developer tier, about `$50/month`, via [Helius pricing](https://www.helius.dev/pricing)
-- 80 timed samples per metric
-- warmup cycles enabled
-- 100 ms request gap, about `10 RPS` per endpoint
+## Supported Sites
 
-Shareable summary:
+The extension site list is moving fast. Current status:
 
-| Provider | HTTP cold avg | HTTP warm avg | WS handshake | WS slotSubscribe avg | WS accountSubscribe avg | WS transactionSubscribe avg |
-| --- | --- | --- | --- | --- | --- | --- |
-| Shyft free tier | 18.97 ms | 18.15 ms | 18.46 ms | 4.77 ms | 5.55 ms | — |
-| Helius standard | 49.24 ms | 29.29 ms | 62.33 ms | 3.74 ms | 3.23 ms | 3.58 ms |
-| Helius Gatekeeper | 6.45 ms | 2.36 ms | 9.88 ms | 43.27 ms | 43.51 ms | 43.56 ms |
+- Live: `axiom.trade`
+- Available, currently disabled: `j7tracker.io`
+- Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, and more terminals
 
-Out of the Helius and Shyft options tested here:
+The foundation is ready, so adding more terminals is incremental. See [docs/EXTENSION.md](docs/EXTENSION.md) for the current extension setup and site-status details.
 
-- Helius Gatekeeper benchmarked best for the HTTP RPC path
-- Helius standard websocket benchmarked best for websocket watcher subscriptions
-- Shyft free tier was still strong enough to be a very good warm RPC choice
+## Voluntary Support Fee
 
-That is why the recommended split in LaunchDeck is:
+Trench Tools defaults to a voluntary `0.1%` fee on supported trade paths.
 
-- Helius Gatekeeper for `SOLANA_RPC_URL`
-- Helius standard websocket for `SOLANA_WS_URL`
-- Shyft free tier for `LAUNCHDECK_WARM_RPC_URL`
-
-Do not treat these numbers as universal.
-
-- benchmark your own connections, especially warm results, from the exact VPS and region you actually run
-- dedicated nodes or more specialized infra will likely beat this
-- for what LaunchDeck is currently meant to do, this baseline is already good enough to launch and compete for `0` block in hundreds of milliseconds
-
-If you want to reproduce or compare your own setup, use:
-
-- `docs/BENCHMARKING.md`
-- `Benchmarking/README.md`
-
-Hello Moon note:
-
-- `hellomoon` is a recommended alternate low-latency execution path
-- it requires a Lunar Lander API key from Hello Moon
-- request access through the [Lunar Lander docs](https://docs.hellomoon.io/reference/lunar-lander) or the [Hello Moon Discord](https://discord.com/invite/HelloMoon)
-
-## Easiest First Setup
-
-If you intentionally want to run LaunchDeck on your own machine, the local setup path is:
-
-1. choose one local setup section below: `Windows` or `Linux`
-2. install the prerequisites for your platform and run `npm install`
-3. copy `.env.example` to `.env`
-4. fill only the values already listed in `.env.example`
-5. start LaunchDeck with `npm start`
-6. leave the advanced defaults alone until you actually need them
-
-The starter template is meant to be enough for a normal first setup. If you want every variable, use `.env.advanced` and `docs/ENV_REFERENCE.md`.
-
-Choose the setup path that matches how you actually run LaunchDeck:
-
-- local workstation or existing machine: follow the quick-start steps in this README
-- fresh VPS instance: use `docs/VPS_SETUP.md` first; this is still the recommended path even for testing because it is cheap, private by default, and closer to the latency profile you actually want
-
-For the exact starter `.env` values, use the `Recommended .env values` section in `Quick Start` below.
-
-## What Is Already Enabled By Default
-
-You do not need to manually enable most of the runtime behavior we recommend.
-
-These already default on or to sensible production values:
-
-- startup warm
-- continuous warm
-- idle warm suspend
-- Helius `transactionSubscribe` probe/fallback behavior when your websocket is Helius
-- Bonk and Bags helper workers
-- benchmark mode `full`
-- Helius auto-fee priority level `high`
-- Jito auto-fee percentile `p99`
-- main host port `8789`
-- follow daemon port `8790`
-
-In most setups, the best move is to leave those defaults alone and start with the values in `.env.example`.
-
-## How The Runtime Works
-
-LaunchDeck runs as two local Rust processes:
-
-- the main host on `http://127.0.0.1:8789` by default
-- the follow daemon on `http://127.0.0.1:8790` by default
-
-The main host serves:
-
-- the browser UI
-- browser-facing `/api/*` routes
-- engine execution routes
-- uploaded assets
-
-The follow daemon handles:
-
-- delayed buys and sells
-- realtime slot, signature, and market watchers
-- follow timing and watcher health
-- persisted follow-job state outside the main request lifecycle
-
-### Warmup and keep-alive
-
-LaunchDeck separates three ideas:
-
-- execution transport
-- read/confirm RPC
-- watcher websocket
-
-In practice:
-
-- `Helius Sender` or `Hello Moon` handle the low-latency send path
-- `SOLANA_RPC_URL` handles reads, confirmations, and general runtime RPC behavior
-- `SOLANA_WS_URL` handles realtime watchers
-- `LAUNCHDECK_WARM_RPC_URL` handles startup warm, continuous warm probes, and block-height observation so that traffic does not have to hit your main execution RPC
-
-Current warm behavior:
-
-- startup warm runs once when the app starts
-- continuous warm keeps the active routes hot while the app is in use
-- idle warm suspend pauses that background warm traffic when the app is idle
-- watcher websocket warm probes the configured watcher path; it is not a separate provider-region fanout path
-
-When you save settings:
-
-- if the effective send routes changed, LaunchDeck immediately rewarms the new paths
-- if the effective routes did not change, LaunchDeck keeps the current warm schedule instead of needlessly restarting it
-
-### Region and metro routing
-
-`USER_REGION` is the shared default profile for region-aware providers.
-
-Supported group values:
-
-- `global`
-- `us`
-- `eu`
-- `asia`
-
-Supported metro tokens:
-
-- `slc`
-- `ewr`
-- `lon`
-- `fra`
-- `ams`
-- `sg`
-- `tyo`
-
-Important behavior:
-
-- Helius Sender supports exact metro routing where those metros exist
-- Hello Moon maps unsupported metros onto the closest Hello Moon endpoints it actually exposes
-- `eu` fans out across Amsterdam + Frankfurt
-- `asia` fans out across Singapore + Tokyo on Helius Sender, while Hello Moon `asia` / `sg` fall back to Tokyo
-- `us` fans out across Salt Lake City + Newark on Helius Sender, while Hello Moon `us` / `slc` / `ewr` fan out across New York + Ashburn
-
-## Quick Start
-
-### 1. Choose Your Local Platform
-
-LaunchDeck uses:
-
-- Rust for the engine and follow daemon
-- Node.js for runtime helpers and launchpad helper scripts
-
-If you are running LaunchDeck on your own machine, expand one section below and follow only that section.
-
-If you are starting from a blank VPS instead, use `docs/VPS_SETUP.md` rather than the local-machine steps here.
-
-<details>
-<summary>Windows Local Setup</summary>
-
-Use PowerShell for the local setup flow.
-
-Install first:
-
-- [`Git`](https://git-scm.com/downloads)
-- [`Node.js 20`](https://nodejs.org/en/download)
-- Rust stable with the normal Windows MSVC toolchain from [`rustup`](https://rustup.rs/)
-- [`Visual Studio Build Tools`](https://visualstudio.microsoft.com/downloads/) with the C++ toolchain if your Rust build complains about missing linker or compiler tools
-
-Recommended flow from the repo root:
-
-```powershell
-npm install
-Copy-Item .env.example .env
-```
-
-Practical notes:
-
-- after installing Rust for the first time, reopen PowerShell before running `npm install`
-- `npm start`, `npm stop`, and `npm restart` use the repo's PowerShell runtime scripts on Windows
-- if startup fails, check `.local\launchdeck\engine-error.log` and `.local\launchdeck\follow-daemon-error.log`
-
-</details>
-
-<details>
-<summary>Linux Local Setup</summary>
-
-These commands assume a Debian or Ubuntu style machine. On other distros, install the equivalent packages first.
-
-Install first:
-
-- [`Git`](https://git-scm.com/downloads)
-- [`Node.js 20`](https://nodejs.org/en/download)
-- Rust stable via [`rustup`](https://rustup.rs/)
-- build tools such as [`build-essential`](https://packages.ubuntu.com/search?keywords=build-essential), [`pkg-config`](https://packages.ubuntu.com/search?keywords=pkg-config), and [`libssl-dev`](https://packages.ubuntu.com/search?keywords=libssl-dev)
-
-Example flow:
+To turn it off:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y git curl build-essential pkg-config libssl-dev
-curl https://sh.rustup.rs -sSf | sh -s -- -y
-source "$HOME/.cargo/env"
-npm install
-cp .env.example .env
+TRENCH_TOOL_FEE=0
 ```
 
-Practical notes:
-
-- if you install Node.js through your package manager, make sure you end up on `Node.js 20`
-- after a first-time Rust install, either `source "$HOME/.cargo/env"` or open a new shell before running LaunchDeck commands
-- if startup fails, check `.local/launchdeck/engine-error.log` and `.local/launchdeck/follow-daemon-error.log`
-
-</details>
-
-Manual/local install baseline:
-
-- Node.js `20`
-- Rust stable via `rustup`
-- Git
-- build tools such as `build-essential`, `pkg-config`, and `libssl-dev` on Ubuntu
-
-If you are starting from a blank VPS, do not hand-roll that first pass unless you want to. `docs/VPS_SETUP.md` walks through the current bootstrap path and the `scripts/vps-bootstrap.sh` installer handles the common system packages plus Rust, Node.js, repo clone, `npm install`, and the `systemd` service setup.
-
-From the repo root, once your dependencies are installed:
+To keep the default, leave it blank or set:
 
 ```bash
-npm install
+TRENCH_TOOL_FEE=0.1
 ```
 
-### 2. Configure `.env`
-
-Copy `.env.example` to `.env`, then fill the starter values.
-
-If you used one of the platform sections above, you may already have created `.env`. In that case, just edit it now.
-
-If you want the full list, use:
-
-- `.env.advanced`
-- `docs/ENV_REFERENCE.md`
-
-### 3. Start the runtime
-
-Primary commands:
-
-- `npm start`
-- `npm stop`
-- `npm restart`
-
-`npm start` launches both the main host and the follow daemon together, waits for health, and opens the UI when supported.
-
-First-run note:
-
-- the first startup can take several minutes because Rust may still need to build the binaries
-
-What success looks like:
-
-- the main host becomes available at `http://127.0.0.1:8789`
-- the follow daemon becomes available at `http://127.0.0.1:8790`
-- the UI opens automatically when your platform supports that behavior
-
-If startup fails, check these logs first:
-
-- Windows: `.local\launchdeck\engine-error.log` and `.local\launchdeck\follow-daemon-error.log`
-- Linux: `.local/launchdeck/engine-error.log` and `.local/launchdeck/follow-daemon-error.log`
-
-### 4. Open the UI
-
-Default local URL:
-
-- `http://127.0.0.1:8789`
-
-Basic run flow:
-
-- confirm your wallets are loaded from `SOLANA_PRIVATE_KEY*`
-- set your normal preset defaults in the Settings modal
-- you are ready to launch
-
-### First Live Run Checklist
-
-For the first live launch, keep it simple:
-
-1. load one wallet
-2. set `SOLANA_RPC_URL`, `SOLANA_WS_URL`, `USER_REGION`, and `LAUNCHDECK_WARM_RPC_URL`
-3. leave the provider on `Helius Sender`
-4. run `Build`
-5. run `Simulate`
-6. only then run `Deploy`
-
-### Recommended `.env` values
-
-If you do not want to fetch the exact Helius URLs from the dashboard yourself, you can copy these exactly and replace only the API key:
+To increase support to `0.2%`:
 
 ```bash
-SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
-SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
-LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY
+TRENCH_TOOL_FEE=0.2
 ```
 
-Put your Helius key immediately after `api-key=`. Put your Shyft key immediately after `api_key=`.
+Restart the runtime after changing `.env`. If Trench Tools has saved you money and time and you want to support development and future tools, consider leaving the default `0.1%` fee enabled. It is still much lower than the average fee charged by current trading platforms.
 
-At minimum, most operators should set:
+## Quick Verification
 
-- `SOLANA_PRIVATE_KEY` or the `SOLANA_PRIVATE_KEY*` wallet slots they want to use
-- `SOLANA_RPC_URL`
-- `SOLANA_WS_URL`
-- `USER_REGION`
-- `LAUNCHDECK_WARM_RPC_URL`
+After setup:
 
-Optional but common:
+- `execution-engine` is reachable at `http://127.0.0.1:8788`
+- `launchdeck-engine` is reachable at `http://127.0.0.1:8789` when running `both` or `ld`
+- `launchdeck-follow-daemon` is running behind LaunchDeck when running `both` or `ld`
+- the token file exists at `.local/trench-tools/default-engine-token.txt`
+- Extension Options -> Global settings shows the expected host connection state
+- Axiom shows the enabled Trench Tools surfaces
 
-- `HELLOMOON_API_KEY`
-- `BAGS_API_KEY`
-- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
-- `PINATA_JWT`
-- `LAUNCHDECK_BENCHMARK_MODE`
+If the runtime is on a VPS and your browser is on your own computer, add both forwards to your SSH config so Cursor/SSH opens them automatically:
 
-## Security Note
+```sshconfig
+Host Trenchtools-vps
+  HostName YOUR_SERVER_IP
+  User root
+  LocalForward 8788 127.0.0.1:8788
+  LocalForward 8789 127.0.0.1:8789
+  ExitOnForwardFailure yes
+  ServerAliveInterval 30
+```
+
+Manual fallback:
+
+```bash
+ssh -L 8788:127.0.0.1:8788 -L 8789:127.0.0.1:8789 root@YOUR_SERVER_IP
+```
+
+Use a small test amount first. Start with the recommended providers: `Helius Sender` or `Hello Moon`.
+
+## Security
 
 Keep the runtime private by default:
 
-- do not expose the raw LaunchDeck UI publicly unless you intentionally add your own access controls
-- do not share your `.env`
-- keep private keys only on the machine or VPS that is actually running LaunchDeck
-- for production, prefer the SSH-tunnel VPS pattern documented in `docs/VPS_SETUP.md`
+- do not share `.env`
+- do not paste real private keys, API keys, JWTs, or auth tokens into issues, screenshots, Discord, or support messages
+- do not expose raw local ports to the public internet
+- use the SSH-tunnel VPS pattern in [docs/VPS_SETUP.md](docs/VPS_SETUP.md)
+- use HTTPS and browser host-permission grants if you intentionally point the extension at non-loopback hosts
 
-## Provider Summary
-
-Current provider choices:
-
-- `Helius Sender`
-- `Hello Moon`
-- `Standard RPC`
-- `Jito Bundle`
-
-Current recommendation:
-
-- start with `Helius Sender` if you want the easiest production default
-- use `Hello Moon` when you want a strong alternate low-latency execution path
-- use `Standard RPC` when you want explicit plain-RPC transport behavior
-- use `Jito Bundle` when you explicitly want bundle semantics
-
-## Follow Automation
-
-LaunchDeck supports:
-
-- same-time sniper buys
-- delayed sniper buys
-- confirmed-block sniper buys
-- automatic dev sell
-- snipe sells
-
-This is handled by the dedicated follow daemon so the main launch request does not have to stay open for delayed actions.
-
-## Current Support
-
-High-level support today:
-
-- Pump: verified primary path
-- Bonk: verified helper-backed path
-- Bagsapp: supported when Bags credentials are configured
-
-See `docs/LAUNCHPADS.md` for the detailed launchpad and mode matrix.
+Read [SECURITY.md](SECURITY.md) before running this with real wallets.
 
 ## Documentation Map
 
 Start here:
 
-- `README.md`
-  First setup path and docs map
-- `docs/CONFIG.md`
-  Recommended setup, runtime behavior, warm/watch explanation, and operator-facing config guidance
-- `docs/ENV_REFERENCE.md`
-  Full environment variable reference, defaults, and override behavior
+- [docs/QUICKSTART.md](docs/QUICKSTART.md) - local Windows/Linux setup, first run, and first extension connection
+- [docs/VPS_SETUP.md](docs/VPS_SETUP.md) - fresh VPS setup, bootstrap script, systemd service, SSH tunnels
+- [docs/EXTENSION.md](docs/EXTENSION.md) - Chrome/Edge developer-mode install, host pairing, auth token, presets, sites, updates
+- [docs/CONFIG.md](docs/CONFIG.md) - recommended stack, runtime defaults, Helius guidance, regions, warm behavior
+- [docs/ENV_REFERENCE.md](docs/ENV_REFERENCE.md) - every `.env.example` and `.env.advanced` variable
 
-Execution and routing:
+Execution and architecture:
 
-- `docs/PROVIDERS.md`
-  Provider behavior, endpoint profiles, endpoint catalogs, and routing rules
-- `docs/EXECUTION_DOS_AND_DONTS.md`
-  Lower-level execution transport reference and implementation rules
+- [docs/PROVIDERS.md](docs/PROVIDERS.md) - Helius Sender, Hello Moon, and deferred provider notes
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - execution engine, extension, LaunchDeck, auth flow, local state
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - startup, extension auth, VPS, RPC, and provider issues
 
-Operator guides:
+LaunchDeck:
 
-- `docs/USAGE.md`
-  Normal UI workflow from startup through deploy and reuse
-- `docs/FOLLOW_DAEMON.md`
-  Follow daemon, triggers, watcher behavior, and follow timing
-- `docs/VPS_SETUP.md`
-  VPS deployment and SSH-tunnel workflow
+- [docs/launchdeck/USAGE.md](docs/launchdeck/USAGE.md) - LaunchDeck operator workflow
+- [docs/launchdeck/LAUNCHPADS.md](docs/launchdeck/LAUNCHPADS.md) - Pump, Bonk, Bagsapp support matrix
+- [docs/launchdeck/STRATEGIES.md](docs/launchdeck/STRATEGIES.md) - dev buys, snipes, dev sells, follow sells
+- [docs/launchdeck/FOLLOW_DAEMON.md](docs/launchdeck/FOLLOW_DAEMON.md) - watcher ownership, triggers, and follow timing
+- [docs/launchdeck/REPORTING.md](docs/launchdeck/REPORTING.md) - reports, history, and local state
 
-Reporting, troubleshooting, and benchmarking:
+Contributor/internal reference:
 
-- `docs/TROUBLESHOOTING.md`
-  Common operator problems and what to check
-- `docs/REPORTING.md`
-  Reports, history, and local state
-- `docs/BENCHMARKING.md`
-  Benchmarking concepts and how to interpret results
-- `Benchmarking/README.md`
-  Copy-paste benchmark commands
-
-Additional reference:
-
-- `docs/LAUNCHPADS.md`
-- `docs/STRATEGIES.md`
-- `docs/ARCHITECTURE.md`
+- [docs/internal/EXECUTION_DOS_AND_DONTS.md](docs/internal/EXECUTION_DOS_AND_DONTS.md)
+- [docs/internal/ROUTE_SOURCE_POLICY.md](docs/internal/ROUTE_SOURCE_POLICY.md)

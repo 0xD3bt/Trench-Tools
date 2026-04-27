@@ -25,6 +25,8 @@ install_base_packages() {
     tmux \
     htop \
     jq \
+    lsof \
+    iproute2 \
     build-essential \
     pkg-config \
     libssl-dev \
@@ -74,6 +76,7 @@ sync_repo() {
 
   cd "$LAUNCHDECK_DIR"
   npm install
+  chmod +x "$LAUNCHDECK_DIR"/trench-tools-*.sh
 
   if [[ ! -f "$LAUNCHDECK_DIR/.env" ]]; then
     cp "$LAUNCHDECK_DIR/.env.example" "$LAUNCHDECK_DIR/.env"
@@ -83,7 +86,7 @@ sync_repo() {
 write_systemd_service() {
   cat >/etc/systemd/system/${LAUNCHDECK_SERVICE_NAME}.service <<EOF
 [Unit]
-Description=LaunchDeck runtime
+Description=Trench Tools runtime
 After=network-online.target
 Wants=network-online.target
 
@@ -92,10 +95,13 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${LAUNCHDECK_DIR}
 Environment=HOME=/root
+Environment=CARGO_HOME=/root/.cargo
+Environment=RUSTUP_HOME=/root/.rustup
+Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/bin/env bash -lc 'cd "${LAUNCHDECK_DIR}" && npm start'
 ExecStop=/usr/bin/env bash -lc 'cd "${LAUNCHDECK_DIR}" && npm stop'
 ExecReload=/usr/bin/env bash -lc 'cd "${LAUNCHDECK_DIR}" && npm restart'
-TimeoutStartSec=300
+TimeoutStartSec=1800
 TimeoutStopSec=180
 
 [Install]
@@ -121,7 +127,7 @@ start_launchdeck() {
 print_next_steps() {
   cat <<EOF
 
-LaunchDeck bootstrap complete.
+Trench Tools bootstrap complete.
 
 Project path:
   ${LAUNCHDECK_DIR}
@@ -131,14 +137,29 @@ Service commands:
   systemctl restart ${LAUNCHDECK_SERVICE_NAME}
   journalctl -u ${LAUNCHDECK_SERVICE_NAME} -n 100 --no-pager
 
+Default local hosts on the VPS:
+  execution-engine:          http://127.0.0.1:8788
+  launchdeck-engine:         http://127.0.0.1:8789
+  launchdeck-follow-daemon:  http://127.0.0.1:8790
+
+Shared auth token file:
+  ${LAUNCHDECK_DIR}/.local/trench-tools/default-engine-token.txt
+
 Next steps:
   1. Edit ${LAUNCHDECK_DIR}/.env
-  2. Restart the service
-  3. Open an SSH tunnel from your local machine:
-       ssh -L 8789:127.0.0.1:8789 root@YOUR_SERVER_IP
-  4. Visit http://127.0.0.1:8789 in your browser
+  2. Restart the service:
+       systemctl restart ${LAUNCHDECK_SERVICE_NAME}
+  3. From your local computer, keep an SSH tunnel open while using the browser:
+       ssh -L 8788:127.0.0.1:8788 -L 8789:127.0.0.1:8789 root@YOUR_SERVER_IP
+  4. Use these local URLs in your browser/extension:
+       Execution host:  http://127.0.0.1:8788
+       LaunchDeck host: http://127.0.0.1:8789
 
-The UI stays bound to localhost on the VPS by default. Use the SSH tunnel unless you intentionally add your own reverse proxy later.
+Recommended daily use:
+  Add those LocalForward entries to your local SSH config so Cursor/SSH opens
+  the browser tunnel automatically whenever you connect.
+
+Keep the raw local hosts private. Use SSH tunnels unless you intentionally add your own HTTPS reverse proxy and access controls.
 EOF
 }
 

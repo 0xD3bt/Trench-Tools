@@ -296,6 +296,11 @@
       return typeof state.getLastDevBuyEditSource === "function" ? state.getLastDevBuyEditSource() : "sol";
     }
 
+    function hasDevBuyAmountSelected() {
+      const amountInput = getNamedInput("devBuyAmount");
+      return Boolean(amountInput && String(amountInput.value || "").trim());
+    }
+
     function getActiveFeeSplitDraftLaunchpad() {
       return typeof state.getActiveFeeSplitDraftLaunchpad === "function"
         ? state.getActiveFeeSplitDraftLaunchpad()
@@ -943,7 +948,11 @@
           if (showValidationErrors(errors)) return;
           clearValidationErrors();
           if (action === "deploy") {
-            showDeployModal();
+            if (hasDevBuyAmountSelected()) {
+              showDeployModal();
+            } else {
+              run(action);
+            }
           } else {
             run(action);
           }
@@ -1053,10 +1062,8 @@
           if (isDevBuyPresetEditorOpen()) return;
           const button = event.target.closest("[data-quick-buy-amount]");
           if (!button) return;
-          const presetId = button.getAttribute("data-quick-buy-preset-id") || defaultPresetId;
           const amount = button.getAttribute("data-quick-buy-amount") || "";
           if (!amount) return;
-          setActivePreset(presetId);
           await triggerDeployWithDevBuy("sol", amount, "sol");
         });
       }
@@ -1065,16 +1072,23 @@
         devBuyCustomDeployButton.addEventListener("click", async () => {
           const mode = getDevBuyMode();
           const amountInput = getNamedInput("devBuyAmount");
-          const amount = amountInput ? String(amountInput.value || "").trim() : "";
+          let amount = amountInput ? String(amountInput.value || "").trim() : "";
+          let source = getLastDevBuyEditSource();
+          if (!amount && mode === "sol" && devBuySolInput) {
+            amount = String(devBuySolInput.value || "").trim();
+            if (amount) source = "custom-sol";
+          } else if (mode === "sol" && source === "sol") {
+            source = "custom-sol";
+          }
           if (!amount) {
             clearDevBuyState();
             const errors = validateForm();
             if (showValidationErrors(errors)) return;
             clearValidationErrors();
-            showDeployModal();
+            await run("deploy");
             return;
           }
-          await triggerDeployWithDevBuy(mode, amount, getLastDevBuyEditSource());
+          await triggerDeployWithDevBuy(mode, amount, source);
         });
       }
 

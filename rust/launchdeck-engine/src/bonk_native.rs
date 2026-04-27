@@ -3,34 +3,30 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
-use serde::{Deserialize, Serialize, de::DeserializeOwned, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use shared_execution_routing::alt_manifest::lookup_table_address_content_hash;
 use solana_address_lookup_table_interface::state::AddressLookupTable;
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    fs,
-    path::PathBuf,
-    process::Stdio,
-    str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
-};
 use solana_sdk::{
     hash::Hash,
     instruction::{AccountMeta, Instruction},
     message::{AddressLookupTableAccount, VersionedMessage, v0},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    transaction::{Transaction, VersionedTransaction},
+    transaction::VersionedTransaction,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    sync::Semaphore,
-    time::{Duration, timeout},
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    fs,
+    str::FromStr,
+    sync::{Mutex, OnceLock},
 };
+use tokio::time::Duration;
+use uuid::Uuid;
 
 use crate::{
+    compiled_transaction_signers,
     config::{
         NormalizedConfig, NormalizedExecution, configured_default_dev_auto_sell_compute_unit_limit,
         configured_default_follow_up_compute_unit_limit,
@@ -38,16 +34,16 @@ use crate::{
         configured_default_launch_usd1_topup_compute_unit_limit,
         configured_default_sniper_buy_compute_unit_limit, validate_launchpad_support,
     },
-    helper_worker::{
-        HelperWorkerClient, HelperWorkerConfig, HelperWorkerError, helper_worker_enabled,
-    },
     launchpad_dispatch::{launchpad_action_backend, launchpad_action_rollout_state},
     paths,
     report::{
         BonkUsd1LaunchSummary, FeeSettings, InstructionSummary, TransactionSummary, build_report,
         render_report,
     },
-    rpc::{CompiledTransaction, fetch_account_data, fetch_latest_blockhash_cached},
+    rpc::{
+        CompiledTransaction, fetch_account_data, fetch_account_data_with_owner,
+        fetch_latest_blockhash_cached, fetch_multiple_account_data,
+    },
     transport::TransportPlan,
     wallet::read_keypair_bytes,
 };
@@ -66,52 +62,41 @@ const BONK_LETSBONK_PLATFORM_ID: &str = "FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN
 const BONK_BONKERS_PLATFORM_ID: &str = "82NMHVCKwehXgbXMyzL41mvv3sdkypaMCtTxvJ4CtTzm";
 const BONK_SOL_QUOTE_MINT: &str = "So11111111111111111111111111111111111111112";
 const BONK_USD1_QUOTE_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
-const BONK_USD1_SUPER_LOOKUP_TABLE: &str = "GHVFasDr4sFtF2fMNBLnaRUKeSxX77DgK5SsThB3Ro7U";
+const BONK_USD1_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc";
 const BONK_PINNED_USD1_ROUTE_POOL_ID: &str = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS";
 const BONK_PREFERRED_USD1_ROUTE_CONFIG_ID: &str = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp";
 const BONK_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
-const RAYDIUM_POOL_SEARCH_MINT_ENDPOINT: &str = "https://api-v3.raydium.io/pools/info/mint";
-const RAYDIUM_MAINNET_LAUNCH_CONFIGS_ENDPOINT: &str = "https://launch-mint-v1.raydium.io/main/configs";
-const RAYDIUM_DEVNET_LAUNCH_CONFIGS_ENDPOINT: &str =
-    "https://launch-mint-v1-devnet.raydium.io/main/configs";
+const BONK_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+const BONK_MAINNET_SOL_LAUNCH_CONFIG_ID: &str = "6s1xP3hpbAfFoNtUNF8mfHsjr2Bd97JxFJRWLbL6aHuX";
+const BONK_MAINNET_USD1_LAUNCH_CONFIG_ID: &str = "EPiZbnrThjyLnoQ6QQzkxeFqyL5uyg9RzNHHAudUPxBz";
+const BONK_DEFAULT_SUPPLY_INIT: &str = "1000000000000000";
+const BONK_DEFAULT_TOTAL_SELL_A: &str = "793100000000000";
+const BONK_DEFAULT_SOL_TOTAL_FUND_RAISING_B: &str = "85000000000";
+const BONK_DEFAULT_USD1_TOTAL_FUND_RAISING_B: &str = "12500000000";
+const BONK_CLMM_MINT_A_OFFSET: usize = 73;
+const BONK_CLMM_MINT_B_OFFSET: usize = 105;
+const BONK_CPMM_TOKEN_0_MINT_OFFSET: usize = 168;
+const BONK_CPMM_TOKEN_1_MINT_OFFSET: usize = 200;
 const BONK_DEFAULT_LAUNCH_DEFAULTS_CACHE_TTL_MS: u64 = 30 * 60 * 1000;
 const BONK_DEFAULT_USD1_ROUTE_SETUP_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
 const BONK_DEFAULT_LOOKUP_TABLE_CACHE_TTL_MS: u64 = 30 * 60 * 1000;
+const BONK_STARTUP_WARM_DEFAULT_STAGGER_MS: u64 = 400;
 const BONK_TOKEN_DECIMALS: u32 = 6;
+const DEFAULT_BONK_SELL_COMPUTE_UNIT_LIMIT: u64 = 240_000;
 const BONK_FEE_RATE_DENOMINATOR: u64 = 1_000_000;
 const BONK_SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const BONK_CLMM_TICK_ARRAY_SIZE: i32 = 60;
 const BONK_CLMM_DEFAULT_BITMAP_OFFSET: i32 = 512;
 const BONK_USD1_QUOTE_MAX_INPUT_LAMPORTS: u64 = 100_000 * 1_000_000_000;
+const BONK_USD1_ROUTE_SLIPPAGE_BPS: u64 = 1_000;
 const BONK_CLMM_MIN_SQRT_PRICE_X64_PLUS_ONE: u128 = 4_295_048_017;
+const BONK_CLMM_MAX_SQRT_PRICE_X64_MINUS_ONE: u128 = 79_226_673_521_066_979_257_578_248_091;
 const BONK_CLMM_SWAP_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
+const BONK_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
 const BONK_INITIALIZE_V2_DISCRIMINATOR: [u8; 8] = [67, 153, 175, 39, 218, 16, 38, 32];
-const DEFAULT_HELPER_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_HELPER_MAX_CONCURRENCY: usize = 4;
 const BONK_BUY_EXACT_IN_DISCRIMINATOR: [u8; 8] = [250, 234, 13, 123, 213, 156, 19, 236];
 const BONK_SELL_EXACT_IN_DISCRIMINATOR: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
-
-fn helper_timeout_ms() -> u64 {
-    std::env::var("LAUNCHDECK_LAUNCHPAD_HELPER_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_HELPER_TIMEOUT_MS)
-}
-
-fn helper_semaphore() -> Arc<Semaphore> {
-    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEMAPHORE
-        .get_or_init(|| {
-            let limit = std::env::var("LAUNCHDECK_LAUNCHPAD_HELPER_MAX_CONCURRENCY")
-                .ok()
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(DEFAULT_HELPER_MAX_CONCURRENCY);
-            Arc::new(Semaphore::new(limit))
-        })
-        .clone()
-}
+const BONK_CPMM_AUTH_SEED: &[u8] = b"vault_and_lp_mint_auth_seed";
 
 fn bonk_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -170,33 +155,13 @@ pub struct BonkImportContext {
     pub detectionSource: String,
 }
 
-#[derive(Debug, Serialize)]
-struct HelperTxConfig<'a> {
-    computeUnitLimit: u64,
-    computeUnitPriceMicroLamports: u64,
-    tipLamports: u64,
-    tipAccount: &'a str,
-    jitodontfront: bool,
-    singleBundleTipLastTx: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperCompiledTransaction {
-    label: String,
-    format: String,
-    blockhash: String,
-    lastValidBlockHeight: u64,
-    serializedBase64: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BonkPoolAddressClassification {
+    pub mint: String,
+    pub pool_id: String,
+    pub family: String,
     #[serde(default)]
-    lookupTablesUsed: Vec<String>,
-    #[serde(default)]
-    computeUnitLimit: Option<u64>,
-    #[serde(default)]
-    computeUnitPriceMicroLamports: Option<u64>,
-    #[serde(default)]
-    inlineTipLamports: Option<u64>,
-    #[serde(default)]
-    inlineTipAccount: Option<String>,
+    pub quote_asset: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -229,65 +194,6 @@ struct HelperUsd1QuoteMetrics {
     bufferQuoteCalls: u64,
     #[serde(default)]
     searchIterations: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperLaunchResponse {
-    mint: String,
-    launchCreator: String,
-    compiledTransactions: Vec<HelperCompiledTransaction>,
-    #[serde(default)]
-    predictedDevBuyTokenAmountRaw: Option<String>,
-    #[serde(default)]
-    atomicCombined: bool,
-    #[serde(default)]
-    atomicFallbackReason: Option<String>,
-    #[serde(default)]
-    usd1LaunchDetails: Option<HelperUsd1LaunchDetails>,
-    #[serde(default)]
-    usd1QuoteMetrics: Option<HelperUsd1QuoteMetrics>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperUsd1LaunchDetails {
-    compilePath: String,
-    requiredQuoteAmount: String,
-    currentQuoteAmount: String,
-    shortfallQuoteAmount: String,
-    #[serde(default)]
-    inputSol: Option<String>,
-    #[serde(default)]
-    expectedQuoteOut: Option<String>,
-    #[serde(default)]
-    minQuoteOut: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperFollowBuyResponse {
-    compiledTransaction: HelperCompiledTransaction,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperFollowSellResponse {
-    compiledTransaction: Option<HelperCompiledTransaction>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperPredictDevBuyResponse {
-    #[serde(default)]
-    predictedDevBuyTokenAmountRaw: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperDerivePoolIdResponse {
-    poolId: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperUsd1TopupResponse {
-    compiledTransaction: Option<HelperCompiledTransaction>,
-    #[serde(default)]
-    usd1QuoteMetrics: Option<HelperUsd1QuoteMetrics>,
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +262,9 @@ struct DecodedBonkClmmPool {
     amm_config: Pubkey,
     mint_a: Pubkey,
     mint_b: Pubkey,
+    vault_a: Pubkey,
+    vault_b: Pubkey,
+    observation_id: Pubkey,
     mint_decimals_a: u8,
     mint_decimals_b: u8,
     tick_spacing: u16,
@@ -363,6 +272,58 @@ struct DecodedBonkClmmPool {
     sqrt_price_x64: BigUint,
     tick_current: i32,
     tick_array_bitmap: [u64; 16],
+}
+
+#[derive(Debug, Clone)]
+struct DecodedBonkCpmmPool {
+    config_id: Pubkey,
+    vault_a: Pubkey,
+    vault_b: Pubkey,
+    token_0_mint: Pubkey,
+    token_1_mint: Pubkey,
+    token_0_program: Pubkey,
+    token_1_program: Pubkey,
+    observation_id: Pubkey,
+    mint_decimals_a: u8,
+    mint_decimals_b: u8,
+    protocol_fees_mint_a: u64,
+    protocol_fees_mint_b: u64,
+    fund_fees_mint_a: u64,
+    fund_fees_mint_b: u64,
+    enable_creator_fee: bool,
+    creator_fees_mint_a: u64,
+    creator_fees_mint_b: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DecodedBonkCpmmConfig {
+    trade_fee_rate: u64,
+    creator_fee_rate: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NativeBonkCpmmPoolContext {
+    pool_id: Pubkey,
+    pool: DecodedBonkCpmmPool,
+    config: DecodedBonkCpmmConfig,
+    reserve_a: u64,
+    reserve_b: u64,
+    quote: BonkQuoteAssetConfig,
+}
+
+#[derive(Debug, Clone)]
+struct NativeBonkClmmPoolContext {
+    setup: BonkUsd1RouteSetup,
+    quote: BonkQuoteAssetConfig,
+    mint_program_a: Pubkey,
+    mint_program_b: Pubkey,
+}
+
+#[derive(Debug, Clone)]
+enum NativeBonkTradeVenueContext {
+    Launchpad(NativeBonkPoolContext),
+    RaydiumCpmm(NativeBonkCpmmPoolContext),
+    RaydiumClmm(NativeBonkClmmPoolContext),
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +343,12 @@ struct BonkClmmTickArray {
 pub struct BonkUsd1RouteSetup {
     pool_id: Pubkey,
     program_id: Pubkey,
+    amm_config: Pubkey,
+    mint_a: Pubkey,
+    mint_b: Pubkey,
+    vault_a: Pubkey,
+    vault_b: Pubkey,
+    observation_id: Pubkey,
     tick_spacing: i32,
     trade_fee_rate: u32,
     sqrt_price_x64: BigUint,
@@ -391,6 +358,7 @@ pub struct BonkUsd1RouteSetup {
     mint_b_decimals: u32,
     current_price: f64,
     tick_arrays_desc: Vec<i32>,
+    tick_arrays_asc: Vec<i32>,
     tick_arrays: HashMap<i32, BonkClmmTickArray>,
 }
 
@@ -414,6 +382,22 @@ struct PersistedBonkLookupTableCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedBonkLookupTableEntry {
     addresses: Vec<String>,
+    #[serde(default)]
+    address_count: Option<usize>,
+    #[serde(default)]
+    content_hash: Option<String>,
+}
+
+fn merge_persisted_bonk_lookup_table_caches(
+    caches: impl IntoIterator<Item = PersistedBonkLookupTableCache>,
+) -> PersistedBonkLookupTableCache {
+    let mut merged = PersistedBonkLookupTableCache::default();
+    for cache in caches {
+        for (address, entry) in cache.tables {
+            merged.tables.entry(address).or_insert(entry);
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Clone)]
@@ -422,6 +406,12 @@ struct BonkUsd1DirectQuote {
     min_out: BigUint,
     price_impact_pct: f64,
     traversed_tick_array_starts: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BonkUsd1BuyAmountQuote {
+    expected_amount_b: u64,
+    guaranteed_amount_b: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +447,20 @@ struct NativeBonkPreparedUsd1Topup {
     expected_quote_out: Option<BigUint>,
     min_quote_out: Option<BigUint>,
     traversed_tick_array_starts: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BonkUsd1TopupMode {
+    RespectExistingBalance,
+    ForceFullAmount,
+}
+
+#[derive(Debug, Clone)]
+pub struct BonkFollowBuyCompileResult {
+    pub transactions: Vec<CompiledTransaction>,
+    pub primary_tx_index: usize,
+    pub requires_ordered_execution: bool,
+    pub entry_preference_asset: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +511,7 @@ pub struct NativeBonkPoolContext {
     config: DecodedBonkLaunchpadConfig,
     platform: DecodedBonkPlatformConfig,
     quote: BonkQuoteAssetConfig,
+    token_program: Pubkey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +524,7 @@ pub struct BonkPredictedDevBuyEffect {
 struct DecomposedBonkVersionedTransaction {
     instructions: Vec<Instruction>,
     lookup_tables: Vec<AddressLookupTableAccount>,
+    signer_pubkeys: Vec<Pubkey>,
 }
 
 #[derive(Debug, Clone)]
@@ -550,7 +556,9 @@ struct RaydiumLaunchConfigDefaultParams {
     total_sell_a: String,
 }
 
-fn parse_raydium_launch_configs_payload(payload: Value) -> Result<Vec<RaydiumLaunchConfigEntry>, String> {
+fn parse_raydium_launch_configs_payload(
+    payload: Value,
+) -> Result<Vec<RaydiumLaunchConfigEntry>, String> {
     let configs_value = payload
         .get("data")
         .and_then(|value| {
@@ -560,7 +568,9 @@ fn parse_raydium_launch_configs_payload(payload: Value) -> Result<Vec<RaydiumLau
                 value.get("data").cloned()
             }
         })
-        .ok_or_else(|| "Raydium launch configs payload did not include a data array.".to_string())?;
+        .ok_or_else(|| {
+            "Raydium launch configs payload did not include a data array.".to_string()
+        })?;
     serde_json::from_value::<Vec<RaydiumLaunchConfigEntry>>(configs_value)
         .map_err(|error| format!("Failed to decode Raydium launch configs payload: {error}"))
 }
@@ -645,6 +655,17 @@ struct RpcMultipleAccountsValue {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct RpcAccountValue {
+    data: (String, String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RpcProgramAccount {
+    pubkey: String,
+    account: RpcAccountValue,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct RpcResponse<T> {
     result: T,
 }
@@ -660,70 +681,6 @@ struct RpcTokenSupplyValue {
 #[derive(Debug, Clone, Deserialize)]
 struct RpcTokenSupplyResult {
     value: RpcTokenSupplyValue,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperWarmLaunchDefault {
-    mode: String,
-    quoteAsset: String,
-    platformId: String,
-    configId: String,
-    quoteMint: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelperWarmStateResponse {
-    #[serde(default)]
-    warmedLaunchDefaults: Vec<HelperWarmLaunchDefault>,
-    #[serde(default)]
-    usd1RoutePoolId: String,
-    #[serde(default)]
-    usd1RouteConfigId: String,
-    #[serde(default)]
-    usd1QuoteMetrics: Option<HelperUsd1QuoteMetrics>,
-}
-
-fn project_root() -> Result<PathBuf, String> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .and_then(|path| path.parent())
-        .map(PathBuf::from)
-        .ok_or_else(|| "Failed to resolve LaunchDeck project root.".to_string())
-}
-
-fn helper_script_path() -> Result<PathBuf, String> {
-    let script_path = project_root()?
-        .join("scripts")
-        .join("bonk-launchpad.js");
-    if script_path.exists() {
-        Ok(script_path)
-    } else {
-        Err(format!(
-            "Bonk helper script was not found at {}.",
-            script_path.display()
-        ))
-    }
-}
-
-fn bonk_worker_enabled() -> bool {
-    helper_worker_enabled("LAUNCHDECK_ENABLE_BONK_HELPER_WORKER")
-}
-
-fn worker_client() -> Result<Arc<HelperWorkerClient>, String> {
-    static CLIENT: OnceLock<Result<Arc<HelperWorkerClient>, String>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            let project_root = project_root()?;
-            let script_path = helper_script_path()?;
-            Ok(Arc::new(HelperWorkerClient::new(HelperWorkerConfig {
-                helper_name: "Bonk",
-                project_root,
-                script_path,
-                timeout_ms: helper_timeout_ms(),
-            })))
-        })
-        .clone()
 }
 
 fn render_usd1_quote_metrics_note(metrics: &HelperUsd1QuoteMetrics) -> Option<String> {
@@ -760,12 +717,23 @@ fn bonk_launchpad_program_id() -> Result<Pubkey, String> {
         .map_err(|error| format!("Invalid Bonk launchpad program id: {error}"))
 }
 
+fn bonk_cpmm_program_id() -> Result<Pubkey, String> {
+    Pubkey::from_str(BONK_CPMM_PROGRAM_ID)
+        .map_err(|error| format!("Invalid Bonk CPMM program id: {error}"))
+}
+
+fn bonk_cpmm_pool_authority() -> Result<Pubkey, String> {
+    let program = bonk_cpmm_program_id()?;
+    Ok(Pubkey::find_program_address(&[BONK_CPMM_AUTH_SEED], &program).0)
+}
+
 fn bonk_quote_mint(quote_asset: &str) -> Result<Pubkey, String> {
     let quote_mint = match quote_asset.trim().to_ascii_lowercase().as_str() {
         "usd1" => BONK_USD1_QUOTE_MINT,
         _ => BONK_SOL_QUOTE_MINT,
     };
-    Pubkey::from_str(quote_mint).map_err(|error| format!("Invalid Bonk quote mint address: {error}"))
+    Pubkey::from_str(quote_mint)
+        .map_err(|error| format!("Invalid Bonk quote mint address: {error}"))
 }
 
 fn bonk_platform_id(mode: &str) -> &'static str {
@@ -821,12 +789,92 @@ fn bonk_quote_asset_from_mint_address(address: &str) -> Option<BonkQuoteAssetCon
     None
 }
 
+pub fn classify_bonk_pool_address(
+    address: &str,
+    owner: &Pubkey,
+    data: &[u8],
+) -> Result<Option<BonkPoolAddressClassification>, String> {
+    let pool_id = address.trim();
+    if pool_id.is_empty() {
+        return Ok(None);
+    }
+    if *owner == bonk_launchpad_program_id()? {
+        let pool = match decode_bonk_launchpad_pool(data) {
+            Ok(pool) => pool,
+            Err(_) => return Ok(None),
+        };
+        return Ok(Some(BonkPoolAddressClassification {
+            mint: pool.mint_a.to_string(),
+            pool_id: pool_id.to_string(),
+            family: "launchpad".to_string(),
+            quote_asset: String::new(),
+        }));
+    }
+    if *owner == bonk_clmm_program_id()? {
+        let pool = match decode_bonk_clmm_pool(data) {
+            Ok(pool) => pool,
+            Err(_) => return Ok(None),
+        };
+        let mint_a = pool.mint_a.to_string();
+        let mint_b = pool.mint_b.to_string();
+        let quote_asset = bonk_quote_asset_from_mint_address(&mint_a)
+            .or_else(|| bonk_quote_asset_from_mint_address(&mint_b))
+            .ok_or_else(|| {
+                format!("Bonk pool {pool_id} does not contain a supported quote mint.")
+            })?;
+        let mint = if quote_asset.mint == mint_a {
+            mint_b
+        } else if quote_asset.mint == mint_b {
+            mint_a
+        } else {
+            return Ok(None);
+        };
+        return Ok(Some(BonkPoolAddressClassification {
+            mint,
+            pool_id: pool_id.to_string(),
+            family: "raydium".to_string(),
+            quote_asset: quote_asset.asset.to_string(),
+        }));
+    }
+    if *owner == bonk_cpmm_program_id()? {
+        let pool = match decode_bonk_cpmm_pool(data) {
+            Ok(pool) => pool,
+            Err(_) => return Ok(None),
+        };
+        let mint_a = pool.token_0_mint.to_string();
+        let mint_b = pool.token_1_mint.to_string();
+        let quote_asset = bonk_quote_asset_from_mint_address(&mint_a)
+            .or_else(|| bonk_quote_asset_from_mint_address(&mint_b))
+            .ok_or_else(|| {
+                format!("Bonk pool {pool_id} does not contain a supported quote mint.")
+            })?;
+        let mint = if quote_asset.mint == mint_a {
+            mint_b
+        } else if quote_asset.mint == mint_b {
+            mint_a
+        } else {
+            return Ok(None);
+        };
+        return Ok(Some(BonkPoolAddressClassification {
+            mint,
+            pool_id: pool_id.to_string(),
+            family: "raydium".to_string(),
+            quote_asset: quote_asset.asset.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
 fn pool_type_priority(pool_type: &str) -> u8 {
     match pool_type.trim() {
         "Standard" => 0,
         "Concentrated" => 1,
         _ => 2,
     }
+}
+
+fn is_raydium_detection_source(source: &str) -> bool {
+    source.trim().to_ascii_lowercase().starts_with("raydium")
 }
 
 fn bonk_launch_defaults_cache_ttl() -> Duration {
@@ -841,6 +889,33 @@ fn bonk_launch_defaults_cache_ttl() -> Duration {
 fn bonk_launch_defaults_cache() -> &'static Mutex<HashMap<String, BonkLaunchDefaultsCacheEntry>> {
     static CACHE: OnceLock<Mutex<HashMap<String, BonkLaunchDefaultsCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_bonk_launch_defaults(launch_mode: &str, quote_asset: &str) -> Option<BonkLaunchDefaults> {
+    let normalized_mode = normalize_bonk_launch_mode(launch_mode);
+    let quote = bonk_quote_asset_config(quote_asset);
+    let cache_key = format!("{normalized_mode}:{}", quote.asset);
+    let ttl = bonk_launch_defaults_cache_ttl();
+    bonk_launch_defaults_cache()
+        .lock()
+        .expect("bonk launch defaults cache")
+        .get(&cache_key)
+        .filter(|entry| entry.fetched_at.elapsed() <= ttl)
+        .cloned()
+        .map(|entry| entry.defaults)
+}
+
+pub fn bonk_startup_warm_defaults_cached() -> bool {
+    [
+        ("regular", "sol"),
+        ("regular", "usd1"),
+        ("bonkers", "sol"),
+        ("bonkers", "usd1"),
+    ]
+    .into_iter()
+    .all(|(launch_mode, quote_asset)| {
+        cached_bonk_launch_defaults(launch_mode, quote_asset).is_some()
+    })
 }
 
 fn bonk_launch_configs_cache() -> &'static Mutex<HashMap<String, RaydiumLaunchConfigCacheEntry>> {
@@ -878,11 +953,35 @@ fn normalize_bonk_launch_mode(mode: &str) -> &'static str {
     }
 }
 
-fn bonk_launch_configs_endpoint(rpc_url: &str) -> &'static str {
-    if rpc_url.to_ascii_lowercase().contains("devnet") {
-        RAYDIUM_DEVNET_LAUNCH_CONFIGS_ENDPOINT
+fn normalize_bonk_buy_funding_policy(policy: &str) -> &'static str {
+    match policy.trim().to_ascii_lowercase().as_str() {
+        "usd1_only" => "usd1_only",
+        "prefer_usd1_else_topup" => "prefer_usd1_else_topup",
+        _ => "sol_only",
+    }
+}
+
+fn select_bonk_usd1_buy_amount_from_sol_quote(
+    funding_policy: &str,
+    current_balance: u64,
+    quote: &BonkUsd1BuyAmountQuote,
+) -> u64 {
+    if funding_policy == "sol_only" {
+        return quote.guaranteed_amount_b;
+    }
+    if current_balance >= quote.expected_amount_b {
+        quote.expected_amount_b
+    } else if current_balance >= quote.guaranteed_amount_b {
+        current_balance
     } else {
-        RAYDIUM_MAINNET_LAUNCH_CONFIGS_ENDPOINT
+        quote.guaranteed_amount_b
+    }
+}
+
+fn normalize_bonk_sell_settlement_asset(asset: &str) -> &'static str {
+    match asset.trim().to_ascii_lowercase().as_str() {
+        "usd1" => "usd1",
+        _ => "sol",
     }
 }
 
@@ -1056,10 +1155,16 @@ fn bonk_total_fee_rate(
 
 fn bonk_calculate_fee(amount: &BigUint, fee_rate: &BigUint) -> BigUint {
     let numerator = amount * fee_rate;
-    bonk_ceil_div(&numerator, &bonk_biguint_from_u64(BONK_FEE_RATE_DENOMINATOR))
+    bonk_ceil_div(
+        &numerator,
+        &bonk_biguint_from_u64(BONK_FEE_RATE_DENOMINATOR),
+    )
 }
 
-fn bonk_calculate_pre_fee(post_fee_amount: &BigUint, fee_rate: &BigUint) -> Result<BigUint, String> {
+fn bonk_calculate_pre_fee(
+    post_fee_amount: &BigUint,
+    fee_rate: &BigUint,
+) -> Result<BigUint, String> {
     if fee_rate == &BigUint::ZERO {
         return Ok(post_fee_amount.clone());
     }
@@ -1088,24 +1193,36 @@ fn bonk_curve_init_virtuals(
             if supply <= total_sell {
                 return Err("supply need gt total sell".to_string());
             }
-            let supply_minus_sell_locked =
-                bonk_big_sub(&bonk_big_sub(supply, total_sell, "supply minus total sell")?, total_locked_amount, "supply minus locked amount")?;
+            let supply_minus_sell_locked = bonk_big_sub(
+                &bonk_big_sub(supply, total_sell, "supply minus total sell")?,
+                total_locked_amount,
+                "supply minus locked amount",
+            )?;
             if supply_minus_sell_locked == BigUint::ZERO {
                 return Err("supplyMinusSellLocked <= 0".to_string());
             }
-            let tf_minus_mf =
-                bonk_big_sub(total_fund_raising, migrate_fee, "total fund raising minus migrate fee")?;
+            let tf_minus_mf = bonk_big_sub(
+                total_fund_raising,
+                migrate_fee,
+                "total fund raising minus migrate fee",
+            )?;
             if tf_minus_mf == BigUint::ZERO {
                 return Err("tfMinusMf <= 0".to_string());
             }
             let numerator = ((&tf_minus_mf * total_sell) * total_sell) / &supply_minus_sell_locked;
             let denominator_base = (&tf_minus_mf * total_sell) / &supply_minus_sell_locked;
-            let denominator =
-                bonk_big_sub(&denominator_base, total_fund_raising, "constant-product denominator")?;
+            let denominator = bonk_big_sub(
+                &denominator_base,
+                total_fund_raising,
+                "constant-product denominator",
+            )?;
             if denominator == BigUint::ZERO {
                 return Err("invalid input 0".to_string());
             }
-            Ok((numerator / &denominator, (total_fund_raising * total_fund_raising) / denominator))
+            Ok((
+                numerator / &denominator,
+                (total_fund_raising * total_fund_raising) / denominator,
+            ))
         }
         1 => {
             let supply_minus_locked =
@@ -1154,11 +1271,16 @@ fn bonk_curve_init_virtuals(
     }
 }
 
-fn bonk_curve_buy_exact_in(pool: &BonkCurvePoolState, curve_type: u8, amount: &BigUint) -> Result<BigUint, String> {
+fn bonk_curve_buy_exact_in(
+    pool: &BonkCurvePoolState,
+    curve_type: u8,
+    amount: &BigUint,
+) -> Result<BigUint, String> {
     match curve_type {
         0 => {
             let input_reserve = &pool.virtual_b + &pool.real_b;
-            let output_reserve = bonk_big_sub(&pool.virtual_a, &pool.real_a, "launch output reserve")?;
+            let output_reserve =
+                bonk_big_sub(&pool.virtual_a, &pool.real_a, "launch output reserve")?;
             Ok((amount * output_reserve) / (input_reserve + amount))
         }
         1 => {
@@ -1180,12 +1302,18 @@ fn bonk_curve_buy_exact_in(pool: &BonkCurvePoolState, curve_type: u8, amount: &B
     }
 }
 
-fn bonk_curve_buy_exact_out(pool: &BonkCurvePoolState, curve_type: u8, amount: &BigUint) -> Result<BigUint, String> {
+fn bonk_curve_buy_exact_out(
+    pool: &BonkCurvePoolState,
+    curve_type: u8,
+    amount: &BigUint,
+) -> Result<BigUint, String> {
     match curve_type {
         0 => {
             let input_reserve = &pool.virtual_b + &pool.real_b;
-            let output_reserve = bonk_big_sub(&pool.virtual_a, &pool.real_a, "launch output reserve")?;
-            let denominator = bonk_big_sub(&output_reserve, amount, "launch remaining output reserve")?;
+            let output_reserve =
+                bonk_big_sub(&pool.virtual_a, &pool.real_a, "launch output reserve")?;
+            let denominator =
+                bonk_big_sub(&output_reserve, amount, "launch remaining output reserve")?;
             if denominator == BigUint::ZERO {
                 return Err("Bonk constant-product buyExactOut denominator was zero.".to_string());
             }
@@ -1221,8 +1349,11 @@ fn bonk_quote_buy_exact_in_amount_a(
     let amount_less_fee_b = bonk_big_sub(amount_b, &total_fee, "buy input after fee")?;
     let quoted_amount_a =
         bonk_curve_buy_exact_in(&defaults.pool, defaults.curve_type, &amount_less_fee_b)?;
-    let remaining_amount_a =
-        bonk_big_sub(&defaults.pool.total_sell_a, &defaults.pool.real_a, "remaining sell amount")?;
+    let remaining_amount_a = bonk_big_sub(
+        &defaults.pool.total_sell_a,
+        &defaults.pool.real_a,
+        "remaining sell amount",
+    )?;
     if quoted_amount_a > remaining_amount_a {
         Ok(remaining_amount_a)
     } else {
@@ -1234,8 +1365,11 @@ fn bonk_quote_buy_exact_out_amount_b(
     defaults: &BonkLaunchDefaults,
     requested_amount_a: &BigUint,
 ) -> Result<BigUint, String> {
-    let remaining_amount_a =
-        bonk_big_sub(&defaults.pool.total_sell_a, &defaults.pool.real_a, "remaining sell amount")?;
+    let remaining_amount_a = bonk_big_sub(
+        &defaults.pool.total_sell_a,
+        &defaults.pool.real_a,
+        "remaining sell amount",
+    )?;
     let real_amount_a = if requested_amount_a > &remaining_amount_a {
         remaining_amount_a
     } else {
@@ -1251,10 +1385,15 @@ fn bonk_quote_buy_exact_out_amount_b(
     bonk_calculate_pre_fee(&amount_in_less_fee_b, &fee_rate)
 }
 
-fn bonk_curve_sell_exact_in(pool: &BonkCurvePoolState, curve_type: u8, amount: &BigUint) -> Result<BigUint, String> {
+fn bonk_curve_sell_exact_in(
+    pool: &BonkCurvePoolState,
+    curve_type: u8,
+    amount: &BigUint,
+) -> Result<BigUint, String> {
     match curve_type {
         0 => {
-            let input_reserve = bonk_big_sub(&pool.virtual_a, &pool.real_a, "launch input reserve")?;
+            let input_reserve =
+                bonk_big_sub(&pool.virtual_a, &pool.real_a, "launch input reserve")?;
             let output_reserve = &pool.virtual_b + &pool.real_b;
             Ok((amount * output_reserve) / (input_reserve + amount))
         }
@@ -1275,10 +1414,15 @@ fn bonk_curve_sell_exact_in(pool: &BonkCurvePoolState, curve_type: u8, amount: &
     }
 }
 
-fn bonk_curve_sell_exact_out(pool: &BonkCurvePoolState, curve_type: u8, amount: &BigUint) -> Result<BigUint, String> {
+fn bonk_curve_sell_exact_out(
+    pool: &BonkCurvePoolState,
+    curve_type: u8,
+    amount: &BigUint,
+) -> Result<BigUint, String> {
     match curve_type {
         0 => {
-            let input_reserve = bonk_big_sub(&pool.virtual_a, &pool.real_a, "launch input reserve")?;
+            let input_reserve =
+                bonk_big_sub(&pool.virtual_a, &pool.real_a, "launch input reserve")?;
             let output_reserve = &pool.virtual_b + &pool.real_b;
             let denominator =
                 bonk_big_sub(&output_reserve, amount, "launch remaining output reserve")?;
@@ -1342,7 +1486,12 @@ fn bonk_quote_sell_exact_out_amount_a(
 
 fn bonk_build_min_amount_from_bps(amount: &BigUint, slippage_bps: u64) -> BigUint {
     let safe_bps = slippage_bps.min(10_000);
-    (amount * BigUint::from(10_000u64 - safe_bps)) / BigUint::from(10_000u64)
+    let minimum = (amount * BigUint::from(10_000u64 - safe_bps)) / BigUint::from(10_000u64);
+    if amount > &BigUint::from(0u8) && minimum == BigUint::from(0u8) {
+        BigUint::from(1u8)
+    } else {
+        minimum
+    }
 }
 
 fn biguint_to_u64(value: &BigUint, label: &str) -> Result<u64, String> {
@@ -1359,7 +1508,8 @@ fn biguint_to_u128(value: &BigUint, label: &str) -> Result<u128, String> {
 }
 
 fn bonk_clmm_program_id() -> Result<Pubkey, String> {
-    Pubkey::from_str(BONK_CLMM_PROGRAM_ID).map_err(|error| format!("Invalid Bonk CLMM program id: {error}"))
+    Pubkey::from_str(BONK_CLMM_PROGRAM_ID)
+        .map_err(|error| format!("Invalid Bonk CLMM program id: {error}"))
 }
 
 fn bonk_clmm_q64() -> BigUint {
@@ -1392,7 +1542,8 @@ fn bonk_tick_array_bit_position(start_index: i32, tick_spacing: i32) -> Result<u
     if !(0..1024).contains(&bit_position) {
         return Err("Bonk USD1 CLMM quote exceeded default bitmap coverage.".to_string());
     }
-    usize::try_from(bit_position).map_err(|error| format!("Invalid Bonk CLMM bitmap index: {error}"))
+    usize::try_from(bit_position)
+        .map_err(|error| format!("Invalid Bonk CLMM bitmap index: {error}"))
 }
 
 fn bonk_bitmap_is_initialized(bitmap_words: &[u64; 16], bit_position: usize) -> bool {
@@ -1412,14 +1563,22 @@ fn bonk_derive_clmm_tick_array_address(
     address
 }
 
-fn bonk_mul_div_floor(left: &BigUint, right: &BigUint, denominator: &BigUint) -> Result<BigUint, String> {
+fn bonk_mul_div_floor(
+    left: &BigUint,
+    right: &BigUint,
+    denominator: &BigUint,
+) -> Result<BigUint, String> {
     if denominator == &BigUint::ZERO {
         return Err("Bonk CLMM division by zero.".to_string());
     }
     Ok((left * right) / denominator)
 }
 
-fn bonk_mul_div_ceil(left: &BigUint, right: &BigUint, denominator: &BigUint) -> Result<BigUint, String> {
+fn bonk_mul_div_ceil(
+    left: &BigUint,
+    right: &BigUint,
+    denominator: &BigUint,
+) -> Result<BigUint, String> {
     if denominator == &BigUint::ZERO {
         return Err("Bonk CLMM division by zero.".to_string());
     }
@@ -1461,9 +1620,17 @@ fn bonk_get_token_amount_b_from_liquidity(
         return Err("Bonk CLMM sqrt price must be greater than zero.".to_string());
     }
     if round_up {
-        bonk_mul_div_ceil(liquidity, &(&sqrt_price_b_x64 - &sqrt_price_a_x64), &bonk_clmm_q64())
+        bonk_mul_div_ceil(
+            liquidity,
+            &(&sqrt_price_b_x64 - &sqrt_price_a_x64),
+            &bonk_clmm_q64(),
+        )
     } else {
-        bonk_mul_div_floor(liquidity, &(&sqrt_price_b_x64 - &sqrt_price_a_x64), &bonk_clmm_q64())
+        bonk_mul_div_floor(
+            liquidity,
+            &(&sqrt_price_b_x64 - &sqrt_price_a_x64),
+            &bonk_clmm_q64(),
+        )
     }
 }
 
@@ -1483,7 +1650,11 @@ fn bonk_get_next_sqrt_price_from_token_amount_a_rounding_up(
             bonk_mul_div_ceil(&liquidity_left_shift, sqrt_price_x64, &denominator)
         } else {
             let fallback_denominator = (&liquidity_left_shift / sqrt_price_x64) + amount;
-            bonk_mul_div_ceil(&liquidity_left_shift, &BigUint::from(1u8), &fallback_denominator)
+            bonk_mul_div_ceil(
+                &liquidity_left_shift,
+                &BigUint::from(1u8),
+                &fallback_denominator,
+            )
         }
     } else {
         let amount_mul_sqrt_price = amount * sqrt_price_x64;
@@ -1503,7 +1674,23 @@ fn bonk_get_next_sqrt_price_from_input_zero_for_one(
     liquidity: &BigUint,
     amount_in: &BigUint,
 ) -> Result<BigUint, String> {
-    bonk_get_next_sqrt_price_from_token_amount_a_rounding_up(sqrt_price_x64, liquidity, amount_in, true)
+    bonk_get_next_sqrt_price_from_token_amount_a_rounding_up(
+        sqrt_price_x64,
+        liquidity,
+        amount_in,
+        true,
+    )
+}
+
+fn bonk_get_next_sqrt_price_from_input_one_for_zero(
+    sqrt_price_x64: &BigUint,
+    liquidity: &BigUint,
+    amount_in: &BigUint,
+) -> Result<BigUint, String> {
+    if liquidity == &BigUint::ZERO {
+        return Err("Bonk CLMM liquidity must be greater than zero.".to_string());
+    }
+    Ok(sqrt_price_x64 + bonk_mul_div_floor(amount_in, &bonk_clmm_q64(), liquidity)?)
 }
 
 fn bonk_sqrt_price_from_tick(tick: i32) -> Result<BigUint, String> {
@@ -1634,7 +1821,9 @@ async fn bonk_rpc_get_balance_lamports(rpc_url: &str, owner: &Pubkey) -> Result<
         .get("result")
         .and_then(|result| result.get("value"))
         .and_then(Value::as_u64)
-        .ok_or_else(|| "Bonk owner SOL balance response did not include a numeric value.".to_string())
+        .ok_or_else(|| {
+            "Bonk owner SOL balance response did not include a numeric value.".to_string()
+        })
 }
 
 async fn native_prepare_bonk_usd1_topup(
@@ -1643,6 +1832,7 @@ async fn native_prepare_bonk_usd1_topup(
     owner: &Pubkey,
     required_quote_amount: &BigUint,
     slippage_bps: u64,
+    mode: BonkUsd1TopupMode,
     mut metrics: Option<&mut HelperUsd1QuoteMetrics>,
     route_setup_override: Option<&BonkUsd1RouteSetup>,
 ) -> Result<NativeBonkPreparedUsd1Topup, String> {
@@ -1652,7 +1842,9 @@ async fn native_prepare_bonk_usd1_topup(
             .await?
             .unwrap_or(0),
     );
-    if current_quote_amount >= *required_quote_amount {
+    if matches!(mode, BonkUsd1TopupMode::RespectExistingBalance)
+        && current_quote_amount >= *required_quote_amount
+    {
         return Ok(NativeBonkPreparedUsd1Topup {
             required_quote_amount: required_quote_amount.clone(),
             current_quote_amount,
@@ -1663,11 +1855,15 @@ async fn native_prepare_bonk_usd1_topup(
             traversed_tick_array_starts: vec![],
         });
     }
-    let shortfall_quote_amount = bonk_big_sub(
-        required_quote_amount,
-        &current_quote_amount,
-        "Bonk USD1 shortfall amount",
-    )?;
+    let shortfall_quote_amount = if matches!(mode, BonkUsd1TopupMode::ForceFullAmount) {
+        required_quote_amount.clone()
+    } else {
+        bonk_big_sub(
+            required_quote_amount,
+            &current_quote_amount,
+            "Bonk USD1 shortfall amount",
+        )?
+    };
     let balance_lamports = bonk_rpc_get_balance_lamports(rpc_url, owner).await?;
     let min_remaining_lamports = bonk_usd1_min_remaining_lamports()?;
     let max_spendable_lamports = balance_lamports.saturating_sub(min_remaining_lamports);
@@ -1775,9 +1971,12 @@ async fn rpc_get_multiple_accounts_data(
                     addresses.get(index).cloned().unwrap_or_default()
                 )
             })?;
-            BASE64
-                .decode(value.data.0.trim())
-                .map_err(|error| format!("Failed to decode Bonk account {}: {error}", addresses[index]))
+            BASE64.decode(value.data.0.trim()).map_err(|error| {
+                format!(
+                    "Failed to decode Bonk account {}: {error}",
+                    addresses[index]
+                )
+            })
         })
         .collect()
 }
@@ -1814,7 +2013,8 @@ async fn load_bonk_usd1_route_setup_with_metrics(
         .map_err(|error| format!("Invalid Bonk USD1 route config id: {error}"))?;
     let program_id = bonk_clmm_program_id()?;
 
-    let pool_data = fetch_account_data(rpc_url, BONK_PINNED_USD1_ROUTE_POOL_ID, "confirmed").await?;
+    let pool_data =
+        fetch_account_data(rpc_url, BONK_PINNED_USD1_ROUTE_POOL_ID, "confirmed").await?;
     let pool = decode_bonk_clmm_pool(&pool_data)?;
     if pool.amm_config != config_id {
         return Err(format!(
@@ -1831,19 +2031,30 @@ async fn load_bonk_usd1_route_setup_with_metrics(
         ));
     }
     if mint_a != BONK_SOL_QUOTE_MINT || mint_b != BONK_USD1_QUOTE_MINT {
-        return Err("Native Bonk USD1 quote currently only supports SOL as CLMM mintA.".to_string());
+        return Err(
+            "Native Bonk USD1 quote currently only supports SOL as CLMM mintA.".to_string(),
+        );
     }
-    let current_array_start = bonk_get_tick_array_start_index_by_tick(pool.tick_current, i32::from(pool.tick_spacing));
-    let current_bit_position = bonk_tick_array_bit_position(current_array_start, i32::from(pool.tick_spacing))?;
+    let current_array_start =
+        bonk_get_tick_array_start_index_by_tick(pool.tick_current, i32::from(pool.tick_spacing));
+    let current_bit_position =
+        bonk_tick_array_bit_position(current_array_start, i32::from(pool.tick_spacing))?;
     if !bonk_bitmap_is_initialized(&pool.tick_array_bitmap, current_bit_position) {
         return Err("Pinned Bonk USD1 CLMM current tick array is not initialized.".to_string());
     }
 
     let tick_count = BONK_CLMM_TICK_ARRAY_SIZE * i32::from(pool.tick_spacing);
-    let tick_array_starts_desc = (0..=current_bit_position)
-        .rev()
+    let initialized_bit_positions = (0..(pool.tick_array_bitmap.len() * 64))
         .filter(|bit_position| bonk_bitmap_is_initialized(&pool.tick_array_bitmap, *bit_position))
-        .map(|bit_position| ((bit_position as i32) - BONK_CLMM_DEFAULT_BITMAP_OFFSET) * tick_count)
+        .collect::<Vec<_>>();
+    let tick_array_starts_desc = initialized_bit_positions
+        .iter()
+        .rev()
+        .map(|bit_position| ((*bit_position as i32) - BONK_CLMM_DEFAULT_BITMAP_OFFSET) * tick_count)
+        .collect::<Vec<_>>();
+    let tick_array_starts_asc = initialized_bit_positions
+        .iter()
+        .map(|bit_position| ((*bit_position as i32) - BONK_CLMM_DEFAULT_BITMAP_OFFSET) * tick_count)
         .collect::<Vec<_>>();
     if tick_array_starts_desc.is_empty() {
         return Err("Pinned Bonk USD1 CLMM had no initialized tick arrays.".to_string());
@@ -1868,7 +2079,8 @@ async fn load_bonk_usd1_route_setup_with_metrics(
         return Err("Pinned Bonk USD1 CLMM current tick array could not be decoded.".to_string());
     }
 
-    let config_data = fetch_account_data(rpc_url, BONK_PREFERRED_USD1_ROUTE_CONFIG_ID, "confirmed").await?;
+    let config_data =
+        fetch_account_data(rpc_url, BONK_PREFERRED_USD1_ROUTE_CONFIG_ID, "confirmed").await?;
     let config = decode_bonk_clmm_config(&config_data)?;
     if config.tick_spacing != pool.tick_spacing {
         return Err("Pinned Bonk USD1 CLMM tick spacing no longer matches its config.".to_string());
@@ -1877,6 +2089,12 @@ async fn load_bonk_usd1_route_setup_with_metrics(
     let setup = BonkUsd1RouteSetup {
         pool_id,
         program_id,
+        amm_config: config_id,
+        mint_a: pool.mint_a,
+        mint_b: pool.mint_b,
+        vault_a: pool.vault_a,
+        vault_b: pool.vault_b,
+        observation_id: pool.observation_id,
         tick_spacing: i32::from(pool.tick_spacing),
         trade_fee_rate: config.trade_fee_rate,
         sqrt_price_x64: pool.sqrt_price_x64.clone(),
@@ -1890,6 +2108,7 @@ async fn load_bonk_usd1_route_setup_with_metrics(
             u32::from(pool.mint_decimals_b),
         )?,
         tick_arrays_desc: tick_array_starts_desc,
+        tick_arrays_asc: tick_array_starts_asc,
         tick_arrays,
     };
     bonk_usd1_route_setup_cache()
@@ -1922,16 +2141,19 @@ fn bonk_find_next_initialized_tick_zero_for_one(
     setup: &BonkUsd1RouteSetup,
     current_tick: i32,
 ) -> Result<BonkClmmTick, String> {
-    let current_array_start = bonk_get_tick_array_start_index_by_tick(current_tick, setup.tick_spacing);
-    let current_array = setup
-        .tick_arrays
-        .get(&current_array_start)
-        .ok_or_else(|| format!("Missing Bonk CLMM tick array for start index {current_array_start}."))?;
+    let current_array_start =
+        bonk_get_tick_array_start_index_by_tick(current_tick, setup.tick_spacing);
+    let current_array = setup.tick_arrays.get(&current_array_start).ok_or_else(|| {
+        format!("Missing Bonk CLMM tick array for start index {current_array_start}.")
+    })?;
     let current_tick_position = (current_tick - current_array_start).div_euclid(setup.tick_spacing);
     for tick_index in (0..=current_tick_position).rev() {
         let tick = current_array
             .ticks
-            .get(usize::try_from(tick_index).map_err(|error| format!("Invalid Bonk tick index: {error}"))?)
+            .get(
+                usize::try_from(tick_index)
+                    .map_err(|error| format!("Invalid Bonk tick index: {error}"))?,
+            )
             .ok_or_else(|| "Bonk CLMM current tick array index overflowed.".to_string())?;
         if tick.liquidity_gross > BigUint::ZERO {
             return Ok(tick.clone());
@@ -1941,7 +2163,9 @@ fn bonk_find_next_initialized_tick_zero_for_one(
         .tick_arrays_desc
         .iter()
         .position(|start_index| *start_index == current_array_start)
-        .ok_or_else(|| "Bonk CLMM current tick array was not present in the route setup.".to_string())?;
+        .ok_or_else(|| {
+            "Bonk CLMM current tick array was not present in the route setup.".to_string()
+        })?;
     setup
         .tick_arrays_desc
         .iter()
@@ -1958,6 +2182,50 @@ fn bonk_find_next_initialized_tick_zero_for_one(
         .ok_or_else(|| "swapCompute LiquidityInsufficient".to_string())
 }
 
+fn bonk_find_next_initialized_tick_one_for_zero(
+    setup: &BonkUsd1RouteSetup,
+    current_tick: i32,
+) -> Result<BonkClmmTick, String> {
+    let current_array_start =
+        bonk_get_tick_array_start_index_by_tick(current_tick, setup.tick_spacing);
+    let current_array = setup.tick_arrays.get(&current_array_start).ok_or_else(|| {
+        format!("Missing Bonk CLMM tick array for start index {current_array_start}.")
+    })?;
+    let current_tick_position = (current_tick - current_array_start).div_euclid(setup.tick_spacing);
+    for tick_index in (current_tick_position + 1)..BONK_CLMM_TICK_ARRAY_SIZE {
+        let tick = current_array
+            .ticks
+            .get(
+                usize::try_from(tick_index)
+                    .map_err(|error| format!("Invalid Bonk tick index: {error}"))?,
+            )
+            .ok_or_else(|| "Bonk CLMM current tick array index overflowed.".to_string())?;
+        if tick.liquidity_gross > BigUint::ZERO {
+            return Ok(tick.clone());
+        }
+    }
+    let current_array_position = setup
+        .tick_arrays_asc
+        .iter()
+        .position(|start_index| *start_index == current_array_start)
+        .ok_or_else(|| {
+            "Bonk CLMM current tick array was not present in the route setup.".to_string()
+        })?;
+    setup
+        .tick_arrays_asc
+        .iter()
+        .skip(current_array_position + 1)
+        .find_map(|start_index| {
+            let tick_array = setup.tick_arrays.get(start_index)?;
+            tick_array
+                .ticks
+                .iter()
+                .find(|tick| tick.liquidity_gross > BigUint::ZERO)
+                .cloned()
+        })
+        .ok_or_else(|| "swapCompute LiquidityInsufficient".to_string())
+}
+
 fn bonk_clmm_swap_step_exact_in_zero_for_one(
     sqrt_price_current_x64: &BigUint,
     sqrt_price_target_x64: &BigUint,
@@ -1967,7 +2235,8 @@ fn bonk_clmm_swap_step_exact_in_zero_for_one(
 ) -> Result<(BigUint, BigUint, BigUint, BigUint), String> {
     let fee_denominator = bonk_biguint_from_u64(BONK_FEE_RATE_DENOMINATOR);
     let fee_rate_big = bonk_biguint_from_u64(u64::from(fee_rate));
-    let amount_remaining_less_fee = (amount_remaining * (&fee_denominator - &fee_rate_big)) / &fee_denominator;
+    let amount_remaining_less_fee =
+        (amount_remaining * (&fee_denominator - &fee_rate_big)) / &fee_denominator;
     let amount_in_to_target = bonk_get_token_amount_a_from_liquidity(
         sqrt_price_target_x64.clone(),
         sqrt_price_current_x64.clone(),
@@ -1997,6 +2266,61 @@ fn bonk_clmm_swap_step_exact_in_zero_for_one(
     let amount_out = bonk_get_token_amount_b_from_liquidity(
         next_sqrt_price_x64.clone(),
         sqrt_price_current_x64.clone(),
+        liquidity,
+        false,
+    )?;
+    let fee_amount = if !reach_target_price {
+        bonk_big_sub(amount_remaining, &amount_in, "CLMM swap fee amount")?
+    } else {
+        bonk_mul_div_ceil(
+            &amount_in,
+            &fee_rate_big,
+            &(&fee_denominator - &fee_rate_big),
+        )?
+    };
+    Ok((next_sqrt_price_x64, amount_in, amount_out, fee_amount))
+}
+
+fn bonk_clmm_swap_step_exact_in_one_for_zero(
+    sqrt_price_current_x64: &BigUint,
+    sqrt_price_target_x64: &BigUint,
+    liquidity: &BigUint,
+    amount_remaining: &BigUint,
+    fee_rate: u32,
+) -> Result<(BigUint, BigUint, BigUint, BigUint), String> {
+    let fee_denominator = bonk_biguint_from_u64(BONK_FEE_RATE_DENOMINATOR);
+    let fee_rate_big = bonk_biguint_from_u64(u64::from(fee_rate));
+    let amount_remaining_less_fee =
+        (amount_remaining * (&fee_denominator - &fee_rate_big)) / &fee_denominator;
+    let amount_in_to_target = bonk_get_token_amount_b_from_liquidity(
+        sqrt_price_current_x64.clone(),
+        sqrt_price_target_x64.clone(),
+        liquidity,
+        true,
+    )?;
+    let next_sqrt_price_x64 = if amount_remaining_less_fee >= amount_in_to_target {
+        sqrt_price_target_x64.clone()
+    } else {
+        bonk_get_next_sqrt_price_from_input_one_for_zero(
+            sqrt_price_current_x64,
+            liquidity,
+            &amount_remaining_less_fee,
+        )?
+    };
+    let reach_target_price = next_sqrt_price_x64 == *sqrt_price_target_x64;
+    let amount_in = if reach_target_price {
+        amount_in_to_target
+    } else {
+        bonk_get_token_amount_b_from_liquidity(
+            sqrt_price_current_x64.clone(),
+            next_sqrt_price_x64.clone(),
+            liquidity,
+            true,
+        )?
+    };
+    let amount_out = bonk_get_token_amount_a_from_liquidity(
+        sqrt_price_current_x64.clone(),
+        next_sqrt_price_x64.clone(),
         liquidity,
         false,
     )?;
@@ -2059,13 +2383,94 @@ fn bonk_quote_usd1_from_exact_sol_input(
                 &amount_remaining,
                 setup.trade_fee_rate,
             )?;
-        amount_remaining =
-            bonk_big_sub(&amount_remaining, &(step_amount_in.clone() + &step_fee_amount), "CLMM remaining input")?;
+        amount_remaining = bonk_big_sub(
+            &amount_remaining,
+            &(step_amount_in.clone() + &step_fee_amount),
+            "CLMM remaining input",
+        )?;
         amount_out_total += &step_amount_out;
         sqrt_price_x64 = step_next_sqrt_price;
         if sqrt_price_x64 == target_sqrt_price {
             liquidity = bonk_apply_liquidity_delta(&liquidity, next_tick.liquidity_net)?;
             current_tick = next_tick.tick.saturating_sub(1);
+        }
+    }
+
+    let execution_price = bonk_sqrt_price_x64_to_price(
+        &sqrt_price_x64,
+        setup.mint_a_decimals,
+        setup.mint_b_decimals,
+    )?;
+    let price_impact_pct = if !setup.current_price.is_finite() || setup.current_price <= 0.0 {
+        0.0
+    } else {
+        ((execution_price - setup.current_price).abs() / setup.current_price) * 100.0
+    };
+    Ok(BonkUsd1DirectQuote {
+        min_out: bonk_build_min_amount_from_bps(&amount_out_total, slippage_bps),
+        expected_out: amount_out_total,
+        price_impact_pct,
+        traversed_tick_array_starts,
+    })
+}
+
+fn bonk_quote_sol_from_exact_usd1_input(
+    setup: &BonkUsd1RouteSetup,
+    input_lamports: &BigUint,
+    slippage_bps: u64,
+) -> Result<BonkUsd1DirectQuote, String> {
+    if input_lamports == &BigUint::ZERO {
+        return Ok(BonkUsd1DirectQuote {
+            expected_out: BigUint::ZERO,
+            min_out: BigUint::ZERO,
+            price_impact_pct: 0.0,
+            traversed_tick_array_starts: vec![],
+        });
+    }
+    let mut amount_remaining = input_lamports.clone();
+    let mut amount_out_total = BigUint::ZERO;
+    let mut sqrt_price_x64 = setup.sqrt_price_x64.clone();
+    let mut liquidity = setup.liquidity.clone();
+    let mut current_tick = setup.tick_current;
+    let mut traversed_tick_array_starts = Vec::new();
+    let max_sqrt_price = bonk_biguint_from_u128(BONK_CLMM_MAX_SQRT_PRICE_X64_MINUS_ONE);
+
+    while amount_remaining > BigUint::ZERO && sqrt_price_x64 < max_sqrt_price {
+        let current_array_start =
+            bonk_get_tick_array_start_index_by_tick(current_tick, setup.tick_spacing);
+        if traversed_tick_array_starts
+            .last()
+            .copied()
+            .map(|value| value != current_array_start)
+            .unwrap_or(true)
+        {
+            traversed_tick_array_starts.push(current_array_start);
+        }
+        let next_tick = bonk_find_next_initialized_tick_one_for_zero(setup, current_tick)?;
+        let next_tick_sqrt_price = bonk_sqrt_price_from_tick(next_tick.tick)?;
+        let target_sqrt_price = if next_tick_sqrt_price > max_sqrt_price {
+            max_sqrt_price.clone()
+        } else {
+            next_tick_sqrt_price
+        };
+        let (step_next_sqrt_price, step_amount_in, step_amount_out, step_fee_amount) =
+            bonk_clmm_swap_step_exact_in_one_for_zero(
+                &sqrt_price_x64,
+                &target_sqrt_price,
+                &liquidity,
+                &amount_remaining,
+                setup.trade_fee_rate,
+            )?;
+        amount_remaining = bonk_big_sub(
+            &amount_remaining,
+            &(step_amount_in.clone() + &step_fee_amount),
+            "CLMM remaining input",
+        )?;
+        amount_out_total += &step_amount_out;
+        sqrt_price_x64 = step_next_sqrt_price;
+        if sqrt_price_x64 == target_sqrt_price {
+            liquidity = bonk_apply_liquidity_delta(&liquidity, next_tick.liquidity_net)?;
+            current_tick = next_tick.tick;
         }
     }
 
@@ -2128,6 +2533,29 @@ async fn native_quote_usd1_output_from_sol_input(
         None,
     )
     .await
+}
+
+async fn native_quote_usd1_buy_amounts_from_sol_input(
+    rpc_url: &str,
+    buy_amount_sol: &str,
+    route_setup_override: Option<&BonkUsd1RouteSetup>,
+) -> Result<BonkUsd1BuyAmountQuote, String> {
+    let input_sol = parse_decimal_biguint(buy_amount_sol, 9, "follow buy amount SOL")?;
+    if input_sol == BigUint::from(0u8) {
+        return Err("Follow buy amount SOL must be greater than zero.".to_string());
+    }
+    let quote = native_quote_usd1_output_from_sol_input_with_metrics(
+        rpc_url,
+        &input_sol,
+        BONK_USD1_ROUTE_SLIPPAGE_BPS,
+        None,
+        route_setup_override,
+    )
+    .await?;
+    Ok(BonkUsd1BuyAmountQuote {
+        expected_amount_b: biguint_to_u64(&quote.expected_out, "follow buy expected USD1 amount")?,
+        guaranteed_amount_b: biguint_to_u64(&quote.min_out, "follow buy guaranteed USD1 amount")?,
+    })
 }
 
 async fn native_quote_sol_input_for_usd1_output(
@@ -2262,45 +2690,17 @@ async fn native_quote_sol_input_for_usd1_output_with_max(
     .await
 }
 
-async fn fetch_raydium_launch_configs(rpc_url: &str) -> Result<Vec<RaydiumLaunchConfigEntry>, String> {
-    let endpoint = bonk_launch_configs_endpoint(rpc_url).to_string();
-    let ttl = bonk_launch_defaults_cache_ttl();
-    if let Some(entry) = bonk_launch_configs_cache()
-        .lock()
-        .expect("bonk launch config cache")
-        .get(&endpoint)
-        .filter(|entry| entry.fetched_at.elapsed() <= ttl)
-        .cloned()
-    {
-        return Ok(entry.configs);
-    }
-    let response = bonk_http_client()
-        .get(&endpoint)
-        .send()
-        .await
-        .map_err(|error| format!("Failed to fetch Raydium launch configs: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Failed to fetch Raydium launch configs: status {}.",
-            response.status()
-        ));
-    }
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("Failed to parse Raydium launch configs: {error}"))?;
-    let configs = parse_raydium_launch_configs_payload(payload)?;
-    bonk_launch_configs_cache()
-        .lock()
-        .expect("bonk launch config cache")
-        .insert(
-            endpoint,
-            RaydiumLaunchConfigCacheEntry {
-                fetched_at: std::time::Instant::now(),
-                configs: configs.clone(),
-            },
-        );
-    Ok(configs)
+fn local_bonk_launch_default_params(config_id: &str) -> Option<RaydiumLaunchConfigDefaultParams> {
+    let total_fund_raising_b = match config_id {
+        BONK_MAINNET_SOL_LAUNCH_CONFIG_ID => BONK_DEFAULT_SOL_TOTAL_FUND_RAISING_B,
+        BONK_MAINNET_USD1_LAUNCH_CONFIG_ID => BONK_DEFAULT_USD1_TOTAL_FUND_RAISING_B,
+        _ => return None,
+    };
+    Some(RaydiumLaunchConfigDefaultParams {
+        supply_init: BONK_DEFAULT_SUPPLY_INIT.to_string(),
+        total_fund_raising_b: total_fund_raising_b.to_string(),
+        total_sell_a: BONK_DEFAULT_TOTAL_SELL_A.to_string(),
+    })
 }
 
 async fn load_bonk_launch_defaults(
@@ -2308,39 +2708,37 @@ async fn load_bonk_launch_defaults(
     launch_mode: &str,
     quote_asset: &str,
 ) -> Result<BonkLaunchDefaults, String> {
+    if let Some(defaults) = cached_bonk_launch_defaults(launch_mode, quote_asset) {
+        return Ok(defaults);
+    }
     let normalized_mode = normalize_bonk_launch_mode(launch_mode);
     let quote = bonk_quote_asset_config(quote_asset);
     let cache_key = format!("{normalized_mode}:{}", quote.asset);
-    let ttl = bonk_launch_defaults_cache_ttl();
-    if let Some(entry) = bonk_launch_defaults_cache()
-        .lock()
-        .expect("bonk launch defaults cache")
-        .get(&cache_key)
-        .filter(|entry| entry.fetched_at.elapsed() <= ttl)
-        .cloned()
-    {
-        return Ok(entry.defaults);
-    }
     let config_id = bonk_launch_config_id(quote.asset)?;
     let platform_id = bonk_platform_id(normalized_mode);
-    let (config_data, platform_data, launch_configs) = tokio::try_join!(
+    let (config_data, platform_data) = tokio::try_join!(
         fetch_account_data(rpc_url, &config_id, "confirmed"),
         fetch_account_data(rpc_url, platform_id, "confirmed"),
-        fetch_raydium_launch_configs(rpc_url),
     )?;
     let config_info = decode_bonk_launchpad_config(&config_data)?;
     let platform_info = decode_bonk_platform_config(&platform_data)?;
-    let api_config = launch_configs
-        .into_iter()
-        .find(|entry| entry.key.pubkey == config_id)
-        .ok_or_else(|| format!("Raydium launch config defaults not found for {config_id}"))?;
-    let supply = parse_biguint_integer(&api_config.default_params.supply_init, "Bonk launch supply")?;
+    let default_params = local_bonk_launch_default_params(&config_id)
+        .ok_or_else(|| format!("Local Bonk launch config defaults not found for {config_id}"))?;
+    let supply = parse_biguint_integer(&default_params.supply_init, "Bonk launch supply")?;
     let total_sell_a =
-        parse_biguint_integer(&api_config.default_params.total_sell_a, "Bonk launch total sell")?;
+        parse_biguint_integer(&default_params.total_sell_a, "Bonk launch total sell")?;
     let total_fund_raising_b = parse_biguint_integer(
-        &api_config.default_params.total_fund_raising_b,
+        &default_params.total_fund_raising_b,
         "Bonk launch total fund raising",
     )?;
+    if config_info.curve_type != 0
+        || config_info.migrate_fee != 0
+        || config_info.trade_fee_rate != 2500
+    {
+        return Err(format!(
+            "Unsupported Bonk launch config {config_id}; local defaults require the verified constant-product config."
+        ));
+    }
     let (virtual_a, virtual_b) = bonk_curve_init_virtuals(
         config_info.curve_type,
         &supply,
@@ -2376,6 +2774,24 @@ async fn load_bonk_launch_defaults(
             },
         );
     Ok(defaults)
+}
+
+async fn load_bonk_launch_defaults_with_startup_stagger(
+    rpc_url: &str,
+    launch_mode: &str,
+    quote_asset: &str,
+    index: u64,
+) -> Result<BonkLaunchDefaults, String> {
+    if let Some(defaults) = cached_bonk_launch_defaults(launch_mode, quote_asset) {
+        return Ok(defaults);
+    }
+    if index > 0 {
+        tokio::time::sleep(Duration::from_millis(
+            BONK_STARTUP_WARM_DEFAULT_STAGGER_MS.saturating_mul(index),
+        ))
+        .await;
+    }
+    load_bonk_launch_defaults(rpc_url, launch_mode, quote_asset).await
 }
 
 fn build_native_bonk_quote_from_defaults(
@@ -2429,10 +2845,14 @@ async fn native_quote_launch(
         let normalized_mode = mode.trim().to_ascii_lowercase();
         if normalized_mode == "tokens" {
             let token_amount = parse_decimal_biguint(amount, BONK_TOKEN_DECIMALS, "buy amount")?;
-            let required_quote_amount = bonk_quote_buy_exact_out_amount_b(&defaults, &token_amount)?;
-            let quoted_sol_input =
-                native_quote_sol_input_for_usd1_output(rpc_url, &required_quote_amount, slippage_bps)
-                    .await?;
+            let required_quote_amount =
+                bonk_quote_buy_exact_out_amount_b(&defaults, &token_amount)?;
+            let quoted_sol_input = native_quote_sol_input_for_usd1_output(
+                rpc_url,
+                &required_quote_amount,
+                slippage_bps,
+            )
+            .await?;
             return Ok(LaunchQuote {
                 mode: normalized_mode,
                 input: amount.to_string(),
@@ -2441,7 +2861,10 @@ async fn native_quote_launch(
                 estimatedQuoteAmount: format_biguint_decimal(&quoted_sol_input, 9, 6),
                 quoteAsset: "sol".to_string(),
                 quoteAssetLabel: "SOL".to_string(),
-                estimatedSupplyPercent: bonk_estimate_supply_percent(&token_amount, &defaults.supply),
+                estimatedSupplyPercent: bonk_estimate_supply_percent(
+                    &token_amount,
+                    &defaults.supply,
+                ),
             });
         }
         let input_sol = parse_decimal_biguint(amount, 9, "buy amount SOL")?;
@@ -2480,13 +2903,9 @@ async fn native_predict_dev_buy_effect(
         bonk_quote_buy_exact_out_amount_b(&defaults, &requested_tokens)?
     } else if defaults.quote.asset == "usd1" {
         let input_sol = parse_decimal_biguint(&dev_buy.amount, 9, "dev buy SOL")?;
-        native_quote_usd1_output_from_sol_input(
-            rpc_url,
-            &input_sol,
-            slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
-        )
-        .await?
-        .min_out
+        native_quote_usd1_output_from_sol_input(rpc_url, &input_sol, BONK_USD1_ROUTE_SLIPPAGE_BPS)
+            .await?
+            .min_out
     } else {
         parse_decimal_biguint(
             &dev_buy.amount,
@@ -2546,6 +2965,10 @@ fn read_bonk_u16(data: &[u8], offset: &mut usize) -> Result<u16, String> {
         .try_into()
         .map_err(|_| "Bonk account returned an invalid u16 field.".to_string())?;
     Ok(u16::from_le_bytes(array))
+}
+
+fn read_bonk_bool(data: &[u8], offset: &mut usize) -> Result<bool, String> {
+    Ok(read_bonk_u8(data, offset)? != 0)
 }
 
 fn read_bonk_u32(data: &[u8], offset: &mut usize) -> Result<u32, String> {
@@ -2623,9 +3046,9 @@ fn decode_bonk_clmm_pool(data: &[u8]) -> Result<DecodedBonkClmmPool, String> {
     let _creator = read_bonk_pubkey(data, &mut offset)?;
     let mint_a = read_bonk_pubkey(data, &mut offset)?;
     let mint_b = read_bonk_pubkey(data, &mut offset)?;
-    let _vault_a = read_bonk_pubkey(data, &mut offset)?;
-    let _vault_b = read_bonk_pubkey(data, &mut offset)?;
-    let _observation_id = read_bonk_pubkey(data, &mut offset)?;
+    let vault_a = read_bonk_pubkey(data, &mut offset)?;
+    let vault_b = read_bonk_pubkey(data, &mut offset)?;
+    let observation_id = read_bonk_pubkey(data, &mut offset)?;
     let mint_decimals_a = read_bonk_u8(data, &mut offset)?;
     let mint_decimals_b = read_bonk_u8(data, &mut offset)?;
     let tick_spacing = read_bonk_u16(data, &mut offset)?;
@@ -2647,6 +3070,9 @@ fn decode_bonk_clmm_pool(data: &[u8]) -> Result<DecodedBonkClmmPool, String> {
         amm_config,
         mint_a,
         mint_b,
+        vault_a,
+        vault_b,
+        observation_id,
         mint_decimals_a,
         mint_decimals_b,
         tick_spacing,
@@ -2654,6 +3080,76 @@ fn decode_bonk_clmm_pool(data: &[u8]) -> Result<DecodedBonkClmmPool, String> {
         sqrt_price_x64,
         tick_current,
         tick_array_bitmap,
+    })
+}
+
+fn decode_bonk_cpmm_pool(data: &[u8]) -> Result<DecodedBonkCpmmPool, String> {
+    let mut offset = 0usize;
+    offset += 8;
+    let config_id = read_bonk_pubkey(data, &mut offset)?;
+    let _pool_creator = read_bonk_pubkey(data, &mut offset)?;
+    let vault_a = read_bonk_pubkey(data, &mut offset)?;
+    let vault_b = read_bonk_pubkey(data, &mut offset)?;
+    let _lp_mint = read_bonk_pubkey(data, &mut offset)?;
+    let token_0_mint = read_bonk_pubkey(data, &mut offset)?;
+    let token_1_mint = read_bonk_pubkey(data, &mut offset)?;
+    let token_0_program = read_bonk_pubkey(data, &mut offset)?;
+    let token_1_program = read_bonk_pubkey(data, &mut offset)?;
+    let observation_id = read_bonk_pubkey(data, &mut offset)?;
+    let _bump = read_bonk_u8(data, &mut offset)?;
+    let _status = read_bonk_u8(data, &mut offset)?;
+    let _lp_decimals = read_bonk_u8(data, &mut offset)?;
+    let mint_decimals_a = read_bonk_u8(data, &mut offset)?;
+    let mint_decimals_b = read_bonk_u8(data, &mut offset)?;
+    let _lp_amount = read_bonk_u64(data, &mut offset)?;
+    let protocol_fees_mint_a = read_bonk_u64(data, &mut offset)?;
+    let protocol_fees_mint_b = read_bonk_u64(data, &mut offset)?;
+    let fund_fees_mint_a = read_bonk_u64(data, &mut offset)?;
+    let fund_fees_mint_b = read_bonk_u64(data, &mut offset)?;
+    let _open_time = read_bonk_u64(data, &mut offset)?;
+    let _epoch = read_bonk_u64(data, &mut offset)?;
+    let _fee_on = read_bonk_u8(data, &mut offset)?;
+    let enable_creator_fee = read_bonk_bool(data, &mut offset)?;
+    offset += 6;
+    let creator_fees_mint_a = read_bonk_u64(data, &mut offset)?;
+    let creator_fees_mint_b = read_bonk_u64(data, &mut offset)?;
+    Ok(DecodedBonkCpmmPool {
+        config_id,
+        vault_a,
+        vault_b,
+        token_0_mint,
+        token_1_mint,
+        token_0_program,
+        token_1_program,
+        observation_id,
+        mint_decimals_a,
+        mint_decimals_b,
+        protocol_fees_mint_a,
+        protocol_fees_mint_b,
+        fund_fees_mint_a,
+        fund_fees_mint_b,
+        enable_creator_fee,
+        creator_fees_mint_a,
+        creator_fees_mint_b,
+    })
+}
+
+fn decode_bonk_cpmm_config(data: &[u8]) -> Result<DecodedBonkCpmmConfig, String> {
+    let mut offset = 0usize;
+    offset += 8;
+    let _bump = read_bonk_u8(data, &mut offset)?;
+    let _disable_create_pool = read_bonk_bool(data, &mut offset)?;
+    let _index = read_bonk_u16(data, &mut offset)?;
+    let trade_fee_rate = read_bonk_u64(data, &mut offset)?;
+    let _protocol_fee_rate = read_bonk_u64(data, &mut offset)?;
+    let _fund_fee_rate = read_bonk_u64(data, &mut offset)?;
+    let _create_pool_fee = read_bonk_u64(data, &mut offset)?;
+    let _protocol_owner = read_bonk_pubkey(data, &mut offset)?;
+    let _fund_owner = read_bonk_pubkey(data, &mut offset)?;
+    let creator_fee_rate = read_bonk_u64(data, &mut offset)?;
+    Ok(DecodedBonkCpmmConfig {
+        trade_fee_rate,
+        creator_fee_rate,
     })
 }
 
@@ -2762,96 +3258,221 @@ async fn fetch_launchpad_pool_candidate(
 }
 
 async fn fetch_migrated_raydium_candidates(
+    rpc_url: &str,
     mint: &Pubkey,
+    preferred_quote_asset: &str,
+    launchpad_candidates: &[BonkMarketCandidate],
 ) -> Result<Vec<BonkMarketCandidate>, String> {
-    let client = bonk_http_client();
-    let mint_string = mint.to_string();
     let mut candidates = Vec::new();
-    for asset in ["sol", "usd1"] {
+    let requested_quote = preferred_quote_asset.trim().to_ascii_lowercase();
+    let assets = if requested_quote.is_empty() {
+        vec!["sol", "usd1"]
+    } else {
+        vec![bonk_quote_asset_config(&requested_quote).asset]
+    };
+    for asset in assets {
         let quote = bonk_quote_asset_config(asset);
-        let (mint1, mint2) = if mint_string.as_str() > quote.mint {
-            (quote.mint.to_string(), mint_string.clone())
-        } else {
-            (mint_string.clone(), quote.mint.to_string())
-        };
-        let response = client
-            .get(RAYDIUM_POOL_SEARCH_MINT_ENDPOINT)
-            .query(&[
-                ("mint1", mint1.as_str()),
-                ("mint2", mint2.as_str()),
-                ("poolType", "all"),
-                ("poolSortField", "default"),
-                ("sortType", "desc"),
-                ("pageSize", "100"),
-                ("page", "1"),
-            ])
-            .send()
-            .await
-            .map_err(|error| format!("Failed to query Raydium migrated pools: {error}"))?;
-        if !response.status().is_success() {
+        let Some(launchpad_candidate) = launchpad_candidates
+            .iter()
+            .find(|candidate| candidate.quote_asset == quote.asset && candidate.complete)
+        else {
             continue;
-        }
-        let payload: RaydiumPoolsResponse = response
-            .json()
-            .await
-            .map_err(|error| format!("Failed to parse Raydium migrated pool response: {error}"))?;
-        for pool in payload.data {
-            let quote_meta = bonk_quote_asset_from_mint_address(if !pool.mint_a.address.is_empty() {
-                &pool.mint_a.address
+        };
+        let quote_mint = bonk_quote_mint(quote.asset)?;
+        for (pool_id, owner, data) in
+            rpc_fetch_bonk_raydium_pools_for_pair(rpc_url, mint, &quote_mint, "processed").await?
+        {
+            let (config_id, pool_type) = if owner == bonk_clmm_program_id()? {
+                let pool = decode_bonk_clmm_pool(&data)?;
+                if pool.mint_a != *mint && pool.mint_b != *mint {
+                    continue;
+                }
+                if pool.mint_a != quote_mint && pool.mint_b != quote_mint {
+                    continue;
+                }
+                if pool.vault_a == Pubkey::default()
+                    || pool.vault_b == Pubkey::default()
+                    || pool.liquidity == BigUint::ZERO
+                {
+                    continue;
+                }
+                (pool.amm_config.to_string(), "Concentrated")
+            } else if owner == bonk_cpmm_program_id()? {
+                let pool = decode_bonk_cpmm_pool(&data)?;
+                if pool.token_0_mint != *mint && pool.token_1_mint != *mint {
+                    continue;
+                }
+                if pool.token_0_mint != quote_mint && pool.token_1_mint != quote_mint {
+                    continue;
+                }
+                if pool.vault_a == Pubkey::default() || pool.vault_b == Pubkey::default() {
+                    continue;
+                }
+                (pool.config_id.to_string(), "Standard")
             } else {
-                &pool.mint_b.address
-            });
-            let Some(quote_meta) = quote_meta else {
                 continue;
             };
-            let lowered_pool_type = pool.pool_type.trim().to_ascii_lowercase();
             candidates.push(BonkMarketCandidate {
-                mode: "regular".to_string(),
-                quote_asset: quote_meta.asset.to_string(),
-                quote_asset_label: quote_meta.label.to_string(),
-                creator: String::new(),
-                platform_id: String::new(),
-                config_id: pool
-                    .config
-                    .as_ref()
-                    .map(|config| config.id.clone())
-                    .unwrap_or_default(),
-                pool_id: pool.id.clone(),
-                real_quote_reserves: pool.tvl.max(0.0).round() as u64 * 1_000_000,
+                mode: launchpad_candidate.mode.clone(),
+                quote_asset: quote.asset.to_string(),
+                quote_asset_label: quote.label.to_string(),
+                creator: launchpad_candidate.creator.clone(),
+                platform_id: launchpad_candidate.platform_id.clone(),
+                config_id,
+                pool_id: pool_id.to_string(),
+                real_quote_reserves: 0,
                 complete: true,
-                detection_source: format!(
-                    "raydium-{}",
-                    if lowered_pool_type.is_empty() {
-                        "migrated"
-                    } else {
-                        lowered_pool_type.as_str()
-                    }
-                ),
-                launch_migrate_pool: pool.launch_migrate_pool,
-                tvl: pool.tvl,
-                pool_type: pool.pool_type.clone(),
+                detection_source: "raydium-migrated-rpc".to_string(),
+                launch_migrate_pool: true,
+                tvl: 0.0,
+                pool_type: pool_type.to_string(),
                 launchpad_pool: None,
-                raydium_pool: Some(pool),
+                raydium_pool: None,
             });
         }
     }
     Ok(candidates)
 }
 
+async fn rpc_fetch_bonk_raydium_pools_for_pair(
+    rpc_url: &str,
+    mint: &Pubkey,
+    quote_mint: &Pubkey,
+    commitment: &str,
+) -> Result<Vec<(Pubkey, Pubkey, Vec<u8>)>, String> {
+    let mut pools = HashMap::new();
+    for (program_id, left_offset, right_offset) in [
+        (
+            BONK_CLMM_PROGRAM_ID,
+            BONK_CLMM_MINT_A_OFFSET,
+            BONK_CLMM_MINT_B_OFFSET,
+        ),
+        (
+            BONK_CPMM_PROGRAM_ID,
+            BONK_CPMM_TOKEN_0_MINT_OFFSET,
+            BONK_CPMM_TOKEN_1_MINT_OFFSET,
+        ),
+    ] {
+        for (left, right) in [(mint, quote_mint), (quote_mint, mint)] {
+            for (pool_id, data) in rpc_fetch_bonk_raydium_pools_for_ordered_pair(
+                rpc_url,
+                program_id,
+                left_offset,
+                right_offset,
+                left,
+                right,
+                commitment,
+            )
+            .await?
+            {
+                pools.entry(pool_id).or_insert((
+                    Pubkey::from_str(program_id)
+                        .map_err(|error| format!("Invalid Bonk Raydium program id: {error}"))?,
+                    data,
+                ));
+            }
+        }
+    }
+    Ok(pools
+        .into_iter()
+        .map(|(pool_id, (owner, data))| (pool_id, owner, data))
+        .collect())
+}
+
+async fn rpc_fetch_bonk_raydium_pools_for_ordered_pair(
+    rpc_url: &str,
+    program_id: &str,
+    left_offset: usize,
+    right_offset: usize,
+    left_mint: &Pubkey,
+    right_mint: &Pubkey,
+    commitment: &str,
+) -> Result<Vec<(Pubkey, Vec<u8>)>, String> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": "launchdeck-bonk-raydium-pools",
+        "method": "getProgramAccounts",
+        "params": [
+            program_id,
+            {
+                "commitment": commitment,
+                "encoding": "base64",
+                "filters": [
+                    {
+                        "memcmp": {
+                            "offset": left_offset,
+                            "bytes": left_mint.to_string()
+                        }
+                    },
+                    {
+                        "memcmp": {
+                            "offset": right_offset,
+                            "bytes": right_mint.to_string()
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+    let response = bonk_http_client()
+        .post(rpc_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to fetch Bonk Raydium pools from RPC: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to fetch Bonk Raydium pools from RPC: status {}.",
+            response.status()
+        ));
+    }
+    let parsed: RpcResponse<Vec<RpcProgramAccount>> = response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to parse Bonk Raydium pool RPC response: {error}"))?;
+    let mut pools = Vec::with_capacity(parsed.result.len());
+    for account in parsed.result {
+        let Ok(pool_id) = Pubkey::from_str(&account.pubkey) else {
+            continue;
+        };
+        let Ok(data) = BASE64.decode(account.account.data.0.trim()) else {
+            continue;
+        };
+        pools.push((pool_id, data));
+    }
+    Ok(pools)
+}
+
 async fn detect_bonk_market_candidates(
     rpc_url: &str,
     mint: &Pubkey,
+    preferred_quote_asset: &str,
 ) -> Result<Vec<BonkMarketCandidate>, String> {
     let mut launchpad_candidates = Vec::new();
-    for asset in ["sol", "usd1"] {
+    let requested_quote = preferred_quote_asset.trim().to_ascii_lowercase();
+    let assets = if requested_quote.is_empty() {
+        vec!["sol", "usd1"]
+    } else {
+        vec![bonk_quote_asset_config(&requested_quote).asset]
+    };
+    for asset in assets {
         if let Some(candidate) = fetch_launchpad_pool_candidate(rpc_url, mint, asset).await? {
             launchpad_candidates.push(candidate);
         }
     }
-    if !launchpad_candidates.iter().any(|candidate| candidate.complete) {
+    if !launchpad_candidates
+        .iter()
+        .any(|candidate| candidate.complete)
+    {
         return Ok(launchpad_candidates);
     }
-    let migrated_candidates = fetch_migrated_raydium_candidates(mint).await?;
+    let migrated_candidates = fetch_migrated_raydium_candidates(
+        rpc_url,
+        mint,
+        preferred_quote_asset,
+        &launchpad_candidates,
+    )
+    .await?;
     if migrated_candidates.is_empty() {
         Ok(launchpad_candidates)
     } else {
@@ -2884,15 +3505,17 @@ fn compare_bonk_market_candidates(
                 .unwrap_or(Ordering::Equal)
         })
         .then_with(|| {
-            let left_requested =
-                (!preferred_quote_asset.is_empty() && left.quote_asset == preferred_quote_asset)
-                    as u8;
-            let right_requested =
-                (!preferred_quote_asset.is_empty() && right.quote_asset == preferred_quote_asset)
-                    as u8;
+            let left_requested = (!preferred_quote_asset.is_empty()
+                && left.quote_asset == preferred_quote_asset)
+                as u8;
+            let right_requested = (!preferred_quote_asset.is_empty()
+                && right.quote_asset == preferred_quote_asset)
+                as u8;
             right_requested.cmp(&left_requested)
         })
-        .then_with(|| pool_type_priority(&left.pool_type).cmp(&pool_type_priority(&right.pool_type)))
+        .then_with(|| {
+            pool_type_priority(&left.pool_type).cmp(&pool_type_priority(&right.pool_type))
+        })
         .then_with(|| {
             if left.quote_asset == right.quote_asset {
                 Ordering::Equal
@@ -2909,7 +3532,19 @@ fn select_preferred_bonk_market_candidate<'a>(
     preferred_quote_asset: &str,
 ) -> Option<&'a BonkMarketCandidate> {
     let normalized_preferred = preferred_quote_asset.trim().to_ascii_lowercase();
-    candidates.iter().min_by(|left, right| {
+    let eligible = if normalized_preferred.is_empty() {
+        candidates.iter().collect::<Vec<_>>()
+    } else {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .quote_asset
+                    .eq_ignore_ascii_case(&normalized_preferred)
+            })
+            .collect::<Vec<_>>()
+    };
+    eligible.into_iter().min_by(|left, right| {
         compare_bonk_market_candidates(left, right, normalized_preferred.as_str())
     })
 }
@@ -2969,7 +3604,9 @@ fn format_decimal_u128(value: u128, decimals: u32, max_fraction_digits: u32) -> 
     }
 }
 
-fn build_launchpad_market_snapshot(candidate: &BonkMarketCandidate) -> Result<BonkMarketSnapshot, String> {
+fn build_launchpad_market_snapshot(
+    candidate: &BonkMarketCandidate,
+) -> Result<BonkMarketSnapshot, String> {
     let pool = candidate
         .launchpad_pool
         .as_ref()
@@ -3049,20 +3686,58 @@ async fn build_migrated_raydium_market_snapshot(
     mint: &Pubkey,
     candidate: &BonkMarketCandidate,
 ) -> Result<BonkMarketSnapshot, String> {
-    let pool = candidate
-        .raydium_pool
-        .as_ref()
-        .ok_or_else(|| "Missing Raydium migrated pool candidate.".to_string())?;
     let supply = fetch_token_supply_value(rpc_url, mint, "processed").await?;
-    let token_supply = supply.amount.trim().parse::<u128>().map_err(|error| {
-        format!(
-            "Invalid Bonk token supply amount for {}: {error}",
-            mint
-        )
-    })?;
+    let token_supply = supply
+        .amount
+        .trim()
+        .parse::<u128>()
+        .map_err(|error| format!("Invalid Bonk token supply amount for {}: {error}", mint))?;
     let quote = bonk_quote_asset_config(&candidate.quote_asset);
-    let market_cap_lamports =
-        market_cap_from_raydium_pool_price(pool, token_supply, supply.decimals, &quote)?;
+    let venue_context = load_bonk_trade_venue_context_by_pool_id(
+        rpc_url,
+        &candidate.pool_id,
+        quote.asset,
+        "processed",
+    )
+    .await?;
+    let market_cap_lamports = match venue_context {
+        NativeBonkTradeVenueContext::RaydiumCpmm(context) => {
+            let (token_reserve, quote_reserve) = if context.pool.token_0_mint == *mint {
+                (context.reserve_a, context.reserve_b)
+            } else {
+                (context.reserve_b, context.reserve_a)
+            };
+            if token_reserve == 0 {
+                0
+            } else {
+                let market_cap = (BigUint::from(token_supply) * BigUint::from(quote_reserve))
+                    / BigUint::from(token_reserve);
+                biguint_to_u128(&market_cap, "Bonk CPMM migrated market cap")?
+            }
+        }
+        NativeBonkTradeVenueContext::RaydiumClmm(context) => {
+            let setup = &context.setup;
+            let token_is_a = setup.mint_a == *mint;
+            let price_quote_per_token = if token_is_a {
+                setup.current_price
+            } else if setup.current_price > 0.0 {
+                1.0 / setup.current_price
+            } else {
+                0.0
+            };
+            let token_amount = token_supply as f64 / 10f64.powi(supply.decimals as i32);
+            let quote_atoms =
+                token_amount * price_quote_per_token * 10f64.powi(quote.decimals as i32);
+            if !quote_atoms.is_finite() || quote_atoms <= 0.0 {
+                0
+            } else {
+                quote_atoms.round() as u128
+            }
+        }
+        NativeBonkTradeVenueContext::Launchpad(_) => {
+            return Err("Bonk migrated Raydium snapshot resolved to a launchpad pool.".to_string());
+        }
+    };
     Ok(BonkMarketSnapshot {
         mint: mint.to_string(),
         creator: candidate.creator.clone(),
@@ -3086,10 +3761,10 @@ async fn native_fetch_bonk_market_snapshot(
 ) -> Result<BonkMarketSnapshot, String> {
     let mint_pubkey =
         Pubkey::from_str(mint).map_err(|error| format!("Invalid Bonk mint address: {error}"))?;
-    let candidates = detect_bonk_market_candidates(rpc_url, &mint_pubkey).await?;
+    let candidates = detect_bonk_market_candidates(rpc_url, &mint_pubkey, quote_asset).await?;
     let preferred = select_preferred_bonk_market_candidate(&candidates, quote_asset)
         .ok_or_else(|| format!("No Bonk market candidate found for {mint}."))?;
-    if preferred.raydium_pool.is_some() {
+    if is_raydium_detection_source(&preferred.detection_source) {
         build_migrated_raydium_market_snapshot(rpc_url, &mint_pubkey, preferred).await
     } else {
         build_launchpad_market_snapshot(preferred)
@@ -3103,7 +3778,7 @@ async fn native_detect_bonk_import_context_with_quote_asset(
 ) -> Result<Option<BonkImportContext>, String> {
     let mint_pubkey =
         Pubkey::from_str(mint).map_err(|error| format!("Invalid Bonk mint address: {error}"))?;
-    let candidates = detect_bonk_market_candidates(rpc_url, &mint_pubkey).await?;
+    let candidates = detect_bonk_market_candidates(rpc_url, &mint_pubkey, quote_asset).await?;
     let Some(preferred) = select_preferred_bonk_market_candidate(&candidates, quote_asset) else {
         return Ok(None);
     };
@@ -3124,158 +3799,6 @@ async fn native_detect_bonk_import_context(
     mint: &str,
 ) -> Result<Option<BonkImportContext>, String> {
     native_detect_bonk_import_context_with_quote_asset(rpc_url, mint, "").await
-}
-
-fn parse_helper_output<R: DeserializeOwned>(
-    output_stdout: &[u8],
-    helper_name: &str,
-) -> Result<R, String> {
-    let stdout = String::from_utf8_lossy(output_stdout);
-    let trimmed = stdout.trim();
-    let mut candidates = Vec::new();
-    if !trimmed.is_empty() {
-        candidates.push(trimmed.to_string());
-        if let Some(last_line) = trimmed.lines().rev().find(|line| !line.trim().is_empty()) {
-            let last_line = last_line.trim();
-            if !last_line.is_empty() && !candidates.iter().any(|entry| entry == last_line) {
-                candidates.push(last_line.to_string());
-            }
-        }
-        for (index, ch) in trimmed.char_indices().rev() {
-            if ch != '{' && ch != '[' {
-                continue;
-            }
-            let candidate = trimmed[index..].trim();
-            if candidate.is_empty() || candidates.iter().any(|entry| entry == candidate) {
-                continue;
-            }
-            candidates.push(candidate.to_string());
-            if candidates.len() >= 12 {
-                break;
-            }
-        }
-    }
-    for candidate in &candidates {
-        if let Ok(parsed) = serde_json::from_str::<R>(candidate) {
-            return Ok(parsed);
-        }
-    }
-    let preview = trimmed.chars().take(240).collect::<String>();
-    Err(format!(
-        "Failed to parse {helper_name} helper output. stdout preview: {}",
-        if preview.is_empty() {
-            "(empty)".to_string()
-        } else {
-            preview.replace('\n', "\\n")
-        }
-    ))
-}
-
-async fn run_helper_once<T: Serialize, R: DeserializeOwned>(request: &T) -> Result<R, String> {
-    let _permit = helper_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|_| "Bonk helper semaphore closed unexpectedly.".to_string())?;
-    let script_path = helper_script_path()?;
-    let request_bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
-    let mut child = Command::new("node")
-        .arg(script_path)
-        .current_dir(project_root()?)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Failed to start Bonk helper: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&request_bytes)
-            .await
-            .map_err(|error| format!("Failed to send Bonk helper request: {error}"))?;
-    }
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Bonk helper stdout was unavailable.".to_string())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Bonk helper stderr was unavailable.".to_string())?;
-    let stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-            .map_err(|error| error.to_string())
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-            .map_err(|error| error.to_string())
-    });
-    let status = match timeout(Duration::from_millis(helper_timeout_ms()), child.wait()).await {
-        Ok(result) => result.map_err(|error| format!("Bonk helper failed to complete: {error}"))?,
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(format!(
-                "Bonk helper timed out after {}ms.",
-                helper_timeout_ms()
-            ));
-        }
-    };
-    let output_stdout = stdout_task
-        .await
-        .map_err(|error| format!("Bonk helper stdout task failed: {error}"))?
-        .map_err(|error| format!("Failed to read Bonk helper stdout: {error}"))?;
-    let output_stderr = stderr_task
-        .await
-        .map_err(|error| format!("Bonk helper stderr task failed: {error}"))?
-        .map_err(|error| format!("Failed to read Bonk helper stderr: {error}"))?;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&output_stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            "Bonk helper exited with a non-zero status.".to_string()
-        } else {
-            format!("Bonk helper error: {stderr}")
-        });
-    }
-    parse_helper_output(&output_stdout, "Bonk")
-}
-
-async fn run_helper<T: Serialize, R: DeserializeOwned>(request: &T) -> Result<R, String> {
-    if bonk_worker_enabled() {
-        match worker_client()?.request::<T, R>(request).await {
-            Ok(response) => return Ok(response),
-            Err(HelperWorkerError::Request(error)) => return Err(error),
-            Err(HelperWorkerError::Transport(error)) => {
-                eprintln!("Bonk worker transport failed, falling back to one-shot helper: {error}");
-            }
-        }
-    }
-    run_helper_once(request).await
-}
-
-fn helper_tx_config(
-    compute_unit_limit: Option<u64>,
-    compute_unit_price_micro_lamports: u64,
-    tip_lamports: u64,
-    tip_account: &str,
-    jitodontfront: bool,
-    single_bundle_tip_last_tx: bool,
-) -> HelperTxConfig<'_> {
-    HelperTxConfig {
-        computeUnitLimit: compute_unit_limit
-            .unwrap_or_else(configured_default_launch_compute_unit_limit),
-        computeUnitPriceMicroLamports: compute_unit_price_micro_lamports,
-        tipLamports: tip_lamports,
-        tipAccount: tip_account,
-        jitodontfront,
-        singleBundleTipLastTx: single_bundle_tip_last_tx,
-    }
 }
 
 fn uses_single_bundle_tip_last_tx(provider: &str, mev_mode: &str) -> bool {
@@ -3341,8 +3864,55 @@ fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, Str
 }
 
 fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
-    let percent = parse_decimal_u64(slippage_percent, 2, "slippage percent")?;
-    Ok(percent.min(10_000))
+    let trimmed = slippage_percent.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    if trimmed.starts_with('-') {
+        return Err("Invalid slippage percent: expected a non-negative decimal.".to_string());
+    }
+    let parts = trimmed.split('.').collect::<Vec<_>>();
+    if parts.len() > 2 {
+        return Err("Invalid slippage percent: expected a decimal value.".to_string());
+    }
+    let whole = parts[0];
+    let fractional = parts.get(1).copied().unwrap_or("");
+    if (whole.is_empty() && fractional.is_empty())
+        || !whole.chars().all(|ch| ch.is_ascii_digit())
+        || !fractional.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err("Invalid slippage percent: expected a non-negative decimal.".to_string());
+    }
+    if fractional.len() > 2 {
+        return Err("slippage percent supports at most 2 decimal places.".to_string());
+    }
+    let whole_bps = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid slippage percent: {error}"))?
+            .checked_mul(100)
+            .ok_or_else(|| "slippage percent is too large.".to_string())?
+    };
+    let fractional_bps = if fractional.is_empty() {
+        0
+    } else {
+        let mut padded = fractional.to_string();
+        while padded.len() < 2 {
+            padded.push('0');
+        }
+        padded
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid slippage percent: {error}"))?
+    };
+    let bps = whole_bps
+        .checked_add(fractional_bps)
+        .ok_or_else(|| "slippage percent is too large.".to_string())?;
+    if bps > 10_000 {
+        return Err("slippage percent must be between 0 and 100.".to_string());
+    }
+    Ok(bps)
 }
 
 fn decode_secret_base64(secret: &[u8]) -> String {
@@ -3357,8 +3927,8 @@ async fn normalize_vanity_secret_for_helper(
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let bytes =
-        read_keypair_bytes(trimmed).map_err(|error| format!("Invalid vanity private key: {error}"))?;
+    let bytes = read_keypair_bytes(trimmed)
+        .map_err(|error| format!("Invalid vanity private key: {error}"))?;
     let keypair = solana_sdk::signature::Keypair::try_from(bytes.as_slice())
         .map_err(|error| format!("Invalid vanity private key: {error}"))?;
     let public_key = bs58::encode(&keypair.to_bytes()[32..]).into_string();
@@ -3380,23 +3950,6 @@ async fn normalize_vanity_secret_for_helper(
         "base58:{}",
         bs58::encode(keypair.to_bytes()).into_string()
     )))
-}
-
-fn convert_compiled_transaction(source: HelperCompiledTransaction) -> CompiledTransaction {
-    let signature = crate::rpc::precompute_transaction_signature(&source.serializedBase64);
-    CompiledTransaction {
-        label: source.label,
-        format: source.format,
-        blockhash: source.blockhash,
-        lastValidBlockHeight: source.lastValidBlockHeight,
-        serializedBase64: source.serializedBase64,
-        signature,
-        lookupTablesUsed: source.lookupTablesUsed,
-        computeUnitLimit: source.computeUnitLimit,
-        computeUnitPriceMicroLamports: source.computeUnitPriceMicroLamports,
-        inlineTipLamports: source.inlineTipLamports,
-        inlineTipAccount: source.inlineTipAccount,
-    }
 }
 
 fn parse_owner_keypair(secret: &[u8]) -> Result<Keypair, String> {
@@ -3423,6 +3976,35 @@ fn bonk_follow_tx_config(
     })
 }
 
+fn configured_default_bonk_sell_compute_unit_limit() -> u64 {
+    configured_default_dev_auto_sell_compute_unit_limit()
+        .max(configured_default_follow_up_compute_unit_limit())
+        .max(DEFAULT_BONK_SELL_COMPUTE_UNIT_LIMIT)
+}
+
+fn configured_default_bonk_launchpad_buy_compute_unit_limit() -> u64 {
+    configured_default_sniper_buy_compute_unit_limit()
+        .max(configured_default_follow_up_compute_unit_limit())
+}
+
+fn configured_default_bonk_usd1_sell_to_sol_compute_unit_limit() -> u64 {
+    std::env::var("LAUNCHDECK_BONK_USD1_SELL_TO_SOL_COMPUTE_UNIT_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BONK_SELL_COMPUTE_UNIT_LIMIT)
+        .max(configured_default_bonk_sell_compute_unit_limit())
+}
+
+fn configured_bonk_sell_compute_unit_limit(quote_asset: &str, sell_settlement_asset: &str) -> u64 {
+    let settlement_asset = normalize_bonk_sell_settlement_asset(sell_settlement_asset);
+    if quote_asset == "usd1" && settlement_asset == "sol" {
+        configured_default_bonk_usd1_sell_to_sol_compute_unit_limit()
+    } else {
+        configured_default_bonk_sell_compute_unit_limit()
+    }
+}
+
 fn bonk_launch_tx_config(config: &NormalizedConfig) -> Result<NativeBonkTxConfig, String> {
     Ok(NativeBonkTxConfig {
         compute_unit_limit: u32::try_from(
@@ -3434,7 +4016,11 @@ fn bonk_launch_tx_config(config: &NormalizedConfig) -> Result<NativeBonkTxConfig
         )
         .map_err(|error| format!("Invalid Bonk launch compute unit limit: {error}"))?,
         compute_unit_price_micro_lamports: u64::try_from(
-            config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0),
+            config
+                .tx
+                .computeUnitPriceMicroLamports
+                .unwrap_or_default()
+                .max(0),
         )
         .unwrap_or_default(),
         tip_lamports: u64::try_from(config.tx.jitoTipLamports.max(0)).unwrap_or_default(),
@@ -3443,11 +4029,8 @@ fn bonk_launch_tx_config(config: &NormalizedConfig) -> Result<NativeBonkTxConfig
 }
 
 fn select_bonk_native_tx_format(requested: &str) -> NativeBonkTxFormat {
-    if requested.trim().eq_ignore_ascii_case("legacy") {
-        NativeBonkTxFormat::Legacy
-    } else {
-        NativeBonkTxFormat::V0
-    }
+    let _ = requested;
+    NativeBonkTxFormat::V0
 }
 
 fn bonk_bundle_tx_config_for_index(
@@ -3493,14 +4076,21 @@ fn build_compute_unit_price_instruction(micro_lamports: u64) -> Result<Instructi
     })
 }
 
-fn apply_jitodontfront(mut instructions: Vec<Instruction>, enabled: bool) -> Result<Vec<Instruction>, String> {
+fn apply_jitodontfront(
+    mut instructions: Vec<Instruction>,
+    enabled: bool,
+) -> Result<Vec<Instruction>, String> {
     if !enabled {
         return Ok(instructions);
     }
     let dontfront = Pubkey::from_str(JITODONTFRONT_ACCOUNT)
         .map_err(|error| format!("Invalid jitodontfront account: {error}"))?;
     for instruction in &mut instructions {
-        if instruction.accounts.iter().any(|meta| meta.pubkey == dontfront) {
+        if instruction
+            .accounts
+            .iter()
+            .any(|meta| meta.pubkey == dontfront)
+        {
             continue;
         }
         instruction
@@ -3550,34 +4140,32 @@ fn build_bonk_compiled_transaction(
     instructions: Vec<Instruction>,
     tx_config: &NativeBonkTxConfig,
 ) -> Result<CompiledTransaction, String> {
+    if tx_format == NativeBonkTxFormat::Legacy {
+        return Err(
+            "Bonk shared-ALT-only compilation no longer supports legacy transaction format."
+                .to_string(),
+        );
+    }
     let hash = Hash::from_str(blockhash).map_err(|error| error.to_string())?;
+    let mut instructions = instructions;
+    append_bonk_uniqueness_memo_if_needed(&mut instructions, label)?;
     let mut signers = Vec::with_capacity(1 + extra_signers.len());
     signers.push(payer);
     signers.extend(extra_signers.iter().copied());
-    let serialized = if tx_format == NativeBonkTxFormat::Legacy {
-        let transaction = Transaction::new_signed_with_payer(
-            &instructions,
-            Some(&payer.pubkey()),
-            &signers,
-            hash,
-        );
-        bincode::serialize(&transaction).map_err(|error| error.to_string())?
-    } else {
-        let message = v0::Message::try_compile(&payer.pubkey(), &instructions, &[], hash)
-            .map_err(|error| error.to_string())?;
-        let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
-            .map_err(|error| error.to_string())?;
-        bincode::serialize(&transaction).map_err(|error| error.to_string())?
-    };
+    let message = v0::Message::try_compile(&payer.pubkey(), &instructions, &[], hash)
+        .map_err(|error| error.to_string())?;
+    let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
+        .map_err(|error| error.to_string())?;
+    let serialized = bincode::serialize(&transaction).map_err(|error| error.to_string())?;
     let serialized_base64 = BASE64.encode(serialized);
+    compiled_transaction_signers::remember_compiled_transaction_signers(
+        &serialized_base64,
+        extra_signers,
+    );
     let signature = crate::rpc::precompute_transaction_signature(&serialized_base64);
     Ok(CompiledTransaction {
         label: label.to_string(),
-        format: if tx_format == NativeBonkTxFormat::Legacy {
-            "legacy".to_string()
-        } else {
-            "v0".to_string()
-        },
+        format: "v0".to_string(),
         blockhash: blockhash.to_string(),
         lastValidBlockHeight: last_valid_block_height,
         serializedBase64: serialized_base64,
@@ -3594,7 +4182,8 @@ fn build_bonk_compiled_transaction(
         } else {
             None
         },
-        inlineTipAccount: if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty() {
+        inlineTipAccount: if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty()
+        {
             Some(tx_config.tip_account.clone())
         } else {
             None
@@ -3748,7 +4337,10 @@ fn split_bonk_instruction_bundle(
             queue = candidate;
         } else {
             if queue.is_empty() {
-                return Err("Bonk launch instruction bundle contained an oversized instruction.".to_string());
+                return Err(
+                    "Bonk launch instruction bundle contained an oversized instruction."
+                        .to_string(),
+                );
             }
             groups.push(queue);
             queue = vec![instruction];
@@ -3783,6 +4375,8 @@ fn build_bonk_v0_compiled_transaction_with_lookup_tables(
     lookup_tables: &[AddressLookupTableAccount],
 ) -> Result<CompiledTransaction, String> {
     let hash = Hash::from_str(blockhash).map_err(|error| error.to_string())?;
+    let mut instructions = instructions;
+    append_bonk_uniqueness_memo_if_needed(&mut instructions, label)?;
     let message = v0::Message::try_compile(&payer.pubkey(), &instructions, lookup_tables, hash)
         .map_err(|error| error.to_string())?;
     let lookup_tables_used = message
@@ -3790,11 +4384,17 @@ fn build_bonk_v0_compiled_transaction_with_lookup_tables(
         .iter()
         .map(|lookup| lookup.account_key.to_string())
         .collect::<Vec<_>>();
+    if lookup_tables_used.is_empty() {
+        return Err(format!(
+            "{label} compiled as shared-ALT Bonk v0 but did not actually use {BONK_USD1_SUPER_LOOKUP_TABLE}."
+        ));
+    }
+    let message_for_diagnostics = message.clone();
     let mut signers = Vec::with_capacity(1 + extra_signers.len());
     signers.push(payer);
     signers.extend(extra_signers.iter().copied());
-    let transaction =
-        VersionedTransaction::try_new(VersionedMessage::V0(message), &signers).map_err(|error| error.to_string())?;
+    let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
+        .map_err(|error| error.to_string())?;
     let serialized = bincode::serialize(&transaction).map_err(|error| error.to_string())?;
     if serialized.len() > PACKET_LIMIT_BYTES {
         return Err(format!(
@@ -3803,11 +4403,24 @@ fn build_bonk_v0_compiled_transaction_with_lookup_tables(
             PACKET_LIMIT_BYTES
         ));
     }
+    crate::alt_diagnostics::emit_alt_coverage_diagnostics(
+        "launchdeck-engine",
+        label,
+        &instructions,
+        lookup_tables,
+        &message_for_diagnostics,
+        Some(serialized.len()),
+        &[],
+    );
     let serialized_base64 = BASE64.encode(serialized);
+    compiled_transaction_signers::remember_compiled_transaction_signers(
+        &serialized_base64,
+        extra_signers,
+    );
     let signature = crate::rpc::precompute_transaction_signature(&serialized_base64);
     Ok(CompiledTransaction {
         label: label.to_string(),
-        format: "v0".to_string(),
+        format: "v0-alt".to_string(),
         blockhash: blockhash.to_string(),
         lastValidBlockHeight: last_valid_block_height,
         serializedBase64: serialized_base64,
@@ -3824,7 +4437,8 @@ fn build_bonk_v0_compiled_transaction_with_lookup_tables(
         } else {
             None
         },
-        inlineTipAccount: if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty() {
+        inlineTipAccount: if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty()
+        {
             Some(tx_config.tip_account.clone())
         } else {
             None
@@ -3836,6 +4450,28 @@ fn is_compute_budget_instruction(instruction: &Instruction) -> bool {
     instruction.program_id == compute_budget_program_id().unwrap_or_default()
 }
 
+fn build_bonk_uniqueness_memo_instruction(label: &str) -> Result<Instruction, String> {
+    Ok(Instruction {
+        program_id: Pubkey::from_str(MEMO_PROGRAM_ID)
+            .map_err(|error| format!("Invalid Bonk memo program id: {error}"))?,
+        accounts: vec![],
+        data: format!("{label}:{}", Uuid::new_v4()).into_bytes(),
+    })
+}
+
+fn append_bonk_uniqueness_memo_if_needed(
+    instructions: &mut Vec<Instruction>,
+    label: &str,
+) -> Result<(), String> {
+    // Launch transactions already contain the fresh mint signer/key, so the memo is
+    // redundant and can be the difference between atomic USD1 launch fitting or not.
+    if label == "launch" {
+        return Ok(());
+    }
+    instructions.push(build_bonk_uniqueness_memo_instruction(label)?);
+    Ok(())
+}
+
 fn is_inline_tip_instruction(
     instruction: &Instruction,
     owner_pubkey: &Pubkey,
@@ -3845,14 +4481,14 @@ fn is_inline_tip_instruction(
     if tip_account.trim().is_empty() || tip_lamports == 0 {
         return false;
     }
-    if instruction.program_id != solana_system_interface::program::ID || instruction.accounts.len() < 2 {
+    if instruction.program_id != solana_system_interface::program::ID
+        || instruction.accounts.len() < 2
+    {
         return false;
     }
-    let Ok(system_instruction) =
-        bincode::deserialize::<solana_system_interface::instruction::SystemInstruction>(
-            &instruction.data,
-        )
-    else {
+    let Ok(system_instruction) = bincode::deserialize::<
+        solana_system_interface::instruction::SystemInstruction,
+    >(&instruction.data) else {
         return false;
     };
     match system_instruction {
@@ -3895,8 +4531,12 @@ async fn resolve_lookup_table_accounts_for_bonk_transaction(
     let mut resolved = Vec::with_capacity(lookups.len());
     for lookup in lookups {
         resolved.push(
-            load_lookup_table_account_for_bonk_transaction(rpc_url, &lookup.account_key, commitment)
-                .await?,
+            load_lookup_table_account_for_bonk_transaction(
+                rpc_url,
+                &lookup.account_key,
+                commitment,
+            )
+            .await?,
         );
     }
     Ok(resolved)
@@ -3918,17 +4558,21 @@ fn resolve_bonk_transaction_account_keys(
             .find(|table| table.key == lookup.account_key)
             .ok_or_else(|| format!("Address lookup table not found: {}", lookup.account_key))?;
         for index in &lookup.writable_indexes {
-            let address = table
-                .addresses
-                .get(usize::from(*index))
-                .ok_or_else(|| format!("Writable ALT index {index} was out of bounds for {}", table.key))?;
+            let address = table.addresses.get(usize::from(*index)).ok_or_else(|| {
+                format!(
+                    "Writable ALT index {index} was out of bounds for {}",
+                    table.key
+                )
+            })?;
             writable.push(*address);
         }
         for index in &lookup.readonly_indexes {
-            let address = table
-                .addresses
-                .get(usize::from(*index))
-                .ok_or_else(|| format!("Readonly ALT index {index} was out of bounds for {}", table.key))?;
+            let address = table.addresses.get(usize::from(*index)).ok_or_else(|| {
+                format!(
+                    "Readonly ALT index {index} was out of bounds for {}",
+                    table.key
+                )
+            })?;
             readonly.push(*address);
         }
     }
@@ -3986,42 +4630,80 @@ async fn decompose_bonk_compiled_v0_transaction(
     let decoded = decode_bonk_versioned_transaction(&transaction.serializedBase64)?;
     let lookup_tables =
         resolve_lookup_table_accounts_for_bonk_transaction(rpc_url, &decoded, commitment).await?;
+    let signer_pubkeys = decoded
+        .message
+        .static_account_keys()
+        .iter()
+        .take(usize::from(
+            decoded.message.header().num_required_signatures,
+        ))
+        .copied()
+        .collect::<Vec<_>>();
     let instructions = decompile_bonk_versioned_transaction_instructions(&decoded, &lookup_tables)?;
     Ok(DecomposedBonkVersionedTransaction {
         instructions,
         lookup_tables,
+        signer_pubkeys,
     })
 }
 
-fn merge_bonk_lookup_tables(
-    lists: &[Vec<AddressLookupTableAccount>],
-) -> Vec<AddressLookupTableAccount> {
-    let mut merged = Vec::new();
-    for list in lists {
-        for table in list {
-            if merged.iter().any(|existing: &AddressLookupTableAccount| existing.key == table.key) {
-                continue;
+fn is_bonk_shared_lookup_table(table: &AddressLookupTableAccount) -> bool {
+    table.key.to_string() == BONK_USD1_SUPER_LOOKUP_TABLE
+}
+
+fn validate_bonk_shared_lookup_tables_only(
+    label: &str,
+    tables: &[AddressLookupTableAccount],
+) -> Result<Vec<AddressLookupTableAccount>, String> {
+    let mut shared_tables = Vec::new();
+    let mut rejected = Vec::new();
+    for table in tables {
+        if is_bonk_shared_lookup_table(table) {
+            if !shared_tables
+                .iter()
+                .any(|existing: &AddressLookupTableAccount| existing.key == table.key)
+            {
+                shared_tables.push(table.clone());
             }
-            merged.push(table.clone());
+        } else {
+            rejected.push(table.key.to_string());
         }
     }
-    merged
+    if !rejected.is_empty() {
+        return Err(format!(
+            "{label} encountered unsupported non-shared Bonk lookup tables: {}",
+            rejected.join(", ")
+        ));
+    }
+    Ok(shared_tables)
 }
 
 fn rewrite_missing_bonk_instruction_signers(
     owner: &Pubkey,
     instructions: &mut [Instruction],
     extra_signers: &[&Keypair],
-) -> Vec<Keypair> {
+    allowed_original_signers: &[Pubkey],
+) -> Result<Vec<Keypair>, String> {
     let known_signers = extra_signers
         .iter()
         .map(|signer| signer.pubkey())
+        .collect::<Vec<_>>();
+    let allowed_missing_signers = allowed_original_signers
+        .iter()
+        .copied()
+        .filter(|pubkey| *pubkey != *owner && !known_signers.contains(pubkey))
         .collect::<Vec<_>>();
     let mut missing_signers = Vec::<Pubkey>::new();
     for instruction in instructions.iter() {
         for meta in &instruction.accounts {
             if !meta.is_signer || meta.pubkey == *owner || known_signers.contains(&meta.pubkey) {
                 continue;
+            }
+            if !allowed_missing_signers.contains(&meta.pubkey) {
+                return Err(format!(
+                    "Atomic Bonk composition encountered unexpected signer {} that was not present in the child transactions.",
+                    meta.pubkey
+                ));
             }
             if !missing_signers.contains(&meta.pubkey) {
                 missing_signers.push(meta.pubkey);
@@ -4034,17 +4716,18 @@ fn rewrite_missing_bonk_instruction_signers(
         .collect::<Vec<_>>();
     for instruction in instructions.iter_mut() {
         for meta in &mut instruction.accounts {
-            if let Some((_, replacement)) =
-                replacements.iter().find(|(original, _)| *original == meta.pubkey)
+            if let Some((_, replacement)) = replacements
+                .iter()
+                .find(|(original, _)| *original == meta.pubkey)
             {
                 meta.pubkey = replacement.pubkey();
             }
         }
     }
-    replacements
+    Ok(replacements
         .into_iter()
         .map(|(_, replacement)| replacement)
-        .collect()
+        .collect())
 }
 
 fn bonk_lookup_table_cache() -> &'static Mutex<HashMap<String, BonkLookupTableCacheEntry>> {
@@ -4055,10 +4738,18 @@ fn bonk_lookup_table_cache() -> &'static Mutex<HashMap<String, BonkLookupTableCa
 fn persisted_bonk_lookup_table_cache() -> &'static Mutex<PersistedBonkLookupTableCache> {
     static CACHE: OnceLock<Mutex<PersistedBonkLookupTableCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let cache = fs::read_to_string(paths::bonk_lookup_table_cache_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str::<PersistedBonkLookupTableCache>(&raw).ok())
-            .unwrap_or_default();
+        let cache = merge_persisted_bonk_lookup_table_caches(
+            [
+                paths::shared_lookup_table_cache_path(),
+                paths::legacy_bonk_lookup_table_cache_path(),
+            ]
+            .into_iter()
+            .filter_map(|path| {
+                fs::read_to_string(path).ok().and_then(|raw| {
+                    serde_json::from_str::<PersistedBonkLookupTableCache>(&raw).ok()
+                })
+            }),
+        );
         Mutex::new(cache)
     })
 }
@@ -4077,14 +4768,23 @@ fn persist_bonk_lookup_table_account(
     let mut cache = persisted_bonk_lookup_table_cache()
         .lock()
         .map_err(|error| error.to_string())?;
+    let addresses = table
+        .addresses
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect::<Vec<_>>();
+    let address_count = addresses.len();
+    let content_hash = lookup_table_address_content_hash(&addresses);
     cache.tables.insert(
         address.to_string(),
         PersistedBonkLookupTableEntry {
-            addresses: table.addresses.iter().map(|entry| entry.to_string()).collect(),
+            addresses,
+            address_count: Some(address_count),
+            content_hash: Some(content_hash),
         },
     );
     let serialized = serde_json::to_string_pretty(&*cache).map_err(|error| error.to_string())?;
-    let path = paths::bonk_lookup_table_cache_path();
+    let path = paths::shared_lookup_table_cache_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -4098,6 +4798,21 @@ fn load_persisted_bonk_lookup_table_account(address: &str) -> Option<AddressLook
     }
     let cache = persisted_bonk_lookup_table_cache().lock().ok()?;
     let entry = cache.tables.get(address)?;
+    if entry.address_count != Some(entry.addresses.len()) {
+        eprintln!(
+            "[launchdeck-engine][alt-cache] ignoring stale Bonk ALT snapshot {} due to missing/mismatched address count",
+            address
+        );
+        return None;
+    }
+    let content_hash = lookup_table_address_content_hash(&entry.addresses);
+    if entry.content_hash.as_deref() != Some(content_hash.as_str()) {
+        eprintln!(
+            "[launchdeck-engine][alt-cache] ignoring stale Bonk ALT snapshot {} due to content hash mismatch",
+            address
+        );
+        return None;
+    }
     let key = Pubkey::from_str(address).ok()?;
     let addresses = entry
         .addresses
@@ -4112,7 +4827,7 @@ async fn load_bonk_preferred_usd1_lookup_tables_with_metrics(
     rpc_url: &str,
     commitment: &str,
     mut metrics: Option<&mut HelperUsd1QuoteMetrics>,
-) -> Vec<AddressLookupTableAccount> {
+) -> Result<Vec<AddressLookupTableAccount>, String> {
     let ttl = bonk_lookup_table_cache_ttl();
     if let Ok(cache) = bonk_lookup_table_cache().lock() {
         if let Some(entry) = cache
@@ -4120,13 +4835,16 @@ async fn load_bonk_preferred_usd1_lookup_tables_with_metrics(
             .filter(|entry| entry.fetched_at.elapsed() <= ttl)
         {
             if let Some(metrics) = metrics.as_deref_mut() {
-                metrics.superAltLocalSnapshotHits = metrics.superAltLocalSnapshotHits.saturating_add(1);
+                metrics.superAltLocalSnapshotHits =
+                    metrics.superAltLocalSnapshotHits.saturating_add(1);
             }
-            return vec![entry.table.clone()];
+            return Ok(vec![entry.table.clone()]);
         }
     }
     let Ok(address) = Pubkey::from_str(BONK_USD1_SUPER_LOOKUP_TABLE) else {
-        return vec![];
+        return Err(format!(
+            "Invalid Bonk shared lookup table address: {BONK_USD1_SUPER_LOOKUP_TABLE}"
+        ));
     };
     if let Some(table) = load_persisted_bonk_lookup_table_account(BONK_USD1_SUPER_LOOKUP_TABLE) {
         if let Some(metrics) = metrics.as_deref_mut() {
@@ -4141,11 +4859,15 @@ async fn load_bonk_preferred_usd1_lookup_tables_with_metrics(
                 },
             );
         }
-        return vec![table];
+        return Ok(vec![table]);
     }
-    let Ok(table) = load_lookup_table_account_for_bonk_transaction(rpc_url, &address, commitment).await else {
-        return vec![];
-    };
+    let table = load_lookup_table_account_for_bonk_transaction(rpc_url, &address, commitment)
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to load Bonk shared lookup table {BONK_USD1_SUPER_LOOKUP_TABLE}: {error}"
+            )
+        })?;
     if let Ok(mut cache) = bonk_lookup_table_cache().lock() {
         cache.insert(
             BONK_USD1_SUPER_LOOKUP_TABLE.to_string(),
@@ -4159,13 +4881,13 @@ async fn load_bonk_preferred_usd1_lookup_tables_with_metrics(
     if let Some(metrics) = metrics.as_deref_mut() {
         metrics.superAltRpcRefreshes = metrics.superAltRpcRefreshes.saturating_add(1);
     }
-    vec![table]
+    Ok(vec![table])
 }
 
 async fn load_bonk_preferred_usd1_lookup_tables(
     rpc_url: &str,
     commitment: &str,
-) -> Vec<AddressLookupTableAccount> {
+) -> Result<Vec<AddressLookupTableAccount>, String> {
     load_bonk_preferred_usd1_lookup_tables_with_metrics(rpc_url, commitment, None).await
 }
 
@@ -4174,37 +4896,6 @@ fn bonk_compiled_transaction_size_bytes(compiled: &CompiledTransaction) -> Resul
         .decode(compiled.serializedBase64.as_bytes())
         .map(|raw| raw.len())
         .map_err(|error| format!("Failed to decode Bonk compiled transaction: {error}"))
-}
-
-fn bonk_lookup_table_candidate_key(tables: &[AddressLookupTableAccount]) -> String {
-    tables
-        .iter()
-        .map(|table| table.key.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn bonk_lookup_table_candidates(
-    base_lookup_tables: &[AddressLookupTableAccount],
-    preferred_lookup_tables: &[AddressLookupTableAccount],
-) -> Vec<Vec<AddressLookupTableAccount>> {
-    let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
-    let merged_lookup_tables = merge_bonk_lookup_tables(&[
-        preferred_lookup_tables.to_vec(),
-        base_lookup_tables.to_vec(),
-    ]);
-    for candidate in [
-        base_lookup_tables.to_vec(),
-        preferred_lookup_tables.to_vec(),
-        merged_lookup_tables,
-    ] {
-        let key = bonk_lookup_table_candidate_key(&candidate);
-        if seen.insert(key) {
-            candidates.push(candidate);
-        }
-    }
-    candidates
 }
 
 fn build_bonk_compiled_transaction_with_lookup_preference(
@@ -4220,50 +4911,28 @@ fn build_bonk_compiled_transaction_with_lookup_preference(
     preferred_lookup_tables: &[AddressLookupTableAccount],
 ) -> Result<CompiledTransaction, String> {
     if tx_format == NativeBonkTxFormat::Legacy {
-        return build_bonk_compiled_transaction(
-            label,
-            tx_format,
-            blockhash,
-            last_valid_block_height,
-            payer,
-            extra_signers,
-            instructions,
-            tx_config,
+        return Err(
+            "Bonk shared-ALT-only compilation no longer supports legacy transaction format."
+                .to_string(),
         );
     }
-    let mut best: Option<(CompiledTransaction, usize)> = None;
-    let mut last_error = None;
-    for lookup_tables in bonk_lookup_table_candidates(base_lookup_tables, preferred_lookup_tables) {
-        match build_bonk_v0_compiled_transaction_with_lookup_tables(
-            label,
-            blockhash,
-            last_valid_block_height,
-            payer,
-            extra_signers,
-            instructions.clone(),
-            tx_config,
-            &lookup_tables,
-        ) {
-            Ok(compiled) => {
-                let serialized_len = bonk_compiled_transaction_size_bytes(&compiled)?;
-                let replace_best = match &best {
-                    None => true,
-                    Some((current, current_len)) => {
-                        serialized_len < *current_len
-                            || (serialized_len == *current_len
-                                && compiled.lookupTablesUsed.len() < current.lookupTablesUsed.len())
-                    }
-                };
-                if replace_best {
-                    best = Some((compiled, serialized_len));
-                }
-            }
-            Err(error) => last_error = Some(error),
-        }
+    let _ = validate_bonk_shared_lookup_tables_only(label, base_lookup_tables)?;
+    let lookup_tables = validate_bonk_shared_lookup_tables_only(label, preferred_lookup_tables)?;
+    if lookup_tables.is_empty() {
+        return Err(format!(
+            "{label} requires the shared Bonk lookup table {BONK_USD1_SUPER_LOOKUP_TABLE} for v0 compilation."
+        ));
     }
-    best.map(|(compiled, _)| compiled).ok_or_else(|| {
-        last_error.unwrap_or_else(|| "Bonk v0 compile failed for all lookup table candidates.".to_string())
-    })
+    build_bonk_v0_compiled_transaction_with_lookup_tables(
+        label,
+        blockhash,
+        last_valid_block_height,
+        payer,
+        extra_signers,
+        instructions,
+        tx_config,
+        &lookup_tables,
+    )
 }
 
 fn bonk_compiled_transaction_fits_with_lookup_preference(
@@ -4305,6 +4974,7 @@ fn filter_atomic_bonk_instructions(
         .into_iter()
         .filter(|instruction| {
             !is_compute_budget_instruction(instruction)
+                && !is_memo_instruction(instruction)
                 && !is_inline_tip_instruction(
                     instruction,
                     owner_pubkey,
@@ -4328,7 +4998,9 @@ fn build_bonk_atomic_tx_instructions(
         )?);
     }
     if tx_config.compute_unit_limit > 0 {
-        instructions.push(build_compute_unit_limit_instruction(tx_config.compute_unit_limit)?);
+        instructions.push(build_compute_unit_limit_instruction(
+            tx_config.compute_unit_limit,
+        )?);
     }
     instructions.extend(apply_jitodontfront(
         core_instructions,
@@ -4366,6 +5038,10 @@ pub fn derive_follow_owner_token_account(owner: &Pubkey, mint: &Pubkey) -> Pubke
 
 fn bonk_memo_program_id() -> Result<Pubkey, String> {
     Pubkey::from_str(MEMO_PROGRAM_ID).map_err(|error| format!("Invalid Memo program id: {error}"))
+}
+
+fn is_memo_instruction(instruction: &Instruction) -> bool {
+    instruction.program_id == bonk_memo_program_id().unwrap_or_default()
 }
 
 fn bonk_launchpad_cpi_event_pda() -> Result<Pubkey, String> {
@@ -4423,7 +5099,8 @@ fn bonk_metadata_account_pda(mint: &Pubkey) -> Result<Pubkey, String> {
 
 fn bonk_append_string_layout(data: &mut Vec<u8>, value: &str) -> Result<(), String> {
     let bytes = value.as_bytes();
-    let length = u32::try_from(bytes.len()).map_err(|_| "Bonk string field exceeded u32 length.".to_string())?;
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| "Bonk string field exceeded u32 length.".to_string())?;
     data.extend_from_slice(&length.to_le_bytes());
     data.extend_from_slice(bytes);
     Ok(())
@@ -4444,13 +5121,17 @@ fn build_bonk_initialize_v2_instruction(
         .map_err(|error| format!("Invalid Bonk config id: {error}"))?;
     let platform_id = Pubkey::from_str(bonk_platform_id(launch_mode))
         .map_err(|error| format!("Invalid Bonk platform id: {error}"))?;
-    let pool_id = Pubkey::find_program_address(&[b"pool", mint.as_ref(), quote_mint.as_ref()], &program_id).0;
+    let pool_id =
+        Pubkey::find_program_address(&[b"pool", mint.as_ref(), quote_mint.as_ref()], &program_id).0;
     let vault_a = bonk_launchpad_pool_vault_pda(&pool_id, mint)?;
     let vault_b = bonk_launchpad_pool_vault_pda(&pool_id, &quote_mint)?;
     let metadata_id = bonk_metadata_account_pda(mint)?;
     let mut data = Vec::new();
     data.extend_from_slice(&BONK_INITIALIZE_V2_DISCRIMINATOR);
-    data.push(u8::try_from(BONK_TOKEN_DECIMALS).map_err(|_| "Invalid Bonk token decimals.".to_string())?);
+    data.push(
+        u8::try_from(BONK_TOKEN_DECIMALS)
+            .map_err(|_| "Invalid Bonk token decimals.".to_string())?,
+    );
     bonk_append_string_layout(&mut data, token_name)?;
     bonk_append_string_layout(&mut data, token_symbol)?;
     bonk_append_string_layout(&mut data, token_uri)?;
@@ -4503,41 +5184,100 @@ fn build_bonk_clmm_swap_exact_in_instruction(
     min_out: u64,
     traversed_tick_array_starts: &[i32],
 ) -> Result<Instruction, String> {
-    let program_id = bonk_clmm_program_id()?;
-    let pool_id = Pubkey::from_str(BONK_PINNED_USD1_ROUTE_POOL_ID)
-        .map_err(|error| format!("Invalid pinned Bonk USD1 route pool id: {error}"))?;
-    let amm_config = Pubkey::from_str(BONK_PREFERRED_USD1_ROUTE_CONFIG_ID)
-        .map_err(|error| format!("Invalid pinned Bonk USD1 route config id: {error}"))?;
-    let input_mint = bonk_quote_mint("sol")?;
-    let output_mint = bonk_quote_mint("usd1")?;
-    let input_vault = bonk_clmm_pool_vault_pda(&pool_id, &input_mint)?;
-    let output_vault = bonk_clmm_pool_vault_pda(&pool_id, &output_mint)?;
-    let observation_id = bonk_clmm_observation_pda(&pool_id)?;
-    let ex_bitmap = bonk_clmm_ex_bitmap_pda(&pool_id)?;
+    let setup = pinned_bonk_usd1_route_setup()?;
+    build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        owner,
+        &setup,
+        user_input_account,
+        user_output_account,
+        amount_in,
+        min_out,
+        traversed_tick_array_starts,
+        &setup.mint_a,
+        &setup.mint_b,
+    )
+}
+
+fn build_bonk_clmm_swap_exact_in_instruction_with_assets(
+    owner: &Pubkey,
+    user_input_account: &Pubkey,
+    user_output_account: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    traversed_tick_array_starts: &[i32],
+    input_asset: &str,
+    output_asset: &str,
+) -> Result<Instruction, String> {
+    let setup = pinned_bonk_usd1_route_setup()?;
+    build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        owner,
+        &setup,
+        user_input_account,
+        user_output_account,
+        amount_in,
+        min_out,
+        traversed_tick_array_starts,
+        &bonk_quote_mint(input_asset)?,
+        &bonk_quote_mint(output_asset)?,
+    )
+}
+
+fn build_bonk_clmm_swap_exact_in_instruction_for_setup(
+    owner: &Pubkey,
+    setup: &BonkUsd1RouteSetup,
+    user_input_account: &Pubkey,
+    user_output_account: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    traversed_tick_array_starts: &[i32],
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+) -> Result<Instruction, String> {
+    let ex_bitmap = bonk_clmm_ex_bitmap_pda(&setup.pool_id)?;
     let tick_arrays = traversed_tick_array_starts
         .iter()
-        .map(|start_index| bonk_derive_clmm_tick_array_address(&program_id, &pool_id, *start_index))
+        .map(|start_index| {
+            bonk_derive_clmm_tick_array_address(&setup.program_id, &setup.pool_id, *start_index)
+        })
         .collect::<Vec<_>>();
     let mut data = Vec::with_capacity(8 + 8 + 8 + 16 + 1);
     data.extend_from_slice(&BONK_CLMM_SWAP_DISCRIMINATOR);
     data.extend_from_slice(&amount_in.to_le_bytes());
     data.extend_from_slice(&min_out.to_le_bytes());
-    data.extend_from_slice(&BONK_CLMM_MIN_SQRT_PRICE_X64_PLUS_ONE.to_le_bytes());
+    let (input_vault, output_vault, sqrt_price_limit) =
+        if *input_mint == setup.mint_a && *output_mint == setup.mint_b {
+            (
+                setup.vault_a,
+                setup.vault_b,
+                BONK_CLMM_MIN_SQRT_PRICE_X64_PLUS_ONE,
+            )
+        } else if *input_mint == setup.mint_b && *output_mint == setup.mint_a {
+            // Raydium rejects the hard max bound for the live USD1 -> SOL unwind,
+            // but accepts the default branch when `sqrt_price_limit_x64` is zero.
+            (setup.vault_b, setup.vault_a, 0u128)
+        } else {
+            return Err(
+                "Bonk CLMM swap input/output mints do not match the selected pool.".to_string(),
+            );
+        };
+    data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
+    // Raydium CLMM exact-in swaps always set `is_base_input = true`.
+    // Direction still comes from the input/output mint ordering above.
     data.push(1u8);
     let mut accounts = vec![
         AccountMeta::new_readonly(*owner, true),
-        AccountMeta::new_readonly(amm_config, false),
-        AccountMeta::new(pool_id, false),
+        AccountMeta::new_readonly(setup.amm_config, false),
+        AccountMeta::new(setup.pool_id, false),
         AccountMeta::new(*user_input_account, false),
         AccountMeta::new(*user_output_account, false),
         AccountMeta::new(input_vault, false),
         AccountMeta::new(output_vault, false),
-        AccountMeta::new(observation_id, false),
+        AccountMeta::new(setup.observation_id, false),
         AccountMeta::new_readonly(spl_token::id(), false),
         AccountMeta::new_readonly(bonk_token_2022_program_id()?, false),
         AccountMeta::new_readonly(bonk_memo_program_id()?, false),
-        AccountMeta::new_readonly(input_mint, false),
-        AccountMeta::new_readonly(output_mint, false),
+        AccountMeta::new_readonly(*input_mint, false),
+        AccountMeta::new_readonly(*output_mint, false),
         AccountMeta::new(ex_bitmap, false),
     ];
     accounts.extend(
@@ -4546,8 +5286,99 @@ fn build_bonk_clmm_swap_exact_in_instruction(
             .map(|pubkey| AccountMeta::new(pubkey, false)),
     );
     Ok(Instruction {
-        program_id,
+        program_id: setup.program_id,
         accounts,
+        data,
+    })
+}
+
+fn pinned_bonk_usd1_route_setup() -> Result<BonkUsd1RouteSetup, String> {
+    let pool_id = Pubkey::from_str(BONK_PINNED_USD1_ROUTE_POOL_ID)
+        .map_err(|error| format!("Invalid pinned Bonk USD1 route pool id: {error}"))?;
+    let program_id = bonk_clmm_program_id()?;
+    let amm_config = Pubkey::from_str(BONK_PREFERRED_USD1_ROUTE_CONFIG_ID)
+        .map_err(|error| format!("Invalid pinned Bonk USD1 route config id: {error}"))?;
+    let mint_a = bonk_quote_mint("sol")?;
+    let mint_b = bonk_quote_mint("usd1")?;
+    Ok(BonkUsd1RouteSetup {
+        pool_id,
+        program_id,
+        amm_config,
+        mint_a,
+        mint_b,
+        vault_a: bonk_clmm_pool_vault_pda(&pool_id, &mint_a)?,
+        vault_b: bonk_clmm_pool_vault_pda(&pool_id, &mint_b)?,
+        observation_id: bonk_clmm_observation_pda(&pool_id)?,
+        tick_spacing: 0,
+        trade_fee_rate: 0,
+        sqrt_price_x64: BigUint::ZERO,
+        liquidity: BigUint::ZERO,
+        tick_current: 0,
+        mint_a_decimals: 0,
+        mint_b_decimals: 0,
+        current_price: 0.0,
+        tick_arrays_desc: vec![],
+        tick_arrays_asc: vec![],
+        tick_arrays: HashMap::new(),
+    })
+}
+
+fn build_bonk_cpmm_swap_exact_in_instruction(
+    owner: &Pubkey,
+    context: &NativeBonkCpmmPoolContext,
+    user_input_account: &Pubkey,
+    user_output_account: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+) -> Result<Instruction, String> {
+    let authority = bonk_cpmm_pool_authority()?;
+    let input_is_a =
+        *input_mint == context.pool.token_0_mint && *output_mint == context.pool.token_1_mint;
+    let input_is_b =
+        *input_mint == context.pool.token_1_mint && *output_mint == context.pool.token_0_mint;
+    if !input_is_a && !input_is_b {
+        return Err(
+            "Bonk CPMM swap input/output mints do not match the selected pool.".to_string(),
+        );
+    }
+    let (input_vault, output_vault, input_token_program, output_token_program) = if input_is_a {
+        (
+            context.pool.vault_a,
+            context.pool.vault_b,
+            context.pool.token_0_program,
+            context.pool.token_1_program,
+        )
+    } else {
+        (
+            context.pool.vault_b,
+            context.pool.vault_a,
+            context.pool.token_1_program,
+            context.pool.token_0_program,
+        )
+    };
+    let mut data = Vec::with_capacity(8 + 8 + 8);
+    data.extend_from_slice(&BONK_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR);
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes());
+    Ok(Instruction {
+        program_id: bonk_cpmm_program_id()?,
+        accounts: vec![
+            AccountMeta::new_readonly(*owner, true),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new_readonly(context.pool.config_id, false),
+            AccountMeta::new(context.pool_id, false),
+            AccountMeta::new(*user_input_account, false),
+            AccountMeta::new(*user_output_account, false),
+            AccountMeta::new(input_vault, false),
+            AccountMeta::new(output_vault, false),
+            AccountMeta::new_readonly(input_token_program, false),
+            AccountMeta::new_readonly(output_token_program, false),
+            AccountMeta::new_readonly(*input_mint, false),
+            AccountMeta::new_readonly(*output_mint, false),
+            AccountMeta::new(context.pool.observation_id, false),
+        ],
         data,
     })
 }
@@ -4570,7 +5401,8 @@ fn build_bonk_buy_exact_in_instruction(
     let creator_claim_fee_vault =
         bonk_creator_fee_vault_pda(&pool_context.pool.creator, &quote_mint)?;
     let cpi_event = bonk_launchpad_cpi_event_pda()?;
-    let token_program = spl_token::id();
+    let token_program = pool_context.token_program;
+    let quote_token_program = spl_token::id();
     let mut data = Vec::with_capacity(32);
     data.extend_from_slice(&BONK_BUY_EXACT_IN_DISCRIMINATOR);
     data.extend_from_slice(&amount_b.to_le_bytes());
@@ -4591,7 +5423,7 @@ fn build_bonk_buy_exact_in_instruction(
             AccountMeta::new_readonly(pool_context.pool.mint_a, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(token_program, false),
-            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(quote_token_program, false),
             AccountMeta::new_readonly(cpi_event, false),
             AccountMeta::new_readonly(launchpad_program, false),
             AccountMeta::new_readonly(solana_system_interface::program::ID, false),
@@ -4620,7 +5452,8 @@ fn build_bonk_sell_exact_in_instruction(
     let creator_claim_fee_vault =
         bonk_creator_fee_vault_pda(&pool_context.pool.creator, &quote_mint)?;
     let cpi_event = bonk_launchpad_cpi_event_pda()?;
-    let token_program = spl_token::id();
+    let token_program = pool_context.token_program;
+    let quote_token_program = spl_token::id();
     let mut data = Vec::with_capacity(32);
     data.extend_from_slice(&BONK_SELL_EXACT_IN_DISCRIMINATOR);
     data.extend_from_slice(&amount_a.to_le_bytes());
@@ -4641,7 +5474,7 @@ fn build_bonk_sell_exact_in_instruction(
             AccountMeta::new_readonly(pool_context.pool.mint_a, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(token_program, false),
-            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(quote_token_program, false),
             AccountMeta::new_readonly(cpi_event, false),
             AccountMeta::new_readonly(launchpad_program, false),
             AccountMeta::new_readonly(solana_system_interface::program::ID, false),
@@ -4678,9 +5511,25 @@ fn build_bonk_wrapped_sol_open_instructions(
     ])
 }
 
-fn build_bonk_wrapped_sol_close_instruction(owner: &Pubkey, wrapped_account: &Pubkey) -> Result<Instruction, String> {
+fn build_bonk_wrapped_sol_close_instruction(
+    owner: &Pubkey,
+    wrapped_account: &Pubkey,
+) -> Result<Instruction, String> {
     spl_token::instruction::close_account(&spl_token::id(), wrapped_account, owner, owner, &[])
         .map_err(|error| format!("Failed to build wrapped SOL close instruction: {error}"))
+}
+
+fn build_bonk_create_ata_instruction(
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+        owner,
+        owner,
+        mint,
+        token_program,
+    )
 }
 
 fn build_bonk_follow_pool_state(pool: &DecodedBonkLaunchpadPool) -> BonkCurvePoolState {
@@ -4738,6 +5587,7 @@ fn build_prelaunch_bonk_pool_context(
             )?,
         },
         quote: defaults.quote.clone(),
+        token_program: spl_token::id(),
     })
 }
 
@@ -4747,21 +5597,27 @@ async fn load_bonk_pool_context_by_pool_id(
     quote_asset: &str,
     commitment: &str,
 ) -> Result<NativeBonkPoolContext, String> {
-    let pool_id = Pubkey::from_str(pool_id_input).map_err(|error| format!("Invalid Bonk pool id: {error}"))?;
+    let pool_id = Pubkey::from_str(pool_id_input)
+        .map_err(|error| format!("Invalid Bonk pool id: {error}"))?;
     let pool_data = fetch_account_data(rpc_url, pool_id_input, commitment).await?;
     let pool = decode_bonk_launchpad_pool(&pool_data)?;
     let config_id = pool.config_id.to_string();
     let platform_id = pool.platform_id.to_string();
-    let (config_data, platform_data) = tokio::try_join!(
+    let mint_a = pool.mint_a.to_string();
+    let (config_data, platform_data, (_, mint_owner)) = tokio::try_join!(
         fetch_account_data(rpc_url, &config_id, commitment),
         fetch_account_data(rpc_url, &platform_id, commitment),
+        fetch_account_data_with_owner(rpc_url, &mint_a, commitment),
     )?;
+    let token_program = Pubkey::from_str(&mint_owner)
+        .map_err(|error| format!("Invalid Bonk mint owner: {error}"))?;
     Ok(NativeBonkPoolContext {
         pool_id,
         pool,
         config: decode_bonk_launchpad_config(&config_data)?,
         platform: decode_bonk_platform_config(&platform_data)?,
         quote: bonk_quote_asset_config(quote_asset),
+        token_program,
     })
 }
 
@@ -4772,23 +5628,22 @@ async fn load_live_bonk_pool_context(
     commitment: &str,
 ) -> Result<NativeBonkPoolContext, String> {
     let requested_quote = bonk_quote_asset_config(quote_asset);
-    let candidate_assets = if requested_quote.asset == "usd1" {
-        vec![requested_quote.asset, "sol"]
-    } else {
-        vec![requested_quote.asset, "usd1"]
-    };
     let mut errors = Vec::new();
-    for asset in candidate_assets {
-        let quote = bonk_quote_asset_config(asset);
-        let pool_id = derive_canonical_pool_id(quote.asset, &mint.to_string()).await?;
-        for attempt in 0..6 {
-            match load_bonk_pool_context_by_pool_id(rpc_url, &pool_id, quote.asset, commitment).await {
-                Ok(context) => return Ok(context),
-                Err(error) => {
-                    errors.push(format!("{}:{}: {}", quote.asset, pool_id, error));
-                    if attempt < 5 {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
+    let pool_id = derive_canonical_pool_id(requested_quote.asset, &mint.to_string()).await?;
+    for attempt in 0..6 {
+        match load_bonk_pool_context_by_pool_id(
+            rpc_url,
+            &pool_id,
+            requested_quote.asset,
+            commitment,
+        )
+        .await
+        {
+            Ok(context) => return Ok(context),
+            Err(error) => {
+                errors.push(format!("{}:{}: {}", requested_quote.asset, pool_id, error));
+                if attempt < 5 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
         }
@@ -4796,6 +5651,286 @@ async fn load_live_bonk_pool_context(
     Err(format!(
         "Unable to resolve Bonk live pool context. Attempts: {}",
         errors.join(" | ")
+    ))
+}
+
+fn resolve_bonk_supported_quote_asset(
+    requested_quote_asset: &str,
+    mint_a: &Pubkey,
+    mint_b: &Pubkey,
+) -> Result<BonkQuoteAssetConfig, String> {
+    let requested = bonk_quote_asset_config(requested_quote_asset);
+    if requested.mint == mint_a.to_string() || requested.mint == mint_b.to_string() {
+        return Ok(requested);
+    }
+    Err(format!(
+        "Bonk Raydium pool does not contain the requested {} quote mint.",
+        requested.label
+    ))
+}
+
+fn net_cpmm_reserve(
+    vault_amount: u64,
+    protocol_fees: u64,
+    fund_fees: u64,
+    creator_fees: u64,
+) -> u64 {
+    vault_amount
+        .saturating_sub(protocol_fees)
+        .saturating_sub(fund_fees)
+        .saturating_sub(creator_fees)
+}
+
+async fn build_bonk_cpmm_pool_context_from_data(
+    rpc_url: &str,
+    pool_id: &Pubkey,
+    quote_asset: &str,
+    commitment: &str,
+    pool_data: &[u8],
+) -> Result<NativeBonkCpmmPoolContext, String> {
+    let pool = decode_bonk_cpmm_pool(pool_data)?;
+    let quote =
+        resolve_bonk_supported_quote_asset(quote_asset, &pool.token_0_mint, &pool.token_1_mint)?;
+    let config_id = pool.config_id.to_string();
+    let vault_accounts = vec![pool.vault_a.to_string(), pool.vault_b.to_string()];
+    let (config_data, vault_datas) = tokio::try_join!(
+        fetch_account_data(rpc_url, &config_id, commitment),
+        fetch_multiple_account_data(rpc_url, &vault_accounts, commitment),
+    )?;
+    let config = decode_bonk_cpmm_config(&config_data)?;
+    if vault_datas.len() != 2 {
+        return Err(
+            "Bonk CPMM vault lookup returned an unexpected number of accounts.".to_string(),
+        );
+    }
+    let vault_a_data = vault_datas
+        .first()
+        .and_then(|value| value.as_ref())
+        .ok_or_else(|| "Bonk CPMM vault A account was missing.".to_string())?;
+    let vault_b_data = vault_datas
+        .get(1)
+        .and_then(|value| value.as_ref())
+        .ok_or_else(|| "Bonk CPMM vault B account was missing.".to_string())?;
+    let creator_fees_a = if pool.enable_creator_fee {
+        pool.creator_fees_mint_a
+    } else {
+        0
+    };
+    let creator_fees_b = if pool.enable_creator_fee {
+        pool.creator_fees_mint_b
+    } else {
+        0
+    };
+    Ok(NativeBonkCpmmPoolContext {
+        pool_id: *pool_id,
+        reserve_a: net_cpmm_reserve(
+            read_spl_token_account_amount(vault_a_data)?,
+            pool.protocol_fees_mint_a,
+            pool.fund_fees_mint_a,
+            creator_fees_a,
+        ),
+        reserve_b: net_cpmm_reserve(
+            read_spl_token_account_amount(vault_b_data)?,
+            pool.protocol_fees_mint_b,
+            pool.fund_fees_mint_b,
+            creator_fees_b,
+        ),
+        pool,
+        config,
+        quote,
+    })
+}
+
+async fn load_bonk_cpmm_pool_context_by_pool_id(
+    rpc_url: &str,
+    pool_id_input: &str,
+    quote_asset: &str,
+    commitment: &str,
+) -> Result<NativeBonkCpmmPoolContext, String> {
+    let pool_id = Pubkey::from_str(pool_id_input)
+        .map_err(|error| format!("Invalid Bonk CPMM pool id: {error}"))?;
+    let pool_data = fetch_account_data(rpc_url, pool_id_input, commitment).await?;
+    build_bonk_cpmm_pool_context_from_data(rpc_url, &pool_id, quote_asset, commitment, &pool_data)
+        .await
+}
+
+async fn build_bonk_clmm_pool_context_from_data(
+    rpc_url: &str,
+    pool_id: &Pubkey,
+    quote_asset: &str,
+    commitment: &str,
+    pool_data: &[u8],
+) -> Result<NativeBonkClmmPoolContext, String> {
+    let pool = decode_bonk_clmm_pool(pool_data)?;
+    let quote = resolve_bonk_supported_quote_asset(quote_asset, &pool.mint_a, &pool.mint_b)?;
+    let current_array_start =
+        bonk_get_tick_array_start_index_by_tick(pool.tick_current, i32::from(pool.tick_spacing));
+    let current_bit_position =
+        bonk_tick_array_bit_position(current_array_start, i32::from(pool.tick_spacing))?;
+    if !bonk_bitmap_is_initialized(&pool.tick_array_bitmap, current_bit_position) {
+        return Err("Bonk CLMM current tick array is not initialized.".to_string());
+    }
+    let tick_count = BONK_CLMM_TICK_ARRAY_SIZE * i32::from(pool.tick_spacing);
+    let initialized_bit_positions = (0..(pool.tick_array_bitmap.len() * 64))
+        .filter(|bit_position| bonk_bitmap_is_initialized(&pool.tick_array_bitmap, *bit_position))
+        .collect::<Vec<_>>();
+    let tick_array_starts_desc = initialized_bit_positions
+        .iter()
+        .rev()
+        .map(|bit_position| ((*bit_position as i32) - BONK_CLMM_DEFAULT_BITMAP_OFFSET) * tick_count)
+        .collect::<Vec<_>>();
+    let tick_array_starts_asc = initialized_bit_positions
+        .iter()
+        .map(|bit_position| ((*bit_position as i32) - BONK_CLMM_DEFAULT_BITMAP_OFFSET) * tick_count)
+        .collect::<Vec<_>>();
+    if tick_array_starts_desc.is_empty() {
+        return Err("Bonk CLMM had no initialized tick arrays.".to_string());
+    }
+    let program_id = bonk_clmm_program_id()?;
+    let tick_array_addresses = tick_array_starts_desc
+        .iter()
+        .map(|start_index| {
+            bonk_derive_clmm_tick_array_address(&program_id, pool_id, *start_index).to_string()
+        })
+        .collect::<Vec<_>>();
+    let tick_array_account_datas =
+        rpc_get_multiple_accounts_data(rpc_url, &tick_array_addresses, commitment).await?;
+    let tick_arrays = tick_array_account_datas
+        .into_iter()
+        .map(|data| decode_bonk_clmm_tick_array(&data))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|tick_array| (tick_array.start_tick_index, tick_array))
+        .collect::<HashMap<_, _>>();
+    if !tick_arrays.contains_key(&current_array_start) {
+        return Err("Bonk CLMM current tick array could not be decoded.".to_string());
+    }
+    let config_data = fetch_account_data(rpc_url, &pool.amm_config.to_string(), commitment).await?;
+    let config = decode_bonk_clmm_config(&config_data)?;
+    if config.tick_spacing != pool.tick_spacing {
+        return Err("Bonk CLMM tick spacing no longer matches its config.".to_string());
+    }
+    let (_, mint_a_owner) =
+        fetch_account_data_with_owner(rpc_url, &pool.mint_a.to_string(), commitment).await?;
+    let (_, mint_b_owner) =
+        fetch_account_data_with_owner(rpc_url, &pool.mint_b.to_string(), commitment).await?;
+    Ok(NativeBonkClmmPoolContext {
+        quote,
+        mint_program_a: Pubkey::from_str(&mint_a_owner)
+            .map_err(|error| format!("Invalid Bonk CLMM mint A owner: {error}"))?,
+        mint_program_b: Pubkey::from_str(&mint_b_owner)
+            .map_err(|error| format!("Invalid Bonk CLMM mint B owner: {error}"))?,
+        setup: BonkUsd1RouteSetup {
+            pool_id: *pool_id,
+            program_id,
+            amm_config: pool.amm_config,
+            mint_a: pool.mint_a,
+            mint_b: pool.mint_b,
+            vault_a: pool.vault_a,
+            vault_b: pool.vault_b,
+            observation_id: pool.observation_id,
+            tick_spacing: i32::from(pool.tick_spacing),
+            trade_fee_rate: config.trade_fee_rate,
+            sqrt_price_x64: pool.sqrt_price_x64.clone(),
+            liquidity: pool.liquidity.clone(),
+            tick_current: pool.tick_current,
+            mint_a_decimals: u32::from(pool.mint_decimals_a),
+            mint_b_decimals: u32::from(pool.mint_decimals_b),
+            current_price: bonk_sqrt_price_x64_to_price(
+                &pool.sqrt_price_x64,
+                u32::from(pool.mint_decimals_a),
+                u32::from(pool.mint_decimals_b),
+            )?,
+            tick_arrays_desc: tick_array_starts_desc,
+            tick_arrays_asc: tick_array_starts_asc,
+            tick_arrays,
+        },
+    })
+}
+
+async fn load_bonk_clmm_pool_context_by_pool_id(
+    rpc_url: &str,
+    pool_id_input: &str,
+    quote_asset: &str,
+    commitment: &str,
+) -> Result<NativeBonkClmmPoolContext, String> {
+    let pool_id = Pubkey::from_str(pool_id_input)
+        .map_err(|error| format!("Invalid Bonk CLMM pool id: {error}"))?;
+    let pool_data = fetch_account_data(rpc_url, pool_id_input, commitment).await?;
+    build_bonk_clmm_pool_context_from_data(rpc_url, &pool_id, quote_asset, commitment, &pool_data)
+        .await
+}
+
+async fn load_bonk_trade_venue_context_by_pool_id(
+    rpc_url: &str,
+    pool_id_input: &str,
+    quote_asset: &str,
+    commitment: &str,
+) -> Result<NativeBonkTradeVenueContext, String> {
+    let pool_id = Pubkey::from_str(pool_id_input)
+        .map_err(|error| format!("Invalid Bonk pool id: {error}"))?;
+    let (pool_data, owner) =
+        fetch_account_data_with_owner(rpc_url, pool_id_input, commitment).await?;
+    let owner_pubkey =
+        Pubkey::from_str(&owner).map_err(|error| format!("Invalid Bonk pool owner: {error}"))?;
+    if owner_pubkey == bonk_launchpad_program_id()? {
+        return Ok(NativeBonkTradeVenueContext::Launchpad(
+            load_bonk_pool_context_by_pool_id(rpc_url, pool_id_input, quote_asset, commitment)
+                .await?,
+        ));
+    }
+    if owner_pubkey == bonk_cpmm_program_id()? {
+        return Ok(NativeBonkTradeVenueContext::RaydiumCpmm(
+            build_bonk_cpmm_pool_context_from_data(
+                rpc_url,
+                &pool_id,
+                quote_asset,
+                commitment,
+                &pool_data,
+            )
+            .await?,
+        ));
+    }
+    if owner_pubkey == bonk_clmm_program_id()? {
+        return Ok(NativeBonkTradeVenueContext::RaydiumClmm(
+            build_bonk_clmm_pool_context_from_data(
+                rpc_url,
+                &pool_id,
+                quote_asset,
+                commitment,
+                &pool_data,
+            )
+            .await?,
+        ));
+    }
+    Err(format!(
+        "Unsupported Bonk pool owner {} for pool {}.",
+        owner_pubkey, pool_id_input
+    ))
+}
+
+async fn load_live_bonk_trade_venue_context(
+    rpc_url: &str,
+    mint: &Pubkey,
+    quote_asset: &str,
+    commitment: &str,
+) -> Result<NativeBonkTradeVenueContext, String> {
+    let import_context =
+        native_detect_bonk_import_context_with_quote_asset(rpc_url, &mint.to_string(), quote_asset)
+            .await?;
+    if let Some(context) = import_context {
+        if is_raydium_detection_source(&context.detectionSource) {
+            return load_bonk_trade_venue_context_by_pool_id(
+                rpc_url,
+                &context.poolId,
+                &context.quoteAsset,
+                commitment,
+            )
+            .await;
+        }
+    }
+    Ok(NativeBonkTradeVenueContext::Launchpad(
+        load_live_bonk_pool_context(rpc_url, mint, quote_asset, commitment).await?,
     ))
 }
 
@@ -4814,12 +5949,28 @@ async fn fetch_bonk_owner_token_balance(
     owner: &Pubkey,
     mint: &Pubkey,
 ) -> Result<Option<u64>, String> {
-    let token_account =
-        spl_associated_token_account::get_associated_token_address_with_program_id(
-            owner,
-            mint,
-            &spl_token::id(),
-        );
+    fetch_bonk_owner_token_balance_with_token_program(
+        rpc_url,
+        commitment,
+        owner,
+        mint,
+        &spl_token::id(),
+    )
+    .await
+}
+
+async fn fetch_bonk_owner_token_balance_with_token_program(
+    rpc_url: &str,
+    commitment: &str,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Result<Option<u64>, String> {
+    let token_account = spl_associated_token_account::get_associated_token_address_with_program_id(
+        owner,
+        mint,
+        token_program,
+    );
     let data = match fetch_account_data(rpc_url, &token_account.to_string(), commitment).await {
         Ok(data) => data,
         Err(error) if error.contains("was not found.") => return Ok(None),
@@ -4877,6 +6028,72 @@ fn bonk_follow_buy_amounts(
     Ok((details.gross_input_b, details.min_amount_a))
 }
 
+fn bonk_cpmm_fee_amount(amount: u64, fee_rate: u64) -> u64 {
+    if fee_rate == 0 || amount == 0 {
+        return 0;
+    }
+    let numerator = u128::from(amount).saturating_mul(u128::from(fee_rate))
+        + u128::from(BONK_FEE_RATE_DENOMINATOR - 1);
+    (numerator / u128::from(BONK_FEE_RATE_DENOMINATOR)) as u64
+}
+
+fn bonk_cpmm_quote_exact_input(
+    pool_context: &NativeBonkCpmmPoolContext,
+    input_mint: &Pubkey,
+    amount_in: u64,
+    slippage_bps: u64,
+) -> Result<(u64, u64), String> {
+    if amount_in == 0 {
+        return Ok((0, 0));
+    }
+    let (input_reserve, output_reserve) = if *input_mint == pool_context.pool.token_0_mint {
+        (pool_context.reserve_a, pool_context.reserve_b)
+    } else if *input_mint == pool_context.pool.token_1_mint {
+        (pool_context.reserve_b, pool_context.reserve_a)
+    } else {
+        return Err("Bonk CPMM quote input mint does not match the selected pool.".to_string());
+    };
+    if input_reserve == 0 || output_reserve == 0 {
+        return Err("Bonk CPMM pool had zero reserves.".to_string());
+    }
+    let trade_fee = bonk_cpmm_fee_amount(amount_in, pool_context.config.trade_fee_rate);
+    let input_after_trade_fee = amount_in.saturating_sub(trade_fee);
+    let output_swapped = (u128::from(input_after_trade_fee) * u128::from(output_reserve))
+        / u128::from(input_reserve.saturating_add(input_after_trade_fee));
+    let creator_fee = if pool_context.pool.enable_creator_fee {
+        bonk_cpmm_fee_amount(
+            u64::try_from(output_swapped)
+                .map_err(|error| format!("Bonk CPMM output exceeded u64: {error}"))?,
+            pool_context.config.creator_fee_rate,
+        )
+    } else {
+        0
+    };
+    let expected_out = u64::try_from(output_swapped)
+        .map_err(|error| format!("Bonk CPMM output exceeded u64: {error}"))?
+        .saturating_sub(creator_fee);
+    let min_out = biguint_to_u64(
+        &bonk_build_min_amount_from_bps(&bonk_biguint_from_u64(expected_out), slippage_bps),
+        "Bonk CPMM min output",
+    )?;
+    Ok((expected_out, min_out))
+}
+
+fn bonk_quote_clmm_exact_input(
+    setup: &BonkUsd1RouteSetup,
+    input_mint: &Pubkey,
+    input_amount: &BigUint,
+    slippage_bps: u64,
+) -> Result<BonkUsd1DirectQuote, String> {
+    if *input_mint == setup.mint_a {
+        bonk_quote_usd1_from_exact_sol_input(setup, input_amount, slippage_bps)
+    } else if *input_mint == setup.mint_b {
+        bonk_quote_sol_from_exact_usd1_input(setup, input_amount, slippage_bps)
+    } else {
+        Err("Bonk CLMM input mint does not match the selected pool.".to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BonkFollowBuyQuoteDetails {
     gross_input_b: u64,
@@ -4900,15 +6117,13 @@ fn bonk_follow_buy_quote_details(
     let total_fee = bonk_calculate_fee(&requested_amount_b_big, &fee_rate);
     let amount_less_fee_b =
         bonk_big_sub(&requested_amount_b_big, &total_fee, "buy input after fee")?;
-    let quoted_amount_a = bonk_curve_buy_exact_in(&pool, pool_context.config.curve_type, &amount_less_fee_b)?;
+    let quoted_amount_a =
+        bonk_curve_buy_exact_in(&pool, pool_context.config.curve_type, &amount_less_fee_b)?;
     let remaining_amount_a =
         bonk_big_sub(&pool.total_sell_a, &pool.real_a, "remaining sell amount")?;
     let (gross_input_b, net_input_b, amount_a) = if quoted_amount_a > remaining_amount_a {
-        let capped_net_input_b = bonk_curve_buy_exact_out(
-            &pool,
-            pool_context.config.curve_type,
-            &remaining_amount_a,
-        )?;
+        let capped_net_input_b =
+            bonk_curve_buy_exact_out(&pool, pool_context.config.curve_type, &remaining_amount_a)?;
         let gross_input_b = bonk_calculate_pre_fee(&capped_net_input_b, &fee_rate)?;
         (gross_input_b, capped_net_input_b, remaining_amount_a)
     } else {
@@ -4940,6 +6155,14 @@ fn bonk_follow_sell_amounts(
     sell_amount_a: u64,
     slippage_bps: u64,
 ) -> Result<u64, String> {
+    Ok(bonk_follow_sell_quote_amounts(pool_context, sell_amount_a, slippage_bps)?.1)
+}
+
+fn bonk_follow_sell_quote_amounts(
+    pool_context: &NativeBonkPoolContext,
+    sell_amount_a: u64,
+    slippage_bps: u64,
+) -> Result<(u64, u64), String> {
     let pool = build_bonk_follow_pool_state(&pool_context.pool);
     let quoted_amount_b = bonk_quote_sell_exact_in_amount_b(
         &pool,
@@ -4949,8 +6172,12 @@ fn bonk_follow_sell_amounts(
         &bonk_biguint_from_u64(pool_context.platform.creator_fee_rate),
         &bonk_biguint_from_u64(sell_amount_a),
     )?;
+    let expected_amount_b = biguint_to_u64(&quoted_amount_b, "follow sell expected output")?;
     let min_amount_b = bonk_build_min_amount_from_bps(&quoted_amount_b, slippage_bps);
-    biguint_to_u64(&min_amount_b, "follow sell min output")
+    Ok((
+        expected_amount_b,
+        biguint_to_u64(&min_amount_b, "follow sell min output")?,
+    ))
 }
 
 async fn native_compile_bonk_buy_transaction_with_pool_context(
@@ -4971,12 +6198,13 @@ async fn native_compile_bonk_buy_transaction_with_pool_context(
     let tip_lamports =
         resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
     let tx_config = bonk_follow_tx_config(
-        configured_default_sniper_buy_compute_unit_limit(),
+        configured_default_bonk_launchpad_buy_compute_unit_limit(),
         priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
         tip_lamports,
         jito_tip_account,
     )?;
-    let token_program = spl_token::id();
+    let token_program = pool_context.token_program;
+    let quote_token_program = spl_token::id();
     let user_token_account_a =
         spl_associated_token_account::get_associated_token_address_with_program_id(
             &owner_pubkey,
@@ -5006,25 +6234,21 @@ async fn native_compile_bonk_buy_transaction_with_pool_context(
             rent_exempt_lamports.saturating_add(requested_amount_b),
         )?);
         extra_signers.push(wrapped_signer);
-        extra_signers
-            .last()
-            .expect("wrapped SOL signer")
-            .pubkey()
+        extra_signers.last().expect("wrapped SOL signer").pubkey()
     } else {
         let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
-        let quote_ata =
-            spl_associated_token_account::get_associated_token_address_with_program_id(
-                &owner_pubkey,
-                &quote_mint,
-                &token_program,
-            );
+        let quote_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_token_program,
+        );
         if allow_ata_creation {
             instructions.push(
                 spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                     &owner_pubkey,
                     &owner_pubkey,
                     &quote_mint,
-                    &token_program,
+                    &quote_token_program,
                 ),
             );
         }
@@ -5053,14 +6277,782 @@ async fn native_compile_bonk_buy_transaction_with_pool_context(
     let extra_signer_refs = extra_signers.iter().collect::<Vec<_>>();
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
-    let preferred_lookup_tables =
-        if tx_format == NativeBonkTxFormat::V0 && pool_context.quote.asset == "usd1" {
-            load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await
-        } else {
-            vec![]
-        };
+    let preferred_lookup_tables = if tx_format == NativeBonkTxFormat::V0 {
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await?
+    } else {
+        vec![]
+    };
     build_bonk_compiled_transaction_with_lookup_preference(
         "follow-buy",
+        tx_format,
+        &blockhash,
+        last_valid_block_height,
+        owner,
+        &extra_signer_refs,
+        tx_instructions,
+        &tx_config,
+        &[],
+        &preferred_lookup_tables,
+    )
+}
+
+async fn native_compile_bonk_buy_transaction_with_cpmm_context(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    owner: &Keypair,
+    mint_pubkey: &Pubkey,
+    pool_context: &NativeBonkCpmmPoolContext,
+    requested_amount_b: u64,
+    allow_ata_creation: bool,
+    tx_format: NativeBonkTxFormat,
+) -> Result<CompiledTransaction, String> {
+    let owner_pubkey = owner.pubkey();
+    let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
+    let tip_lamports =
+        resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
+    let tx_config = bonk_follow_tx_config(
+        configured_default_sniper_buy_compute_unit_limit(),
+        priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
+        tip_lamports,
+        jito_tip_account,
+    )?;
+    let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+    let (token_mint, token_program, quote_program) = if pool_context.pool.token_0_mint == quote_mint
+    {
+        (
+            pool_context.pool.token_1_mint,
+            pool_context.pool.token_1_program,
+            pool_context.pool.token_0_program,
+        )
+    } else if pool_context.pool.token_1_mint == quote_mint {
+        (
+            pool_context.pool.token_0_mint,
+            pool_context.pool.token_0_program,
+            pool_context.pool.token_1_program,
+        )
+    } else {
+        return Err("Bonk CPMM quote mint did not match the selected pool.".to_string());
+    };
+    if *mint_pubkey != token_mint {
+        return Err("Bonk CPMM token mint did not match the selected pool.".to_string());
+    }
+    let user_token_account_a =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            mint_pubkey,
+            &token_program,
+        );
+    let mut instructions = Vec::new();
+    if allow_ata_creation {
+        instructions.push(build_bonk_create_ata_instruction(
+            &owner_pubkey,
+            mint_pubkey,
+            &token_program,
+        ));
+    }
+    let mut extra_signers = Vec::new();
+    let user_quote_account = if pool_context.quote.asset == "sol" {
+        let wrapped_signer = Keypair::new();
+        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
+            rpc_url,
+            &execution.commitment,
+            BONK_SPL_TOKEN_ACCOUNT_LEN,
+        )
+        .await?;
+        instructions.extend(build_bonk_wrapped_sol_open_instructions(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+            rent_exempt_lamports.saturating_add(requested_amount_b),
+        )?);
+        extra_signers.push(wrapped_signer);
+        extra_signers.last().expect("wrapped SOL signer").pubkey()
+    } else {
+        let quote_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_program,
+        );
+        if allow_ata_creation {
+            instructions.push(build_bonk_create_ata_instruction(
+                &owner_pubkey,
+                &quote_mint,
+                &quote_program,
+            ));
+        }
+        quote_ata
+    };
+    let (_, min_amount_a) =
+        bonk_cpmm_quote_exact_input(pool_context, &quote_mint, requested_amount_b, slippage_bps)?;
+    instructions.push(build_bonk_cpmm_swap_exact_in_instruction(
+        &owner_pubkey,
+        pool_context,
+        &user_quote_account,
+        &user_token_account_a,
+        requested_amount_b,
+        min_amount_a,
+        &quote_mint,
+        mint_pubkey,
+    )?);
+    if pool_context.quote.asset == "sol" {
+        instructions.push(build_bonk_wrapped_sol_close_instruction(
+            &owner_pubkey,
+            &user_quote_account,
+        )?);
+    }
+    let tx_instructions = with_bonk_tx_settings(
+        instructions,
+        &tx_config,
+        &owner_pubkey,
+        execution.buyJitodontfront,
+    )?;
+    let extra_signer_refs = extra_signers.iter().collect::<Vec<_>>();
+    let (blockhash, last_valid_block_height) =
+        fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
+    let preferred_lookup_tables = if tx_format == NativeBonkTxFormat::V0 {
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await?
+    } else {
+        vec![]
+    };
+    build_bonk_compiled_transaction_with_lookup_preference(
+        "follow-buy",
+        tx_format,
+        &blockhash,
+        last_valid_block_height,
+        owner,
+        &extra_signer_refs,
+        tx_instructions,
+        &tx_config,
+        &[],
+        &preferred_lookup_tables,
+    )
+}
+
+async fn native_compile_bonk_buy_transaction_with_clmm_context(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    owner: &Keypair,
+    mint_pubkey: &Pubkey,
+    pool_context: &NativeBonkClmmPoolContext,
+    requested_amount_b: u64,
+    allow_ata_creation: bool,
+    tx_format: NativeBonkTxFormat,
+) -> Result<CompiledTransaction, String> {
+    let owner_pubkey = owner.pubkey();
+    let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
+    let tip_lamports =
+        resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
+    let tx_config = bonk_follow_tx_config(
+        configured_default_sniper_buy_compute_unit_limit(),
+        priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
+        tip_lamports,
+        jito_tip_account,
+    )?;
+    let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+    let (token_program, quote_program) = if pool_context.setup.mint_a == quote_mint {
+        (pool_context.mint_program_b, pool_context.mint_program_a)
+    } else if pool_context.setup.mint_b == quote_mint {
+        (pool_context.mint_program_a, pool_context.mint_program_b)
+    } else {
+        return Err("Bonk CLMM quote mint did not match the selected pool.".to_string());
+    };
+    let token_mint = if pool_context.setup.mint_a == quote_mint {
+        pool_context.setup.mint_b
+    } else {
+        pool_context.setup.mint_a
+    };
+    if *mint_pubkey != token_mint {
+        return Err("Bonk CLMM token mint did not match the selected pool.".to_string());
+    }
+    let user_token_account_a =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            mint_pubkey,
+            &token_program,
+        );
+    let mut instructions = Vec::new();
+    if allow_ata_creation {
+        instructions.push(build_bonk_create_ata_instruction(
+            &owner_pubkey,
+            mint_pubkey,
+            &token_program,
+        ));
+    }
+    let mut extra_signers = Vec::new();
+    let user_quote_account = if pool_context.quote.asset == "sol" {
+        let wrapped_signer = Keypair::new();
+        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
+            rpc_url,
+            &execution.commitment,
+            BONK_SPL_TOKEN_ACCOUNT_LEN,
+        )
+        .await?;
+        instructions.extend(build_bonk_wrapped_sol_open_instructions(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+            rent_exempt_lamports.saturating_add(requested_amount_b),
+        )?);
+        extra_signers.push(wrapped_signer);
+        extra_signers.last().expect("wrapped SOL signer").pubkey()
+    } else {
+        let quote_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_program,
+        );
+        if allow_ata_creation {
+            instructions.push(build_bonk_create_ata_instruction(
+                &owner_pubkey,
+                &quote_mint,
+                &quote_program,
+            ));
+        }
+        quote_ata
+    };
+    let quote = bonk_quote_clmm_exact_input(
+        &pool_context.setup,
+        &quote_mint,
+        &bonk_biguint_from_u64(requested_amount_b),
+        slippage_bps,
+    )?;
+    instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        &owner_pubkey,
+        &pool_context.setup,
+        &user_quote_account,
+        &user_token_account_a,
+        requested_amount_b,
+        biguint_to_u64(&quote.min_out, "Bonk CLMM buy min output")?,
+        &quote.traversed_tick_array_starts,
+        &quote_mint,
+        mint_pubkey,
+    )?);
+    if pool_context.quote.asset == "sol" {
+        instructions.push(build_bonk_wrapped_sol_close_instruction(
+            &owner_pubkey,
+            &user_quote_account,
+        )?);
+    }
+    let tx_instructions = with_bonk_tx_settings(
+        instructions,
+        &tx_config,
+        &owner_pubkey,
+        execution.buyJitodontfront,
+    )?;
+    let extra_signer_refs = extra_signers.iter().collect::<Vec<_>>();
+    let (blockhash, last_valid_block_height) =
+        fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
+    let preferred_lookup_tables = if tx_format == NativeBonkTxFormat::V0 {
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await?
+    } else {
+        vec![]
+    };
+    build_bonk_compiled_transaction_with_lookup_preference(
+        "follow-buy",
+        tx_format,
+        &blockhash,
+        last_valid_block_height,
+        owner,
+        &extra_signer_refs,
+        tx_instructions,
+        &tx_config,
+        &[],
+        &preferred_lookup_tables,
+    )
+}
+
+async fn native_compile_bonk_buy_transaction_with_venue_context(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    owner: &Keypair,
+    mint_pubkey: &Pubkey,
+    venue_context: &NativeBonkTradeVenueContext,
+    requested_amount_b: u64,
+    allow_ata_creation: bool,
+    tx_format: NativeBonkTxFormat,
+) -> Result<CompiledTransaction, String> {
+    match venue_context {
+        NativeBonkTradeVenueContext::Launchpad(context) => {
+            native_compile_bonk_buy_transaction_with_pool_context(
+                rpc_url,
+                execution,
+                jito_tip_account,
+                owner,
+                mint_pubkey,
+                context,
+                requested_amount_b,
+                allow_ata_creation,
+                tx_format,
+            )
+            .await
+        }
+        NativeBonkTradeVenueContext::RaydiumCpmm(context) => {
+            native_compile_bonk_buy_transaction_with_cpmm_context(
+                rpc_url,
+                execution,
+                jito_tip_account,
+                owner,
+                mint_pubkey,
+                context,
+                requested_amount_b,
+                allow_ata_creation,
+                tx_format,
+            )
+            .await
+        }
+        NativeBonkTradeVenueContext::RaydiumClmm(context) => {
+            native_compile_bonk_buy_transaction_with_clmm_context(
+                rpc_url,
+                execution,
+                jito_tip_account,
+                owner,
+                mint_pubkey,
+                context,
+                requested_amount_b,
+                allow_ata_creation,
+                tx_format,
+            )
+            .await
+        }
+    }
+}
+
+async fn native_compile_bonk_sell_transaction_with_cpmm_context(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    owner: &Keypair,
+    mint_pubkey: &Pubkey,
+    pool_context: &NativeBonkCpmmPoolContext,
+    sell_amount: u64,
+    sell_settlement_asset: &str,
+) -> Result<CompiledTransaction, String> {
+    let owner_pubkey = owner.pubkey();
+    let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
+    let tip_lamports =
+        resolve_follow_tip_lamports(&execution.sellProvider, &execution.sellTipSol, "sell tip")?;
+    let tx_config = bonk_follow_tx_config(
+        configured_bonk_sell_compute_unit_limit(&pool_context.quote.asset, sell_settlement_asset),
+        priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
+        tip_lamports,
+        jito_tip_account,
+    )?;
+    let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+    let (token_program, quote_program) = if pool_context.pool.token_0_mint == quote_mint {
+        (
+            pool_context.pool.token_1_program,
+            pool_context.pool.token_0_program,
+        )
+    } else if pool_context.pool.token_1_mint == quote_mint {
+        (
+            pool_context.pool.token_0_program,
+            pool_context.pool.token_1_program,
+        )
+    } else {
+        return Err("Bonk CPMM quote mint did not match the selected pool.".to_string());
+    };
+    let user_token_account_a =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            mint_pubkey,
+            &token_program,
+        );
+    let mut instructions = Vec::new();
+    let mut extra_signers = Vec::new();
+    let user_quote_account = if pool_context.quote.asset == "sol" {
+        let wrapped_signer = Keypair::new();
+        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
+            rpc_url,
+            &execution.commitment,
+            BONK_SPL_TOKEN_ACCOUNT_LEN,
+        )
+        .await?;
+        instructions.extend(build_bonk_wrapped_sol_open_instructions(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+            rent_exempt_lamports,
+        )?);
+        extra_signers.push(wrapped_signer);
+        extra_signers.last().expect("wrapped SOL signer").pubkey()
+    } else {
+        let quote_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_program,
+        );
+        instructions.push(build_bonk_create_ata_instruction(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_program,
+        ));
+        quote_ata
+    };
+    let (_, min_amount_b) =
+        bonk_cpmm_quote_exact_input(pool_context, mint_pubkey, sell_amount, slippage_bps)?;
+    instructions.push(build_bonk_cpmm_swap_exact_in_instruction(
+        &owner_pubkey,
+        pool_context,
+        &user_token_account_a,
+        &user_quote_account,
+        sell_amount,
+        min_amount_b,
+        mint_pubkey,
+        &quote_mint,
+    )?);
+    let settlement_asset = normalize_bonk_sell_settlement_asset(sell_settlement_asset);
+    if pool_context.quote.asset == "usd1" && settlement_asset == "sol" {
+        let wrapped_signer = Keypair::new();
+        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
+            rpc_url,
+            &execution.commitment,
+            BONK_SPL_TOKEN_ACCOUNT_LEN,
+        )
+        .await?;
+        instructions.extend(build_bonk_wrapped_sol_open_instructions(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+            rent_exempt_lamports,
+        )?);
+        let route_setup = load_bonk_usd1_route_setup(rpc_url).await?;
+        // The preceding sell can output anywhere down to min_amount_b. In the
+        // same transaction, only the minimum is guaranteed to be available for
+        // the USD1 -> SOL unwind.
+        let unwind_quote = bonk_quote_sol_from_exact_usd1_input(
+            &route_setup,
+            &bonk_biguint_from_u64(min_amount_b),
+            BONK_USD1_ROUTE_SLIPPAGE_BPS,
+        )?;
+        instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+            &owner_pubkey,
+            &route_setup,
+            &user_quote_account,
+            &wrapped_signer.pubkey(),
+            min_amount_b,
+            biguint_to_u64(&unwind_quote.min_out, "Bonk CPMM unwind min output")?,
+            &unwind_quote.traversed_tick_array_starts,
+            &route_setup.mint_b,
+            &route_setup.mint_a,
+        )?);
+        instructions.push(build_bonk_wrapped_sol_close_instruction(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+        )?);
+        extra_signers.push(wrapped_signer);
+    } else if pool_context.quote.asset == "sol" {
+        instructions.push(build_bonk_wrapped_sol_close_instruction(
+            &owner_pubkey,
+            &user_quote_account,
+        )?);
+    }
+    let tx_instructions = with_bonk_tx_settings(
+        instructions,
+        &tx_config,
+        &owner_pubkey,
+        execution.sellJitodontfront,
+    )?;
+    let extra_signer_refs = extra_signers.iter().collect::<Vec<_>>();
+    let (blockhash, last_valid_block_height) =
+        fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
+    let preferred_lookup_tables =
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await?;
+    build_bonk_compiled_transaction_with_lookup_preference(
+        "follow-sell",
+        select_bonk_native_tx_format(&execution.txFormat),
+        &blockhash,
+        last_valid_block_height,
+        owner,
+        &extra_signer_refs,
+        tx_instructions,
+        &tx_config,
+        &[],
+        &preferred_lookup_tables,
+    )
+}
+
+async fn native_compile_bonk_sell_transaction_with_clmm_context(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    owner: &Keypair,
+    mint_pubkey: &Pubkey,
+    pool_context: &NativeBonkClmmPoolContext,
+    sell_amount: u64,
+    sell_settlement_asset: &str,
+) -> Result<CompiledTransaction, String> {
+    let owner_pubkey = owner.pubkey();
+    let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
+    let tip_lamports =
+        resolve_follow_tip_lamports(&execution.sellProvider, &execution.sellTipSol, "sell tip")?;
+    let tx_config = bonk_follow_tx_config(
+        configured_bonk_sell_compute_unit_limit(&pool_context.quote.asset, sell_settlement_asset),
+        priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
+        tip_lamports,
+        jito_tip_account,
+    )?;
+    let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+    let (token_program, quote_program) = if pool_context.setup.mint_a == quote_mint {
+        (pool_context.mint_program_b, pool_context.mint_program_a)
+    } else if pool_context.setup.mint_b == quote_mint {
+        (pool_context.mint_program_a, pool_context.mint_program_b)
+    } else {
+        return Err("Bonk CLMM quote mint did not match the selected pool.".to_string());
+    };
+    let user_token_account_a =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            mint_pubkey,
+            &token_program,
+        );
+    let mut instructions = Vec::new();
+    let mut extra_signers = Vec::new();
+    let user_quote_account = if pool_context.quote.asset == "sol" {
+        let wrapped_signer = Keypair::new();
+        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
+            rpc_url,
+            &execution.commitment,
+            BONK_SPL_TOKEN_ACCOUNT_LEN,
+        )
+        .await?;
+        instructions.extend(build_bonk_wrapped_sol_open_instructions(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+            rent_exempt_lamports,
+        )?);
+        extra_signers.push(wrapped_signer);
+        extra_signers.last().expect("wrapped SOL signer").pubkey()
+    } else {
+        let quote_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_program,
+        );
+        instructions.push(build_bonk_create_ata_instruction(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_program,
+        ));
+        quote_ata
+    };
+    let quote = bonk_quote_clmm_exact_input(
+        &pool_context.setup,
+        mint_pubkey,
+        &bonk_biguint_from_u64(sell_amount),
+        slippage_bps,
+    )?;
+    instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        &owner_pubkey,
+        &pool_context.setup,
+        &user_token_account_a,
+        &user_quote_account,
+        sell_amount,
+        biguint_to_u64(&quote.min_out, "Bonk CLMM sell min output")?,
+        &quote.traversed_tick_array_starts,
+        mint_pubkey,
+        &quote_mint,
+    )?);
+    let settlement_asset = normalize_bonk_sell_settlement_asset(sell_settlement_asset);
+    if pool_context.quote.asset == "usd1" && settlement_asset == "sol" {
+        let wrapped_signer = Keypair::new();
+        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
+            rpc_url,
+            &execution.commitment,
+            BONK_SPL_TOKEN_ACCOUNT_LEN,
+        )
+        .await?;
+        instructions.extend(build_bonk_wrapped_sol_open_instructions(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+            rent_exempt_lamports,
+        )?);
+        let route_setup = load_bonk_usd1_route_setup(rpc_url).await?;
+        // The preceding sell can output anywhere down to quote.min_out. In the
+        // same transaction, only the minimum is guaranteed to be available for
+        // the USD1 -> SOL unwind.
+        let unwind_quote = bonk_quote_sol_from_exact_usd1_input(
+            &route_setup,
+            &quote.min_out,
+            BONK_USD1_ROUTE_SLIPPAGE_BPS,
+        )?;
+        let unwind_input = biguint_to_u64(&quote.min_out, "Bonk CLMM sell minimum output")?;
+        instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+            &owner_pubkey,
+            &route_setup,
+            &user_quote_account,
+            &wrapped_signer.pubkey(),
+            unwind_input,
+            biguint_to_u64(&unwind_quote.min_out, "Bonk CLMM unwind min output")?,
+            &unwind_quote.traversed_tick_array_starts,
+            &route_setup.mint_b,
+            &route_setup.mint_a,
+        )?);
+        instructions.push(build_bonk_wrapped_sol_close_instruction(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+        )?);
+        extra_signers.push(wrapped_signer);
+    } else if pool_context.quote.asset == "sol" {
+        instructions.push(build_bonk_wrapped_sol_close_instruction(
+            &owner_pubkey,
+            &user_quote_account,
+        )?);
+    }
+    let tx_instructions = with_bonk_tx_settings(
+        instructions,
+        &tx_config,
+        &owner_pubkey,
+        execution.sellJitodontfront,
+    )?;
+    let extra_signer_refs = extra_signers.iter().collect::<Vec<_>>();
+    let (blockhash, last_valid_block_height) =
+        fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
+    let preferred_lookup_tables =
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await?;
+    build_bonk_compiled_transaction_with_lookup_preference(
+        "follow-sell",
+        select_bonk_native_tx_format(&execution.txFormat),
+        &blockhash,
+        last_valid_block_height,
+        owner,
+        &extra_signer_refs,
+        tx_instructions,
+        &tx_config,
+        &[],
+        &preferred_lookup_tables,
+    )
+}
+
+async fn native_compile_follow_sell_launchpad_transaction(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    owner: &Keypair,
+    mint_pubkey: &Pubkey,
+    pool_context: &NativeBonkPoolContext,
+    sell_amount: u64,
+    sell_settlement_asset: &str,
+) -> Result<CompiledTransaction, String> {
+    let owner_pubkey = owner.pubkey();
+    let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
+    let (_, min_amount_b) =
+        bonk_follow_sell_quote_amounts(pool_context, sell_amount, slippage_bps)?;
+    let tip_lamports =
+        resolve_follow_tip_lamports(&execution.sellProvider, &execution.sellTipSol, "sell tip")?;
+    let tx_config = bonk_follow_tx_config(
+        configured_bonk_sell_compute_unit_limit(&pool_context.quote.asset, sell_settlement_asset),
+        priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
+        tip_lamports,
+        jito_tip_account,
+    )?;
+    let tx_format = select_bonk_native_tx_format(&execution.txFormat);
+    let token_program = pool_context.token_program;
+    let quote_token_program = spl_token::id();
+    let settlement_asset = normalize_bonk_sell_settlement_asset(sell_settlement_asset);
+    let user_token_account_a =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            mint_pubkey,
+            &token_program,
+        );
+    let mut instructions = Vec::new();
+    let mut extra_signers = Vec::new();
+    let user_token_account_b = if pool_context.quote.asset == "sol" {
+        let wrapped_signer = Keypair::new();
+        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
+            rpc_url,
+            &execution.commitment,
+            BONK_SPL_TOKEN_ACCOUNT_LEN,
+        )
+        .await?;
+        instructions.extend(build_bonk_wrapped_sol_open_instructions(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+            rent_exempt_lamports,
+        )?);
+        extra_signers.push(wrapped_signer);
+        extra_signers.last().expect("wrapped SOL signer").pubkey()
+    } else {
+        let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+        let quote_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_token_program,
+        );
+        instructions.push(build_bonk_create_ata_instruction(
+            &owner_pubkey,
+            &quote_mint,
+            &quote_token_program,
+        ));
+        quote_ata
+    };
+    instructions.push(build_bonk_sell_exact_in_instruction(
+        &owner_pubkey,
+        pool_context,
+        &user_token_account_a,
+        &user_token_account_b,
+        sell_amount,
+        min_amount_b,
+    )?);
+    if pool_context.quote.asset == "usd1" && settlement_asset == "sol" {
+        let wrapped_signer = Keypair::new();
+        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
+            rpc_url,
+            &execution.commitment,
+            BONK_SPL_TOKEN_ACCOUNT_LEN,
+        )
+        .await?;
+        instructions.extend(build_bonk_wrapped_sol_open_instructions(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+            rent_exempt_lamports,
+        )?);
+        let route_setup = load_bonk_usd1_route_setup(rpc_url).await?;
+        // The preceding launchpad sell can output anywhere down to min_amount_b.
+        // In the same transaction, only the minimum is guaranteed to be
+        // available for the USD1 -> SOL unwind.
+        let unwind_quote = bonk_quote_sol_from_exact_usd1_input(
+            &route_setup,
+            &bonk_biguint_from_u64(min_amount_b),
+            BONK_USD1_ROUTE_SLIPPAGE_BPS,
+        )?;
+        instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+            &owner_pubkey,
+            &route_setup,
+            &user_token_account_b,
+            &wrapped_signer.pubkey(),
+            min_amount_b,
+            biguint_to_u64(&unwind_quote.min_out, "follow sell unwind min output")?,
+            &unwind_quote.traversed_tick_array_starts,
+            &route_setup.mint_b,
+            &route_setup.mint_a,
+        )?);
+        instructions.push(build_bonk_wrapped_sol_close_instruction(
+            &owner_pubkey,
+            &wrapped_signer.pubkey(),
+        )?);
+        extra_signers.push(wrapped_signer);
+    } else if pool_context.quote.asset == "sol" {
+        instructions.push(build_bonk_wrapped_sol_close_instruction(
+            &owner_pubkey,
+            &user_token_account_b,
+        )?);
+    }
+    let tx_instructions = with_bonk_tx_settings(
+        instructions,
+        &tx_config,
+        &owner_pubkey,
+        execution.sellJitodontfront,
+    )?;
+    let extra_signer_refs = extra_signers.iter().collect::<Vec<_>>();
+    let (blockhash, last_valid_block_height) =
+        fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
+    let preferred_lookup_tables = if tx_format == NativeBonkTxFormat::V0 {
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await?
+    } else {
+        vec![]
+    };
+    build_bonk_compiled_transaction_with_lookup_preference(
+        "follow-sell",
         tx_format,
         &blockhash,
         last_valid_block_height,
@@ -5127,35 +7119,85 @@ async fn native_compile_follow_buy_transaction(
     buy_amount: &str,
     allow_ata_creation: bool,
     pool_context_override: Option<&NativeBonkPoolContext>,
+    pool_id_override: Option<&str>,
     usd1_route_setup_override: Option<&BonkUsd1RouteSetup>,
-) -> Result<CompiledTransaction, String> {
+) -> Result<BonkFollowBuyCompileResult, String> {
     let owner = parse_owner_keypair(wallet_secret)?;
     let mint_pubkey =
         Pubkey::from_str(mint).map_err(|error| format!("Invalid Bonk mint address: {error}"))?;
-    let pool_context = if let Some(pool_context) = pool_context_override {
-        pool_context.clone()
-    } else {
-        load_live_bonk_pool_context(rpc_url, &mint_pubkey, quote_asset, &execution.commitment).await?
-    };
-    let quote = bonk_quote_asset_config(quote_asset);
-    let requested_amount_b = parse_decimal_u64(
-        buy_amount,
-        quote.decimals,
-        &format!("follow buy amount {}", quote.label),
-    )?;
-    if quote.asset == "usd1" {
-        let current_balance = fetch_bonk_owner_token_balance(
+    let venue_context = if let Some(pool_context) = pool_context_override {
+        NativeBonkTradeVenueContext::Launchpad(pool_context.clone())
+    } else if let Some(pool_id) = pool_id_override {
+        load_bonk_trade_venue_context_by_pool_id(
             rpc_url,
+            pool_id,
+            quote_asset,
             &execution.commitment,
-            &owner.pubkey(),
-            &bonk_quote_mint("usd1")?,
         )
         .await?
-        .unwrap_or_default();
-        if current_balance < requested_amount_b {
-            let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
-            let tip_lamports =
-                resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
+    } else {
+        load_live_bonk_trade_venue_context(
+            rpc_url,
+            &mint_pubkey,
+            quote_asset,
+            &execution.commitment,
+        )
+        .await?
+    };
+    let quote = bonk_quote_asset_config(quote_asset);
+    if quote.asset == "usd1" {
+        let funding_policy = normalize_bonk_buy_funding_policy(&execution.buyFundingPolicy);
+        let sol_input_quote = if funding_policy == "usd1_only" {
+            None
+        } else {
+            Some(
+                native_quote_usd1_buy_amounts_from_sol_input(
+                    rpc_url,
+                    buy_amount,
+                    usd1_route_setup_override,
+                )
+                .await?,
+            )
+        };
+        let current_balance = match funding_policy {
+            "sol_only" => 0,
+            _ => fetch_bonk_owner_token_balance(
+                rpc_url,
+                &execution.commitment,
+                &owner.pubkey(),
+                &bonk_quote_mint("usd1")?,
+            )
+            .await?
+            .unwrap_or_default(),
+        };
+        let requested_amount_b = if funding_policy == "usd1_only" {
+            parse_decimal_u64(
+                buy_amount,
+                quote.decimals,
+                &format!("follow buy amount {}", quote.label),
+            )?
+        } else {
+            select_bonk_usd1_buy_amount_from_sol_quote(
+                funding_policy,
+                current_balance,
+                sol_input_quote
+                    .as_ref()
+                    .ok_or_else(|| "Bonk USD1 SOL input quote was not prepared.".to_string())?,
+            )
+        };
+        if funding_policy == "usd1_only" && current_balance < requested_amount_b {
+            return Err(format!(
+                "USD1-only buy requires {} USD1 available, but wallet only had {}.",
+                format_biguint_decimal(&bonk_biguint_from_u64(requested_amount_b), 6, 6),
+                format_biguint_decimal(&bonk_biguint_from_u64(current_balance), 6, 6),
+            ));
+        }
+        if funding_policy == "sol_only" || current_balance < requested_amount_b {
+            let tip_lamports = resolve_follow_tip_lamports(
+                &execution.buyProvider,
+                &execution.buyTipSol,
+                "buy tip",
+            )?;
             let buy_tx_config = bonk_follow_tx_config(
                 configured_default_sniper_buy_compute_unit_limit(),
                 priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
@@ -5167,7 +7209,12 @@ async fn native_compile_follow_buy_transaction(
                 &execution.commitment,
                 &owner.pubkey(),
                 &bonk_biguint_from_u64(requested_amount_b),
-                slippage_bps,
+                BONK_USD1_ROUTE_SLIPPAGE_BPS,
+                if funding_policy == "sol_only" {
+                    BonkUsd1TopupMode::ForceFullAmount
+                } else {
+                    BonkUsd1TopupMode::RespectExistingBalance
+                },
                 None,
                 usd1_route_setup_override,
             )
@@ -5188,19 +7235,19 @@ async fn native_compile_follow_buy_transaction(
                 "Native Bonk live USD1 follow buy could not prepare a required top-up transaction."
                     .to_string()
             })?;
-            let action_transaction = native_compile_bonk_buy_transaction_with_pool_context(
+            let action_transaction = native_compile_bonk_buy_transaction_with_venue_context(
                 rpc_url,
                 execution,
                 jito_tip_account,
                 &owner,
                 &mint_pubkey,
-                &pool_context,
+                &venue_context,
                 requested_amount_b,
                 allow_ata_creation,
                 NativeBonkTxFormat::V0,
             )
             .await?;
-            return combine_atomic_bonk_usd1_follow_buy_transactions(
+            return match combine_atomic_bonk_usd1_follow_buy_transactions(
                 rpc_url,
                 execution,
                 jito_tip_account,
@@ -5208,25 +7255,77 @@ async fn native_compile_follow_buy_transaction(
                 &topup_transaction,
                 &action_transaction,
             )
-            .await;
+            .await
+            {
+                Ok(transaction) => Ok(BonkFollowBuyCompileResult {
+                    transactions: vec![transaction],
+                    primary_tx_index: 0,
+                    requires_ordered_execution: false,
+                    entry_preference_asset: Some("sol".to_string()),
+                }),
+                Err(error) => {
+                    let transport_plan = crate::transport::build_transport_plan(execution, 2);
+                    if transport_plan.executionClass != "bundle"
+                        && transport_plan.ordering != "bundle"
+                    {
+                        return Err(format!(
+                            "Bonk USD1 follow buy could not be compiled atomically, and the resolved transport {} cannot safely carry the required dependent split: {}",
+                            transport_plan.transportType, error
+                        ));
+                    }
+                    Ok(BonkFollowBuyCompileResult {
+                        transactions: vec![topup_transaction, action_transaction],
+                        primary_tx_index: 1,
+                        requires_ordered_execution: true,
+                        entry_preference_asset: Some("sol".to_string()),
+                    })
+                }
+            };
         }
+        return Ok(BonkFollowBuyCompileResult {
+            transactions: vec![
+                native_compile_bonk_buy_transaction_with_venue_context(
+                    rpc_url,
+                    execution,
+                    jito_tip_account,
+                    &owner,
+                    &mint_pubkey,
+                    &venue_context,
+                    requested_amount_b,
+                    allow_ata_creation,
+                    NativeBonkTxFormat::V0,
+                )
+                .await?,
+            ],
+            primary_tx_index: 0,
+            requires_ordered_execution: false,
+            entry_preference_asset: Some("usd1".to_string()),
+        });
     }
-    native_compile_bonk_buy_transaction_with_pool_context(
-        rpc_url,
-        execution,
-        jito_tip_account,
-        &owner,
-        &mint_pubkey,
-        &pool_context,
-        requested_amount_b,
-        allow_ata_creation,
-        if quote.asset == "usd1" {
-            NativeBonkTxFormat::V0
-        } else {
-            select_bonk_native_tx_format(&execution.txFormat)
-        },
-    )
-    .await
+    let requested_amount_b = parse_decimal_u64(
+        buy_amount,
+        quote.decimals,
+        &format!("follow buy amount {}", quote.label),
+    )?;
+    Ok(BonkFollowBuyCompileResult {
+        transactions: vec![
+            native_compile_bonk_buy_transaction_with_venue_context(
+                rpc_url,
+                execution,
+                jito_tip_account,
+                &owner,
+                &mint_pubkey,
+                &venue_context,
+                requested_amount_b,
+                allow_ata_creation,
+                select_bonk_native_tx_format(&execution.txFormat),
+            )
+            .await?,
+        ],
+        primary_tx_index: 0,
+        requires_ordered_execution: false,
+        entry_preference_asset: Some("sol".to_string()),
+    })
 }
 
 async fn native_compile_follow_sell_transaction_with_token_amount(
@@ -5241,15 +7340,107 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
     pool_id_override: Option<&str>,
     launch_mode_override: Option<&str>,
     launch_creator_override: Option<&str>,
+    sell_settlement_asset: &str,
 ) -> Result<Option<CompiledTransaction>, String> {
     let owner = parse_owner_keypair(wallet_secret)?;
     let owner_pubkey = owner.pubkey();
     let mint_pubkey =
         Pubkey::from_str(mint).map_err(|error| format!("Invalid Bonk mint address: {error}"))?;
+    if should_use_prelaunch_follow_sell_override(
+        quote_asset,
+        &mint_pubkey,
+        token_amount_override,
+        pool_id_override,
+        launch_mode_override,
+        launch_creator_override,
+    )? {
+        let defaults = load_bonk_launch_defaults(
+            rpc_url,
+            launch_mode_override.unwrap_or_default(),
+            quote_asset,
+        )
+        .await?;
+        let creator = Pubkey::from_str(launch_creator_override.unwrap_or_default())
+            .map_err(|error| format!("Invalid Bonk launch creator: {error}"))?;
+        let pool_context = build_prelaunch_bonk_pool_context(
+            &defaults,
+            &mint_pubkey,
+            &creator,
+            launch_mode_override.unwrap_or_default(),
+        )?;
+        let raw_amount = token_amount_override.unwrap_or_default();
+        if raw_amount == 0 {
+            return Ok(None);
+        }
+        let sell_amount = (u128::from(raw_amount) * u128::from(sell_percent) / 100u128) as u64;
+        if sell_amount == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(
+            native_compile_follow_sell_launchpad_transaction(
+                rpc_url,
+                execution,
+                jito_tip_account,
+                &owner,
+                &mint_pubkey,
+                &pool_context,
+                sell_amount,
+                sell_settlement_asset,
+            )
+            .await?,
+        ));
+    }
+
+    let venue_context = if let Some(pool_id) = pool_id_override {
+        load_bonk_trade_venue_context_by_pool_id(
+            rpc_url,
+            pool_id,
+            quote_asset,
+            &execution.commitment,
+        )
+        .await?
+    } else {
+        load_live_bonk_trade_venue_context(
+            rpc_url,
+            &mint_pubkey,
+            quote_asset,
+            &execution.commitment,
+        )
+        .await?
+    };
+    let token_program = match &venue_context {
+        NativeBonkTradeVenueContext::Launchpad(context) => context.token_program,
+        NativeBonkTradeVenueContext::RaydiumCpmm(context) => {
+            if context.pool.token_0_mint == mint_pubkey {
+                context.pool.token_0_program
+            } else if context.pool.token_1_mint == mint_pubkey {
+                context.pool.token_1_program
+            } else {
+                return Err("Bonk CPMM token mint did not match the selected pool.".to_string());
+            }
+        }
+        NativeBonkTradeVenueContext::RaydiumClmm(context) => {
+            if context.setup.mint_a == mint_pubkey {
+                context.mint_program_a
+            } else if context.setup.mint_b == mint_pubkey {
+                context.mint_program_b
+            } else {
+                return Err("Bonk CLMM token mint did not match the selected pool.".to_string());
+            }
+        }
+    };
     let raw_amount = if let Some(value) = token_amount_override {
         value
     } else {
-        match fetch_bonk_owner_token_balance(rpc_url, &execution.commitment, &owner_pubkey, &mint_pubkey).await? {
+        match fetch_bonk_owner_token_balance_with_token_program(
+            rpc_url,
+            &execution.commitment,
+            &owner_pubkey,
+            &mint_pubkey,
+            &token_program,
+        )
+        .await?
+        {
             Some(value) => value,
             None => return Ok(None),
         }
@@ -5261,123 +7452,47 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
     if sell_amount == 0 {
         return Ok(None);
     }
-    let pool_context =
-        if token_amount_override.is_some()
-            && pool_id_override.is_some()
-            && launch_mode_override.is_some()
-            && launch_creator_override.is_some()
-        {
-            let defaults = load_bonk_launch_defaults(
+    Ok(Some(match &venue_context {
+        NativeBonkTradeVenueContext::Launchpad(pool_context) => {
+            native_compile_follow_sell_launchpad_transaction(
                 rpc_url,
-                launch_mode_override.unwrap_or_default(),
-                quote_asset,
+                execution,
+                jito_tip_account,
+                &owner,
+                &mint_pubkey,
+                pool_context,
+                sell_amount,
+                sell_settlement_asset,
             )
-            .await?;
-            let creator = Pubkey::from_str(launch_creator_override.unwrap_or_default())
-                .map_err(|error| format!("Invalid Bonk launch creator: {error}"))?;
-            build_prelaunch_bonk_pool_context(&defaults, &mint_pubkey, &creator, launch_mode_override.unwrap_or_default())?
-        } else if let Some(pool_id) = pool_id_override {
-            load_bonk_pool_context_by_pool_id(rpc_url, pool_id, quote_asset, &execution.commitment).await?
-        } else {
-            load_live_bonk_pool_context(rpc_url, &mint_pubkey, quote_asset, &execution.commitment).await?
-        };
-    let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
-    let min_amount_b = bonk_follow_sell_amounts(&pool_context, sell_amount, slippage_bps)?;
-    let tip_lamports =
-        resolve_follow_tip_lamports(&execution.sellProvider, &execution.sellTipSol, "sell tip")?;
-    let tx_config = bonk_follow_tx_config(
-        configured_default_dev_auto_sell_compute_unit_limit(),
-        priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
-        tip_lamports,
-        jito_tip_account,
-    )?;
-    let tx_format = select_bonk_native_tx_format(&execution.txFormat);
-    let token_program = spl_token::id();
-    let user_token_account_a =
-        spl_associated_token_account::get_associated_token_address_with_program_id(
-            &owner_pubkey,
-            &mint_pubkey,
-            &token_program,
-        );
-    let mut instructions = Vec::new();
-    let mut extra_signers = Vec::new();
-    let user_token_account_b = if pool_context.quote.asset == "sol" {
-        let wrapped_signer = Keypair::new();
-        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
-            rpc_url,
-            &execution.commitment,
-            BONK_SPL_TOKEN_ACCOUNT_LEN,
-        )
-        .await?;
-        instructions.extend(build_bonk_wrapped_sol_open_instructions(
-            &owner_pubkey,
-            &wrapped_signer.pubkey(),
-            rent_exempt_lamports,
-        )?);
-        extra_signers.push(wrapped_signer);
-        extra_signers
-            .last()
-            .expect("wrapped SOL signer")
-            .pubkey()
-    } else {
-        let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
-        let quote_ata =
-            spl_associated_token_account::get_associated_token_address_with_program_id(
-                &owner_pubkey,
-                &quote_mint,
-                &token_program,
-            );
-        instructions.push(
-            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                &owner_pubkey,
-                &owner_pubkey,
-                &quote_mint,
-                &token_program,
-            ),
-        );
-        quote_ata
-    };
-    instructions.push(build_bonk_sell_exact_in_instruction(
-        &owner_pubkey,
-        &pool_context,
-        &user_token_account_a,
-        &user_token_account_b,
-        sell_amount,
-        min_amount_b,
-    )?);
-    if pool_context.quote.asset == "sol" {
-        instructions.push(build_bonk_wrapped_sol_close_instruction(
-            &owner_pubkey,
-            &user_token_account_b,
-        )?);
-    }
-    let tx_instructions = with_bonk_tx_settings(
-        instructions,
-        &tx_config,
-        &owner_pubkey,
-        execution.sellJitodontfront,
-    )?;
-    let extra_signer_refs = extra_signers.iter().collect::<Vec<_>>();
-    let (blockhash, last_valid_block_height) =
-        fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
-    let preferred_lookup_tables =
-        if tx_format == NativeBonkTxFormat::V0 && pool_context.quote.asset == "usd1" {
-            load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await
-        } else {
-            vec![]
-        };
-    Ok(Some(build_bonk_compiled_transaction_with_lookup_preference(
-        "follow-sell",
-        tx_format,
-        &blockhash,
-        last_valid_block_height,
-        &owner,
-        &extra_signer_refs,
-        tx_instructions,
-        &tx_config,
-        &[],
-        &preferred_lookup_tables,
-    )?))
+            .await?
+        }
+        NativeBonkTradeVenueContext::RaydiumCpmm(pool_context) => {
+            native_compile_bonk_sell_transaction_with_cpmm_context(
+                rpc_url,
+                execution,
+                jito_tip_account,
+                &owner,
+                &mint_pubkey,
+                pool_context,
+                sell_amount,
+                sell_settlement_asset,
+            )
+            .await?
+        }
+        NativeBonkTradeVenueContext::RaydiumClmm(pool_context) => {
+            native_compile_bonk_sell_transaction_with_clmm_context(
+                rpc_url,
+                execution,
+                jito_tip_account,
+                &owner,
+                &mint_pubkey,
+                pool_context,
+                sell_amount,
+                sell_settlement_asset,
+            )
+            .await?
+        }
+    }))
 }
 
 async fn native_compile_atomic_follow_buy_transaction(
@@ -5413,12 +7528,9 @@ async fn native_compile_atomic_follow_buy_transaction(
             buy_slippage_bps,
         )?;
     }
-    let requested_amount_b = parse_decimal_u64(
-        buy_amount,
-        defaults.quote.decimals,
-        &format!("follow buy amount {}", defaults.quote.label),
-    )?;
-    if defaults.quote.asset == "usd1" {
+    let (requested_amount_b, current_usd1_balance) = if defaults.quote.asset == "usd1" {
+        let sol_input_quote =
+            native_quote_usd1_buy_amounts_from_sol_input(rpc_url, buy_amount, None).await?;
         let current_balance = fetch_bonk_owner_token_balance(
             rpc_url,
             &execution.commitment,
@@ -5427,6 +7539,26 @@ async fn native_compile_atomic_follow_buy_transaction(
         )
         .await?
         .unwrap_or_default();
+        (
+            select_bonk_usd1_buy_amount_from_sol_quote(
+                "prefer_usd1_else_topup",
+                current_balance,
+                &sol_input_quote,
+            ),
+            current_balance,
+        )
+    } else {
+        (
+            parse_decimal_u64(
+                buy_amount,
+                defaults.quote.decimals,
+                &format!("follow buy amount {}", defaults.quote.label),
+            )?,
+            0,
+        )
+    };
+    if defaults.quote.asset == "usd1" {
+        let current_balance = current_usd1_balance;
         if current_balance < requested_amount_b {
             let required_quote_amount =
                 format_biguint_decimal(&bonk_biguint_from_u64(requested_amount_b), 6, 6);
@@ -5593,7 +7725,7 @@ async fn native_compile_sol_to_usd1_topup_transaction_with_format(
     if required_quote_amount == BigUint::ZERO {
         return Ok(None);
     }
-    let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
+    let slippage_bps = BONK_USD1_ROUTE_SLIPPAGE_BPS;
     let usd1_mint = bonk_quote_mint("usd1")?;
     let current_quote_amount = bonk_biguint_from_u64(
         fetch_bonk_owner_token_balance(rpc_url, "processed", &owner_pubkey, &usd1_mint)
@@ -5641,8 +7773,9 @@ async fn native_compile_sol_to_usd1_topup_transaction_with_format(
     let tx_format = select_bonk_native_tx_format(tx_format_override.unwrap_or(&execution.txFormat));
     let tip_lamports = parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?;
     let tx_config = NativeBonkTxConfig {
-        compute_unit_limit: u32::try_from(configured_default_launch_usd1_topup_compute_unit_limit())
-            .map_err(|error| format!("Invalid USD1 top-up compute unit limit: {error}"))?,
+        compute_unit_limit:
+            u32::try_from(configured_default_launch_usd1_topup_compute_unit_limit())
+                .map_err(|error| format!("Invalid USD1 top-up compute unit limit: {error}"))?,
         compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(
             &execution.buyPriorityFeeSol,
         )?,
@@ -5656,11 +7789,12 @@ async fn native_compile_sol_to_usd1_topup_transaction_with_format(
         },
     };
     let token_program = spl_token::id();
-    let user_output_account = spl_associated_token_account::get_associated_token_address_with_program_id(
-        &owner_pubkey,
-        &usd1_mint,
-        &token_program,
-    );
+    let user_output_account =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &usd1_mint,
+            &token_program,
+        );
     let wrapped_signer = Keypair::new();
     let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
         rpc_url,
@@ -5702,7 +7836,7 @@ async fn native_compile_sol_to_usd1_topup_transaction_with_format(
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
     let preferred_lookup_tables = if tx_format == NativeBonkTxFormat::V0 {
-        load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, &execution.commitment).await?
     } else {
         vec![]
     };
@@ -5763,32 +7897,6 @@ pub async fn compile_sol_to_usd1_topup_transaction(
     .await
 }
 
-fn helper_launch_response_to_native_result(response: HelperLaunchResponse) -> NativeBonkLaunchResult {
-    NativeBonkLaunchResult {
-        mint: response.mint,
-        launch_creator: response.launchCreator,
-        compiled_transactions: response
-            .compiledTransactions
-            .into_iter()
-            .map(convert_compiled_transaction)
-            .collect(),
-        predicted_dev_buy_token_amount_raw: response.predictedDevBuyTokenAmountRaw,
-        atomic_combined: response.atomicCombined,
-        atomic_fallback_reason: response.atomicFallbackReason,
-        usd1_launch_details: response.usd1LaunchDetails.map(|details| NativeBonkUsd1LaunchDetails {
-            compile_path: details.compilePath,
-            required_quote_amount: details.requiredQuoteAmount,
-            current_quote_amount: details.currentQuoteAmount,
-            shortfall_quote_amount: details.shortfallQuoteAmount,
-            input_sol: details.inputSol,
-            expected_quote_out: details.expectedQuoteOut,
-            min_quote_out: details.minQuoteOut,
-        }),
-        usd1_quote_metrics: response.usd1QuoteMetrics,
-        compiled_via_native: false,
-    }
-}
-
 fn build_native_bonk_artifacts_from_launch_result(
     config: &NormalizedConfig,
     transport_plan: &TransportPlan,
@@ -5816,7 +7924,8 @@ fn build_native_bonk_artifacts_from_launch_result(
         "Bonk launch assembly uses the Raydium LaunchLab SDK-backed compile bridge.".to_string()
     });
     if let Some(backend) = launchpad_action_backend("bonk", "build-launch") {
-        let rollout_state = launchpad_action_rollout_state("bonk", "build-launch").unwrap_or("unknown");
+        let rollout_state =
+            launchpad_action_rollout_state("bonk", "build-launch").unwrap_or("unknown");
         report.execution.notes.push(format!(
             "Launchpad backend owner: {backend} ({rollout_state})."
         ));
@@ -5827,10 +7936,9 @@ fn build_native_bonk_artifacts_from_launch_result(
             .notes
             .push("USD1 dev buy was assembled atomically with the launch transaction.".to_string());
     } else if let Some(reason) = result.atomic_fallback_reason.as_ref() {
-        report
-            .execution
-            .notes
-            .push(format!("USD1 dev buy uses split launch transactions: {reason}"));
+        report.execution.notes.push(format!(
+            "USD1 dev buy uses split launch transactions: {reason}"
+        ));
     }
     if let Some(details) = result.usd1_launch_details.as_ref() {
         report.bonkUsd1Launch = Some(BonkUsd1LaunchSummary {
@@ -5866,12 +7974,16 @@ fn build_native_bonk_artifacts_from_launch_result(
     })
 }
 
-async fn resolve_bonk_launch_mint_keypair(rpc_url: &str, vanity_private_key: &str) -> Result<Keypair, String> {
+async fn resolve_bonk_launch_mint_keypair(
+    rpc_url: &str,
+    vanity_private_key: &str,
+) -> Result<Keypair, String> {
     let trimmed = vanity_private_key.trim();
     if trimmed.is_empty() {
         return Ok(Keypair::new());
     }
-    let bytes = read_keypair_bytes(trimmed).map_err(|error| format!("Invalid vanity private key: {error}"))?;
+    let bytes = read_keypair_bytes(trimmed)
+        .map_err(|error| format!("Invalid vanity private key: {error}"))?;
     let keypair = Keypair::try_from(bytes.as_slice())
         .map_err(|error| format!("Invalid vanity private key: {error}"))?;
     match fetch_account_data(rpc_url, &keypair.pubkey().to_string(), "confirmed").await {
@@ -5895,9 +8007,14 @@ fn build_native_bonk_launch_dev_buy_instructions(
     min_amount_a_override: Option<&BigUint>,
     allow_ata_creation: bool,
 ) -> Result<Vec<Instruction>, String> {
-    let token_program = spl_token::id();
+    let token_program = pool_context.token_program;
+    let quote_token_program = spl_token::id();
     let user_token_account_a =
-        spl_associated_token_account::get_associated_token_address_with_program_id(owner, mint, &token_program);
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            owner,
+            mint,
+            &token_program,
+        );
     let mut instructions = vec![
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(
             owner,
@@ -5919,17 +8036,18 @@ fn build_native_bonk_launch_dev_buy_instructions(
         )?
     };
     let user_token_account_b = if pool_context.quote.asset == "sol" {
-        let wrapped_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            owner,
-            &bonk_quote_mint("sol")?,
-            &token_program,
-        );
+        let wrapped_ata =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                owner,
+                &bonk_quote_mint("sol")?,
+                &quote_token_program,
+            );
         instructions.push(
             spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 owner,
                 owner,
                 &bonk_quote_mint("sol")?,
-                &token_program,
+                &quote_token_program,
             ),
         );
         instructions.push(solana_system_interface::instruction::transfer(
@@ -5938,21 +8056,25 @@ fn build_native_bonk_launch_dev_buy_instructions(
             instruction_amount_b,
         ));
         instructions.push(
-            spl_token::instruction::sync_native(&token_program, &wrapped_ata)
-                .map_err(|error| format!("Failed to build launch sync-native instruction: {error}"))?,
+            spl_token::instruction::sync_native(&quote_token_program, &wrapped_ata).map_err(
+                |error| format!("Failed to build launch sync-native instruction: {error}"),
+            )?,
         );
         wrapped_ata
     } else {
         let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
-        let quote_ata =
-            spl_associated_token_account::get_associated_token_address_with_program_id(owner, &quote_mint, &token_program);
+        let quote_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            owner,
+            &quote_mint,
+            &quote_token_program,
+        );
         if allow_ata_creation {
             instructions.push(
                 spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                     owner,
                     owner,
                     &quote_mint,
-                    &token_program,
+                    &quote_token_program,
                 ),
             );
         }
@@ -5986,14 +8108,16 @@ async fn native_compile_bonk_usd1_topup_from_prepared(
     let owner_pubkey = owner.pubkey();
     let token_program = spl_token::id();
     let usd1_mint = bonk_quote_mint("usd1")?;
-    let user_output_account = spl_associated_token_account::get_associated_token_address_with_program_id(
-        &owner_pubkey,
-        &usd1_mint,
-        &token_program,
-    );
+    let user_output_account =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &usd1_mint,
+            &token_program,
+        );
     let wrapped_signer = Keypair::new();
     let rent_exempt_lamports =
-        rpc_get_minimum_balance_for_rent_exemption(rpc_url, commitment, BONK_SPL_TOKEN_ACCOUNT_LEN).await?;
+        rpc_get_minimum_balance_for_rent_exemption(rpc_url, commitment, BONK_SPL_TOKEN_ACCOUNT_LEN)
+            .await?;
     let mut instructions = Vec::new();
     if allow_ata_creation {
         instructions.push(
@@ -6008,7 +8132,10 @@ async fn native_compile_bonk_usd1_topup_from_prepared(
     instructions.extend(build_bonk_wrapped_sol_open_instructions(
         &owner_pubkey,
         &wrapped_signer.pubkey(),
-        rent_exempt_lamports.saturating_add(biguint_to_u64(input_lamports, "Bonk USD1 top-up input lamports")?),
+        rent_exempt_lamports.saturating_add(biguint_to_u64(
+            input_lamports,
+            "Bonk USD1 top-up input lamports",
+        )?),
     )?);
     instructions.push(build_bonk_clmm_swap_exact_in_instruction(
         &owner_pubkey,
@@ -6028,25 +8155,33 @@ async fn native_compile_bonk_usd1_topup_from_prepared(
         &owner_pubkey,
         &wrapped_signer.pubkey(),
     )?);
-    let tx_instructions = with_bonk_tx_settings(instructions, tx_config, &owner_pubkey, jitodontfront_enabled)?;
-    let (blockhash, last_valid_block_height) = fetch_latest_blockhash_cached(rpc_url, commitment).await?;
+    let tx_instructions = with_bonk_tx_settings(
+        instructions,
+        tx_config,
+        &owner_pubkey,
+        jitodontfront_enabled,
+    )?;
+    let (blockhash, last_valid_block_height) =
+        fetch_latest_blockhash_cached(rpc_url, commitment).await?;
     let preferred_lookup_tables = if tx_format == NativeBonkTxFormat::V0 {
-        load_bonk_preferred_usd1_lookup_tables(rpc_url, commitment).await
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, commitment).await?
     } else {
         vec![]
     };
-    Ok(Some(build_bonk_compiled_transaction_with_lookup_preference(
-        label_prefix,
-        tx_format,
-        &blockhash,
-        last_valid_block_height,
-        owner,
-        &[&wrapped_signer],
-        tx_instructions,
-        tx_config,
-        &[],
-        &preferred_lookup_tables,
-    )?))
+    Ok(Some(
+        build_bonk_compiled_transaction_with_lookup_preference(
+            label_prefix,
+            tx_format,
+            &blockhash,
+            last_valid_block_height,
+            owner,
+            &[&wrapped_signer],
+            tx_instructions,
+            tx_config,
+            &[],
+            &preferred_lookup_tables,
+        )?,
+    ))
 }
 
 async fn combine_atomic_bonk_transactions(
@@ -6060,11 +8195,17 @@ async fn combine_atomic_bonk_transactions(
     topup_transaction: &CompiledTransaction,
     action_transaction: &CompiledTransaction,
 ) -> Result<CompiledTransaction, String> {
-    let topup = decompose_bonk_compiled_v0_transaction(rpc_url, topup_transaction, commitment).await?;
-    let action = decompose_bonk_compiled_v0_transaction(rpc_url, action_transaction, commitment).await?;
+    let topup =
+        decompose_bonk_compiled_v0_transaction(rpc_url, topup_transaction, commitment).await?;
+    let action =
+        decompose_bonk_compiled_v0_transaction(rpc_url, action_transaction, commitment).await?;
+    let _ = validate_bonk_shared_lookup_tables_only(label, &topup.lookup_tables)?;
+    let _ = validate_bonk_shared_lookup_tables_only(label, &action.lookup_tables)?;
     let owner_pubkey = owner.pubkey();
-    let swap_instructions = filter_atomic_bonk_instructions(topup.instructions, &owner_pubkey, tx_config);
-    let action_instructions = filter_atomic_bonk_instructions(action.instructions, &owner_pubkey, tx_config);
+    let swap_instructions =
+        filter_atomic_bonk_instructions(topup.instructions, &owner_pubkey, tx_config);
+    let action_instructions =
+        filter_atomic_bonk_instructions(action.instructions, &owner_pubkey, tx_config);
     let mut merged_instructions = build_bonk_atomic_tx_instructions(
         swap_instructions
             .into_iter()
@@ -6074,14 +8215,25 @@ async fn combine_atomic_bonk_transactions(
         &owner_pubkey,
         jitodontfront_enabled,
     )?;
-    let generated_signers =
-        rewrite_missing_bonk_instruction_signers(&owner_pubkey, &mut merged_instructions, extra_signers);
+    let allowed_child_signers = topup
+        .signer_pubkeys
+        .iter()
+        .chain(action.signer_pubkeys.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    let generated_signers = rewrite_missing_bonk_instruction_signers(
+        &owner_pubkey,
+        &mut merged_instructions,
+        extra_signers,
+        &allowed_child_signers,
+    )?;
     let mut merged_signers = extra_signers.to_vec();
     let generated_signer_refs = generated_signers.iter().collect::<Vec<_>>();
     merged_signers.extend(generated_signer_refs.iter().copied());
-    let merged_lookup_tables = merge_bonk_lookup_tables(&[topup.lookup_tables, action.lookup_tables]);
-    let (blockhash, last_valid_block_height) = fetch_latest_blockhash_cached(rpc_url, commitment).await?;
-    let preferred_lookup_tables = load_bonk_preferred_usd1_lookup_tables(rpc_url, commitment).await;
+    let (blockhash, last_valid_block_height) =
+        fetch_latest_blockhash_cached(rpc_url, commitment).await?;
+    let preferred_lookup_tables =
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, commitment).await?;
     build_bonk_compiled_transaction_with_lookup_preference(
         label,
         NativeBonkTxFormat::V0,
@@ -6091,7 +8243,7 @@ async fn combine_atomic_bonk_transactions(
         &merged_signers,
         merged_instructions,
         tx_config,
-        &merged_lookup_tables,
+        &[],
         &preferred_lookup_tables,
     )
 }
@@ -6127,17 +8279,16 @@ async fn native_build_launch_result(
     } else {
         None
     };
-    let preferred_lookup_tables =
-        if tx_format == NativeBonkTxFormat::V0 && defaults.quote.asset == "usd1" {
-            load_bonk_preferred_usd1_lookup_tables_with_metrics(
-                rpc_url,
-                &config.execution.commitment,
-                usd1_quote_metrics.as_mut(),
-            )
-            .await
-        } else {
-            vec![]
-        };
+    let preferred_lookup_tables = if tx_format == NativeBonkTxFormat::V0 {
+        load_bonk_preferred_usd1_lookup_tables_with_metrics(
+            rpc_url,
+            &config.execution.commitment,
+            usd1_quote_metrics.as_mut(),
+        )
+        .await?
+    } else {
+        vec![]
+    };
     let single_bundle_tip_last_tx =
         uses_single_bundle_tip_last_tx(&config.execution.provider, &config.execution.mevMode);
     let mut launch_instructions = vec![build_bonk_initialize_v2_instruction(
@@ -6156,22 +8307,29 @@ async fn native_build_launch_result(
             .devBuy
             .as_ref()
             .ok_or_else(|| "Bonk dev buy was missing after create-only detection.".to_string())?;
-        let prelaunch_pool_context =
-            build_prelaunch_bonk_pool_context(&defaults, &mint_pubkey, &owner_pubkey, &config.mode)?;
+        let prelaunch_pool_context = build_prelaunch_bonk_pool_context(
+            &defaults,
+            &mint_pubkey,
+            &owner_pubkey,
+            &config.mode,
+        )?;
         let mut min_mint_a_amount = None;
         let requested_amount_b = if dev_buy.mode.trim().eq_ignore_ascii_case("tokens") {
             let requested_tokens =
                 parse_decimal_biguint(&dev_buy.amount, BONK_TOKEN_DECIMALS, "dev buy tokens")?;
             let required_quote_amount =
                 bonk_quote_buy_exact_out_amount_b(&defaults, &requested_tokens)?;
-            min_mint_a_amount = Some(bonk_build_min_amount_from_bps(&requested_tokens, slippage_bps));
+            min_mint_a_amount = Some(bonk_build_min_amount_from_bps(
+                &requested_tokens,
+                slippage_bps,
+            ));
             required_quote_amount
         } else if defaults.quote.asset == "usd1" {
             let input_sol = parse_decimal_biguint(&dev_buy.amount, 9, "dev buy SOL")?;
             let usd1_route_quote = native_quote_usd1_output_from_sol_input_with_metrics(
                 rpc_url,
                 &input_sol,
-                slippage_bps,
+                BONK_USD1_ROUTE_SLIPPAGE_BPS,
                 usd1_quote_metrics.as_mut(),
                 None,
             )
@@ -6190,7 +8348,8 @@ async fn native_build_launch_result(
                 &config.execution.commitment,
                 &owner_pubkey,
                 &requested_amount_b,
-                slippage_bps,
+                BONK_USD1_ROUTE_SLIPPAGE_BPS,
+                BonkUsd1TopupMode::RespectExistingBalance,
                 usd1_quote_metrics.as_mut(),
                 None,
             )
@@ -6202,9 +8361,17 @@ async fn native_build_launch_result(
                 } else {
                     "launch-only".to_string()
                 },
-                required_quote_amount: format_biguint_decimal(&prepared.required_quote_amount, 6, 6),
+                required_quote_amount: format_biguint_decimal(
+                    &prepared.required_quote_amount,
+                    6,
+                    6,
+                ),
                 current_quote_amount: format_biguint_decimal(&prepared.current_quote_amount, 6, 6),
-                shortfall_quote_amount: format_biguint_decimal(&prepared.shortfall_quote_amount, 6, 6),
+                shortfall_quote_amount: format_biguint_decimal(
+                    &prepared.shortfall_quote_amount,
+                    6,
+                    6,
+                ),
                 input_sol: prepared
                     .input_lamports
                     .as_ref()
@@ -6288,7 +8455,8 @@ async fn native_build_launch_result(
                         }
                     }
                     Err(error) => {
-                        atomic_fallback_reason = Some(format!("Atomic USD1 launch fallback: {error}"));
+                        atomic_fallback_reason =
+                            Some(format!("Atomic USD1 launch fallback: {error}"));
                         compiled_launch_transactions.insert(0, topup_transaction);
                     }
                 }
@@ -6300,8 +8468,9 @@ async fn native_build_launch_result(
                 compiled_launch_transactions.insert(0, topup_transaction);
             }
             if !atomic_combined && atomic_fallback_reason.is_none() {
-                atomic_fallback_reason =
-                    Some("USD1 launch path is using split top-up plus launch transactions.".to_string());
+                atomic_fallback_reason = Some(
+                    "USD1 launch path is using split top-up plus launch transactions.".to_string(),
+                );
             }
         }
     }
@@ -6363,8 +8532,49 @@ pub async fn compile_follow_buy_transaction(
     buy_amount_sol: &str,
     allow_ata_creation: bool,
     pool_context_override: Option<&NativeBonkPoolContext>,
+    pool_id_override: Option<&str>,
     usd1_route_setup_override: Option<&BonkUsd1RouteSetup>,
 ) -> Result<CompiledTransaction, String> {
+    let result = native_compile_follow_buy_transaction(
+        rpc_url,
+        quote_asset,
+        execution,
+        jito_tip_account,
+        wallet_secret,
+        mint,
+        buy_amount_sol,
+        allow_ata_creation,
+        pool_context_override,
+        pool_id_override,
+        usd1_route_setup_override,
+    )
+    .await?;
+    if result.transactions.len() != 1 {
+        return Err(
+            "Bonk follow buy produced multiple transactions; use the metadata/multi-transaction API."
+                .to_string(),
+        );
+    }
+    result
+        .transactions
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Bonk follow buy produced no transactions.".to_string())
+}
+
+pub async fn compile_follow_buy_transaction_with_metadata(
+    rpc_url: &str,
+    quote_asset: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    buy_amount_sol: &str,
+    allow_ata_creation: bool,
+    pool_context_override: Option<&NativeBonkPoolContext>,
+    pool_id_override: Option<&str>,
+    usd1_route_setup_override: Option<&BonkUsd1RouteSetup>,
+) -> Result<BonkFollowBuyCompileResult, String> {
     native_compile_follow_buy_transaction(
         rpc_url,
         quote_asset,
@@ -6375,6 +8585,7 @@ pub async fn compile_follow_buy_transaction(
         buy_amount_sol,
         allow_ata_creation,
         pool_context_override,
+        pool_id_override,
         usd1_route_setup_override,
     )
     .await
@@ -6422,7 +8633,7 @@ pub async fn compile_follow_sell_transaction(
     sell_percent: u8,
     _prefer_post_setup_creator_vault: bool,
 ) -> Result<Option<CompiledTransaction>, String> {
-    compile_follow_sell_transaction_with_token_amount(
+    compile_follow_sell_transaction_with_token_amount_and_settlement(
         rpc_url,
         quote_asset,
         execution,
@@ -6434,6 +8645,7 @@ pub async fn compile_follow_sell_transaction(
         None,
         None,
         None,
+        quote_asset,
     )
     .await
 }
@@ -6451,6 +8663,37 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
     launch_mode_override: Option<&str>,
     launch_creator_override: Option<&str>,
 ) -> Result<Option<CompiledTransaction>, String> {
+    compile_follow_sell_transaction_with_token_amount_and_settlement(
+        rpc_url,
+        quote_asset,
+        execution,
+        jito_tip_account,
+        wallet_secret,
+        mint,
+        sell_percent,
+        token_amount_override,
+        pool_id_override,
+        launch_mode_override,
+        launch_creator_override,
+        quote_asset,
+    )
+    .await
+}
+
+pub async fn compile_follow_sell_transaction_with_token_amount_and_settlement(
+    rpc_url: &str,
+    quote_asset: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    sell_percent: u8,
+    token_amount_override: Option<u64>,
+    pool_id_override: Option<&str>,
+    launch_mode_override: Option<&str>,
+    launch_creator_override: Option<&str>,
+    sell_settlement_asset: &str,
+) -> Result<Option<CompiledTransaction>, String> {
     native_compile_follow_sell_transaction_with_token_amount(
         rpc_url,
         quote_asset,
@@ -6463,6 +8706,7 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
         pool_id_override,
         launch_mode_override,
         launch_creator_override,
+        sell_settlement_asset,
     )
     .await
 }
@@ -6498,16 +8742,56 @@ pub async fn load_live_follow_buy_usd1_route_setup(
     load_bonk_usd1_route_setup_fresh(rpc_url).await
 }
 
-pub async fn derive_canonical_pool_id(quote_asset: &str, mint: &str) -> Result<String, String> {
+pub async fn quote_sol_lamports_for_exact_usd1_input(
+    rpc_url: &str,
+    usd1_raw: u64,
+) -> Result<u64, String> {
+    if usd1_raw == 0 {
+        return Ok(0);
+    }
+    let setup = load_bonk_usd1_route_setup_fresh(rpc_url).await?;
+    let quote = bonk_quote_sol_from_exact_usd1_input(&setup, &BigUint::from(usd1_raw), 0)?;
+    biguint_to_u64(&quote.min_out, "Bonk USD1 route quote output lamports")
+}
+
+fn bonk_canonical_pool_id_for_mint(
+    quote_asset: &str,
+    mint_pubkey: &Pubkey,
+) -> Result<String, String> {
     let launchpad_program = bonk_launchpad_program_id()?;
-    let mint_pubkey =
-        Pubkey::from_str(mint).map_err(|error| format!("Invalid Bonk mint address: {error}"))?;
     let quote_pubkey = bonk_quote_mint(quote_asset)?;
     let (pool_id, _) = Pubkey::find_program_address(
         &[b"pool", mint_pubkey.as_ref(), quote_pubkey.as_ref()],
         &launchpad_program,
     );
     Ok(pool_id.to_string())
+}
+
+fn should_use_prelaunch_follow_sell_override(
+    quote_asset: &str,
+    mint_pubkey: &Pubkey,
+    token_amount_override: Option<u64>,
+    pool_id_override: Option<&str>,
+    launch_mode_override: Option<&str>,
+    launch_creator_override: Option<&str>,
+) -> Result<bool, String> {
+    if token_amount_override.is_none()
+        || launch_mode_override.is_none()
+        || launch_creator_override.is_none()
+    {
+        return Ok(false);
+    }
+    let Some(pool_id_override) = pool_id_override.filter(|pool_id| !pool_id.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    Ok(pool_id_override == bonk_canonical_pool_id_for_mint(quote_asset, mint_pubkey)?)
+}
+
+pub async fn derive_canonical_pool_id(quote_asset: &str, mint: &str) -> Result<String, String> {
+    let mint_pubkey =
+        Pubkey::from_str(mint).map_err(|error| format!("Invalid Bonk mint address: {error}"))?;
+    bonk_canonical_pool_id_for_mint(quote_asset, &mint_pubkey)
 }
 
 pub async fn fetch_bonk_market_snapshot(
@@ -6548,10 +8832,10 @@ pub async fn poll_bonk_market_cap_lamports(
 
 pub async fn warm_bonk_state(rpc_url: &str) -> Result<Value, String> {
     let (regular_sol, regular_usd1, bonkers_sol, bonkers_usd1) = tokio::try_join!(
-        load_bonk_launch_defaults(rpc_url, "regular", "sol"),
-        load_bonk_launch_defaults(rpc_url, "regular", "usd1"),
-        load_bonk_launch_defaults(rpc_url, "bonkers", "sol"),
-        load_bonk_launch_defaults(rpc_url, "bonkers", "usd1"),
+        load_bonk_launch_defaults_with_startup_stagger(rpc_url, "regular", "sol", 0),
+        load_bonk_launch_defaults_with_startup_stagger(rpc_url, "regular", "usd1", 1),
+        load_bonk_launch_defaults_with_startup_stagger(rpc_url, "bonkers", "sol", 2),
+        load_bonk_launch_defaults_with_startup_stagger(rpc_url, "bonkers", "usd1", 3),
     )?;
     let helper_launch_defaults = vec![
         json!({
@@ -6682,6 +8966,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn usd1_sol_input_buy_amount_uses_expected_only_when_already_available() {
+        let quote = BonkUsd1BuyAmountQuote {
+            expected_amount_b: 1_000_000,
+            guaranteed_amount_b: 900_000,
+        };
+
+        assert_eq!(
+            select_bonk_usd1_buy_amount_from_sol_quote("sol_only", 2_000_000, &quote),
+            900_000
+        );
+        assert_eq!(
+            select_bonk_usd1_buy_amount_from_sol_quote("prefer_usd1_else_topup", 1_500_000, &quote),
+            1_000_000
+        );
+        assert_eq!(
+            select_bonk_usd1_buy_amount_from_sol_quote("prefer_usd1_else_topup", 950_000, &quote),
+            950_000
+        );
+        assert_eq!(
+            select_bonk_usd1_buy_amount_from_sol_quote("prefer_usd1_else_topup", 500_000, &quote),
+            900_000
+        );
+    }
+
+    fn push_test_pubkey(bytes: &mut Vec<u8>, value: &Pubkey) {
+        bytes.extend_from_slice(value.as_ref());
+    }
+
+    fn encode_test_cpmm_pool(token_0_mint: &Pubkey, token_1_mint: &Pubkey) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 8]);
+        for _ in 0..5 {
+            push_test_pubkey(&mut data, &Pubkey::new_unique());
+        }
+        push_test_pubkey(&mut data, token_0_mint);
+        push_test_pubkey(&mut data, token_1_mint);
+        push_test_pubkey(&mut data, &spl_token::id());
+        push_test_pubkey(&mut data, &spl_token::id());
+        push_test_pubkey(&mut data, &Pubkey::new_unique());
+        data.push(0);
+        data.push(1);
+        data.push(9);
+        data.push(9);
+        data.push(6);
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.push(0);
+        data.push(0);
+        data.extend_from_slice(&[0u8; 6]);
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data
+    }
+
+    fn encode_test_clmm_pool(mint_a: &Pubkey, mint_b: &Pubkey) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 8]);
+        data.push(0);
+        push_test_pubkey(&mut data, &Pubkey::new_unique());
+        push_test_pubkey(&mut data, &Pubkey::new_unique());
+        push_test_pubkey(&mut data, mint_a);
+        push_test_pubkey(&mut data, mint_b);
+        push_test_pubkey(&mut data, &Pubkey::new_unique());
+        push_test_pubkey(&mut data, &Pubkey::new_unique());
+        push_test_pubkey(&mut data, &Pubkey::new_unique());
+        data.push(9);
+        data.push(6);
+        data.extend_from_slice(&60u16.to_le_bytes());
+        data.extend_from_slice(&1u128.to_le_bytes());
+        data.extend_from_slice(&1u128.to_le_bytes());
+        data.extend_from_slice(&0i32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 16 + 16]);
+        data.extend_from_slice(&[0u8; 8 + 8]);
+        data.extend_from_slice(&[0u8; 16 + 16 + 16 + 16]);
+        data.push(0);
+        data.extend_from_slice(&[0u8; 7]);
+        data.extend_from_slice(&[0u8; 3 * 169]);
+        data.extend_from_slice(&[0u8; 16 * 8]);
+        data
+    }
+
+    #[test]
     fn standard_rpc_follow_tip_is_ignored_when_blank() {
         let tip_lamports =
             resolve_follow_tip_lamports("standard-rpc", "", "buy tip").expect("standard rpc tip");
@@ -6718,7 +9090,10 @@ mod tests {
     fn slippage_percent_maps_to_expected_bps() {
         assert_eq!(slippage_bps_from_percent("20").expect("20%"), 2_000);
         assert_eq!(slippage_bps_from_percent("0.5").expect("0.5%"), 50);
+        assert_eq!(slippage_bps_from_percent("99.99").expect("99.99%"), 9_999);
         assert_eq!(slippage_bps_from_percent("100").expect("100%"), 10_000);
+        slippage_bps_from_percent("99.999").expect_err("too many decimals");
+        slippage_bps_from_percent("100.01").expect_err("above 100%");
     }
 
     #[test]
@@ -6778,7 +9153,10 @@ mod tests {
         assert_eq!(payload.data.len(), 1);
         assert_eq!(payload.data[0].id, "pool-a");
         assert!(payload.data[0].launch_migrate_pool);
-        assert_eq!(payload.data[0].mint_a.address, "So11111111111111111111111111111111111111112");
+        assert_eq!(
+            payload.data[0].mint_a.address,
+            "So11111111111111111111111111111111111111112"
+        );
     }
 
     #[test]
@@ -6839,6 +9217,145 @@ mod tests {
     }
 
     #[test]
+    fn requested_quote_asset_rejects_more_liquid_wrong_quote_pool() {
+        let sol = BonkMarketCandidate {
+            mode: "regular".to_string(),
+            quote_asset: "sol".to_string(),
+            quote_asset_label: "SOL".to_string(),
+            creator: String::new(),
+            platform_id: String::new(),
+            config_id: String::new(),
+            pool_id: "sol".to_string(),
+            real_quote_reserves: 0,
+            complete: true,
+            detection_source: "raydium-standard".to_string(),
+            launch_migrate_pool: true,
+            tvl: 1_000_000.0,
+            pool_type: "Standard".to_string(),
+            launchpad_pool: None,
+            raydium_pool: None,
+        };
+        let usd1 = BonkMarketCandidate {
+            quote_asset: "usd1".to_string(),
+            quote_asset_label: "USD1".to_string(),
+            pool_id: "usd1".to_string(),
+            tvl: 10.0,
+            ..sol.clone()
+        };
+        let candidates = vec![sol, usd1];
+        let preferred =
+            select_preferred_bonk_market_candidate(&candidates, "usd1").expect("preferred");
+        assert_eq!(preferred.pool_id, "usd1");
+    }
+
+    #[test]
+    fn requested_quote_asset_returns_none_when_candidate_quote_is_missing() {
+        let sol = BonkMarketCandidate {
+            mode: "regular".to_string(),
+            quote_asset: "sol".to_string(),
+            quote_asset_label: "SOL".to_string(),
+            creator: String::new(),
+            platform_id: String::new(),
+            config_id: String::new(),
+            pool_id: "sol".to_string(),
+            real_quote_reserves: 0,
+            complete: true,
+            detection_source: "raydium-standard".to_string(),
+            launch_migrate_pool: true,
+            tvl: 25.0,
+            pool_type: "Standard".to_string(),
+            launchpad_pool: None,
+            raydium_pool: None,
+        };
+        assert!(select_preferred_bonk_market_candidate(&[sol], "usd1").is_none());
+    }
+
+    #[test]
+    fn prelaunch_follow_sell_override_requires_canonical_launchpad_pool_id() {
+        let mint = Pubkey::new_unique();
+        let canonical_pool_id =
+            bonk_canonical_pool_id_for_mint("sol", &mint).expect("canonical pool id");
+
+        assert!(
+            should_use_prelaunch_follow_sell_override(
+                "sol",
+                &mint,
+                Some(1_000),
+                Some(&canonical_pool_id),
+                Some("regular"),
+                Some(&Pubkey::new_unique().to_string()),
+            )
+            .expect("canonical pool should be accepted")
+        );
+        assert!(
+            !should_use_prelaunch_follow_sell_override(
+                "sol",
+                &mint,
+                Some(1_000),
+                Some(&Pubkey::new_unique().to_string()),
+                Some("regular"),
+                Some(&Pubkey::new_unique().to_string()),
+            )
+            .expect("raydium pool id should be rejected")
+        );
+    }
+
+    #[test]
+    fn classify_bonk_pool_address_accepts_cpmm_owner() {
+        let mint = Pubkey::new_unique();
+        let sol = Pubkey::from_str(BONK_SOL_QUOTE_MINT).expect("sol mint");
+        let data = encode_test_cpmm_pool(&mint, &sol);
+
+        let classified = classify_bonk_pool_address(
+            "pool-1",
+            &bonk_cpmm_program_id().expect("cpmm program"),
+            &data,
+        )
+        .expect("classification")
+        .expect("cpmm classification");
+
+        assert_eq!(classified.mint, mint.to_string());
+        assert_eq!(classified.pool_id, "pool-1");
+        assert_eq!(classified.family, "raydium");
+        assert_eq!(classified.quote_asset, "sol");
+    }
+
+    #[test]
+    fn classify_bonk_pool_address_accepts_clmm_owner() {
+        let usd1 = Pubkey::from_str(BONK_USD1_QUOTE_MINT).expect("usd1 mint");
+        let mint = Pubkey::new_unique();
+        let data = encode_test_clmm_pool(&usd1, &mint);
+
+        let classified = classify_bonk_pool_address(
+            "pool-2",
+            &bonk_clmm_program_id().expect("clmm program"),
+            &data,
+        )
+        .expect("classification")
+        .expect("clmm classification");
+
+        assert_eq!(classified.mint, mint.to_string());
+        assert_eq!(classified.pool_id, "pool-2");
+        assert_eq!(classified.family, "raydium");
+        assert_eq!(classified.quote_asset, "usd1");
+    }
+
+    #[test]
+    fn classify_bonk_pool_address_rejects_unrelated_raydium_owner() {
+        let mint = Pubkey::new_unique();
+        let sol = Pubkey::from_str(BONK_SOL_QUOTE_MINT).expect("sol mint");
+        let data = encode_test_cpmm_pool(&mint, &sol);
+        let unrelated_raydium_owner =
+            Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
+                .expect("raydium amm owner");
+
+        let classified =
+            classify_bonk_pool_address("pool-3", &unrelated_raydium_owner, &data).expect("result");
+
+        assert!(classified.is_none());
+    }
+
+    #[test]
     fn bonk_launch_config_id_matches_raydium_sdk_pda_layout() {
         assert_eq!(
             bonk_launch_config_id("sol").expect("sol config"),
@@ -6867,7 +9384,10 @@ mod tests {
         }))
         .expect("configs");
         assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].key.pubkey, "6s1xP3hpbAfFoNtUNF8mfHsjr2Bd97JxFJRWLbL6aHuX");
+        assert_eq!(
+            configs[0].key.pubkey,
+            "6s1xP3hpbAfFoNtUNF8mfHsjr2Bd97JxFJRWLbL6aHuX"
+        );
         assert_eq!(configs[0].default_params.supply_init, "1000");
     }
 
@@ -6923,8 +9443,7 @@ mod tests {
             "regular",
         )
         .expect("context");
-        let min_amount_b =
-            bonk_follow_sell_amounts(&context, 125_000_000, 0).expect("sell quote");
+        let min_amount_b = bonk_follow_sell_amounts(&context, 125_000_000, 0).expect("sell quote");
         assert_eq!(min_amount_b, 250_000_000);
     }
 
@@ -6933,8 +9452,8 @@ mod tests {
         let defaults = test_launch_defaults();
         let mint = Pubkey::new_unique();
         let creator = Pubkey::new_unique();
-        let context =
-            build_prelaunch_bonk_pool_context(&defaults, &mint, &creator, "regular").expect("context");
+        let context = build_prelaunch_bonk_pool_context(&defaults, &mint, &creator, "regular")
+            .expect("context");
         let base_quote =
             bonk_follow_buy_quote_details(&context, 800_000_000, 0).expect("base quote");
         let advanced = advance_prelaunch_bonk_pool_context_after_buy(&context, 800_000_000, 0)
@@ -6948,10 +9467,10 @@ mod tests {
     }
 
     #[test]
-    fn bonk_follow_tx_format_uses_v0_for_non_legacy_inputs() {
+    fn bonk_follow_tx_format_is_shared_alt_only() {
         assert_eq!(
             select_bonk_native_tx_format("legacy"),
-            NativeBonkTxFormat::Legacy
+            NativeBonkTxFormat::V0
         );
         assert_eq!(select_bonk_native_tx_format("v0"), NativeBonkTxFormat::V0);
         assert_eq!(select_bonk_native_tx_format("auto"), NativeBonkTxFormat::V0);
@@ -6974,12 +9493,35 @@ mod tests {
             ],
             data: vec![],
         }];
-        let generated =
-            rewrite_missing_bonk_instruction_signers(&owner.pubkey(), &mut instructions, &[]);
+        let generated = rewrite_missing_bonk_instruction_signers(
+            &owner.pubkey(),
+            &mut instructions,
+            &[],
+            &[missing],
+        )
+        .expect("allowed missing signer should be rewritten");
         assert_eq!(generated.len(), 1);
         assert_ne!(generated[0].pubkey(), missing);
         assert_eq!(instructions[0].accounts[1].pubkey, generated[0].pubkey());
         assert!(instructions[0].accounts[1].is_signer);
+    }
+
+    #[test]
+    fn rewrite_missing_bonk_instruction_signers_rejects_unexpected_signers() {
+        let owner = Keypair::new();
+        let unexpected = Pubkey::new_unique();
+        let mut instructions = vec![Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![
+                AccountMeta::new_readonly(owner.pubkey(), true),
+                AccountMeta::new(unexpected, true),
+            ],
+            data: vec![],
+        }];
+        let error =
+            rewrite_missing_bonk_instruction_signers(&owner.pubkey(), &mut instructions, &[], &[])
+                .expect_err("unexpected signer should fail");
+        assert!(error.contains("unexpected signer"));
     }
 
     #[test]
@@ -6995,6 +9537,20 @@ mod tests {
         assert_eq!(
             configured_atomic_bonk_usd1_follow_buy_compute_unit_limit(Some(50_000), Some(60_000)),
             configured_default_follow_up_compute_unit_limit()
+        );
+    }
+
+    #[test]
+    fn bonk_sells_use_larger_compute_budget() {
+        assert_eq!(configured_default_bonk_sell_compute_unit_limit(), 240_000);
+        assert_eq!(
+            configured_bonk_sell_compute_unit_limit("sol", "sol"),
+            240_000
+        );
+        assert!(configured_bonk_sell_compute_unit_limit("usd1", "sol") >= 240_000);
+        assert!(
+            configured_bonk_sell_compute_unit_limit("usd1", "sol")
+                >= configured_default_bonk_sell_compute_unit_limit()
         );
     }
 
@@ -7020,12 +9576,48 @@ mod tests {
         )
         .expect("atomic instructions");
         assert_eq!(instructions.len(), 4);
-        assert_eq!(instructions[0].program_id, compute_budget_program_id().expect("compute budget"));
+        assert_eq!(
+            instructions[0].program_id,
+            compute_budget_program_id().expect("compute budget")
+        );
         assert_eq!(instructions[0].data.first().copied(), Some(3));
-        assert_eq!(instructions[1].program_id, compute_budget_program_id().expect("compute budget"));
+        assert_eq!(
+            instructions[1].program_id,
+            compute_budget_program_id().expect("compute budget")
+        );
         assert_eq!(instructions[1].data.first().copied(), Some(2));
         assert_eq!(instructions[2].program_id, core_instruction.program_id);
-        assert_eq!(instructions[3].program_id, solana_system_interface::program::ID);
+        assert_eq!(
+            instructions[3].program_id,
+            solana_system_interface::program::ID
+        );
+    }
+
+    #[test]
+    fn atomic_bonk_filter_drops_budget_tip_and_memo() {
+        let owner = Pubkey::new_unique();
+        let tip_account = Pubkey::new_unique();
+        let core_instruction = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![AccountMeta::new(owner, true)],
+            data: vec![7],
+        };
+        let filtered = filter_atomic_bonk_instructions(
+            vec![
+                build_compute_unit_limit_instruction(400_000).expect("cu"),
+                build_bonk_uniqueness_memo_instruction("follow-buy-atomic").expect("memo"),
+                solana_system_interface::instruction::transfer(&owner, &tip_account, 5_000),
+                core_instruction.clone(),
+            ],
+            &owner,
+            &NativeBonkTxConfig {
+                compute_unit_limit: 400_000,
+                compute_unit_price_micro_lamports: 0,
+                tip_lamports: 5_000,
+                tip_account: tip_account.to_string(),
+            },
+        );
+        assert_eq!(filtered, vec![core_instruction]);
     }
 
     #[test]
@@ -7058,7 +9650,10 @@ mod tests {
             &test_launch_defaults(),
         )
         .expect("initialize");
-        assert_eq!(instruction.program_id, bonk_launchpad_program_id().expect("launchpad"));
+        assert_eq!(
+            instruction.program_id,
+            bonk_launchpad_program_id().expect("launchpad")
+        );
         assert_eq!(&instruction.data[..8], &BONK_INITIALIZE_V2_DISCRIMINATOR);
         assert_eq!(instruction.accounts.len(), 18);
         assert_eq!(instruction.accounts[0].pubkey, owner);
@@ -7074,8 +9669,9 @@ mod tests {
     fn native_bonk_launch_dev_buy_sol_uses_owner_wsol_ata_path() {
         let owner = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let context = build_prelaunch_bonk_pool_context(&test_launch_defaults(), &mint, &owner, "regular")
-            .expect("context");
+        let context =
+            build_prelaunch_bonk_pool_context(&test_launch_defaults(), &mint, &owner, "regular")
+                .expect("context");
         let instructions = build_native_bonk_launch_dev_buy_instructions(
             &owner,
             &mint,
@@ -7087,11 +9683,23 @@ mod tests {
         )
         .expect("instructions");
         assert_eq!(instructions.len(), 5);
-        assert_eq!(instructions[0].program_id, spl_associated_token_account::id());
-        assert_eq!(instructions[1].program_id, spl_associated_token_account::id());
-        assert_eq!(instructions[2].program_id, solana_system_interface::program::ID);
+        assert_eq!(
+            instructions[0].program_id,
+            spl_associated_token_account::id()
+        );
+        assert_eq!(
+            instructions[1].program_id,
+            spl_associated_token_account::id()
+        );
+        assert_eq!(
+            instructions[2].program_id,
+            solana_system_interface::program::ID
+        );
         assert_eq!(instructions[3].program_id, spl_token::id());
-        assert_eq!(instructions[4].program_id, bonk_launchpad_program_id().expect("launchpad"));
+        assert_eq!(
+            instructions[4].program_id,
+            bonk_launchpad_program_id().expect("launchpad")
+        );
     }
 
     #[test]
@@ -7108,32 +9716,124 @@ mod tests {
             &[0, -3_600],
         )
         .expect("swap instruction");
-        assert_eq!(instruction.program_id, bonk_clmm_program_id().expect("clmm program"));
+        assert_eq!(
+            instruction.program_id,
+            bonk_clmm_program_id().expect("clmm program")
+        );
         assert_eq!(instruction.accounts[0].pubkey, owner);
         assert_eq!(instruction.accounts[3].pubkey, input_account);
         assert_eq!(instruction.accounts[4].pubkey, output_account);
-        assert_eq!(instruction.accounts[13].pubkey, bonk_clmm_ex_bitmap_pda(
-            &Pubkey::from_str(BONK_PINNED_USD1_ROUTE_POOL_ID).expect("pool"),
-        )
-        .expect("bitmap"));
-        assert_eq!(instruction.accounts[14].pubkey, bonk_derive_clmm_tick_array_address(
-            &bonk_clmm_program_id().expect("clmm"),
-            &Pubkey::from_str(BONK_PINNED_USD1_ROUTE_POOL_ID).expect("pool"),
-            0,
-        ));
-        assert_eq!(instruction.accounts[15].pubkey, bonk_derive_clmm_tick_array_address(
-            &bonk_clmm_program_id().expect("clmm"),
-            &Pubkey::from_str(BONK_PINNED_USD1_ROUTE_POOL_ID).expect("pool"),
-            -3_600,
-        ));
+        assert_eq!(
+            instruction.accounts[13].pubkey,
+            bonk_clmm_ex_bitmap_pda(
+                &Pubkey::from_str(BONK_PINNED_USD1_ROUTE_POOL_ID).expect("pool"),
+            )
+            .expect("bitmap")
+        );
+        assert_eq!(
+            instruction.accounts[14].pubkey,
+            bonk_derive_clmm_tick_array_address(
+                &bonk_clmm_program_id().expect("clmm"),
+                &Pubkey::from_str(BONK_PINNED_USD1_ROUTE_POOL_ID).expect("pool"),
+                0,
+            )
+        );
+        assert_eq!(
+            instruction.accounts[15].pubkey,
+            bonk_derive_clmm_tick_array_address(
+                &bonk_clmm_program_id().expect("clmm"),
+                &Pubkey::from_str(BONK_PINNED_USD1_ROUTE_POOL_ID).expect("pool"),
+                -3_600,
+            )
+        );
         assert_eq!(&instruction.data[..8], &BONK_CLMM_SWAP_DISCRIMINATOR);
-        assert_eq!(u64::from_le_bytes(instruction.data[8..16].try_into().expect("amount in")), 123_456_789);
-        assert_eq!(u64::from_le_bytes(instruction.data[16..24].try_into().expect("min out")), 45_000_000);
+        assert_eq!(
+            u64::from_le_bytes(instruction.data[8..16].try_into().expect("amount in")),
+            123_456_789
+        );
+        assert_eq!(
+            u64::from_le_bytes(instruction.data[16..24].try_into().expect("min out")),
+            45_000_000
+        );
         assert_eq!(
             u128::from_le_bytes(instruction.data[24..40].try_into().expect("sqrt limit")),
             BONK_CLMM_MIN_SQRT_PRICE_X64_PLUS_ONE
         );
         assert_eq!(instruction.data[40], 1);
+    }
+
+    #[test]
+    fn native_bonk_usd1_unwind_swap_instruction_marks_reverse_direction_as_exact_input() {
+        let owner = Pubkey::new_unique();
+        let input_account = Pubkey::new_unique();
+        let output_account = Pubkey::new_unique();
+        let instruction = build_bonk_clmm_swap_exact_in_instruction_with_assets(
+            &owner,
+            &input_account,
+            &output_account,
+            45_000_000,
+            123_456_789,
+            &[0, 3_600],
+            "usd1",
+            "sol",
+        )
+        .expect("swap instruction");
+        assert_eq!(
+            u128::from_le_bytes(instruction.data[24..40].try_into().expect("sqrt limit")),
+            0
+        );
+        assert_eq!(
+            instruction.data[40], 1,
+            "reverse-direction exact-in swaps must still set is_base_input"
+        );
+    }
+
+    #[test]
+    fn clmm_swap_instruction_for_setup_uses_live_pool_keys() {
+        let owner = Pubkey::new_unique();
+        let input_account = Pubkey::new_unique();
+        let output_account = Pubkey::new_unique();
+        let setup = BonkUsd1RouteSetup {
+            pool_id: Pubkey::new_unique(),
+            program_id: Pubkey::new_unique(),
+            amm_config: Pubkey::new_unique(),
+            mint_a: Pubkey::new_unique(),
+            mint_b: Pubkey::new_unique(),
+            vault_a: Pubkey::new_unique(),
+            vault_b: Pubkey::new_unique(),
+            observation_id: Pubkey::new_unique(),
+            tick_spacing: 60,
+            trade_fee_rate: 2_500,
+            sqrt_price_x64: BigUint::from(1u8),
+            liquidity: BigUint::from(1u8),
+            tick_current: 0,
+            mint_a_decimals: 9,
+            mint_b_decimals: 6,
+            current_price: 1.0,
+            tick_arrays_desc: vec![],
+            tick_arrays_asc: vec![],
+            tick_arrays: HashMap::new(),
+        };
+        let instruction = build_bonk_clmm_swap_exact_in_instruction_for_setup(
+            &owner,
+            &setup,
+            &input_account,
+            &output_account,
+            1_000,
+            900,
+            &[],
+            &setup.mint_b,
+            &setup.mint_a,
+        )
+        .expect("swap instruction");
+
+        assert_eq!(instruction.accounts[5].pubkey, setup.vault_b);
+        assert_eq!(instruction.accounts[6].pubkey, setup.vault_a);
+        assert_eq!(instruction.accounts[7].pubkey, setup.observation_id);
+        assert_eq!(
+            u128::from_le_bytes(instruction.data[24..40].try_into().expect("sqrt limit")),
+            0
+        );
     }
 
     #[test]
@@ -7162,6 +9862,12 @@ mod tests {
         let setup = BonkUsd1RouteSetup {
             pool_id: Pubkey::new_unique(),
             program_id: Pubkey::new_unique(),
+            amm_config: Pubkey::new_unique(),
+            mint_a: Pubkey::new_unique(),
+            mint_b: Pubkey::new_unique(),
+            vault_a: Pubkey::new_unique(),
+            vault_b: Pubkey::new_unique(),
+            observation_id: Pubkey::new_unique(),
             tick_spacing,
             trade_fee_rate: 2_500,
             sqrt_price_x64: sqrt_price_x64.clone(),
@@ -7172,6 +9878,7 @@ mod tests {
             current_price: bonk_sqrt_price_x64_to_price(&sqrt_price_x64, 9, 6)
                 .expect("current price"),
             tick_arrays_desc: vec![start_tick_index],
+            tick_arrays_asc: vec![start_tick_index],
             tick_arrays: HashMap::from([(
                 start_tick_index,
                 BonkClmmTickArray {
@@ -7188,5 +9895,35 @@ mod tests {
             quote.min_out,
             (&quote.expected_out * BigUint::from(9_950u64)) / BigUint::from(10_000u64)
         );
+    }
+
+    #[test]
+    fn merge_persisted_bonk_lookup_table_caches_keeps_entries_from_both_sources() {
+        let merged = merge_persisted_bonk_lookup_table_caches([
+            PersistedBonkLookupTableCache {
+                tables: HashMap::from([(
+                    "shared".to_string(),
+                    PersistedBonkLookupTableEntry {
+                        addresses: vec!["A".to_string()],
+                        address_count: None,
+                        content_hash: None,
+                    },
+                )]),
+            },
+            PersistedBonkLookupTableCache {
+                tables: HashMap::from([(
+                    "legacy".to_string(),
+                    PersistedBonkLookupTableEntry {
+                        addresses: vec!["B".to_string()],
+                        address_count: None,
+                        content_hash: None,
+                    },
+                )]),
+            },
+        ]);
+
+        assert_eq!(merged.tables.len(), 2);
+        assert_eq!(merged.tables["shared"].addresses, vec!["A".to_string()]);
+        assert_eq!(merged.tables["legacy"].addresses, vec!["B".to_string()]);
     }
 }

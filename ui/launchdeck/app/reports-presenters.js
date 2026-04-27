@@ -1,10 +1,15 @@
 (function initLaunchDeckReportsPresenters(global) {
+  const REPORTS_SHARED_CONSTANTS = (typeof window !== "undefined" && window.__launchdeckShared) || {};
+  const REPORTS_HOST_OFFLINE_CALLOUT_HTML = REPORTS_SHARED_CONSTANTS.REPORTS_HOST_OFFLINE_CALLOUT_HTML
+    || '<div class="reports-callout is-bad">Reports are unavailable while <code>launchdeck-engine</code> is offline. They refresh automatically once the host is reachable again.</div>';
+
   function createReportsPresenters(config) {
     const {
       elements,
       renderCache,
       setCachedHTML,
       getState,
+      getLaunchdeckHostConnectionState = () => ({ checked: false, reachable: true, error: "" }),
       getFollowJobsState,
       getFollowStatusSnapshot,
       syncFollowStatusChrome,
@@ -43,6 +48,16 @@
 
     function followJobsState() {
       return getFollowJobsState();
+    }
+
+    function buildLaunchdeckHostOfflineMarkup() {
+      const hostState = getLaunchdeckHostConnectionState();
+      if (!hostState || !hostState.checked || hostState.reachable !== false) return "";
+      // The main launchdeck-host-banner already surfaces the primary offline
+      // message. Keep this Reports-local callout distinct so operators can
+      // tell at a glance why this particular subview is empty rather than
+      // seeing the same line twice stacked on top of each other.
+      return REPORTS_HOST_OFFLINE_CALLOUT_HTML;
     }
 
     function writeCachedHTML(cacheKey, node, markup) {
@@ -1644,6 +1659,66 @@
   `;
     }
 
+    function formatLaunchHistoryPnlMetric(value, digits = 3) {
+      if (value == null || value === "") return "--";
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return "--";
+      if (numeric === 0) return `0.${"0".repeat(digits)}`;
+      return `${numeric > 0 ? "+" : ""}${numeric.toFixed(digits)}`;
+    }
+
+    function formatLaunchHistoryPnlPercent(value) {
+      if (value == null || value === "") return "--";
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return "--";
+      if (numeric === 0) return "0.0%";
+      return `${numeric > 0 ? "+" : ""}${numeric.toFixed(1)}%`;
+    }
+
+    function buildLaunchHistoryPnlMarkup(launch) {
+      const snapshot = launch && launch.pnlSnapshot && typeof launch.pnlSnapshot === "object"
+        ? launch.pnlSnapshot
+        : null;
+      if (!snapshot) {
+        return '<div class="reports-launch-card-copy">PnL snapshot unavailable for this wallet/mint.</div>';
+      }
+      const pnlRequiresQuote = snapshot.pnlRequiresQuote === true;
+      const netPnl = formatLaunchHistoryPnlMetric(snapshot.pnlNet ?? snapshot.pnl);
+      const netPercent = formatLaunchHistoryPnlPercent(snapshot.pnlPercentNet);
+      const grossPnl = formatLaunchHistoryPnlMetric(snapshot.pnlGross ?? snapshot.pnl);
+      const grossPercent = formatLaunchHistoryPnlPercent(snapshot.pnlPercentGross);
+      const bought = formatLaunchHistoryPnlMetric(snapshot.trackedBoughtSol ?? snapshot.totalBought, 3);
+      const sold = formatLaunchHistoryPnlMetric(snapshot.trackedSoldSol ?? snapshot.totalSold, 3);
+      const fees = formatLaunchHistoryPnlMetric(snapshot.explicitFeeTotalSol, 3);
+      const netSummary = pnlRequiresQuote ? "Requires live quote" : `${netPnl} SOL (${netPercent})`;
+      const grossSummary = pnlRequiresQuote ? "Requires live quote" : `${grossPnl} SOL (${grossPercent})`;
+      return `
+    <div class="reports-launch-card-detail-list">
+      <div class="reports-launch-card-detail-row">
+        <div class="reports-launch-card-detail-key">Net PnL</div>
+        <div class="reports-launch-card-detail-value">${escapeHTML(netSummary)}</div>
+      </div>
+      <div class="reports-launch-card-detail-row">
+        <div class="reports-launch-card-detail-key">Gross PnL</div>
+        <div class="reports-launch-card-detail-value">${escapeHTML(grossSummary)}</div>
+      </div>
+      <div class="reports-launch-card-detail-row">
+        <div class="reports-launch-card-detail-key">Bought</div>
+        <div class="reports-launch-card-detail-value">${escapeHTML(`${bought} SOL`)}</div>
+      </div>
+      <div class="reports-launch-card-detail-row">
+        <div class="reports-launch-card-detail-key">Sold</div>
+        <div class="reports-launch-card-detail-value">${escapeHTML(`${sold} SOL`)}</div>
+      </div>
+      <div class="reports-launch-card-detail-row">
+        <div class="reports-launch-card-detail-key">Fees</div>
+        <div class="reports-launch-card-detail-value">${escapeHTML(`${fees} SOL`)}</div>
+      </div>
+    </div>
+    ${pnlRequiresQuote ? '<div class="reports-launch-card-copy">Open positions need a live quote for total PnL.</div>' : ""}
+  `;
+    }
+
     function formatLaunchHistoryDisplayTime(entry) {
       const writtenAtMs = entry && entry.writtenAtMs != null ? entry.writtenAtMs : 0;
       const numeric = Number(writtenAtMs);
@@ -2106,6 +2181,10 @@
               <div class="reports-launch-card-label">Buy Amounts</div>
               ${buildLaunchHistoryBuyAmountsMarkup(launch)}
             </div>
+            <div class="reports-launch-card-section">
+              <div class="reports-launch-card-label">PnL Card Snapshot</div>
+              ${buildLaunchHistoryPnlMarkup(launch)}
+            </div>
             <div class="reports-launch-card-footer">
               ${solscanUrl ? `<a class="reports-inline-link" href="${escapeHTML(solscanUrl)}" target="_blank" rel="noreferrer">Open in Solscan</a>` : '<span class="reports-launch-card-copy">No signature recorded.</span>'}
               <div class="reports-launch-card-actions">
@@ -2124,14 +2203,15 @@
     function buildReportsTerminalOutputMarkup() {
       const state = reportsState();
       const view = normalizeReportsTerminalView(state.view);
+      const launchdeckHostOfflineMarkup = buildLaunchdeckHostOfflineMarkup();
       if (view === "launches") {
-        return `<div class="reports-terminal-content">${buildReportsLaunchesMarkup()}</div>`;
+        return `<div class="reports-terminal-content">${launchdeckHostOfflineMarkup}${buildReportsLaunchesMarkup()}</div>`;
       }
       if (view === "active-jobs") {
-        return `<div class="reports-terminal-content">${buildReportsActiveJobsMarkup()}</div>`;
+        return `<div class="reports-terminal-content">${launchdeckHostOfflineMarkup}${buildReportsActiveJobsMarkup()}</div>`;
       }
       if (view === "active-logs") {
-        return `<div class="reports-terminal-content">${buildActiveLogsMarkup()}</div>`;
+        return `<div class="reports-terminal-content">${launchdeckHostOfflineMarkup}${buildActiveLogsMarkup()}</div>`;
       }
       const payload = currentReportsTerminalPayload();
       const tab = normalizeReportsTerminalTab(state.activeTab);
@@ -2172,7 +2252,7 @@
         ${payload ? "" : "disabled"}
       >&#x29C9;</button>
     </div>
-    <div class="reports-terminal-content">${content}</div>
+    <div class="reports-terminal-content">${launchdeckHostOfflineMarkup}${content}</div>
   `;
     }
 

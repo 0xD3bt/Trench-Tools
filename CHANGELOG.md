@@ -7,14 +7,38 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
-### Fixed
+## [1.0.0] - 2026-04-27
 
-- Fixed migrated Bonk Raydium pool decoding so market snapshots accept both the older flat `data: [...]` payload and the newer nested `data: { data: [...] }` response shape returned by Raydium.
-- Fixed migrated Bonk market-cap math to avoid `u128` overflow when converting Raydium pool prices into SOL-denominated market caps, restoring correct large-supply migrated-token results.
-- Changed SOL/USD normalization for market-cap tracking to prefer Helius asset pricing and fall back to the configured HTTP source, removing the older on-chain fallback path from the active pricing flow.
-- Fixed `pump` and `bagsapp` market-cap websocket watching so migration-capable launches keep recomputing from the live post-migration market source instead of staying pinned to only the pre-migration watcher target.
-- Fixed Pump sell confirmation parsing on the Helius `transactionSubscribe` path so follow sells request full transaction details and treat both structured websocket errors and log-derived `creator_vault` / `ConstraintSeeds` / `Custom 2006` failures as terminal websocket failures.
-- Fixed Pump `creator_vault` mismatch recovery so the special `Custom 2006` rebuild/retry paths now cover both pre-signed sniper buys and Pump follow sells with default-on env toggles to disable either retry path when desired.
+### Added
+
+- Trench Tools umbrella release with three documented pieces: execution engine, browser extension, and LaunchDeck.
+- `execution-engine` as the primary local trading host for extension trades, wallets, presets, fee/route resolution, sends, confirmations, PnL, and event streaming.
+- Trench Tools browser extension docs for Chrome/Edge developer-mode install, local host pairing, shared auth token setup, presets, wallet groups, supported sites, and update flow.
+- Split-host runtime documentation for `execution-engine` on `8788`, `launchdeck-engine` on `8789`, and `launchdeck-follow-daemon` on `8790`.
+- Shared bearer token flow documented around `.local/trench-tools/default-engine-token.txt`.
+- New quickstart guide for local Windows/Linux setup and first extension connection.
+- New extension guide and refreshed VPS, config, environment, provider, architecture, troubleshooting, and security docs.
+- Voluntary fee documentation with the simpler `TRENCH_TOOL_FEE` setting: blank/`0.1` by default, `0` to turn off, `0.2` for increased support.
+
+### Changed
+
+- Rebranded user-facing docs from LaunchDeck-first wording to Trench Tools, with LaunchDeck kept as the named launchpad feature.
+- Simplified `.env.example` into a practical starter file and moved tuning/override knobs to `.env.advanced`.
+- Limited default provider recommendations to `Helius Sender` and `Hello Moon`.
+- Moved Standard RPC and Jito Bundle guidance into a deferred provider section pending re-validation.
+- Kept Helius Gatekeeper HTTP, Helius standard websocket, Shyft warm RPC, region routing, and priority-fee guidance in the main setup docs.
+- Updated VPS setup around the current bootstrap script, shared token path, three local hosts, and SSH tunnel patterns.
+- Reorganized LaunchDeck-specific operator docs under `docs/launchdeck/` with redirect stubs at old paths.
+- Reorganized lower-level contributor execution policy docs under `docs/internal/` with redirect stubs at old paths.
+
+### Security
+
+- Rewrote `SECURITY.md` around the current local-first model, private keys in `.env`, shared bearer token handling, VPS SSH tunnels, remote-host HTTPS requirements, and third-party trust boundaries.
+
+### Notes
+
+- `j7tracker.io` integration is shipped but currently disabled by default and expected to return soon.
+- Terminal (formerly Padre), GMGN, and more terminals are planned on top of the current extension foundation.
 
 ## [0.1.0] - 2026-04-13
 
@@ -49,12 +73,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Updated the runtime support-state payload so configured Bagsapp now reports as supported instead of unverified.
 - Expanded Rust launchpad dispatch and orchestration so Pump, Bonk, and Bags now expose clearer runtime capabilities for compile, warm, quote, follow, and prelaunch-setup behavior.
 - Expanded Bonk support to better document and surface the `USD1` quote-asset path, including top-up handling and atomic or split launch/buy behavior where required.
-- Moved the live Bonk JS helper path to `scripts/bonk-launchpad.js` so `Legacy/` remains archive/reference code rather than a live runtime dependency.
 - Cleaned `.gitignore` to remove stale project-specific entries while keeping standard local, build, and editor ignores.
 
 ### Fixed
 
-- Added direct `bn.js` dependency coverage for the live Bonk helper instead of relying on transitive installation behavior.
 - Restored the live UI image asset set under `ui/images/` so the new shell ships with its referenced marks and branding files.
 
 ### Removed
@@ -66,5 +88,4 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Notes
 
-- `Legacy/` is kept in the repo as reference material only, and the live runtime no longer depends on it.
 - This entry captures the current repository refresh and documentation pass; future work should be added under `Unreleased` until the next tagged version is cut.

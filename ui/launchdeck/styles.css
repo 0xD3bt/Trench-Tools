@@ -163,16 +163,15 @@ html.boot-pending .boot-overlay {
 }
 
 .boot-overlay-note {
-  max-width: 320px;
+  width: min(360px, calc(100% - 32px));
+  max-width: 360px;
+  min-height: calc(1.45em * 2);
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.45;
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  justify-content: center;
-  column-gap: 0.16em;
-  row-gap: 0;
+  display: block;
+  text-align: center;
+  text-wrap: balance;
 }
 
 .boot-overlay-note-text {
@@ -201,6 +200,7 @@ html.boot-pending .boot-overlay {
 
 .boot-overlay-note.is-animating .boot-overlay-note-dots {
   display: inline-block;
+  vertical-align: baseline;
 }
 
 .boot-overlay-note.is-animating .boot-overlay-note-dots::before {
@@ -395,7 +395,6 @@ h2 {
   gap: 4px;
 }
 
-/* ── Wallet ── */
 
 .wallet-box {
   background: var(--surface);
@@ -955,16 +954,105 @@ body.popout-mode {
   overflow-x: hidden;
 }
 
+html.overlay-create-mode,
+html.overlay-create-mode body {
+  --create-overlay-stable-width: var(--launchdeck-create-overlay-width, 532px);
+  --create-overlay-stable-height: var(--launchdeck-create-overlay-height, 717px);
+  min-height: auto;
+  background: transparent;
+  overflow-x: hidden;
+}
+
 .popout-mode .shell {
   width: 100%;
   margin: 0;
   padding: 0;
 }
 
+.overlay-create-mode .shell {
+  width: 100%;
+  min-height: 100vh;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .popout-mode .launch-surface,
 .popout-mode .output {
   padding: 10px 12px;
   border-radius: 0;
+}
+
+.overlay-create-mode .workspace-shell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+}
+
+.overlay-create-mode .flow {
+  flex: 0 1 var(--create-overlay-stable-width);
+  max-width: var(--create-overlay-stable-width);
+  min-height: var(--create-overlay-stable-height);
+}
+
+.overlay-create-mode .launch-surface,
+.overlay-create-mode .output {
+  border-radius: 20px;
+}
+
+.overlay-create-mode .launch-surface {
+  min-height: var(--create-overlay-stable-height);
+  box-sizing: border-box;
+}
+
+.overlay-create-mode #output-section,
+.overlay-create-mode #toggle-output-button,
+.overlay-create-mode #toggle-reports-button {
+  display: none !important;
+}
+
+.overlay-create-mode #reports-terminal-section {
+  display: none !important;
+}
+
+.overlay-create-mode #open-popout-button {
+  display: none;
+}
+
+.overlay-create-mode #open-vamp-button {
+  display: none;
+}
+
+.overlay-create-mode .boot-overlay {
+  min-height: 100vh;
+  width: 100%;
+  padding: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.overlay-create-mode .boot-overlay-brand {
+  width: 100%;
+  max-width: none;
+  min-height: var(--create-overlay-stable-height);
+  border-radius: 24px;
+  border: 0;
+  background: var(--surface-gradient);
+  box-shadow: none;
+  padding: 32px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.overlay-create-mode .boot-overlay-logo {
+  width: min(240px, 52vw);
+  height: auto;
+  max-height: 140px;
 }
 
 .popout-mode .launch-surface-section + .launch-surface-section {
@@ -976,7 +1064,6 @@ body.popout-mode {
   display: none;
 }
 
-/* ── Form elements ── */
 
 label {
   display: flex;
@@ -1272,6 +1359,17 @@ textarea.input-error {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 14%, transparent) !important;
 }
 
+label.is-field-error {
+  border-color: color-mix(in srgb, var(--danger) 36%, transparent);
+}
+
+.settings-route-grid label.is-field-error {
+  border-radius: var(--radius-control-tight);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--danger) 28%, transparent);
+  outline-offset: 3px;
+}
+
 .validation-errors {
   padding: 10px 12px;
   background: linear-gradient(
@@ -1297,7 +1395,6 @@ textarea.input-error {
   font-weight: 500;
 }
 
-/* ── Image ── */
 
 .image-panel-wrap {
   display: grid;
@@ -1767,7 +1864,6 @@ textarea.input-error {
   line-height: 1;
 }
 
-/* ── Mode ── */
 
 .mode-grid {
   display: flex;
@@ -2184,7 +2280,6 @@ textarea.input-error {
   color: var(--accent);
 }
 
-/* ── Launchpad ── */
 
 .launchpad-grid {
   display: grid;
@@ -2271,7 +2366,6 @@ textarea.input-error {
   object-fit: contain;
 }
 
-/* ── Dev buy ── */
 
 .dev-buy-quick-head {
   display: flex;
@@ -4471,7 +4565,63 @@ textarea.input-error {
 }
 
 .vamp-modal {
-  width: min(560px, 100%);
+  width: min(var(--launchdeck-vamp-modal-width, 420px), calc(100vw - 24px));
+  display: block;
+  overflow: hidden;
+}
+
+.vamp-modal-header {
+  border-color: rgba(255, 255, 255, 0.08);
+  align-items: center;
+}
+
+.vamp-modal-body {
+  padding: 12px;
+  display: block;
+}
+
+.vamp-modal-body .stack {
+  gap: 8px;
+}
+
+.vamp-modal-body input {
+  min-height: 36px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.01em;
+}
+
+.vamp-modal #vamp-status {
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--border-subtle) 78%);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--surface-raised) 84%, var(--accent-dim) 16%),
+      color-mix(in srgb, var(--surface) 90%, var(--accent-dim) 10%)
+    );
+}
+
+.vamp-modal-footer {
+  gap: 8px;
+}
+
+.popout-mode .modal-overlay {
+  padding: 16px;
+  align-items: center;
+  justify-content: center;
+}
+
+.popout-mode .modal {
+  max-height: calc(100vh - 32px);
+}
+
+.popout-mode .settings-modal {
+  width: min(var(--launchdeck-settings-modal-popout-width, 500px), calc(100vw - 32px));
+  max-width: var(--launchdeck-settings-modal-popout-width, 500px);
+  max-height: calc(100vh - 32px);
+}
+
+.popout-mode .vamp-modal {
+  width: min(var(--launchdeck-vamp-modal-width, 420px), calc(100vw - 32px));
 }
 
 .fee-split-modal {
@@ -4488,7 +4638,6 @@ textarea.input-error {
   font-family: var(--font-mono);
 }
 
-/* ── Fee split ── */
 
 .fee-split-pill {
   display: inline-flex;
@@ -5272,7 +5421,6 @@ textarea.input-error {
   margin-top: 2px;
 }
 
-/* ── Buttons ── */
 
 button {
   font: inherit;
@@ -5344,7 +5492,6 @@ button {
   pointer-events: none;
 }
 
-/* ── Output ── */
 
 .output { margin-top: 0; }
 
@@ -6314,6 +6461,14 @@ button {
   color: #ffb6c0;
 }
 
+.launchdeck-host-banner {
+  margin: 0 18px;
+}
+
+.sniper-host-banner {
+  margin-top: 12px;
+}
+
 .reports-inline-link {
   font-size: 11px;
   color: var(--accent);
@@ -6351,7 +6506,6 @@ button {
   text-decoration: none;
 }
 
-/* ── Modal ── */
 
 .modal-overlay {
   position: fixed;
@@ -7439,7 +7593,6 @@ label.is-disabled textarea {
   margin-top: 0;
 }
 
-/* ── Light theme ── */
 
 .theme-light h1,
 .theme-light .modal-header h3 {
@@ -7917,7 +8070,6 @@ label.is-disabled textarea {
   color: var(--text);
 }
 
-/* ── Theme polish ── */
 
 html,
 body {
@@ -8216,7 +8368,6 @@ textarea:focus {
   color: var(--text);
 }
 
-/* ── Reports theme alignment ── */
 
 .reports-terminal {
   background: var(--surface-gradient);
@@ -8379,7 +8530,6 @@ textarea:focus-visible,
   }
 }
 
-/* ── Responsive ── */
 
 @media (max-width: 680px) {
   .modal-overlay {
@@ -8508,14 +8658,14 @@ textarea:focus-visible,
   }
 
   .popout-mode .flow {
-    flex: 0 1 532px;
-    max-width: 532px;
+    flex: 0 1 var(--launchdeck-popout-form-width, 532px);
+    max-width: var(--launchdeck-popout-form-width, 532px);
   }
 
   .popout-mode .settings-modal {
-    width: calc(100vw - 12px);
-    max-width: none;
-    max-height: calc(100vh - 12px);
+    width: min(var(--launchdeck-settings-modal-popout-width, 500px), calc(100vw - 32px));
+    max-width: var(--launchdeck-settings-modal-popout-width, 500px);
+    max-height: calc(100vh - 32px);
   }
 
   .popout-mode .settings-modal-body {
@@ -8662,7 +8812,15 @@ textarea:focus-visible,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .overlay-create-mode .row.two {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .popout-mode .row.three {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .overlay-create-mode .row.three {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
@@ -8670,7 +8828,15 @@ textarea:focus-visible,
     grid-template-columns: minmax(0, 1.48fr) minmax(0, 0.82fr);
   }
 
+  .overlay-create-mode .token-primary-row {
+    grid-template-columns: minmax(0, 1.48fr) minmax(0, 0.82fr);
+  }
+
   .popout-mode .launchpad-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .overlay-create-mode .launchpad-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
@@ -8678,7 +8844,15 @@ textarea:focus-visible,
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .overlay-create-mode .dev-buy-quick-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .popout-mode .dev-buy-custom-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 1.08fr;
+  }
+
+  .overlay-create-mode .dev-buy-custom-grid {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 1.08fr;
   }
 
@@ -8687,7 +8861,18 @@ textarea:focus-visible,
     flex-basis: calc(33.333% - 6px);
   }
 
+  .overlay-create-mode .mode-option {
+    max-width: calc(33.333% - 4px);
+    flex-basis: calc(33.333% - 6px);
+  }
+
   .popout-mode .mode-action-row {
+    --mode-action-button-width: calc((100% - 18px) / 4);
+    flex-wrap: nowrap;
+    justify-content: center;
+  }
+
+  .overlay-create-mode .mode-action-row {
     --mode-action-button-width: calc((100% - 18px) / 4);
     flex-wrap: nowrap;
     justify-content: center;

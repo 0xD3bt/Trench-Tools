@@ -27,7 +27,7 @@
 //! ## Blockhash cache key and compile handoff
 //!
 //! This uses the **same** `rpc_url` string as native compile (`configured_rpc_url()` in the handler),
-//! not `LAUNCHDECK_WARM_RPC_URL`, so `fetch_latest_blockhash_cached` shares one process-wide cache entry
+//! not `WARM_RPC_URL`, so `fetch_latest_blockhash_cached` shares one process-wide cache entry
 //! with Pump, Bonk, and Bags compile paths.
 //!
 //! On success, the handler passes `(blockhash, last_valid_block_height)` into `try_compile_native_launchpad`

@@ -10,6 +10,14 @@
       return getState();
     }
 
+    function pnlSnapshotCache() {
+      const state = reportsState();
+      if (!state.pnlSnapshotsByScope || typeof state.pnlSnapshotsByScope !== "object") {
+        state.pnlSnapshotsByScope = {};
+      }
+      return state.pnlSnapshotsByScope;
+    }
+
     function metadataUriToGatewayUrl(uri) {
       const raw = String(uri || "").trim();
       if (!raw) return "";
@@ -51,6 +59,17 @@
       return metadataUriToGatewayUrl(raw);
     }
 
+    function selectedWalletKeyFromReport(report) {
+      const normalizedReport = report && typeof report === "object" ? report : {};
+      const followDaemon = normalizedReport.followDaemon && typeof normalizedReport.followDaemon === "object"
+        ? normalizedReport.followDaemon
+        : {};
+      const followJob = followDaemon.job && typeof followDaemon.job === "object"
+        ? followDaemon.job
+        : {};
+      return String(normalizedReport.savedSelectedWalletKey || followJob.selectedWalletKey || "").trim();
+    }
+
     async function fetchLaunchMetadataSummary(metadataUriValue) {
       const state = reportsState();
       const metadataUriValueNormalized = String(metadataUriValue || "").trim();
@@ -90,6 +109,38 @@
       return payload;
     }
 
+    async function fetchPnlSnapshotSummary(walletKey, mint) {
+      const normalizedWalletKey = String(walletKey || "").trim();
+      const normalizedMint = String(mint || "").trim();
+      if (!normalizedWalletKey || !normalizedMint) return null;
+      const cacheKey = `${normalizedWalletKey}::${normalizedMint}`;
+      const cache = pnlSnapshotCache();
+      if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) {
+        return cache[cacheKey];
+      }
+      try {
+        const response = await fetch("/api/extension/wallet-status", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            walletKey: normalizedWalletKey,
+            mint: normalizedMint,
+            readOnly: true,
+            skipSolBalance: true,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload || payload.ok === false) {
+          throw new Error(payload && payload.error || "wallet status failed");
+        }
+        cache[cacheKey] = payload;
+        return payload;
+      } catch (_error) {
+        cache[cacheKey] = null;
+        return null;
+      }
+    }
+
     function getLaunchHistoryEntry(id) {
       const state = reportsState();
       const normalizedId = String(id || "").trim();
@@ -97,7 +148,7 @@
       return state.launches.find((entry) => entry.id === normalizedId) || null;
     }
 
-    function buildLaunchHistoryEntry(entry, bundle, metadata) {
+    function buildLaunchHistoryEntry(entry, bundle, metadata, pnlSnapshot) {
       const payload = bundle && bundle.payload && typeof bundle.payload === "object" ? bundle.payload : {};
       const report = payload.report && typeof payload.report === "object" ? payload.report : {};
       const execution = report.execution && typeof report.execution === "object" ? report.execution : {};
@@ -115,6 +166,7 @@
           ? normalizeSavedFollowLaunchForUi(followJob.followLaunch)
           : {});
       const devBuy = parseDevBuyDescription(report.devBuyDescription);
+      const selectedWalletKey = selectedWalletKeyFromReport(report);
       return {
         id: entry.id,
         traceId: String(entry && entry.traceId || followJob.traceId || "").trim(),
@@ -124,7 +176,7 @@
         execution,
         followJob,
         followLaunch,
-        selectedWalletKey: String(report.savedSelectedWalletKey || followJob.selectedWalletKey || "").trim(),
+        selectedWalletKey,
         quoteAsset: String(report.savedQuoteAsset || followJob.quoteAsset || "sol").trim(),
         metadata: metadata || null,
         title: launchHistoryTitle(metadata, report),
@@ -136,7 +188,24 @@
         feeSharingRecipients: savedFeeSharingRecipients,
         agentFeeRecipients: savedAgentFeeRecipients,
         creatorFee: savedCreatorFee,
+        pnlSnapshot: pnlSnapshot || null,
       };
+    }
+
+    async function runWithConcurrency(items, limit, task) {
+      const results = new Array(items.length);
+      let cursor = 0;
+      const workerCount = Math.max(1, Math.min(limit, items.length));
+      const workers = new Array(workerCount).fill(0).map(async () => {
+        while (true) {
+          const index = cursor;
+          cursor += 1;
+          if (index >= items.length) return;
+          results[index] = await task(items[index], index);
+        }
+      });
+      await Promise.all(workers);
+      return results;
     }
 
     async function loadReportsTerminalLaunches() {
@@ -144,17 +213,22 @@
       const sourceEntries = state.allEntries
         .filter((entry) => String(entry && entry.action || "").trim().toLowerCase() === "send")
         .slice(0, reportLimit);
-      const launches = await Promise.all(sourceEntries.map(async (entry) => {
+      const launches = await runWithConcurrency(sourceEntries, 6, async (entry) => {
         try {
           const bundle = await fetchReportBundleForLaunch(entry.id);
           const payload = bundle && bundle.payload && typeof bundle.payload === "object" ? bundle.payload : {};
           const report = payload.report && typeof payload.report === "object" ? payload.report : {};
           const metadata = await fetchLaunchMetadataSummary(report.metadataUri || "");
-          return buildLaunchHistoryEntry(entry, bundle, metadata);
+          const walletKey = selectedWalletKeyFromReport(report);
+          const mint = String(report.mint || "").trim();
+          const pnlSnapshot = walletKey && mint
+            ? await fetchPnlSnapshotSummary(walletKey, mint)
+            : null;
+          return buildLaunchHistoryEntry(entry, bundle, metadata, pnlSnapshot);
         } catch (_error) {
-          return buildLaunchHistoryEntry(entry, null, null);
+          return buildLaunchHistoryEntry(entry, null, null, null);
         }
-      }));
+      });
       state.launches = launches;
       return launches;
     }
@@ -162,6 +236,7 @@
     return {
       fetchLaunchMetadataSummary,
       fetchReportBundleForLaunch,
+      fetchPnlSnapshotSummary,
       getLaunchHistoryEntry,
       buildLaunchHistoryEntry,
       loadReportsTerminalLaunches,

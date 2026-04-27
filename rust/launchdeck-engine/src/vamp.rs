@@ -1001,7 +1001,10 @@ async fn parse_pump_sharing_config_recipients(
             sourceUsername: String::new(),
         });
     }
-    Ok(PumpSharingConfigImportData { admin: _admin, recipients })
+    Ok(PumpSharingConfigImportData {
+        admin: _admin,
+        recipients,
+    })
 }
 
 async fn detect_pump_import_context(
@@ -1154,9 +1157,7 @@ fn map_bags_import_context(context: BagsImportContext) -> ImportedTokenData {
             feeSharingRecipients: context
                 .feeRecipients
                 .into_iter()
-                .filter(|entry| {
-                    creator_wallet.is_empty() || entry.address.trim() != creator_wallet
-                })
+                .filter(|entry| creator_wallet.is_empty() || entry.address.trim() != creator_wallet)
                 .map(map_bags_import_recipient)
                 .collect(),
             notes: context.notes.clone(),
@@ -1183,7 +1184,11 @@ fn infer_launchpad_hint(contract_address: &str) -> Option<&'static str> {
     }
 }
 
-fn build_pump_image_proxy_url(contract_address: &str, raw_source_url: &str, variant: &str) -> String {
+fn build_pump_image_proxy_url(
+    contract_address: &str,
+    raw_source_url: &str,
+    variant: &str,
+) -> String {
     let mint = contract_address.trim();
     let source_url = normalize_remote_resource_url(raw_source_url);
     if mint.is_empty() || source_url.is_empty() || variant.trim().is_empty() {
@@ -1361,9 +1366,14 @@ async fn enrich_from_bonk_raydium(
     );
     prioritize_image_url(
         &mut imported,
-        row.get("imgUrl").and_then(Value::as_str).unwrap_or_default(),
+        row.get("imgUrl")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
     );
-    push_unique(&mut imported.detection.sources, "raydium-launchpad".to_string());
+    push_unique(
+        &mut imported.detection.sources,
+        "raydium-launchpad".to_string(),
+    );
     imported
 }
 
@@ -1473,7 +1483,8 @@ pub async fn fetch_imported_token_metadata(
             }
             "bonk" => {
                 if let Some(context) =
-                    detect_import_context_for_launchpad("bonk", rpc_url, contract_address, None).await?
+                    detect_import_context_for_launchpad("bonk", rpc_url, contract_address, None)
+                        .await?
                 {
                     if let LaunchpadImportContext::Bonk(context) = context {
                         hinted = apply_import_context(hinted, map_bonk_import_context(context));
@@ -1656,12 +1667,10 @@ pub async fn import_remote_image_to_library(
 #[cfg(test)]
 mod tests {
     use super::{
-        ImportedTokenData, attach_pump_image_proxy_candidate, build_pump_image_proxy_url,
-        build_pump_creator_fee_route, choose_merged_image_url, extract_html_meta_content,
+        ImportedTokenData, attach_pump_image_proxy_candidate, build_pump_creator_fee_route,
+        build_pump_image_proxy_url, choose_merged_image_url, extract_html_meta_content,
         infer_image_extension_from_bytes, infer_imported_mode, merge_imported,
-        normalize_imported_metadata_payload,
-        prioritize_image_url,
-        remote_resource_url_candidates,
+        normalize_imported_metadata_payload, prioritize_image_url, remote_resource_url_candidates,
     };
     use serde_json::json;
     use solana_sdk::pubkey::Pubkey;

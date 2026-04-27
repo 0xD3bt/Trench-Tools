@@ -3,6 +3,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use shared_execution_routing::alt_manifest::{
+    PUMP_APR28_FEE_RECIPIENTS, lookup_table_address_content_hash,
+};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_sdk::{
     hash::Hash,
@@ -10,7 +13,7 @@ use solana_sdk::{
     message::{AddressLookupTableAccount, VersionedMessage, v0},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    transaction::{Transaction, VersionedTransaction},
+    transaction::VersionedTransaction,
 };
 use solana_system_interface::{instruction::transfer, program as system_program};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
@@ -24,6 +27,7 @@ use std::{
 use tokio::{join, task::JoinSet, time::sleep};
 
 use crate::{
+    compiled_transaction_signers,
     config::{
         NormalizedConfig, NormalizedExecution, NormalizedRecipient,
         configured_default_agent_setup_compute_unit_limit,
@@ -36,13 +40,14 @@ use crate::{
     paths,
     report::{LaunchReport, build_report, render_report},
     rpc::{
-        CompiledTransaction, fetch_account_data, fetch_account_exists,
-        COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS, fetch_latest_blockhash_cached,
-        fetch_latest_blockhash_cached_with_prime,
-        fetch_multiple_account_data, fetch_multiple_account_exists,
+        COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS, CompiledTransaction, fetch_account_data,
+        fetch_account_exists, fetch_latest_blockhash_cached,
+        fetch_latest_blockhash_cached_with_prime, fetch_multiple_account_data,
+        fetch_multiple_account_exists,
     },
     transport::TransportPlan,
     wallet::read_keypair_bytes,
+    wrapper_compile::{estimate_sol_in_fee_lamports, wrapper_fee_vault},
 };
 
 const JITODONTFRONT_ACCOUNT: &str = "jitodontfront111111111111111111111111111111";
@@ -61,19 +66,11 @@ const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
+const SHARED_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc";
 const PLATFORM_GITHUB: u8 = 2;
-const DEFAULT_LOOKUP_TABLES: [&str; 2] = [
-    "AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ",
-    "BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj",
-];
-const DEFAULT_LAUNCH_LOOKUP_TABLE_PROFILES: [[&str; 1]; 2] = [
-    ["AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ"],
-    ["BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj"],
-];
-const DEFAULT_FOLLOW_UP_LOOKUP_TABLE_PROFILES: [[&str; 1]; 2] = [
-    ["BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj"],
-    ["AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ"],
-];
+const DEFAULT_LOOKUP_TABLES: [&str; 1] = [SHARED_SUPER_LOOKUP_TABLE];
+const DEFAULT_LAUNCH_LOOKUP_TABLE_PROFILES: [[&str; 1]; 1] = [[SHARED_SUPER_LOOKUP_TABLE]];
+const DEFAULT_FOLLOW_UP_LOOKUP_TABLE_PROFILES: [[&str; 1]; 1] = [[SHARED_SUPER_LOOKUP_TABLE]];
 const LOOKUP_TABLE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
@@ -662,7 +659,6 @@ pub struct PreparedFollowBuyStatic {
     launch_creator: Pubkey,
     sol_amount: u64,
     tx_config: NativeTxConfig,
-    tx_format: NativeTxFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -785,6 +781,10 @@ fn wsol_mint() -> Result<Pubkey, String> {
 
 fn event_authority_pda(program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"__event_authority"], program_id).0
+}
+
+fn selected_pump_apr28_fee_recipient() -> Result<Pubkey, String> {
+    parse_pubkey(PUMP_APR28_FEE_RECIPIENTS[0], "Pump April 28 fee recipient")
 }
 
 fn bonding_curve_pda(mint: &Pubkey) -> Result<Pubkey, String> {
@@ -1400,7 +1400,8 @@ fn quote_buy_sol_from_tokens(global: &PumpGlobalState, token_amount: u64) -> u64
         sol_cost * u128::from(global.creator_fee_basis_points),
         10_000,
     );
-    (sol_cost + protocol_fee + creator_fee)
+    // The exact-SOL-in path derives effective curve input from spendable SOL minus one lamport.
+    (sol_cost + protocol_fee + creator_fee + 1)
         .min(u128::from(u64::MAX))
         .try_into()
         .unwrap_or(u64::MAX)
@@ -1726,7 +1727,6 @@ pub async fn prepare_follow_buy_static(
         jito_tip_lamports,
         jito_tip_account,
     };
-    let tx_format = select_native_format(&execution.txFormat, false)?;
     let _ = rpc_url;
     Ok(PreparedFollowBuyStatic {
         user,
@@ -1734,7 +1734,6 @@ pub async fn prepare_follow_buy_static(
         launch_creator,
         sol_amount,
         tx_config,
-        tx_format,
     })
 }
 
@@ -1777,21 +1776,29 @@ pub async fn finalize_follow_buy_transaction(
     }
     let token_amount =
         quote_buy_tokens_from_curve(&runtime.curve, &runtime.global, prepared.sol_amount);
-    let max_sol_cost = apply_buy_slippage_buffer(
-        prepared.sol_amount,
+    let min_tokens_out = apply_buy_token_slippage(
+        token_amount,
         slippage_bps_from_percent(&execution.buySlippagePercent)?,
     );
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
+    let lookup_tables =
+        load_shared_lookup_tables_for_tx_format(rpc_url, &execution.txFormat).await?;
+    let lookup_table_variants = if lookup_tables.is_empty() {
+        vec![]
+    } else {
+        vec![lookup_tables]
+    };
+    let tx_format = select_native_format(&execution.txFormat, !lookup_table_variants.is_empty())?;
     let instructions = vec![
         build_create_token_ata_instruction(&user, &prepared.mint)?,
-        build_buy_instruction(
+        build_buy_exact_sol_in_instruction(
             &runtime.global,
             &prepared.mint,
             &runtime.creator_vault_authority,
             &user,
-            max_sol_cost,
-            token_amount,
+            prepared.sol_amount,
+            min_tokens_out,
             token_mayhem_mode,
         )?,
     ];
@@ -1803,14 +1810,14 @@ pub async fn finalize_follow_buy_transaction(
     )?;
     let (compiled, _) = compile_transaction_with_metrics(
         "follow-buy",
-        prepared.tx_format,
+        tx_format,
         &blockhash,
         last_valid_block_height,
         &user_keypair,
         None,
         tx_instructions,
         &prepared.tx_config,
-        &[vec![]],
+        &lookup_table_variants,
     )?;
     Ok(compiled)
 }
@@ -1849,13 +1856,13 @@ pub async fn compile_atomic_follow_buy_transaction(
     };
     let instructions = vec![
         build_create_token_ata_instruction(&user, &mint)?,
-        build_buy_instruction(
+        build_buy_exact_sol_in_instruction(
             &global,
             &mint,
             &launch_creator,
             &user,
-            apply_buy_slippage_buffer(sol_amount, buy_slippage_bps),
-            tokens_out,
+            sol_amount,
+            apply_buy_token_slippage(tokens_out, buy_slippage_bps),
             token_mayhem_mode,
         )?,
     ];
@@ -1878,7 +1885,14 @@ pub async fn compile_atomic_follow_buy_transaction(
     };
     let tx_instructions =
         with_tx_settings(instructions, &tx_config, &user, execution.buyJitodontfront)?;
-    let tx_format = select_native_format(&execution.txFormat, false)?;
+    let lookup_tables =
+        load_shared_lookup_tables_for_tx_format(rpc_url, &execution.txFormat).await?;
+    let lookup_table_variants = if lookup_tables.is_empty() {
+        vec![]
+    } else {
+        vec![lookup_tables]
+    };
+    let tx_format = select_native_format(&execution.txFormat, !lookup_table_variants.is_empty())?;
     let (compiled, _) = compile_transaction_with_metrics(
         "follow-buy-atomic",
         tx_format,
@@ -1888,7 +1902,7 @@ pub async fn compile_atomic_follow_buy_transaction(
         None,
         tx_instructions,
         &tx_config,
-        &[vec![]],
+        &lookup_table_variants,
     )?;
     Ok(compiled)
 }
@@ -1990,8 +2004,7 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
     }
     let gross_quote = quote_sell_sol_from_curve(&curve, &global, token_amount);
     let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
-    let min_sol_output =
-        gross_quote.saturating_mul(10_000u64.saturating_sub(slippage_bps)) / 10_000;
+    let min_sol_output = apply_sell_side_slippage(gross_quote, slippage_bps);
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
     let instructions = vec![build_sell_instruction(
@@ -2023,7 +2036,14 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
     };
     let tx_instructions =
         with_tx_settings(instructions, &tx_config, &user, execution.sellJitodontfront)?;
-    let tx_format = select_native_format(&execution.txFormat, false)?;
+    let lookup_tables =
+        load_shared_lookup_tables_for_tx_format(rpc_url, &execution.txFormat).await?;
+    let lookup_table_variants = if lookup_tables.is_empty() {
+        vec![]
+    } else {
+        vec![lookup_tables]
+    };
+    let tx_format = select_native_format(&execution.txFormat, !lookup_table_variants.is_empty())?;
     let (compiled, _) = compile_transaction_with_metrics(
         "follow-sell",
         tx_format,
@@ -2033,21 +2053,33 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
         None,
         tx_instructions,
         &tx_config,
-        &[vec![]],
+        &lookup_table_variants,
     )?;
     Ok(Some(compiled))
 }
 
-fn apply_atomic_buy_buffer(sol_amount: u64) -> u64 {
-    apply_buy_slippage_buffer(sol_amount, 100)
+fn apply_buy_token_slippage(token_amount: u64, slippage_bps: u64) -> u64 {
+    let minimum = (u128::from(token_amount)
+        * u128::from(10_000u64.saturating_sub(slippage_bps.min(10_000))))
+        / 10_000u128;
+    let minimum = minimum.min(u128::from(u64::MAX)) as u64;
+    if token_amount > 0 && minimum == 0 {
+        1
+    } else {
+        minimum
+    }
 }
 
-fn apply_buy_slippage_buffer(sol_amount: u64, slippage_bps: u64) -> u64 {
-    ceil_div(
-        u128::from(sol_amount) * u128::from(10_000u64.saturating_add(slippage_bps)),
-        10_000,
-    )
-    .min(u128::from(u64::MAX)) as u64
+fn apply_sell_side_slippage(value: u64, slippage_bps: u64) -> u64 {
+    let minimum = (u128::from(value)
+        * u128::from(10_000u64.saturating_sub(slippage_bps.min(10_000))))
+        / 10_000u128;
+    let minimum = minimum.min(u128::from(u64::MAX)) as u64;
+    if value > 0 && minimum == 0 {
+        1
+    } else {
+        minimum
+    }
 }
 
 fn select_buy_fee_recipient(global: &PumpGlobalState, mayhem_mode: bool) -> Pubkey {
@@ -2147,6 +2179,7 @@ fn build_launch_instructions(
         config.token.mayhemMode,
         config.mode == "cashback",
     )?];
+    let mut launch_dev_buy_fee_transfer = None;
     if let Some(global) = global {
         if let Some((sol_amount, token_amount)) = resolve_dev_buy_quote(config, global)? {
             let buy_slippage_bps = slippage_bps_from_percent(&config.execution.buySlippagePercent)?;
@@ -2155,15 +2188,17 @@ fn build_launch_instructions(
                 &creator,
             )?);
             instructions.push(build_create_token_ata_instruction(&creator, &mint)?);
-            instructions.push(build_buy_instruction(
+            instructions.push(build_buy_exact_sol_in_instruction(
                 global,
                 &mint,
                 &launch_creator,
                 &creator,
-                apply_buy_slippage_buffer(sol_amount, buy_slippage_bps),
-                token_amount,
+                sol_amount,
+                apply_buy_token_slippage(token_amount, buy_slippage_bps),
                 config.token.mayhemMode,
             )?);
+            launch_dev_buy_fee_transfer =
+                build_launch_dev_buy_fee_transfer_instruction(config, creator, sol_amount);
         }
     }
     if config.mode == "agent-unlocked"
@@ -2178,6 +2213,9 @@ fn build_launch_instructions(
             authority,
             config.agent.buybackBps.unwrap_or(0) as u16,
         )?);
+    }
+    if let Some(fee_transfer) = launch_dev_buy_fee_transfer {
+        instructions.push(fee_transfer);
     }
     Ok(instructions)
 }
@@ -2251,6 +2289,18 @@ fn build_jito_tip_instruction(
     ))
 }
 
+fn build_launch_dev_buy_fee_transfer_instruction(
+    config: &NormalizedConfig,
+    payer: Pubkey,
+    dev_buy_lamports: u64,
+) -> Option<Instruction> {
+    let fee_lamports = estimate_sol_in_fee_lamports(dev_buy_lamports, config.wrapperDefaultFeeBps);
+    if fee_lamports == 0 {
+        return None;
+    }
+    Some(transfer(&payer, &wrapper_fee_vault(), fee_lamports))
+}
+
 fn build_agent_initialize_instruction(
     mint: &Pubkey,
     creator: &Pubkey,
@@ -2310,13 +2360,13 @@ fn build_create_token_ata_instruction(
     )
 }
 
-fn build_buy_instruction(
+fn build_buy_exact_sol_in_instruction(
     global: &PumpGlobalState,
     mint: &Pubkey,
     launch_creator: &Pubkey,
     user: &Pubkey,
-    sol_amount: u64,
-    token_amount: u64,
+    spendable_sol_in: u64,
+    min_tokens_out: u64,
     mayhem_mode: bool,
 ) -> Result<Instruction, String> {
     let pump_program = pump_program_id()?;
@@ -2325,31 +2375,37 @@ fn build_buy_instruction(
     let associated_bonding_curve =
         get_associated_token_address_with_program_id(&bonding_curve, mint, &token_2022);
     let associated_user = get_associated_token_address_with_program_id(user, mint, &token_2022);
-    let mut data = vec![102, 6, 61, 18, 1, 218, 235, 234];
-    data.extend_from_slice(&token_amount.to_le_bytes());
-    data.extend_from_slice(&sol_amount.to_le_bytes());
+    let mut data = vec![56, 252, 116, 8, 158, 223, 205, 95];
+    data.extend_from_slice(&spendable_sol_in.to_le_bytes());
+    data.extend_from_slice(&min_tokens_out.to_le_bytes());
     data.push(1);
+    let mut accounts = vec![
+        AccountMeta::new_readonly(global_pda()?, false),
+        AccountMeta::new(select_buy_fee_recipient(global, mayhem_mode), false),
+        AccountMeta::new_readonly(*mint, false),
+        AccountMeta::new(bonding_curve, false),
+        AccountMeta::new(associated_bonding_curve, false),
+        AccountMeta::new(associated_user, false),
+        AccountMeta::new(*user, true),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(token_2022, false),
+        AccountMeta::new(creator_vault_pda(launch_creator)?, false),
+        AccountMeta::new_readonly(event_authority_pda(&pump_program), false),
+        AccountMeta::new_readonly(pump_program, false),
+        AccountMeta::new_readonly(global_volume_accumulator_pda()?, false),
+        AccountMeta::new(user_volume_accumulator_pda(user)?, false),
+        AccountMeta::new_readonly(fee_config_pda()?, false),
+        AccountMeta::new_readonly(pump_fee_program_id()?, false),
+        AccountMeta::new_readonly(bonding_curve_v2_pda(mint)?, false),
+    ];
+    accounts.push(AccountMeta::new(
+        selected_pump_apr28_fee_recipient()?,
+        false,
+    ));
+
     let instruction = Instruction {
         program_id: pump_program,
-        accounts: vec![
-            AccountMeta::new_readonly(global_pda()?, false),
-            AccountMeta::new(select_buy_fee_recipient(global, mayhem_mode), false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(bonding_curve, false),
-            AccountMeta::new(associated_bonding_curve, false),
-            AccountMeta::new(associated_user, false),
-            AccountMeta::new(*user, true),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(token_2022, false),
-            AccountMeta::new(creator_vault_pda(launch_creator)?, false),
-            AccountMeta::new_readonly(event_authority_pda(&pump_program), false),
-            AccountMeta::new_readonly(pump_program, false),
-            AccountMeta::new_readonly(global_volume_accumulator_pda()?, false),
-            AccountMeta::new(user_volume_accumulator_pda(user)?, false),
-            AccountMeta::new_readonly(fee_config_pda()?, false),
-            AccountMeta::new_readonly(pump_fee_program_id()?, false),
-            AccountMeta::new_readonly(bonding_curve_v2_pda(mint)?, false),
-        ],
+        accounts,
         data,
     };
     Ok(instruction)
@@ -2402,6 +2458,10 @@ fn build_sell_instruction(
     }
     instruction.accounts.push(AccountMeta::new_readonly(
         bonding_curve_v2_pda(mint)?,
+        false,
+    ));
+    instruction.accounts.push(AccountMeta::new(
+        selected_pump_apr28_fee_recipient()?,
         false,
     ));
     Ok(instruction)
@@ -2796,12 +2856,11 @@ fn apply_jitodontfront(
 }
 
 fn parse_lookup_table_addresses(config: &NormalizedConfig) -> Vec<String> {
-    let mut values = Vec::new();
-    if config.tx.useDefaultLookupTables {
-        values.extend(DEFAULT_LOOKUP_TABLES.iter().map(|entry| entry.to_string()));
-    }
-    values.extend(config.tx.lookupTables.clone());
-    dedupe_lookup_table_addresses(values)
+    let _ = config;
+    DEFAULT_LOOKUP_TABLES
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect()
 }
 
 fn dedupe_lookup_table_addresses(values: Vec<String>) -> Vec<String> {
@@ -2832,56 +2891,20 @@ fn default_lookup_table_profiles_for_label(label: &str) -> Vec<Vec<String>> {
 }
 
 fn lookup_table_variants_for_transaction(
-    label: &str,
-    config: &NormalizedConfig,
+    _label: &str,
+    _config: &NormalizedConfig,
     loaded_lookup_tables: &[AddressLookupTableAccount],
 ) -> Vec<Vec<AddressLookupTableAccount>> {
-    let explicit = dedupe_lookup_table_addresses(config.tx.lookupTables.clone());
-    let mut requested_variants = Vec::new();
-    if config.tx.useDefaultLookupTables {
-        for profile in default_lookup_table_profiles_for_label(label) {
-            let mut combined = profile;
-            combined.extend(explicit.clone());
-            requested_variants.push(dedupe_lookup_table_addresses(combined));
-        }
-        let mut union = DEFAULT_LOOKUP_TABLES
-            .iter()
-            .map(|entry| entry.to_string())
-            .collect::<Vec<_>>();
-        union.extend(explicit.clone());
-        requested_variants.push(dedupe_lookup_table_addresses(union));
+    let shared_variant = loaded_lookup_tables
+        .iter()
+        .filter(|table| table.key.to_string() == SHARED_SUPER_LOOKUP_TABLE)
+        .cloned()
+        .collect::<Vec<_>>();
+    if shared_variant.is_empty() {
+        vec![]
+    } else {
+        vec![shared_variant]
     }
-    if !explicit.is_empty() {
-        requested_variants.push(explicit);
-    }
-
-    let mut unique_keys = Vec::new();
-    let mut variants = Vec::new();
-    for addresses in requested_variants {
-        let mut variant = Vec::new();
-        for address in &addresses {
-            if let Some(table) = loaded_lookup_tables
-                .iter()
-                .find(|table| table.key.to_string() == *address)
-            {
-                variant.push(table.clone());
-            }
-        }
-        if variant.is_empty() {
-            continue;
-        }
-        let key = variant
-            .iter()
-            .map(|table| table.key.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        if unique_keys.iter().any(|entry| entry == &key) {
-            continue;
-        }
-        unique_keys.push(key);
-        variants.push(variant);
-    }
-    variants
 }
 
 #[derive(Clone)]
@@ -2898,6 +2921,22 @@ struct PersistedLookupTableCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedLookupTableEntry {
     addresses: Vec<String>,
+    #[serde(default)]
+    address_count: Option<usize>,
+    #[serde(default)]
+    content_hash: Option<String>,
+}
+
+fn merge_persisted_lookup_table_caches(
+    caches: impl IntoIterator<Item = PersistedLookupTableCache>,
+) -> PersistedLookupTableCache {
+    let mut merged = PersistedLookupTableCache::default();
+    for cache in caches {
+        for (address, entry) in cache.tables {
+            merged.tables.entry(address).or_insert(entry);
+        }
+    }
+    merged
 }
 
 fn lookup_table_cache() -> &'static Mutex<HashMap<String, CachedLookupTableAccount>> {
@@ -2908,10 +2947,18 @@ fn lookup_table_cache() -> &'static Mutex<HashMap<String, CachedLookupTableAccou
 fn persisted_lookup_table_cache() -> &'static Mutex<PersistedLookupTableCache> {
     static CACHE: OnceLock<Mutex<PersistedLookupTableCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let cache = fs::read_to_string(paths::lookup_table_cache_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str::<PersistedLookupTableCache>(&raw).ok())
-            .unwrap_or_default();
+        let cache = merge_persisted_lookup_table_caches(
+            [
+                paths::shared_lookup_table_cache_path(),
+                paths::legacy_bonk_lookup_table_cache_path(),
+            ]
+            .into_iter()
+            .filter_map(|path| {
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<PersistedLookupTableCache>(&raw).ok())
+            }),
+        );
         Mutex::new(cache)
     })
 }
@@ -2930,18 +2977,23 @@ fn persist_lookup_table_account(
     let mut cache = persisted_lookup_table_cache()
         .lock()
         .map_err(|error| error.to_string())?;
+    let addresses = table
+        .addresses
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect::<Vec<_>>();
+    let address_count = addresses.len();
+    let content_hash = lookup_table_address_content_hash(&addresses);
     cache.tables.insert(
         address.to_string(),
         PersistedLookupTableEntry {
-            addresses: table
-                .addresses
-                .iter()
-                .map(|entry| entry.to_string())
-                .collect(),
+            addresses,
+            address_count: Some(address_count),
+            content_hash: Some(content_hash),
         },
     );
     let serialized = serde_json::to_string_pretty(&*cache).map_err(|error| error.to_string())?;
-    let path = paths::lookup_table_cache_path();
+    let path = paths::shared_lookup_table_cache_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -2955,6 +3007,21 @@ fn load_persisted_lookup_table_account(address: &str) -> Option<AddressLookupTab
     }
     let cache = persisted_lookup_table_cache().lock().ok()?;
     let entry = cache.tables.get(address)?;
+    if entry.address_count != Some(entry.addresses.len()) {
+        eprintln!(
+            "[launchdeck-engine][alt-cache] ignoring stale shared ALT snapshot {} due to missing/mismatched address count",
+            address
+        );
+        return None;
+    }
+    let content_hash = lookup_table_address_content_hash(&entry.addresses);
+    if entry.content_hash.as_deref() != Some(content_hash.as_str()) {
+        eprintln!(
+            "[launchdeck-engine][alt-cache] ignoring stale shared ALT snapshot {} due to content hash mismatch",
+            address
+        );
+        return None;
+    }
     let key = parse_pubkey(address, "lookup table address").ok()?;
     let addresses = entry
         .addresses
@@ -3043,8 +3110,7 @@ async fn load_lookup_table_accounts(
     config: &NormalizedConfig,
 ) -> Result<Vec<AddressLookupTableAccount>, String> {
     let requested = parse_lookup_table_addresses(config);
-    let should_load = matches!(config.execution.txFormat.as_str(), "auto" | "v0-alt");
-    if !should_load || requested.is_empty() {
+    if requested.is_empty() {
         return Ok(vec![]);
     }
     load_lookup_table_accounts_for_addresses(rpc_url, &requested).await
@@ -3060,21 +3126,32 @@ pub async fn warm_default_lookup_tables(rpc_url: &str) -> Result<usize, String> 
     Ok(loaded.len())
 }
 
+async fn load_shared_lookup_tables_for_tx_format(
+    rpc_url: &str,
+    requested_format: &str,
+) -> Result<Vec<AddressLookupTableAccount>, String> {
+    let _ = requested_format;
+    let requested = DEFAULT_LOOKUP_TABLES
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect::<Vec<_>>();
+    load_lookup_table_accounts_for_addresses(rpc_url, &requested).await
+}
+
 fn select_native_format(
     requested: &str,
     has_lookup_tables: bool,
 ) -> Result<NativeTxFormat, String> {
     match requested {
-        "legacy" => Ok(NativeTxFormat::Legacy),
-        "v0" => Ok(NativeTxFormat::V0),
-        "v0-alt" => {
+        "legacy" | "v0" | "v0-alt" | "auto" => {
             if has_lookup_tables {
                 Ok(NativeTxFormat::V0Alt)
             } else {
-                Err("Native Pump compile requires at least one loaded lookup table for txFormat=v0-alt.".to_string())
+                Err(format!(
+                    "Native Pump compile requires the shared lookup table {SHARED_SUPER_LOOKUP_TABLE} for txFormat={requested}."
+                ))
             }
         }
-        "auto" => Ok(NativeTxFormat::Auto),
         unsupported => Err(format!(
             "Native Pump compile does not yet support txFormat={unsupported}."
         )),
@@ -3261,61 +3338,60 @@ fn compile_transaction_candidate(
     if tx_format == NativeTxFormat::Auto {
         return Err("Auto transaction format must be resolved before compile.".to_string());
     }
-    let hash = Hash::from_str(blockhash).map_err(|error| error.to_string())?;
-    let (serialized, format, lookup_tables_used) = if tx_format == NativeTxFormat::Legacy {
-        let signers: Vec<&Keypair> = match mint_signer {
-            Some(mint) => vec![payer, mint],
-            None => vec![payer],
-        };
-        let transaction = Transaction::new_signed_with_payer(
-            &instructions,
-            Some(&payer.pubkey()),
-            &signers,
-            hash,
+    if tx_format == NativeTxFormat::Legacy {
+        return Err(
+            "Native Pump shared-ALT-only compilation no longer supports legacy transaction format."
+                .to_string(),
         );
-        (
-            bincode::serialize(&transaction).map_err(|error| error.to_string())?,
-            "legacy".to_string(),
-            vec![],
-        )
-    } else {
-        let dynamic_lookups = if tx_format == NativeTxFormat::V0Alt {
-            lookup_tables
-        } else {
-            &[]
-        };
-        let message =
-            v0::Message::try_compile(&payer.pubkey(), &instructions, dynamic_lookups, hash)
-                .map_err(|error| error.to_string())?;
-        let lookup_tables_used = message
-            .address_table_lookups
-            .iter()
-            .map(|lookup| lookup.account_key.to_string())
-            .collect::<Vec<_>>();
-        let signers: Vec<&Keypair> = match mint_signer {
-            Some(mint) => vec![payer, mint],
-            None => vec![payer],
-        };
-        let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
-            .map_err(|error| error.to_string())?;
-        (
-            bincode::serialize(&transaction).map_err(|error| error.to_string())?,
-            if lookup_tables_used.is_empty() {
-                "v0".to_string()
-            } else {
-                "v0-alt".to_string()
-            },
-            lookup_tables_used,
-        )
+    }
+    if tx_format == NativeTxFormat::V0Alt && lookup_tables.is_empty() {
+        return Err(format!(
+            "Native Pump v0-alt compile requires the shared lookup table {SHARED_SUPER_LOOKUP_TABLE}."
+        ));
+    }
+    let hash = Hash::from_str(blockhash).map_err(|error| error.to_string())?;
+    let message = v0::Message::try_compile(&payer.pubkey(), &instructions, lookup_tables, hash)
+        .map_err(|error| error.to_string())?;
+    let lookup_tables_used = message
+        .address_table_lookups
+        .iter()
+        .map(|lookup| lookup.account_key.to_string())
+        .collect::<Vec<_>>();
+    if lookup_tables_used.len() != 1 || lookup_tables_used[0] != SHARED_SUPER_LOOKUP_TABLE {
+        return Err(format!(
+            "Native Pump v0-alt compilation must actually use the shared lookup table {SHARED_SUPER_LOOKUP_TABLE}; used [{}].",
+            lookup_tables_used.join(", ")
+        ));
+    }
+    let signers: Vec<&Keypair> = match mint_signer {
+        Some(mint) => vec![payer, mint],
+        None => vec![payer],
     };
+    let message_for_diagnostics = message.clone();
+    let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
+        .map_err(|error| error.to_string())?;
+    let serialized = bincode::serialize(&transaction).map_err(|error| error.to_string())?;
     let serialized_len = serialized.len();
+    crate::alt_diagnostics::emit_alt_coverage_diagnostics(
+        "launchdeck-engine",
+        label,
+        &instructions,
+        lookup_tables,
+        &message_for_diagnostics,
+        Some(serialized_len),
+        &[],
+    );
     let serialized_base64 = BASE64.encode(serialized);
+    compiled_transaction_signers::remember_compiled_transaction_signers(
+        &serialized_base64,
+        &signers[1..],
+    );
     let signature = crate::rpc::precompute_transaction_signature(&serialized_base64);
     Ok(CompiledTxCandidate {
         serialized_len,
         compiled: CompiledTransaction {
             label: label.to_string(),
-            format,
+            format: "v0-alt".to_string(),
             blockhash: blockhash.to_string(),
             lastValidBlockHeight: last_valid_block_height,
             serializedBase64: serialized_base64,
@@ -3442,6 +3518,166 @@ mod tests {
     use super::*;
     use crate::config::{RawConfig, normalize_raw_config};
     use crate::transport::{build_transport_plan, estimate_transaction_count};
+
+    fn assert_sol_transfer_instruction(
+        instruction: &Instruction,
+        from: &Pubkey,
+        to: &Pubkey,
+        lamports: u64,
+    ) {
+        assert_eq!(instruction.program_id, system_program::id());
+        assert_eq!(instruction.accounts[0].pubkey, *from);
+        assert!(instruction.accounts[0].is_signer);
+        assert_eq!(instruction.accounts[1].pubkey, *to);
+        let decoded =
+            bincode::deserialize::<solana_system_interface::instruction::SystemInstruction>(
+                &instruction.data,
+            )
+            .expect("system transfer instruction");
+        assert_eq!(
+            decoded,
+            solana_system_interface::instruction::SystemInstruction::Transfer { lamports }
+        );
+    }
+
+    fn sample_global() -> PumpGlobalState {
+        PumpGlobalState {
+            fee_recipient: Pubkey::new_unique(),
+            initial_virtual_token_reserves: 1_073_000_000_000_000,
+            initial_virtual_sol_reserves: 30_000_000_000,
+            initial_real_token_reserves: 793_100_000_000_000,
+            fee_basis_points: 100,
+            creator_fee_basis_points: 50,
+            fee_recipients: [Pubkey::default(); 7],
+            reserved_fee_recipient: Pubkey::default(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+        }
+    }
+
+    fn deployed_shared_alt_lookup_table_fixture() -> AddressLookupTableAccount {
+        let addresses = [
+            "ComputeBudget111111111111111111111111111111",
+            "11111111111111111111111111111111",
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+            "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
+            "FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1",
+            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+            "DTgyhdzARWt8fiFrA5E2ECTdR5U3rpGho2AmaPWsieWg",
+            "9bcapqGioeAGybVSbtYoSZR23qZESNbToTV5C2QUJMqZ",
+            "5JXjm3xUYU7St1g7hptBF6bPqZAeTpWR8kzoeDK8uvPr",
+            "67pirGqYiCT6j56DdQmAivWZSuZEtYbzSqMTWUNcHZAL",
+            "So11111111111111111111111111111111111111112",
+            "SysvarRent111111111111111111111111111111111",
+            "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+            "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",
+            "WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh",
+            "EPiZbnrThjyLnoQ6QQzkxeFqyL5uyg9RzNHHAudUPxBz",
+            "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS",
+            "5QpMZ6MuyKjg8Qa1X8gM5G3YMsd43rpHb2iQ6hdcRM7m",
+            "DHY2efKhMcZyAgmPw82C2Gez1e98Ab7oWcXfxz9frUCr",
+            "2s8VC2vpZcoUCbvEqwUagvdyHfUeWYQZuKV376acx6iF",
+            "HKcNrRDTFuXVTyMCkp5h3eU4cyqbzteAW1UR7m2CWbVs",
+            "2DPAtwB8L12vrMRExbLuyGnC7n2J5LNoZQSejeQGpwkr",
+            "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+            "8m39KcS9MJb4QnLW7sXA8pHXMvKQFbyfeEBnsXJSxybu",
+            "Dz7NXp8838CivsPYZvACQ23gtAuq2DVtVLMQLaUQR3JE",
+            "6s1xP3hpbAfFoNtUNF8mfHsjr2Bd97JxFJRWLbL6aHuX",
+            "13ec7XdrjF3h3YcqBTFDSReRcUFwbCnJaAQspM4j6DDJ",
+            "2mFsfTTscbFcjE7spzaucYuGSj9kPj1oLaotemzNetST",
+            "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+            "5FqUo9aBjsp7QeeyN6Vi2ZmF2fjS4H5EU7wnAQwPy17z",
+            "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
+            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            "6sd8BkAkqsrxbfsxLsjBxA2yCbMppNCt6sJk8MHh85VP",
+            "71YUh7AEj2MFWAtUX8anpr5Lig7n9NR2xReW7QDkJqpb",
+            "7osZceLJJJ6jbk58XxyTwvcqQauQgSyRkym8R8UAwBqd",
+            "8FoNgzmjuSmiy86EPCWxvv1q7oJSu2WGA7wPymwki2LJ",
+            "8R4wThp45WHYQQuCbz5GqTm4pYUVk6eCTZe1NSa8EBnV",
+            "8viRCH1uDz8BUdBQkT88ymgQrtdmYEvs3Efy31GuWntu",
+            "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+            "91tDWyGdurPekG8JCWCfzJn7aGfLgb9zb711fHpyGR2j",
+            "94qWNrtmfn42h3ZjUZwWvK1MEo9uVmmrBPd2hpNjYDjb",
+            "96bWWuSF6de5H3wFAMb2gQ2sV2NLuwFJpB4WZ7BZnFJD",
+            "9VCdFMNuUddxpRichH5AVtZgtZXvLwto4VWYaMaKpW3J",
+            "A1zfX5kBQWreVwDFUN22KjCcBBMt1RAuPCCoKqZczdrD",
+            "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw",
+            "AgenTMiC2hvxGebTsgmsD4HHBa8WEcqGFf87iwRRxLo7",
+            "ALeLWphFxNVNXpXFEC4Ssf2Jan1Wki72Us8tXMMrQuQZ",
+            "ARoYcw8G5iKpx73FtZFUpDergSk6SFLDPDiqNxbrthj4",
+            "AV7PjXHL5JXZ1YoYRoN9Dsstg1x2UciBupMCXcJP8gUz",
+            "AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ",
+            "BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj",
+            "BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s",
+            "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw",
+            "C6rJRXMjCz4dRaNBWKHGdCFhU4BjsbkY4qkgnDfJ7SHy",
+            "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+            "CHqnuTkj6sXDFknM652aEFPECZh9qVsBXWkhPohmV9dA",
+            "CLxr3hPwBGZTYW28ybKe1upWU8HTSPD7HVUtExemA5gf",
+            "D6QxXDt6hhcCpto4HiZKkN2YQ2iZRF5R7S3caCHpUsML",
+            "D7Md4MyZFukPP6AErnhDDEYVrytS91sUaEnsjDj9msDR",
+            "EKyrMGEiA6pUEC3TBUXeHgwQFkbWCuxinn72JMBNo7Zk",
+            "EPbCowNs3NJxCogQjnguV38zXaSikkJMZcoBjU2Sobwc",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+            "F1ppSHedBsGGwEKH78JVgoqr4xkQHswtsGGLpgM7bCP2",
+            "F2nCzGoVTQp1x18X1Hy3M48JqCGD4xHYJxiX6fXu1SVG",
+            "FzkaMusramphgC5TEs79f5RCfbdMy1PH7gDqQSP7xzDa",
+            "GDGbYoY6gGyac26T8dXrct6N3k4jVrCmWPDor5AbsuK5",
+            "GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS",
+            "GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR",
+            "GuGi1hEUEpUKpeVvFqvhoYQKibbpqJDUcuMr5iEvitoA",
+            "HcAR1LpgSGFxeLyb1vkhsCuN6AtxQsww3E2pMMXkwHqx",
+            "Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y",
+            "HsC37rNFvJgpfH7y2Y6kqnwEQN4WfdM5FLArWnux5GUs",
+            "Hu6v7CzuGmhMVVWoZCyr4e7gRPkdDB3qxG6AqG6fpSBu",
+            "J7jjNCcg3qbansJjLWvq86q5qgUJNhve3vLSnGBEK4kB",
+            "J7QDYTAuLoH27kZbnKMpPvW6wLUjDTH5Z2LbAfYqAq2q",
+            "J9rxfQowAB45Xnwc5fZCRWCHMEuSDbTjzCFQdQrkGSyV",
+            "jitodontfront111111111111111111111111111111",
+            "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e",
+            "NDHxDztmnJCkSCvA2BRGCbn2X2iR3iFPktCdqY8niv3",
+            "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+            "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+            "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM",
+            "2ciX7vPQDYZe7YA8bgieADdJWeGRkWAKJsNHa8YTnPki",
+            "3rmHSu74h1ZcmAisVcWerTCiRDQbUrBKmcwptYGjHfet",
+            "65ZmLL5QPVeN2dW2TW2LTZzCK3vnjLpHpRj7AzuByvsY",
+            "82NMHVCKwehXgbXMyzL41mvv3sdkypaMCtTxvJ4CtTzm",
+            "8Ks12pbrD6PXxfty1hVQiE9sc289zgU1zHkvXhrSdriF",
+            "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+            "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
+            "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM",
+            "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC",
+            "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+            "TRENCHCfkCTud86C8ZC9kk2CFWJErYz4oZFaYttoxJF",
+            "3y5uHX5whbkayE7SzZ945tsTdPAqUNN15jc3UBzFZ7b7",
+            "Sysvar1nstructions1111111111111111111111111",
+            "7HKc2NAi2Q2ZG3eSN7VJrtBgGi7dNFAz9DLnPNDUncM2",
+            "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
+            "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+            "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
+            "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+            "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
+            "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
+            "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
+            "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+            "HjQjngTDqoHE6aaGhUqfz9aQ7WZcBRjy5xB8PScLSr8i",
+            "2HLoA8PQuxqUfNDVa6kCL8CZ1FkDMcqZZSE3HDEpKqSZ",
+            "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+            "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+            "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",
+        ]
+        .into_iter()
+        .map(|address| Pubkey::from_str(address).expect("deployed ALT fixture address"))
+        .collect();
+        AddressLookupTableAccount {
+            key: parse_pubkey(SHARED_SUPER_LOOKUP_TABLE, "shared lookup table").unwrap(),
+            addresses,
+        }
+    }
 
     fn regular_config() -> crate::config::NormalizedConfig {
         let mut raw = RawConfig {
@@ -3595,15 +3831,16 @@ mod tests {
     }
 
     #[test]
-    fn auto_keeps_auto_format_until_compile_time() {
+    fn auto_now_resolves_to_shared_alt_path() {
         assert_eq!(
             select_native_format("auto", true).expect("format"),
-            NativeTxFormat::Auto
+            NativeTxFormat::V0Alt
         );
         assert_eq!(
-            select_native_format("auto", false).expect("format"),
-            NativeTxFormat::Auto
+            select_native_format("legacy", true).expect("format"),
+            NativeTxFormat::V0Alt
         );
+        assert!(select_native_format("auto", false).is_err());
     }
 
     #[test]
@@ -3655,29 +3892,23 @@ mod tests {
     }
 
     #[test]
-    fn launch_lookup_table_profiles_prioritize_launchdeck_table() {
+    fn launch_lookup_table_profiles_prioritize_shared_super_table() {
         let profiles = default_lookup_table_profiles_for_label("launch");
         assert_eq!(
             profiles[0],
-            vec!["AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ".to_string()]
+            vec!["7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc".to_string()]
         );
-        assert_eq!(
-            profiles[1],
-            vec!["BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj".to_string()]
-        );
+        assert_eq!(profiles.len(), 1);
     }
 
     #[test]
-    fn follow_up_lookup_table_profiles_prioritize_agent_table() {
+    fn follow_up_lookup_table_profiles_prioritize_shared_super_table() {
         let profiles = default_lookup_table_profiles_for_label("agent-setup");
         assert_eq!(
             profiles[0],
-            vec!["BckPpoRV4h329qAuhTCNoWdWAy2pZSJ89Qu3nuCU1zsj".to_string()]
+            vec!["7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc".to_string()]
         );
-        assert_eq!(
-            profiles[1],
-            vec!["AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ".to_string()]
-        );
+        assert_eq!(profiles.len(), 1);
     }
 
     #[test]
@@ -3797,7 +4028,7 @@ mod tests {
     }
 
     #[test]
-    fn buy_instruction_shape_matches_expected_accounts() {
+    fn buy_exact_sol_instruction_shape_matches_expected_accounts() {
         let global = PumpGlobalState {
             fee_recipient: Pubkey::new_unique(),
             initial_virtual_token_reserves: 1_073_000_000_000_000,
@@ -3812,7 +4043,7 @@ mod tests {
         let mint = Pubkey::new_unique();
         let creator = Pubkey::new_unique();
         let user = Pubkey::new_unique();
-        let instruction = build_buy_instruction(
+        let instruction = build_buy_exact_sol_in_instruction(
             &global,
             &mint,
             &creator,
@@ -3824,12 +4055,18 @@ mod tests {
         .expect("buy instruction");
 
         assert_eq!(instruction.program_id.to_string(), PUMP_PROGRAM_ID);
-        assert_eq!(instruction.accounts.len(), 17);
-        assert_eq!(&instruction.data[..8], &[102, 6, 61, 18, 1, 218, 235, 234]);
+        assert_eq!(instruction.accounts.len(), 18);
+        assert_eq!(
+            &instruction.data[..8],
+            &[56, 252, 116, 8, 158, 223, 205, 95]
+        );
+        assert_eq!(&instruction.data[8..16], &100_000_000u64.to_le_bytes());
+        assert_eq!(&instruction.data[16..24], &1_000_000u64.to_le_bytes());
+        assert_eq!(instruction.data[24], 1);
     }
 
     #[test]
-    fn buy_instruction_keeps_fee_accounts_before_bonding_curve_v2() {
+    fn buy_exact_sol_instruction_keeps_fee_accounts_before_bonding_curve_v2() {
         let global = PumpGlobalState {
             fee_recipient: Pubkey::new_unique(),
             initial_virtual_token_reserves: 1_073_000_000_000_000,
@@ -3844,7 +4081,7 @@ mod tests {
         let mint = Pubkey::new_unique();
         let creator = Pubkey::new_unique();
         let user = Pubkey::new_unique();
-        let instruction = build_buy_instruction(
+        let instruction = build_buy_exact_sol_in_instruction(
             &global,
             &mint,
             &creator,
@@ -3866,6 +4103,107 @@ mod tests {
         assert_eq!(
             instruction.accounts[16].pubkey,
             bonding_curve_v2_pda(&mint).expect("bonding curve v2 pda")
+        );
+        assert_eq!(
+            instruction.accounts[17].pubkey,
+            selected_pump_apr28_fee_recipient().expect("Pump April 28 fee recipient")
+        );
+        assert!(instruction.accounts[17].is_writable);
+    }
+
+    #[test]
+    fn bonding_curve_buy_token_slippage_floors_positive_quote_to_one() {
+        assert_eq!(apply_buy_token_slippage(1_000, 0), 1_000);
+        assert_eq!(apply_buy_token_slippage(1_000, 5_000), 500);
+        assert_eq!(apply_buy_token_slippage(1_000, 10_000), 1);
+        assert_eq!(apply_buy_token_slippage(0, 10_000), 0);
+    }
+
+    #[test]
+    fn bonding_curve_exact_sol_buy_quote_math_keeps_spend_fixed() {
+        let global = PumpGlobalState {
+            fee_recipient: Pubkey::new_unique(),
+            initial_virtual_token_reserves: 1_073_000_000_000_000,
+            initial_virtual_sol_reserves: 30_000_000_000,
+            initial_real_token_reserves: 793_100_000_000_000,
+            fee_basis_points: 100,
+            creator_fee_basis_points: 50,
+            fee_recipients: [Pubkey::default(); 7],
+            reserved_fee_recipient: Pubkey::default(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+        };
+        let spend_lamports = 500_000_000;
+        let quoted_tokens = quote_buy_tokens_from_sol(&global, spend_lamports);
+
+        assert!(quoted_tokens > 1);
+        assert_eq!(apply_buy_token_slippage(quoted_tokens, 0), quoted_tokens);
+        assert_eq!(
+            apply_buy_token_slippage(quoted_tokens, 5_000),
+            quoted_tokens / 2
+        );
+        assert_eq!(apply_buy_token_slippage(quoted_tokens, 10_000), 1);
+
+        let instruction = build_buy_exact_sol_in_instruction(
+            &global,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            spend_lamports,
+            apply_buy_token_slippage(quoted_tokens, 10_000),
+            false,
+        )
+        .expect("buy exact sol instruction");
+        assert_eq!(&instruction.data[8..16], &spend_lamports.to_le_bytes());
+    }
+
+    #[test]
+    fn token_mode_dev_buy_exact_sol_quote_preserves_first_buy_token_target() {
+        let mut config = regular_config();
+        config.execution.buySlippagePercent = "100".to_string();
+        config.devBuy = Some(crate::config::NormalizedDevBuy {
+            mode: "tokens".to_string(),
+            amount: "1000".to_string(),
+            source: "test".to_string(),
+        });
+        let global = PumpGlobalState {
+            fee_recipient: Pubkey::new_unique(),
+            initial_virtual_token_reserves: 1_073_000_000_000_000,
+            initial_virtual_sol_reserves: 30_000_000_000,
+            initial_real_token_reserves: 793_100_000_000_000,
+            fee_basis_points: 100,
+            creator_fee_basis_points: 50,
+            fee_recipients: [Pubkey::default(); 7],
+            reserved_fee_recipient: Pubkey::default(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+        };
+        let requested_tokens = 1_000u64 * 10u64.pow(TOKEN_DECIMALS);
+        let (quoted_sol, quoted_tokens) = resolve_dev_buy_quote(&config, &global)
+            .expect("dev buy quote")
+            .expect("token-mode quote");
+
+        assert_eq!(quoted_tokens, requested_tokens);
+        assert!(quote_buy_tokens_from_sol(&global, quoted_sol) >= requested_tokens);
+
+        let instructions = build_launch_instructions(
+            &config,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            None,
+            Some(&global),
+        )
+        .expect("launch instructions");
+        assert_eq!(
+            &instructions[3].data[..8],
+            &[56, 252, 116, 8, 158, 223, 205, 95]
+        );
+        assert_eq!(&instructions[3].data[8..16], &quoted_sol.to_le_bytes());
+        assert_eq!(&instructions[3].data[16..24], &1u64.to_le_bytes());
+        assert_sol_transfer_instruction(
+            &instructions[4],
+            &instructions[0].accounts[5].pubkey,
+            &wrapper_fee_vault(),
+            estimate_sol_in_fee_lamports(quoted_sol, config.wrapperDefaultFeeBps),
         );
     }
 
@@ -3897,7 +4235,7 @@ mod tests {
             build_launch_instructions(&config, mint, creator, launch_creator, None, Some(&global))
                 .expect("launch instructions");
 
-        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions.len(), 5);
         assert_eq!(instructions[0].program_id.to_string(), PUMP_PROGRAM_ID);
         assert_eq!(instructions[1].program_id.to_string(), PUMP_PROGRAM_ID);
         assert_eq!(
@@ -3907,16 +4245,197 @@ mod tests {
         assert_eq!(instructions[3].program_id.to_string(), PUMP_PROGRAM_ID);
         assert_eq!(
             &instructions[3].data[..8],
-            &[102, 6, 61, 18, 1, 218, 235, 234]
+            &[56, 252, 116, 8, 158, 223, 205, 95]
         );
 
-        let quoted_sol_amount =
-            quote_buy_sol_from_tokens(&global, quote_buy_tokens_from_sol(&global, 500_000_000));
-        let expected_max_sol_cost = apply_buy_slippage_buffer(quoted_sol_amount, 500);
+        let quoted_tokens = quote_buy_tokens_from_sol(&global, 500_000_000);
+        let expected_min_tokens_out = apply_buy_token_slippage(quoted_tokens, 500);
+        assert_eq!(&instructions[3].data[8..16], &500_000_000u64.to_le_bytes());
         assert_eq!(
             &instructions[3].data[16..24],
-            &expected_max_sol_cost.to_le_bytes()
+            &expected_min_tokens_out.to_le_bytes()
         );
+        assert_sol_transfer_instruction(&instructions[4], &creator, &wrapper_fee_vault(), 500_000);
+    }
+
+    #[test]
+    fn launch_dev_buy_fee_transfer_is_omitted_when_fee_bps_is_zero() {
+        let mut config = regular_config();
+        config.wrapperDefaultFeeBps = 0;
+        config.execution.buySlippagePercent = "5".to_string();
+        config.devBuy = Some(crate::config::NormalizedDevBuy {
+            mode: "sol".to_string(),
+            amount: "0.5".to_string(),
+            source: "test".to_string(),
+        });
+        let global = PumpGlobalState {
+            fee_recipient: Pubkey::new_unique(),
+            initial_virtual_token_reserves: 1_073_000_000_000_000,
+            initial_virtual_sol_reserves: 30_000_000_000,
+            initial_real_token_reserves: 793_100_000_000_000,
+            fee_basis_points: 100,
+            creator_fee_basis_points: 50,
+            fee_recipients: [Pubkey::default(); 7],
+            reserved_fee_recipient: Pubkey::default(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+        };
+
+        let instructions = build_launch_instructions(
+            &config,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            None,
+            Some(&global),
+        )
+        .expect("launch instructions");
+
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions[3].program_id.to_string(), PUMP_PROGRAM_ID);
+    }
+
+    #[test]
+    fn agent_launch_with_dev_buy_keeps_fee_transfer_after_agent_initialize() {
+        let mut config = regular_config();
+        config.mode = "agent-locked".to_string();
+        config.agent.buybackBps = Some(2_500);
+        config.execution.buySlippagePercent = "5".to_string();
+        config.devBuy = Some(crate::config::NormalizedDevBuy {
+            mode: "sol".to_string(),
+            amount: "0.1".to_string(),
+            source: "test".to_string(),
+        });
+        let global = PumpGlobalState {
+            fee_recipient: Pubkey::new_unique(),
+            initial_virtual_token_reserves: 1_073_000_000_000_000,
+            initial_virtual_sol_reserves: 30_000_000_000,
+            initial_real_token_reserves: 793_100_000_000_000,
+            fee_basis_points: 100,
+            creator_fee_basis_points: 50,
+            fee_recipients: [Pubkey::default(); 7],
+            reserved_fee_recipient: Pubkey::default(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+        };
+        let creator = Pubkey::new_unique();
+        let agent_authority = Pubkey::new_unique();
+
+        let instructions = build_launch_instructions(
+            &config,
+            Pubkey::new_unique(),
+            creator,
+            Pubkey::new_unique(),
+            Some(&agent_authority),
+            Some(&global),
+        )
+        .expect("agent launch instructions");
+
+        assert_eq!(instructions.len(), 6);
+        assert_eq!(instructions[3].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(
+            instructions[4].program_id.to_string(),
+            PUMP_AGENT_PAYMENTS_PROGRAM_ID
+        );
+        assert_sol_transfer_instruction(&instructions[5], &creator, &wrapper_fee_vault(), 100_000);
+    }
+
+    #[test]
+    fn launch_dev_buy_transactions_fit_with_deployed_shared_alt() {
+        // Keep this tied to a fixture of the deployed shared ALT instead of
+        // dynamically adding launch-specific accounts that cannot exist in one global table.
+        let modes = [
+            "regular",
+            "cashback",
+            "agent-unlocked",
+            "agent-locked",
+            "agent-custom",
+        ];
+        let dev_buy_modes = [("sol", "0.5"), ("tokens", "1000")];
+        let global = sample_global();
+
+        for mode in modes {
+            for (dev_buy_mode, amount) in dev_buy_modes {
+                let mut config = regular_config();
+                config.mode = mode.to_string();
+                config.execution.txFormat = "v0-alt".to_string();
+                config.execution.buySlippagePercent = "5".to_string();
+                config.devBuy = Some(crate::config::NormalizedDevBuy {
+                    mode: dev_buy_mode.to_string(),
+                    amount: amount.to_string(),
+                    source: "test".to_string(),
+                });
+                if mode.starts_with("agent-") {
+                    config.agent.buybackBps = Some(2_500);
+                }
+                if mode == "agent-custom" {
+                    config.agent.feeRecipients = vec![
+                        crate::config::NormalizedRecipient {
+                            r#type: Some("agent".to_string()),
+                            address: String::new(),
+                            githubUserId: String::new(),
+                            githubUsername: String::new(),
+                            shareBps: 2_500,
+                        },
+                        crate::config::NormalizedRecipient {
+                            r#type: Some("wallet".to_string()),
+                            address: Pubkey::new_unique().to_string(),
+                            githubUserId: String::new(),
+                            githubUsername: String::new(),
+                            shareBps: 7_500,
+                        },
+                    ];
+                }
+
+                let payer = Keypair::new();
+                let mint = Keypair::new();
+                let agent_authority = mode.starts_with("agent-").then(Pubkey::new_unique);
+                let core_instructions = build_launch_instructions(
+                    &config,
+                    mint.pubkey(),
+                    payer.pubkey(),
+                    payer.pubkey(),
+                    agent_authority.as_ref(),
+                    Some(&global),
+                )
+                .expect("launch instructions");
+                let tx_config = NativeTxConfig {
+                    compute_unit_limit: configured_launch_compute_unit_limit(&config).unwrap(),
+                    compute_unit_price_micro_lamports: config
+                        .tx
+                        .computeUnitPriceMicroLamports
+                        .unwrap_or_default(),
+                    jito_tip_lamports: config.tx.jitoTipLamports,
+                    jito_tip_account: config.tx.jitoTipAccount.clone(),
+                };
+                let instructions = with_tx_settings(
+                    core_instructions,
+                    &tx_config,
+                    &payer.pubkey(),
+                    config.execution.jitodontfront,
+                )
+                .expect("tx settings");
+                let lookup_table = deployed_shared_alt_lookup_table_fixture();
+                let candidate = compile_transaction_candidate(
+                    "launch-fit-test",
+                    NativeTxFormat::V0Alt,
+                    &Hash::new_unique().to_string(),
+                    0,
+                    &payer,
+                    Some(&mint),
+                    instructions,
+                    &tx_config,
+                    &[lookup_table],
+                )
+                .unwrap_or_else(|error| {
+                    panic!("compile failed for mode={mode} dev_buy_mode={dev_buy_mode}: {error}")
+                });
+
+                assert!(
+                    candidate.serialized_len <= 1232,
+                    "mode={mode} dev_buy_mode={dev_buy_mode} deployed shared ALT serialized to {} bytes",
+                    candidate.serialized_len
+                );
+            }
+        }
     }
 
     #[test]
@@ -4360,5 +4879,35 @@ mod tests {
             current_market_cap_quote_units(1_000_000_000_000, 500_000_000, 250_000_000_000),
             2_000_000_000
         );
+    }
+
+    #[test]
+    fn merge_persisted_lookup_table_caches_keeps_entries_from_both_sources() {
+        let merged = merge_persisted_lookup_table_caches([
+            PersistedLookupTableCache {
+                tables: HashMap::from([(
+                    "shared".to_string(),
+                    PersistedLookupTableEntry {
+                        addresses: vec!["A".to_string()],
+                        address_count: None,
+                        content_hash: None,
+                    },
+                )]),
+            },
+            PersistedLookupTableCache {
+                tables: HashMap::from([(
+                    "legacy".to_string(),
+                    PersistedLookupTableEntry {
+                        addresses: vec!["B".to_string()],
+                        address_count: None,
+                        content_hash: None,
+                    },
+                )]),
+            },
+        ]);
+
+        assert_eq!(merged.tables.len(), 2);
+        assert_eq!(merged.tables["shared"].addresses, vec!["A".to_string()]);
+        assert_eq!(merged.tables["legacy"].addresses, vec!["B".to_string()]);
     }
 }

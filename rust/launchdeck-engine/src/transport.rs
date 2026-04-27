@@ -1,6 +1,7 @@
 #![allow(non_snake_case, dead_code)]
 
 use serde::{Deserialize, Serialize};
+use shared_execution_routing::transport::{ProviderRegionConfig, TransportEnvironment};
 use std::env;
 
 use crate::{
@@ -42,12 +43,7 @@ const DEFAULT_JITO_BUNDLE_BASE_URLS: [&str; 9] = [
 ];
 const DEFAULT_ENDPOINT_PROFILE: &str = "global";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JitoBundleEndpoint {
-    pub name: String,
-    pub send: String,
-    pub status: String,
-}
+pub use shared_execution_routing::transport::JitoBundleEndpoint;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloMoonEndpoint {
@@ -88,6 +84,40 @@ pub struct TransportPlan {
     pub warnings: Vec<String>,
 }
 
+pub fn shared_transport_plan(
+    plan: &TransportPlan,
+) -> shared_execution_routing::transport::TransportPlan {
+    shared_execution_routing::transport::TransportPlan {
+        requestedProvider: plan.requestedProvider.clone(),
+        resolvedProvider: plan.resolvedProvider.clone(),
+        requestedEndpointProfile: plan.requestedEndpointProfile.clone(),
+        resolvedEndpointProfile: plan.resolvedEndpointProfile.clone(),
+        executionClass: plan.executionClass.clone(),
+        transportType: plan.transportType.clone(),
+        ordering: plan.ordering.clone(),
+        verified: plan.verified,
+        supportsBundle: plan.supportsBundle,
+        requiresInlineTip: plan.requiresInlineTip,
+        requiresPriorityFee: plan.requiresPriorityFee,
+        separateTipTransaction: plan.separateTipTransaction,
+        skipPreflight: plan.skipPreflight,
+        maxRetries: plan.maxRetries,
+        standardRpcSubmitEndpoints: plan.standardRpcSubmitEndpoints.clone(),
+        helloMoonApiKeyConfigured: plan.helloMoonApiKeyConfigured,
+        helloMoonMevProtect: plan.helloMoonMevProtect,
+        helloMoonQuicEndpoint: plan.helloMoonQuicEndpoint.clone(),
+        helloMoonQuicEndpoints: plan.helloMoonQuicEndpoints.clone(),
+        helloMoonBundleEndpoint: plan.helloMoonBundleEndpoint.clone(),
+        helloMoonBundleEndpoints: plan.helloMoonBundleEndpoints.clone(),
+        heliusSenderEndpoint: plan.heliusSenderEndpoint.clone(),
+        heliusSenderEndpoints: plan.heliusSenderEndpoints.clone(),
+        watchEndpoint: plan.watchEndpoint.clone(),
+        watchEndpoints: plan.watchEndpoints.clone(),
+        jitoBundleEndpoints: plan.jitoBundleEndpoints.clone(),
+        warnings: plan.warnings.clone(),
+    }
+}
+
 fn normalize_provider(provider: &str) -> String {
     if provider.trim().is_empty() {
         "helius-sender".to_string()
@@ -108,6 +138,11 @@ fn first_non_empty_env(keys: &[&str]) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+fn optional_env(keys: &[&str]) -> Option<String> {
+    let value = first_non_empty_env(keys);
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn provider_region_env_key(provider: &str) -> Option<&'static str> {
@@ -144,6 +179,39 @@ pub fn configured_provider_region(provider: &str) -> String {
     provider_region_env_key(provider)
         .map(|key| first_non_empty_env(&[key]))
         .unwrap_or_default()
+}
+
+pub fn transport_environment_snapshot() -> TransportEnvironment {
+    TransportEnvironment {
+        shared_region: configured_shared_region(),
+        provider_regions: ProviderRegionConfig {
+            helius_sender: configured_provider_region("helius-sender"),
+            hellomoon: configured_provider_region("hellomoon"),
+            jito_bundle: configured_provider_region("jito-bundle"),
+        },
+        standard_rpc_submit_endpoints: configured_standard_rpc_submit_endpoints(),
+        solana_rpc_url: optional_env(&["SOLANA_RPC_URL"]),
+        solana_ws_url: optional_env(&["SOLANA_WS_URL"]),
+        helius_rpc_url: optional_env(&["HELIUS_RPC_URL"]),
+        helius_ws_url: optional_env(&["HELIUS_WS_URL"]),
+        helius_sender_endpoint: optional_env(&["HELIUS_SENDER_ENDPOINT"]),
+        helius_sender_base_url: optional_env(&["HELIUS_SENDER_BASE_URL"]),
+        hellomoon_api_key: optional_env(&["HELLOMOON_API_KEY"]),
+        hellomoon_mev_protect: configured_hellomoon_mev_protect(),
+        hellomoon_quic_endpoint: optional_env(&[
+            "HELLOMOON_QUIC_ENDPOINT",
+            "LUNAR_LANDER_QUIC_ENDPOINT",
+        ]),
+        jito_send_bundle_endpoint: optional_env(&["JITO_SEND_BUNDLE_ENDPOINT"]),
+        jito_bundle_status_endpoint: optional_env(&["JITO_BUNDLE_STATUS_ENDPOINT"]),
+        jito_bundle_base_urls: first_non_empty_env(&["JITO_BUNDLE_BASE_URLS"])
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        enable_helius_transaction_subscribe: configured_enable_helius_transaction_subscribe(),
+    }
 }
 
 pub fn default_endpoint_profile() -> String {

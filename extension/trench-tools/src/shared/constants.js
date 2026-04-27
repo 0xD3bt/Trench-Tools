@@ -1,0 +1,8 @@
+export const DEFAULT_HOST_BASE = "http://127.0.0.1:8788";
+export const HOST_STORAGE_KEY = "trenchTools.hostBaseUrl";
+export const HOST_AUTH_TOKEN_STORAGE_KEY = "trenchTools.hostAuthToken";
+export const DEFAULT_LAUNCHDECK_HOST_BASE = "http://127.0.0.1:8789";
+export const LAUNCHDECK_HOST_STORAGE_KEY = "trenchTools.launchdeckHostBaseUrl";
+export const SITE_FEATURES_STORAGE_KEY = "trenchTools.siteFeatures";
+export const OPTIONS_TARGET_SECTION_KEY = "trenchTools.optionsTargetSection";
+export const APPEARANCE_STORAGE_KEY = "trenchTools.appearance";

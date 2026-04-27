@@ -1,0 +1,1621 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    "Geist",
+    "Manrope",
+    "SF Pro Rounded",
+    "SF Pro Display",
+    "SF Pro Text",
+    "Inter",
+    "Segoe UI Variable Display",
+    "Segoe UI Variable",
+    "Segoe UI",
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+  font-feature-settings:
+    "cv11" 1,
+    "ss01" 1,
+    "ss03" 1,
+    "cv02" 1;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  --tt-bg: #050505;
+  --tt-surface: #0a0a0a;
+  --tt-surface-2: #111111;
+  --tt-border: rgba(255, 255, 255, 0.06);
+  --tt-border-strong: rgba(255, 255, 255, 0.12);
+  --tt-text: #ffffff;
+  --tt-muted: #dcdce2;
+  --tt-muted-2: #9a9aa2;
+  --tt-divider: rgba(255, 255, 255, 0.06);
+  --tt-buy: #2fe3ac;
+  --tt-buy-bright: #6ff0c8;
+  --tt-buy-deep: #20c191;
+  --tt-buy-bg: #0c2a20;
+  --tt-sell: #ec397a;
+  --tt-sell-bright: #f370a0;
+  --tt-sell-deep: #c81f60;
+  --tt-sell-bg: #2a0d18;
+  --tt-positive: #e5e7eb;
+  --tt-negative: #e5e7eb;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--tt-bg);
+  color: var(--tt-text);
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.panel-shell {
+  width: 100%;
+  height: max-content;
+  box-sizing: border-box;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--tt-bg);
+  overflow: hidden;
+  position: relative;
+  border-radius: 12px;
+}
+
+
+.modal-topbar,
+.header-main,
+.header-row,
+.window-actions,
+.custom-action-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.modal-topbar {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin: 0 -12px;
+  /* Slightly larger right padding so the wallet/settings/minimize icons
+     don't sit flush against the panel's right edge. The brand logo on the
+     left absorbs the smaller left padding via its own negative margin. */
+  padding: 0 10px 8px 4px;
+  border-bottom: 1px solid var(--tt-divider);
+  position: relative;
+}
+
+.header-row {
+  justify-content: space-between;
+}
+
+.header-main {
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+
+.window-actions {
+  gap: 2px;
+}
+
+.brand-logo {
+  width: 48px;
+  height: 48px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  margin: -10px -6px -10px -2px;
+}
+
+.brand-copy {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  line-height: 1;
+}
+
+.brand-copy strong {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: #ffffff;
+  background: linear-gradient(180deg, #ffffff 0%, #b8b8bf 140%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.version-text {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--tt-muted-2);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+}
+
+.version-text.is-waiting {
+  color: var(--tt-muted-2);
+  opacity: 0.55;
+}
+
+
+.window-button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--tt-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font: inherit;
+  border-radius: 6px;
+  transition: background-color 0.18s ease;
+}
+
+.window-button svg,
+.wallet-button-icon,
+.settings-button-icon,
+.minimize-button-icon {
+  width: 22px;
+  height: 22px;
+  display: block;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+  opacity: 1;
+  transition: opacity 0.16s ease;
+}
+
+.window-button:hover .wallet-button-icon,
+.window-button:hover .settings-button-icon,
+.window-button:hover .minimize-button-icon,
+.window-button:hover svg {
+  opacity: 0.85;
+}
+
+.close-button-icon {
+  display: block;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+  opacity: 0.78;
+  transition: opacity 0.16s ease;
+}
+
+.window-button:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.window-button:hover img {
+  opacity: 0.95;
+}
+
+.window-button:active {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.panel-settings-menu {
+  position: absolute;
+  top: 42px;
+  right: 34px;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px;
+  border-radius: 4px;
+  border: 1px solid var(--tt-border-strong);
+  background: rgba(10, 10, 10, 0.98);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
+  z-index: 20;
+}
+
+.panel-settings-menu.hidden {
+  display: none;
+}
+
+.panel-settings-menu-item {
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--tt-text);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 0.14s ease;
+}
+
+.panel-settings-menu-item:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.panel-settings-menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.panel-settings-menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--tt-border, rgba(255, 255, 255, 0.08));
+}
+
+.panel-settings-menu-flyout-host {
+  position: relative;
+  display: block;
+}
+
+.panel-settings-menu-item--with-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.panel-settings-menu-item-arrow {
+  color: var(--tt-text-muted, rgba(255, 255, 255, 0.55));
+  font-size: 14px;
+  line-height: 1;
+  visibility: hidden;
+}
+
+.panel-settings-menu-flyout-host.is-hideable .panel-settings-menu-item-arrow {
+  visibility: visible;
+}
+
+/* The flyout chip list is rendered as a host-page overlay in
+   content/index.js (see panel-flyout-* messages) so it can extend beyond the
+   iframe's bounds without being clipped. The .is-open class on the host
+   here is purely cosmetic (e.g. arrow highlight) while the cursor is over
+   the in-iframe trigger. */
+.panel-settings-menu-flyout-host.is-open .panel-settings-menu-item {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+#preset-chip-row.is-hidden,
+#wallet-group-chips.is-hidden,
+.section-divider.is-hidden {
+  display: none;
+}
+
+
+[data-tooltip] {
+  position: relative;
+}
+
+[data-tooltip]::before,
+[data-tooltip]::after {
+  position: absolute;
+  left: 50%;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: 80;
+}
+
+[data-tooltip]::before {
+  content: attr(data-tooltip);
+  min-width: max-content;
+  max-width: 180px;
+  padding: 6px 9px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--tt-border-strong);
+  background: #000000;
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  transform: translateX(-50%);
+}
+
+[data-tooltip]::after {
+  content: "";
+  width: 6px;
+  height: 6px;
+  background: #000000;
+  border-left: 1px solid var(--tt-border-strong);
+  border-top: 1px solid var(--tt-border-strong);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+[data-tooltip][data-tooltip-position="top"]::before {
+  bottom: calc(100% + 6px);
+}
+
+[data-tooltip][data-tooltip-position="top"]::after {
+  bottom: calc(100% + 2px);
+}
+
+[data-tooltip][data-tooltip-position="bottom"]::before {
+  top: calc(100% + 6px);
+}
+
+[data-tooltip][data-tooltip-position="bottom"]::after {
+  top: calc(100% + 2px);
+  transform: translateX(-50%) rotate(225deg);
+}
+
+[data-tooltip]:hover::before,
+[data-tooltip]:hover::after,
+[data-tooltip]:focus-visible::before,
+[data-tooltip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+}
+
+#drag-handle {
+  cursor: move;
+  user-select: none;
+}
+
+#drag-handle button {
+  cursor: pointer;
+}
+
+
+.panel-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  padding-top: 0;
+  min-height: 0;
+}
+
+.panel-flow > * {
+  flex-shrink: 0;
+}
+
+.engine-status-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  background: #080808;
+  color: #fafafa;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+}
+
+.engine-status-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.engine-status-copy strong {
+  color: #fafafa;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+}
+
+.engine-status-copy span {
+  color: #a1a1aa;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.engine-status-retry {
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #fafafa;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color 0.14s ease,
+    color 0.14s ease;
+}
+
+.engine-status-retry:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.section-divider {
+  width: 100%;
+  height: 1px;
+  background: var(--tt-divider);
+  margin: 0;
+}
+
+.panel-flow > .section-divider {
+  flex: 0 0 auto;
+  min-height: 1px;
+  height: 1px;
+  margin: 6px 0;
+  background: transparent;
+  position: relative;
+}
+
+.panel-flow > .section-divider::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--tt-divider);
+}
+
+.panel-divider {
+  display: none;
+}
+
+.panel-flow .panel-divider.balance-section-divider {
+  display: block;
+  width: 100%;
+  height: 1px;
+  background: var(--tt-divider);
+  margin: 3px 0 2px;
+}
+
+
+.compact-chip-row {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding-bottom: 0;
+  align-items: center;
+}
+
+.compact-chip-row::-webkit-scrollbar {
+  display: none;
+}
+
+.header-section-label {
+  display: none;
+}
+
+/* Preset + wallet-group chip rows — pill style, drag-to-scroll */
+
+.slider-viewport {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+.slider-viewport > #preset-chip-row,
+.slider-viewport > #wallet-group-chips {
+  width: 100%;
+}
+
+.slider-arrow {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  transform: translateY(-50%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.slider-arrow::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-top: 1.5px solid currentColor;
+  border-right: 1.5px solid currentColor;
+  display: block;
+}
+
+.slider-arrow-left {
+  left: 2px;
+}
+
+.slider-arrow-left::before {
+  transform: rotate(-135deg);
+  margin-left: 2px;
+}
+
+.slider-arrow-right {
+  right: 2px;
+}
+
+.slider-arrow-right::before {
+  transform: rotate(45deg);
+  margin-right: 2px;
+}
+
+.slider-viewport::before,
+.slider-viewport::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 24px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 2;
+}
+
+.slider-viewport::before {
+  left: 0;
+  background: linear-gradient(to right, var(--tt-bg) 0%, rgba(5, 5, 5, 0) 100%);
+}
+
+.slider-viewport::after {
+  right: 0;
+  background: linear-gradient(to left, var(--tt-bg) 0%, rgba(5, 5, 5, 0) 100%);
+}
+
+.slider-viewport.can-scroll-left::before,
+.slider-viewport.can-scroll-left .slider-arrow-left {
+  opacity: 1;
+}
+
+.slider-viewport.can-scroll-right::after,
+.slider-viewport.can-scroll-right .slider-arrow-right {
+  opacity: 1;
+}
+
+#preset-chip-row,
+#wallet-group-chips {
+  display: flex;
+  gap: 4px;
+  padding: 2px 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  align-items: center;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  scroll-behavior: auto;
+  overscroll-behavior-x: contain;
+  touch-action: pan-x;
+  cursor: grab;
+  user-select: none;
+}
+
+#preset-chip-row::-webkit-scrollbar,
+#wallet-group-chips::-webkit-scrollbar {
+  display: none;
+}
+
+#preset-chip-row.is-dragging,
+#wallet-group-chips.is-dragging {
+  cursor: grabbing;
+}
+
+#preset-chip-row.is-dragging *,
+#wallet-group-chips.is-dragging * {
+  pointer-events: none;
+}
+
+#preset-chip-row .compact-chip-button,
+#wallet-group-chips .compact-chip-button {
+  min-height: 26px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--tt-border);
+  background: var(--tt-surface);
+  color: var(--tt-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease,
+    border-color 0.16s ease;
+}
+
+#preset-chip-row .compact-chip-button:hover,
+#wallet-group-chips .compact-chip-button:hover {
+  background: var(--tt-surface-2);
+  color: #ffffff;
+}
+
+#preset-chip-row .compact-chip-button.active-chip,
+#wallet-group-chips .compact-chip-button.active-chip {
+  background: #ffffff;
+  border-color: #ffffff;
+  color: #050505;
+}
+
+#preset-chip-row .compact-chip-button.overflow-chip,
+#wallet-group-chips .compact-chip-button.overflow-chip {
+  color: var(--tt-muted-2);
+}
+
+
+.quick-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+input,
+select,
+button {
+  font: inherit;
+}
+
+input,
+select {
+  width: 100%;
+  box-sizing: border-box;
+  border-radius: 6px;
+  border: 1px solid var(--tt-border);
+  background: var(--tt-surface);
+  color: var(--tt-text);
+  padding: 7px 10px;
+  font-size: 12px;
+  outline: none;
+}
+
+input::placeholder {
+  color: var(--tt-muted-2);
+  font-size: 12px;
+}
+
+input:focus,
+select:focus {
+  border-color: var(--tt-border-strong);
+  background: var(--tt-surface-2);
+}
+
+
+.primary-button,
+.secondary-button,
+.danger-button,
+.shortcut-button {
+  min-height: 34px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  /* Bold (700) keeps the value text legible on the bright green / pink
+     button fills; semibold washed out at 14px against the saturated bg. */
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.005em;
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings:
+    "tnum" 1,
+    "zero" 1,
+    "ss01" 1,
+    "ss03" 1,
+    "cv11" 1;
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background-color 0.14s ease,
+    color 0.14s ease,
+    transform 0.06s ease;
+}
+
+.button-unit-icon {
+  width: 12px;
+  height: 12px;
+  object-fit: contain;
+  display: inline-block;
+  vertical-align: middle;
+  flex: 0 0 auto;
+}
+
+
+.primary-button,
+.buy-shortcut {
+  background: #2fe3ac;
+  color: #04140e;
+}
+
+.primary-button:hover,
+.buy-shortcut:hover:not(:disabled) {
+  background: #5eecbd;
+  color: #04140e;
+}
+
+.buy-shortcut.active {
+  background: #20c191;
+  color: #04140e;
+}
+
+.secondary-button,
+.sell-shortcut {
+  background: #ec397a;
+  color: #1a0612;
+}
+
+.secondary-button:hover,
+.sell-shortcut:hover:not(:disabled) {
+  background: #f370a0;
+  color: #1a0612;
+}
+
+.sell-shortcut.active {
+  background: #c81f60;
+  color: #1a0612;
+}
+
+.shortcut-button {
+  padding: 0 8px;
+}
+
+/* Legacy small-label support — older button shapes had a stacked
+   value + label. The new shortcut markup uses `.shortcut-value-with-icon`
+   which is `inline-flex`, so we explicitly avoid forcing it to `block`
+   (otherwise the wrapper collapses and the SOL/% icon stacks on top of
+   the value instead of sitting next to it). */
+.shortcut-button > small {
+  display: block;
+}
+
+.shortcut-value-with-icon,
+.value-with-unit-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 5px;
+  white-space: nowrap;
+  /* Lock the wrapper to a single line at its declared font-size so the
+     icon (14px) and the value text share the same optical baseline.
+     Without this the % / SOL glyphs visually drift up because the text's
+     line-box is taller than the icon's intrinsic height. */
+  line-height: 1;
+}
+
+.shortcut-value-with-icon > span,
+.value-with-unit-icon > span {
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+
+.shortcut-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.shortcut-button:active:not(:disabled),
+.primary-button:active,
+.secondary-button:active {
+  transform: scale(0.97);
+}
+
+.danger-button {
+  background: #1a0909;
+  color: #fca5a5;
+  font-weight: 700;
+}
+
+.link-button {
+  background: transparent;
+  color: var(--tt-muted);
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+
+.custom-action-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.custom-action-row > * {
+  flex: 1 1 0;
+}
+
+.custom-action-row > .compact-input,
+.custom-action-row > .compact-input-shell {
+  flex: 1 1 auto;
+}
+
+.custom-action-row > .compact-button {
+  flex: 0 0 88px;
+  width: 88px;
+  min-width: 88px;
+}
+
+.compact-input-shell {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.compact-input {
+  flex: 1 1 auto;
+  min-height: 34px;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+.compact-input.has-lead-icon {
+  padding-left: 28px;
+}
+
+.input-lead-icon {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  color: var(--tt-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  z-index: 1;
+}
+
+.input-lead-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0.85;
+  filter: brightness(0) invert(1);
+}
+
+.input-lead-icon-text {
+  color: var(--tt-muted);
+  font-size: 13px;
+}
+
+.input-placeholder-with-icon {
+  position: absolute;
+  left: 28px;
+  top: 0;
+  bottom: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 18px);
+  color: var(--tt-muted-2);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.inline-placeholder-icon {
+  width: 11px;
+  height: 11px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  opacity: 0.7;
+}
+
+.compact-input-shell .compact-input:focus + .input-placeholder-with-icon,
+.compact-input-shell .compact-input:not(:placeholder-shown) + .input-placeholder-with-icon {
+  opacity: 0;
+}
+
+
+.sell-combo-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px minmax(0, 1fr) 72px;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.sell-combo-row .compact-input,
+.sell-combo-row .compact-input-shell {
+  min-width: 0;
+}
+
+.sell-combo-row .compact-button {
+  flex: 0 0 72px;
+  width: 72px;
+  min-width: 72px;
+  padding: 0 8px;
+}
+
+
+.option-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+  gap: 0;
+  width: 100%;
+  min-height: 22px;
+  color: var(--tt-muted);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 2px;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+}
+
+
+.unit-icon {
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+  display: block;
+  flex: 0 0 auto;
+  transform: translateY(0.5px);
+}
+
+.buy-shortcut .unit-icon {
+  filter: brightness(0);
+  opacity: 0.85;
+}
+
+.unit-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  color: currentColor;
+  transform: translateY(0.5px);
+}
+
+.option-inline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 0;
+  flex: 1 1 0;
+  text-align: center;
+  padding: 6px 0;
+}
+
+.option-inline.icon-only {
+  gap: 0;
+}
+
+.option-inline.icon-only .option-inline-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.option-inline-icon,
+.option-inline-icon-text {
+  width: 11px;
+  height: 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.option-inline-icon {
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+  opacity: 0.8;
+}
+
+.option-inline-icon[src$="lighting-icon.png"] {
+  transform: translateX(-10px);
+}
+
+.option-inline-icon.is-enabled {
+  opacity: 1;
+  filter: brightness(0) invert(1) drop-shadow(0 0 4px rgba(255, 255, 255, 0.28));
+}
+
+.option-inline-icon.is-disabled {
+  opacity: 0.32;
+}
+
+.option-inline-icon-text {
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.option-inline-value {
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.option-separator {
+  color: transparent;
+  font-size: 0;
+  line-height: 0;
+  flex: 0 0 auto;
+  width: 1px;
+  margin: 0 3px;
+  position: relative;
+}
+
+.option-separator::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 1px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+
+.balance-stats-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.6fr);
+  grid-auto-rows: 1fr;
+  gap: 0;
+  margin: 0 -12px -12px;
+  padding: 0;
+  flex: 0 0 auto;
+  min-height: 36px;
+  max-height: 36px;
+  align-items: stretch;
+  border-top: 1px solid var(--tt-divider);
+}
+
+.balance-stat {
+  min-width: 0;
+  padding: 0 10px;
+  display: flex;
+  flex-direction: row;
+  gap: 5px;
+  align-items: center;
+  justify-content: flex-start;
+  text-align: left;
+  border: 0;
+  position: relative;
+}
+
+.balance-stat + .balance-stat::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.balance-stat-label {
+  display: none;
+}
+
+.balance-stat-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.balance-stat-icon {
+  width: 14px;
+  height: 14px;
+  display: inline-block;
+  flex: 0 0 auto;
+  background-color: currentColor;
+  mask-image: url("../../assets/sol-icon-white.png");
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  -webkit-mask-image: url("../../assets/sol-icon-white.png");
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  opacity: 0.9;
+}
+
+.balance-stat-value {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.005em;
+  font-variant-numeric: tabular-nums slashed-zero;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+}
+
+.balance-stat-detail {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.1;
+  /* No opacity reduction — over the bright green/pink PnL background the dark
+     text needs full opacity to stay legible. The chip's own `color` token
+     (#04140e or #1a0612) supplies the near-black hue. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+
+.balance-stat-buy {
+  color: #04140e;
+  background: #2fe3ac;
+}
+
+.balance-stat-sell {
+  color: #1a0612;
+  background: #ec397a;
+}
+
+.balance-stat-hold {
+  /* Solid light grey-white fill matching the saturated solid fills on the
+     buy/sell/PnL chips around it — keeps the row visually consistent.
+     Dark text on top for high contrast against the bright background. */
+  color: #0a0a0a;
+  background: #d4d4d8;
+}
+
+.balance-stat-pnl {
+  color: #04140e;
+  background: #2fe3ac;
+}
+
+.balance-stat-pnl.is-negative {
+  color: #1a0612;
+  background: #ec397a;
+}
+
+.balance-stat-pnl .balance-stat-value.is-negative,
+.balance-stat-pnl.is-negative,
+.balance-stat-pnl .balance-stat-detail.is-negative {
+  color: #1a0612;
+}
+
+
+.hidden {
+  display: none;
+}
+
+.wallet-modal.hidden {
+  display: none;
+}
+
+h2,
+strong {
+  margin: 0;
+}
+
+h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.wallet-modal {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 36px 8px 8px;
+  background: rgba(0, 0, 0, 0.78);
+}
+
+.wallet-modal-card {
+  width: 100%;
+  max-height: 100%;
+  border-radius: 5px;
+  border: 1px solid var(--tt-border-strong);
+  background: var(--tt-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.4);
+  min-height: 0;
+}
+
+.wallet-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+
+.wallet-section.is-hidden {
+  display: none;
+}
+
+/* Separator only renders when section 1 (holders) is actually visible.
+   When holders is hidden via .is-hidden, the regular section is the only
+   one shown and shouldn't carry an orphan top border. */
+.wallet-section:not(.is-hidden) + .wallet-section {
+  border-top: 1px solid var(--tt-divider);
+  padding-top: 6px;
+  margin-top: 2px;
+}
+
+.wallet-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  /* Keep all action items + the inline close on a single line so the X stays
+     anchored to the right edge of the actions row (i.e. the top-right
+     corner of the visible section). */
+  flex-wrap: nowrap;
+}
+
+.wallet-action-icon {
+  width: 11px;
+  height: 11px;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+  opacity: 0.85;
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+
+.wallet-modal-action,
+.wallet-modal-close {
+  border: 1px solid var(--tt-border-strong);
+  background: var(--tt-surface-2);
+  color: var(--tt-text);
+  border-radius: 3px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.wallet-modal-action {
+  min-height: 26px;
+  padding: 0 9px;
+  font-size: 10px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease;
+}
+
+.wallet-modal-action:hover {
+  background: #181818;
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.wallet-modal-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.wallet-modal-close {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.16s ease;
+}
+
+
+.wallet-modal-close--inline {
+  margin-left: auto;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  background: transparent;
+  border: 0;
+}
+
+.wallet-modal-close--inline .close-button-icon {
+  width: 18px;
+  height: 18px;
+  opacity: 0.72;
+  transition: opacity 0.14s ease;
+}
+
+.wallet-modal-close--inline:hover {
+  background: transparent;
+}
+
+.wallet-modal-close--inline:hover .close-button-icon {
+  opacity: 1;
+}
+
+.wallet-modal-close--inline:active .close-button-icon {
+  opacity: 0.85;
+}
+
+.wallet-picker-list {
+  min-height: 0;
+  max-height: 220px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.35) transparent;
+}
+
+#wallet-holders-list {
+  max-height: 140px;
+}
+
+.wallet-picker-list::-webkit-scrollbar {
+  width: 5px;
+}
+
+.wallet-picker-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.wallet-picker-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.wallet-picker-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.wallet-picker-row {
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  color: #ffffff;
+  padding: 7px 8px;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  text-align: left;
+  position: relative;
+  transition: background-color 0.14s ease;
+}
+
+.wallet-picker-row.has-token {
+  grid-template-columns: 16px minmax(0, 1fr) auto auto;
+}
+
+.wallet-picker-row + .wallet-picker-row::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 0;
+  height: 1px;
+  background: var(--tt-divider);
+}
+
+.wallet-picker-row:hover,
+.wallet-picker-row:focus-visible {
+  background: rgba(255, 255, 255, 0.04);
+  outline: none;
+}
+
+/* Subtle tint on selected/prioritized rows so the active set reads at a
+   glance without competing with the hover state. */
+.wallet-picker-row.is-selected,
+.wallet-picker-row.is-prioritized {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.wallet-picker-row.is-selected:hover,
+.wallet-picker-row.is-selected:focus-visible,
+.wallet-picker-row.is-prioritized:hover,
+.wallet-picker-row.is-prioritized:focus-visible {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.wallet-picker-checkbox {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: #0b0b0b;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease;
+}
+
+.wallet-picker-checkbox-dot {
+  display: none;
+}
+
+.wallet-picker-checkbox.is-selected {
+  border-color: #ffffff;
+  background: #ffffff;
+}
+
+.wallet-picker-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wallet-picker-name {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wallet-picker-meta {
+  color: var(--tt-muted);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.wallet-picker-balance {
+  min-width: 48px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--tt-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.wallet-picker-balance.has-balance {
+  color: #ffffff;
+}
+
+.wallet-balance-sol-icon {
+  width: 11px;
+  height: 11px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+
+.wallet-picker-token {
+  min-width: 54px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #ffffff;
+  padding-left: 4px;
+}
+
+.wallet-token-icon {
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  object-fit: cover;
+  flex: 0 0 auto;
+  background: linear-gradient(135deg, #7c4dff 0%, #ff4da6 50%, #ffc24d 100%);
+  display: inline-block;
+}
+
+.wallet-picker-empty {
+  border-radius: 10px;
+  border: 1px solid var(--tt-border);
+  background: var(--tt-surface);
+  color: var(--tt-muted);
+  padding: 12px;
+  text-align: center;
+  font-size: 11px;
+}
+
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #a1a1aa;
+  font-size: 12px;
+}
+
+select[multiple] {
+  min-height: 110px;
+}
+
+
+.execution-summary-bar {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.execution-summary-item {
+  min-width: 0;
+  border-radius: 6px;
+  border: 1px solid var(--tt-border);
+  background: var(--tt-surface);
+  padding: 6px;
+}
+
+.execution-summary-item span {
+  display: block;
+  color: var(--tt-muted);
+  font-size: 9px;
+  margin-bottom: 2px;
+}
+
+.execution-summary-item strong {
+  display: block;
+  color: #f8fafc;
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

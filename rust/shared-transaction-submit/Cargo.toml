@@ -1,0 +1,24 @@
+[package]
+name = "shared-transaction-submit"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["shared-transaction-submit-internal"]
+shared-transaction-submit-internal = []
+
+[dependencies]
+base64 = { workspace = true }
+bincode = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-sdk = { workspace = true }
+tokio = { workspace = true }
+shared-execution-routing = { path = "../shared-execution-routing" }
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+lunar-lander-quic-client = { git = "https://github.com/hellomoon-io/lunar-lander-quic-client-rs" }
+
+[dev-dependencies]
+axum = { workspace = true }

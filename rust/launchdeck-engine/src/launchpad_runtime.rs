@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 use crate::{
     bags_native::BagsFeeRecipientLookupResponse,
+    bonk_native::bonk_startup_warm_defaults_cached,
     config::NormalizedConfig,
     launchpad_dispatch::{
         LaunchpadStartupWarmResult, NativeLaunchArtifacts, launchpad_action_backend,
@@ -13,6 +14,9 @@ use crate::{
     pump_native::LaunchQuote,
     transport::TransportPlan,
 };
+use tokio::time::{Duration, sleep};
+
+const BONK_STARTUP_WARM_OFFSET_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
 pub struct NativeLaunchCompileRequest<'a> {
@@ -85,7 +89,9 @@ fn pump_startup_warm_payload(
             (error.clone(), error)
         }
         Ok(None) => {
-            let error = startup_warm_error_payload("Pump startup warm payload was unavailable.".to_string());
+            let error = startup_warm_error_payload(
+                "Pump startup warm payload was unavailable.".to_string(),
+            );
             (error.clone(), error)
         }
         Err(error) => {
@@ -101,7 +107,9 @@ fn bonk_startup_warm_payload(result: Result<Option<LaunchpadStartupWarmResult>, 
         Ok(Some(other)) => startup_warm_error_payload(format!(
             "Unexpected startup warm payload for bonk launchpad: {other:?}"
         )),
-        Ok(None) => startup_warm_error_payload("Bonk startup warm payload was unavailable.".to_string()),
+        Ok(None) => {
+            startup_warm_error_payload("Bonk startup warm payload was unavailable.".to_string())
+        }
         Err(error) => startup_warm_error_payload(error),
     }
 }
@@ -117,7 +125,9 @@ fn bags_startup_warm_payload(result: Result<Option<LaunchpadStartupWarmResult>, 
         Ok(Some(other)) => startup_warm_error_payload(format!(
             "Unexpected startup warm payload for bagsapp launchpad: {other:?}"
         )),
-        Ok(None) => startup_warm_error_payload("Bags startup warm payload was unavailable.".to_string()),
+        Ok(None) => {
+            startup_warm_error_payload("Bags startup warm payload was unavailable.".to_string())
+        }
         Err(error) => startup_warm_error_payload(error),
     }
 }
@@ -127,7 +137,12 @@ pub async fn warm_launchpads_for_startup(
 ) -> Result<StartupWarmLaunchpadPayloads, String> {
     let (pump, bonk, bags) = tokio::join!(
         warm_launchpad_for_startup("pump", rpc_url),
-        warm_launchpad_for_startup("bonk", rpc_url),
+        async {
+            if !bonk_startup_warm_defaults_cached() {
+                sleep(Duration::from_millis(BONK_STARTUP_WARM_OFFSET_MS)).await;
+            }
+            warm_launchpad_for_startup("bonk", rpc_url).await
+        },
         warm_launchpad_for_startup("bagsapp", rpc_url),
     );
     let (lookup_tables, pump_global) = pump_startup_warm_payload(pump);
@@ -159,9 +174,7 @@ pub async fn compile_native_launch(
     .await
 }
 
-pub async fn quote_launch(
-    request: LaunchQuoteRequest<'_>,
-) -> Result<Option<LaunchQuote>, String> {
+pub async fn quote_launch(request: LaunchQuoteRequest<'_>) -> Result<Option<LaunchQuote>, String> {
     quote_launch_for_launchpad(
         request.rpc_url,
         request.launchpad,

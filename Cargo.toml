@@ -1,3 +1,43 @@
 [workspace]
-members = ["rust/launchdeck-engine"]
+members = [
+    "rust/launchdeck-engine",
+    "rust/execution-engine",
+    "rust/shared-auth",
+    "rust/shared-extension-runtime",
+    "rust/shared-fee-market",
+    "rust/shared-execution-routing",
+    "rust/shared-transaction-submit",
+]
+# The on-chain fee-routing program lives outside this public workspace.
+# It is intentionally NOT a workspace member so that public CI and
+# cargo commands from the repo root never need the private source.
 resolver = "3"
+
+# Shared dependency versions for the Rust workspace.
+[workspace.dependencies]
+axum = { version = "0.8", features = ["multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dotenvy = "0.15"
+bs58 = "0.5"
+base64 = "0.22.1"
+bincode = "1"
+sha2 = "0.10"
+solana-sdk = "4.0.1"
+solana-system-interface = { version = "3.1.0", features = ["bincode"] }
+spl-associated-token-account = "8.0.0"
+spl-token = "9.0.0"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+fs2 = "0.4"
+
+# Release profile tuning for the long-lived host binaries.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+debug = false
+panic = "abort"
