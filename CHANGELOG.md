@@ -7,14 +7,54 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-09
+
 ### Added
 
-- Documentation for current extension popup, Axiom surfaces, token split/consolidate, live PnL controls, and route prewarm behavior.
-- Documentation for current execution route coverage, including Raydium CPMM, Raydium LaunchLab, Meteora DBC/DAMM v2, wrapper v3 notes, and route metrics.
+- Native execution-engine routing and compilation for Raydium CPMM and Raydium LaunchLab SOL routes.
+- Expanded Raydium AMM v4, CPMM, LaunchLab, Meteora, Pump, Bonk, Bags, wrapper, and trusted-stable route classification and compile coverage.
+- Broader Meteora DBC and DAMM v2 support across launchpad routes instead of only Bags-specific Meteora paths.
+- USDC swap route support for compatible stable and launchpad swap flows.
+- Route planning and compile metrics for route-family timing, RPC usage, warm-hit behavior, and route diagnostics.
+- Runtime diagnostics collection for local services, RPC endpoints, websocket endpoints, auth token state, and startup health checks.
+- Extension popup controls for quick-buy amount, active preset selection, wallet group selection, and manual wallet selection.
+- Axiom surface support refinements across Pulse, token detail, watchlist, wallet tracker, and token distribution flows.
+- Extension background diagnostics storage and richer runtime status/event plumbing.
+- Rewards page and claim flow for checking and claiming supported wallet rewards across enabled wallets.
+- Token split and consolidate transfer execution through the selected preset provider, endpoint profile, priority fee, and inline tip path for Helius Sender and Hello Moon presets.
+- LaunchDeck vanity-key pool support and improved native metadata/upload handling for Pump, Bonk, and Bags launch flows.
+- Follow daemon capacity, compile/send concurrency, transport timing, and market-cap trigger controls.
+- Bonk USD1 route setup, top-up, sell-to-SOL, and quote-asset execution support.
+- Dexscreener and provider/fee/slippage asset coverage in the extension bundle.
+- Shared Raydium LaunchLab support crate and updated shared transaction-submit support for low-latency providers.
 
 ### Changed
 
-- Refreshed LaunchDeck, environment, and configuration docs for native metadata defaults, Pump/Bonk vanity queues, Bonk USD1 behavior, Bags prepare flow, follow daemon capacity/offset behavior, and newer route-family safety switches.
+- Bumped the browser extension package and manifest to `1.1.0`.
+- Improved warm-route lifecycle handling, prewarm cache matching, route invalidation, and background warm controls per route family.
+- Reworked provider routing and submission behavior for Helius Sender, Hello Moon QUIC/bundle paths, priority fees, tips, skip-preflight behavior, and confirmation tracking.
+- Improved auto-fee fallback behavior and provider-specific tip handling.
+- Refined Pump bonding-curve compile behavior to freshen creator-vault authority at compile time.
+- Improved Axiom route extraction, pair/mint handling, UI blockers/overrides, panel behavior, and site-feature toggles.
+- Expanded balance streaming, wallet-token caching, trade ledger updates, and live PnL handling.
+- Refined LaunchDeck Pump, Bonk, Bags, wrapper, follow, prelaunch setup, and runtime dispatch behavior.
+- Updated startup scripts with clearer service readiness output, runtime health checks, tunnel guidance, and optional final diagnostics.
+- Simplified root package dependencies and moved the extension into an npm workspace.
+- Expanded `.env.example` and `.env.advanced` runtime switches for route families, warm paths, provider behavior, Bonk USD1 tuning, follow capacity, and Pump creator-vault retry control.
+
+### Fixed
+
+- Added one-shot forced-fresh retry for Pump bonding-curve `Custom(2006)` creator-vault seed races.
+- Fixed stale warmed Pump creator-vault authority usage by resolving the current creator-vault authority during compile.
+- Improved fail-closed behavior for unsupported or non-canonical pair/pool inputs.
+- Improved token distribution sends so split/consolidate no longer default to standard RPC with no preset fee policy.
+- Improved runtime status, diagnostics, and local auth error reporting in the extension and startup flow.
+
+### Removed
+
+- Removed obsolete extension icon assets that were replaced by the current provider/fee/slippage assets.
+- Removed the old extension Axiom smoke script entry.
+- Removed unused root package dependencies that are no longer required by the runtime scripts.
 
 ## [1.0.0] - 2026-04-27
 
