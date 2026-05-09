@@ -85,6 +85,21 @@ pub fn bags_session_path() -> PathBuf {
     local_root_dir().join("bags-session.json")
 }
 
+pub fn vanity_dir() -> PathBuf {
+    local_root_dir().join("vanity")
+}
+
+pub fn vanity_queue_path(launchpad: &str) -> PathBuf {
+    vanity_dir().join(format!("{}.txt", launchpad.trim().to_ascii_lowercase()))
+}
+
+pub fn vanity_used_state_path(launchpad: &str) -> PathBuf {
+    vanity_dir().join(format!(
+        "{}.used.jsonl",
+        launchpad.trim().to_ascii_lowercase()
+    ))
+}
+
 pub fn lookup_table_cache_path() -> PathBuf {
     shared_lookup_table_cache_path()
 }

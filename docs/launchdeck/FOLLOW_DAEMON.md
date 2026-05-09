@@ -16,6 +16,7 @@ You usually do not talk to it directly. `launchdeck-engine` talks to it for foll
 - confirmed-block / offset actions
 - dev auto-sells
 - sniper/follow sells
+- market-cap triggered actions where supported
 - watcher health for active jobs
 - persisted follow job state
 
@@ -56,8 +57,35 @@ Advanced controls live in [.env.advanced](../../.env.advanced):
 - `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS`
 - `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS`
 - `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER`
+- `LAUNCHDECK_SOL_USD_HTTP_PRICE_URL`
+- `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY`
+- `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY`
 
 Do not tune capacity until the default path is healthy.
+
+## Timing And Capacity
+
+Confirmed-block and offset actions use a real block-height offset worker by default. `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER` is an advanced fallback and should stay off unless you intentionally want local timer approximation.
+
+Capacity settings are optional caps:
+
+- `LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS` limits active jobs.
+- `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES` limits compile work.
+- `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS` limits send work.
+- `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS` controls how long LaunchDeck waits for capacity when caps are set.
+
+Blank or `0` capacity values mean uncapped.
+
+## Pump Creator-vault Retries
+
+Pump follow buys and sells have narrow creator-vault retry paths enabled by default. Leave these blank for normal operation:
+
+```bash
+LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY=
+LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY=
+```
+
+Set a false-like value only when debugging the retry path itself.
 
 ## Troubleshooting
 

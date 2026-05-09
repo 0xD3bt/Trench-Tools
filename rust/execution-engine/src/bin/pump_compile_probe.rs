@@ -10,6 +10,7 @@ use execution_engine::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::time::Instant;
 
 const PACKET_LIMIT_BYTES: usize = 1232;
 
@@ -19,9 +20,12 @@ struct AuditCase {
     label: Option<String>,
     side: String,
     mint: String,
+    pair: Option<String>,
     wallet_key: String,
     buy_amount_sol: Option<String>,
     provider: Option<String>,
+    platform: Option<String>,
+    mev_mode: Option<String>,
     tip_sol: Option<String>,
     sell_percent: Option<String>,
     sell_output_sol: Option<String>,
@@ -38,8 +42,11 @@ fn parse_args() -> Result<
     (
         TradeSide,
         String,
+        Option<String>,
         String,
         String,
+        String,
+        MevMode,
         String,
         Option<RuntimeSellIntent>,
     ),
@@ -47,9 +54,12 @@ fn parse_args() -> Result<
 > {
     let mut side = TradeSide::Buy;
     let mut mint = String::new();
+    let mut pair: Option<String> = None;
     let mut wallet_key = String::new();
     let mut buy_amount_sol = "0.01".to_string();
     let mut provider = "standard-rpc".to_string();
+    let mut mev_mode = MevMode::Off;
+    let mut tip_sol = "0".to_string();
     let mut sell_intent: Option<RuntimeSellIntent> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -66,11 +76,14 @@ fn parse_args() -> Result<
                 }
             }
             "--mint" => mint = args.next().unwrap_or_default(),
+            "--pool" | "--pair" => pair = Some(args.next().unwrap_or_default()),
             "--wallet-key" => wallet_key = args.next().unwrap_or_default(),
             "--buy-amount-sol" => {
                 buy_amount_sol = args.next().unwrap_or_else(|| "0.01".to_string())
             }
             "--provider" => provider = args.next().unwrap_or_else(|| "standard-rpc".to_string()),
+            "--mev-mode" => mev_mode = mev_mode_from_str(&args.next().unwrap_or_default())?,
+            "--tip-sol" => tip_sol = args.next().unwrap_or_else(|| "0".to_string()),
             "--sell-percent" => {
                 sell_intent = Some(RuntimeSellIntent::Percent(args.next().unwrap_or_default()))
             }
@@ -94,9 +107,12 @@ fn parse_args() -> Result<
     Ok((
         side,
         mint,
+        pair,
         wallet_key,
         buy_amount_sol,
         provider,
+        mev_mode,
+        tip_sol,
         sell_intent,
     ))
 }
@@ -106,6 +122,15 @@ fn side_from_str(value: &str) -> Result<TradeSide, String> {
         "buy" => Ok(TradeSide::Buy),
         "sell" => Ok(TradeSide::Sell),
         other => Err(format!("Unsupported side: {other}")),
+    }
+}
+
+fn mev_mode_from_str(value: &str) -> Result<MevMode, String> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" | "off" => Ok(MevMode::Off),
+        "reduced" => Ok(MevMode::Reduced),
+        "secure" => Ok(MevMode::Secure),
+        other => Err(format!("Unsupported MEV mode: {other}")),
     }
 }
 
@@ -123,10 +148,13 @@ fn sell_intent_from_case(case: &AuditCase) -> Option<RuntimeSellIntent> {
 fn build_request(
     side: TradeSide,
     mint: String,
+    pair: Option<String>,
     buy_amount_sol: Option<String>,
     provider: String,
+    mev_mode: MevMode,
     tip_sol: String,
     sell_intent: Option<RuntimeSellIntent>,
+    platform_label: Option<String>,
 ) -> TradeRuntimeRequest {
     TradeRuntimeRequest {
         side: side.clone(),
@@ -139,7 +167,7 @@ fn build_request(
         sell_intent,
         policy: RuntimeExecutionPolicy {
             slippage_percent: "25".to_string(),
-            mev_mode: MevMode::Off,
+            mev_mode,
             auto_tip_enabled: false,
             fee_sol: "0.001".to_string(),
             tip_sol,
@@ -152,10 +180,12 @@ fn build_request(
             sell_settlement_policy: SellSettlementPolicy::AlwaysToSol,
             sell_settlement_asset: TradeSettlementAsset::Sol,
         },
-        platform_label: None,
+        platform_label,
         planned_route: None,
         planned_trade: None,
-        pinned_pool: None,
+        pinned_pool: pair
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         warm_key: None,
     }
 }
@@ -198,29 +228,68 @@ async fn run_case_file(path: &str) -> Result<(), String> {
         let request = build_request(
             side.clone(),
             case.mint.clone(),
+            case.pair.clone(),
             buy_amount_sol,
             case.provider
                 .clone()
                 .unwrap_or_else(|| "standard-rpc".to_string()),
+            case.mev_mode
+                .as_deref()
+                .map(mev_mode_from_str)
+                .transpose()?
+                .unwrap_or(MevMode::Off),
             case.tip_sol.clone().unwrap_or_else(|| "0".to_string()),
             sell_intent_from_case(&case).or_else(|| {
                 matches!(side, TradeSide::Sell)
                     .then(|| RuntimeSellIntent::Percent("10".to_string()))
             }),
+            case.platform.clone(),
         );
+        let compile_started = Instant::now();
         let compiled = compile_wallet_trade(&request, &case.wallet_key).await?;
+        let compile_wall_ms = compile_started.elapsed().as_millis();
         let should_simulate = case.simulate.unwrap_or(false);
+        let mut simulation_wall_ms = None;
         let simulation = if should_simulate {
+            let simulation_started = Instant::now();
             let rpc_url = configured_rpc_url();
             let (simulation, warnings) =
                 simulate_transactions(&rpc_url, &compiled.transactions, &request.policy.commitment)
                     .await?;
-            Some(json!({ "results": simulation, "warnings": warnings }))
+            let wall_ms = simulation_started.elapsed().as_millis();
+            simulation_wall_ms = Some(wall_ms);
+            Some(json!({
+                "wallMs": wall_ms,
+                "results": simulation,
+                "warnings": warnings
+            }))
         } else {
             None
         };
         results.push(json!({
             "label": case.label.unwrap_or_else(|| format!("{}:{}", case.side, case.mint)),
+            "input": {
+                "mint": case.mint,
+                "pair": case.pair,
+                "platform": case.platform,
+            },
+            "compileWallMs": compile_wall_ms,
+            "phaseMs": {
+                "compileWall": compile_wall_ms,
+                "simulation": simulation_wall_ms,
+            },
+            "adapter": compiled.adapter,
+            "executionBackend": compiled.execution_backend,
+            "normalizedRequest": {
+                "mint": compiled.normalized_request.mint,
+                "pinnedPool": compiled.normalized_request.pinned_pool,
+            },
+            "compileMetrics": {
+                "elapsedMs": compiled.compile_metrics.elapsed_ms,
+                "phaseMs": compiled.compile_metrics.phases_json(),
+                "rpcTotal": compiled.compile_metrics.rpc_total(),
+                "rpcMethods": compiled.compile_metrics.rpc_methods_json(),
+            },
             "selector": compiled.selector,
             "transactions": transaction_summaries(&compiled.transactions),
             "simulation": simulation,
@@ -262,31 +331,63 @@ async fn async_main() -> Result<(), String> {
     }
 
     let no_simulate = std::env::args().any(|arg| arg == "--no-simulate");
-    let (side, mint, wallet_key, buy_amount_sol, provider, sell_intent) = parse_args()?;
+    let (side, mint, pair, wallet_key, buy_amount_sol, provider, mev_mode, tip_sol, sell_intent) =
+        parse_args()?;
     let request = build_request(
         side.clone(),
         mint.clone(),
+        pair.clone(),
         Some(buy_amount_sol.clone()),
         provider,
-        "0".to_string(),
+        mev_mode,
+        tip_sol,
         sell_intent,
+        None,
     );
 
+    let compile_started = Instant::now();
     let compiled = compile_wallet_trade(&request, &wallet_key).await?;
+    let compile_wall_ms = compile_started.elapsed().as_millis();
+    let mut simulation_wall_ms = None;
     let simulation_output = if no_simulate {
         None
     } else {
+        let simulation_started = Instant::now();
         let rpc_url = configured_rpc_url();
         let (simulation, warnings) =
             simulate_transactions(&rpc_url, &compiled.transactions, &request.policy.commitment)
                 .await?;
-        Some(json!({ "results": simulation, "warnings": warnings }))
+        let wall_ms = simulation_started.elapsed().as_millis();
+        simulation_wall_ms = Some(wall_ms);
+        Some(json!({
+            "wallMs": wall_ms,
+            "results": simulation,
+            "warnings": warnings
+        }))
     };
 
     let output = json!({
         "mint": mint,
+        "pair": pair,
         "side": side,
         "walletKey": wallet_key,
+        "compileWallMs": compile_wall_ms,
+        "phaseMs": {
+            "compileWall": compile_wall_ms,
+            "simulation": simulation_wall_ms,
+        },
+        "adapter": compiled.adapter,
+        "executionBackend": compiled.execution_backend,
+        "normalizedRequest": {
+            "mint": compiled.normalized_request.mint,
+            "pinnedPool": compiled.normalized_request.pinned_pool,
+        },
+        "compileMetrics": {
+            "elapsedMs": compiled.compile_metrics.elapsed_ms,
+            "phaseMs": compiled.compile_metrics.phases_json(),
+            "rpcTotal": compiled.compile_metrics.rpc_total(),
+            "rpcMethods": compiled.compile_metrics.rpc_methods_json(),
+        },
         "selector": compiled.selector,
         "transactions": transaction_summaries(&compiled.transactions),
         "simulation": simulation_output,

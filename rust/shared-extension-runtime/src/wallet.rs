@@ -403,7 +403,7 @@ async fn fetch_balance_lamports_with_client(
         client,
         rpc_url,
         "getBalance",
-        serde_json::json!([public_key, "confirmed"]),
+        serde_json::json!([public_key, { "commitment": "confirmed" }]),
     )
     .await?
     .get("value")

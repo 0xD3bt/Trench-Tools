@@ -17,11 +17,17 @@ Supported operator flows:
 
 Use Pump as the first launchpad path when validating a new install.
 
+Metadata uses the shared LaunchDeck uploader. Vanity mint queues are supported through `.local/trench-tools/vanity/pump.txt`; queued public mints must end with `pump`.
+
 ## Bonk
 
-Status: supported helper-backed path.
+Status: supported Rust-native path.
 
-Supported operator flows depend on the current Bonk mode and quote-asset requirements. Keep the first run small and verify build/preview output before sending.
+Supported operator flows depend on the current Bonk mode and quote-asset requirements. Bonk launches can use SOL or USD1 quote behavior where the launch flow requires it. The runtime handles the pinned SOL/USD1 route setup and related shared lookup-table behavior internally.
+
+Keep the first run small and verify build/preview output before sending.
+
+Metadata uses the shared LaunchDeck uploader with the Bonk default upload endpoints unless Pinata is selected. Vanity mint queues are supported through `.local/trench-tools/vanity/bonk.txt`; queued public mints must end with `bonk`.
 
 ## Bagsapp
 
@@ -34,6 +40,12 @@ BAGS_API_KEY=YOUR_BAGS_API_KEY
 ```
 
 Advanced Bags setup, tip, and confirmation controls live in [.env.advanced](../../.env.advanced) and [../ENV_REFERENCE.md](../ENV_REFERENCE.md).
+
+Bagsapp owns mint and metadata preparation through the Bags API. The operator-facing Bags flow is wallet-identity based, and LaunchDeck does not use a Bags vanity queue because Bags returns the mint during prepare.
+
+Bags routes can involve Meteora DBC before migration and Meteora DAMM v2 after migration. Follow and sell behavior depends on the market state the runtime can verify from RPC.
+
+See [METADATA_AND_VANITY.md](METADATA_AND_VANITY.md) for metadata/IPFS and vanity queue details.
 
 ## Provider Guidance
 

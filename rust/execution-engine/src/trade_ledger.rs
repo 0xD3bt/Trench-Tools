@@ -224,6 +224,8 @@ pub struct TokenTransferMarkerEvent {
     pub amount_raw: u64,
     pub signature: String,
     pub applied_at_unix_ms: u64,
+    #[serde(default)]
+    pub slot: Option<u64>,
 }
 
 pub const JOURNAL_TOKEN_TRANSFER_MARKER_KIND: &str = "token_transfer_marker";
@@ -246,7 +248,13 @@ impl TokenTransferMarkerEvent {
             amount_raw,
             signature: signature.to_string(),
             applied_at_unix_ms,
+            slot: None,
         }
+    }
+
+    pub fn with_slot(mut self, slot: Option<u64>) -> Self {
+        self.slot = slot;
+        self
     }
 
     pub fn event_id(&self) -> String {
@@ -261,12 +269,123 @@ impl TokenTransferMarkerEvent {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncompleteBalanceAdjustmentKind {
+    ReceivedWithoutCostBasis,
+    SentWithoutProceeds,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompleteBalanceAdjustmentMarkerEvent {
+    #[serde(default = "trade_ledger_schema_version")]
+    pub schema_version: u32,
+    pub event_kind: String,
+    pub adjustment_kind: IncompleteBalanceAdjustmentKind,
+    pub wallet_key: String,
+    pub mint: String,
+    pub amount_raw: u64,
+    pub signature: String,
+    pub applied_at_unix_ms: u64,
+    #[serde(default)]
+    pub slot: Option<u64>,
+}
+
+pub const JOURNAL_INCOMPLETE_BALANCE_ADJUSTMENT_MARKER_KIND: &str =
+    "incomplete_balance_adjustment_marker";
+
+impl IncompleteBalanceAdjustmentMarkerEvent {
+    pub fn received_without_cost_basis(
+        wallet_key: &str,
+        mint: &str,
+        amount_raw: u64,
+        signature: &str,
+        applied_at_unix_ms: u64,
+        slot: Option<u64>,
+    ) -> Self {
+        Self::new(
+            IncompleteBalanceAdjustmentKind::ReceivedWithoutCostBasis,
+            wallet_key,
+            mint,
+            amount_raw,
+            signature,
+            applied_at_unix_ms,
+            slot,
+        )
+    }
+
+    pub fn sent_without_proceeds(
+        wallet_key: &str,
+        mint: &str,
+        amount_raw: u64,
+        signature: &str,
+        applied_at_unix_ms: u64,
+        slot: Option<u64>,
+    ) -> Self {
+        Self::new(
+            IncompleteBalanceAdjustmentKind::SentWithoutProceeds,
+            wallet_key,
+            mint,
+            amount_raw,
+            signature,
+            applied_at_unix_ms,
+            slot,
+        )
+    }
+
+    fn new(
+        adjustment_kind: IncompleteBalanceAdjustmentKind,
+        wallet_key: &str,
+        mint: &str,
+        amount_raw: u64,
+        signature: &str,
+        applied_at_unix_ms: u64,
+        slot: Option<u64>,
+    ) -> Self {
+        Self {
+            schema_version: trade_ledger_schema_version(),
+            event_kind: JOURNAL_INCOMPLETE_BALANCE_ADJUSTMENT_MARKER_KIND.to_string(),
+            adjustment_kind,
+            wallet_key: wallet_key.to_string(),
+            mint: mint.to_string(),
+            amount_raw,
+            signature: signature.to_string(),
+            applied_at_unix_ms,
+            slot,
+        }
+    }
+
+    pub fn event_id(&self) -> String {
+        if self
+            .signature
+            .trim()
+            .starts_with("resync-balance-reconcile:")
+        {
+            return format!(
+                "resync-balance-reconcile::{:?}::{}::{}",
+                self.adjustment_kind,
+                self.wallet_key.trim(),
+                self.mint.trim()
+            );
+        }
+        format!(
+            "{}::{:?}::{}::{}",
+            self.signature.trim(),
+            self.adjustment_kind,
+            self.wallet_key.trim(),
+            self.mint.trim()
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum JournalEntry {
     Trade(ConfirmedTradeEvent),
     ResetMarker(ResetMarkerEvent),
     ForceCloseMarker(ForceCloseMarkerEvent),
     TokenTransferMarker(TokenTransferMarkerEvent),
+    IncompleteBalanceAdjustmentMarker(IncompleteBalanceAdjustmentMarkerEvent),
 }
 
 impl JournalEntry {
@@ -276,6 +395,19 @@ impl JournalEntry {
             JournalEntry::ResetMarker(marker) => marker.reset_at_unix_ms,
             JournalEntry::ForceCloseMarker(marker) => marker.applied_at_unix_ms,
             JournalEntry::TokenTransferMarker(marker) => marker.applied_at_unix_ms,
+            JournalEntry::IncompleteBalanceAdjustmentMarker(marker) => marker.applied_at_unix_ms,
+        }
+    }
+
+    fn slot_sort_key(&self) -> u64 {
+        match self {
+            JournalEntry::Trade(event) => event.slot.unwrap_or(u64::MAX),
+            JournalEntry::ResetMarker(marker) => marker.reset_at_slot.unwrap_or(u64::MAX),
+            JournalEntry::TokenTransferMarker(marker) => marker.slot.unwrap_or(u64::MAX),
+            JournalEntry::IncompleteBalanceAdjustmentMarker(marker) => {
+                marker.slot.unwrap_or(u64::MAX)
+            }
+            JournalEntry::ForceCloseMarker(_) => u64::MAX,
         }
     }
 
@@ -289,6 +421,9 @@ impl JournalEntry {
             JournalEntry::TokenTransferMarker(marker) => {
                 trade_ledger_key(&marker.source_wallet_key, &marker.mint)
             }
+            JournalEntry::IncompleteBalanceAdjustmentMarker(marker) => {
+                trade_ledger_key(&marker.wallet_key, &marker.mint)
+            }
         }
     }
 
@@ -297,9 +432,55 @@ impl JournalEntry {
             JournalEntry::Trade(_) => 0,
             JournalEntry::ResetMarker(_) => 1,
             JournalEntry::TokenTransferMarker(_) => 2,
-            JournalEntry::ForceCloseMarker(_) => 3,
+            JournalEntry::IncompleteBalanceAdjustmentMarker(_) => 3,
+            JournalEntry::ForceCloseMarker(_) => 4,
         }
     }
+
+    fn identity_key(&self) -> String {
+        match self {
+            JournalEntry::Trade(event) => event.event_id(),
+            JournalEntry::ResetMarker(marker) => format!(
+                "reset::{}::{}::{}::{}",
+                marker.wallet_key.trim(),
+                marker.mint.trim(),
+                marker.reset_at_unix_ms,
+                marker.reset_at_slot.unwrap_or(u64::MAX)
+            ),
+            JournalEntry::ForceCloseMarker(marker) => format!(
+                "force-close::{}::{}::{}::{}",
+                marker.wallet_key.trim(),
+                marker.mint.trim(),
+                marker.applied_at_unix_ms,
+                marker.reason.trim()
+            ),
+            JournalEntry::TokenTransferMarker(marker) => marker.event_id(),
+            JournalEntry::IncompleteBalanceAdjustmentMarker(marker) => marker.event_id(),
+        }
+    }
+}
+
+fn incomplete_marker_order_key(marker: &IncompleteBalanceAdjustmentMarkerEvent) -> (u64, u64) {
+    (marker.slot.unwrap_or(0), marker.applied_at_unix_ms)
+}
+
+fn incomplete_marker_clear_scope(marker: &IncompleteBalanceAdjustmentMarkerEvent) -> String {
+    format!(
+        "{:?}::{}::{}::{}",
+        marker.adjustment_kind,
+        marker.wallet_key.trim(),
+        marker.mint.trim(),
+        marker.signature.trim()
+    )
+}
+
+fn compare_journal_entries(left: &JournalEntry, right: &JournalEntry) -> std::cmp::Ordering {
+    left.timestamp()
+        .cmp(&right.timestamp())
+        .then_with(|| left.slot_sort_key().cmp(&right.slot_sort_key()))
+        .then_with(|| left.wallet_mint_key().cmp(&right.wallet_mint_key()))
+        .then_with(|| left.replay_rank().cmp(&right.replay_rank()))
+        .then_with(|| left.identity_key().cmp(&right.identity_key()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -478,7 +659,8 @@ pub fn read_confirmed_trade_events(paths: &TradeLedgerPaths) -> Vec<ConfirmedTra
             JournalEntry::Trade(event) => Some(event),
             JournalEntry::ResetMarker(_)
             | JournalEntry::ForceCloseMarker(_)
-            | JournalEntry::TokenTransferMarker(_) => None,
+            | JournalEntry::TokenTransferMarker(_)
+            | JournalEntry::IncompleteBalanceAdjustmentMarker(_) => None,
         })
         .collect()
 }
@@ -512,6 +694,13 @@ pub fn read_journal_entries(paths: &TradeLedgerPaths) -> Vec<JournalEntry> {
                 Some(JOURNAL_TOKEN_TRANSFER_MARKER_KIND) => {
                     if let Ok(marker) = serde_json::from_value::<TokenTransferMarkerEvent>(value) {
                         entries.push(JournalEntry::TokenTransferMarker(marker));
+                    }
+                }
+                Some(JOURNAL_INCOMPLETE_BALANCE_ADJUSTMENT_MARKER_KIND) => {
+                    if let Ok(marker) =
+                        serde_json::from_value::<IncompleteBalanceAdjustmentMarkerEvent>(value)
+                    {
+                        entries.push(JournalEntry::IncompleteBalanceAdjustmentMarker(marker));
                     }
                 }
                 _ => {
@@ -648,6 +837,29 @@ pub fn append_token_transfer_marker(
     Ok(JournalAppendStatus::Appended)
 }
 
+pub fn append_incomplete_balance_adjustment_marker(
+    paths: &TradeLedgerPaths,
+    marker: &IncompleteBalanceAdjustmentMarkerEvent,
+) -> Result<JournalAppendStatus, (StatusCode, String)> {
+    let event_id = marker.event_id();
+    if read_journal_entries(paths).into_iter().any(|entry| {
+        matches!(
+            entry,
+            JournalEntry::IncompleteBalanceAdjustmentMarker(existing)
+                if existing.event_id() == event_id
+                    && existing.amount_raw == marker.amount_raw
+                    && existing.slot == marker.slot
+        )
+    }) {
+        return Ok(JournalAppendStatus::Duplicate);
+    }
+    append_journal_line(
+        paths,
+        &serde_json::to_string(marker).map_err(internal_error)?,
+    )?;
+    Ok(JournalAppendStatus::Appended)
+}
+
 fn append_journal_line(paths: &TradeLedgerPaths, line: &str) -> Result<(), (StatusCode, String)> {
     fs::create_dir_all(&paths.journal_dir).map_err(internal_error)?;
     let path = active_journal_segment_path(&paths.journal_dir).map_err(internal_error)?;
@@ -748,17 +960,18 @@ pub fn transfer_trade_ledger_position(
     amount_raw: u64,
     signature: &str,
     applied_at_unix_ms: u64,
-) {
+) -> u64 {
     if amount_raw == 0 || source_wallet_key == destination_wallet_key {
-        return;
+        return 0;
     }
     let source_key = trade_ledger_key(source_wallet_key, mint);
     let destination_key = trade_ledger_key(destination_wallet_key, mint);
     let Some(source) = ledger.get_mut(&source_key) else {
-        return;
+        return 0;
     };
     let mut remaining_to_move = amount_raw;
     let mut moved_lots = Vec::new();
+    let mut moved_total = 0u64;
     for lot in &mut source.open_lots {
         if remaining_to_move == 0 || lot.remaining_amount_raw == 0 {
             continue;
@@ -780,10 +993,11 @@ pub fn transfer_trade_ledger_position(
             remaining_amount_raw: moved_amount,
             remaining_cost_basis_lamports: moved_cost,
         });
+        moved_total = moved_total.saturating_add(moved_amount);
         remaining_to_move = remaining_to_move.saturating_sub(moved_amount);
     }
     if moved_lots.is_empty() {
-        return;
+        return 0;
     }
 
     source.open_lots.retain(|lot| lot.remaining_amount_raw > 0);
@@ -827,6 +1041,73 @@ pub fn transfer_trade_ledger_position(
         if !destination.platform_tags.contains(&tag) {
             destination.platform_tags.push(tag);
         }
+    }
+    moved_total
+}
+
+pub fn mark_trade_ledger_received_without_cost_basis(
+    ledger: &mut HashMap<String, TradeLedgerEntry>,
+    wallet_key: &str,
+    mint: &str,
+    _amount_raw: u64,
+    _signature: &str,
+    applied_at_unix_ms: u64,
+) {
+    let entry = ledger
+        .entry(trade_ledger_key(wallet_key, mint))
+        .or_insert_with(|| TradeLedgerEntry {
+            wallet_key: wallet_key.to_string(),
+            mint: mint.to_string(),
+            ..TradeLedgerEntry::default()
+        });
+    entry.last_trade_at_unix_ms = entry.last_trade_at_unix_ms.max(applied_at_unix_ms);
+    entry.needs_resync = true;
+}
+
+pub fn mark_trade_ledger_sent_without_proceeds(
+    ledger: &mut HashMap<String, TradeLedgerEntry>,
+    wallet_key: &str,
+    mint: &str,
+    amount_raw: u64,
+    _signature: &str,
+    applied_at_unix_ms: u64,
+) {
+    let key = trade_ledger_key(wallet_key, mint);
+    let entry = ledger.entry(key).or_insert_with(|| TradeLedgerEntry {
+        wallet_key: wallet_key.to_string(),
+        mint: mint.to_string(),
+        ..TradeLedgerEntry::default()
+    });
+    entry.last_trade_at_unix_ms = entry.last_trade_at_unix_ms.max(applied_at_unix_ms);
+    let mut remaining_to_send = amount_raw;
+    for lot in &mut entry.open_lots {
+        if remaining_to_send == 0 || lot.remaining_amount_raw == 0 {
+            continue;
+        }
+        let sent_amount = remaining_to_send.min(lot.remaining_amount_raw);
+        let sent_cost = proportional_amount(
+            lot.remaining_cost_basis_lamports,
+            sent_amount,
+            lot.remaining_amount_raw,
+        );
+        lot.remaining_amount_raw = lot.remaining_amount_raw.saturating_sub(sent_amount);
+        lot.remaining_cost_basis_lamports =
+            lot.remaining_cost_basis_lamports.saturating_sub(sent_cost);
+        remaining_to_send = remaining_to_send.saturating_sub(sent_amount);
+    }
+    entry.open_lots.retain(|lot| lot.remaining_amount_raw > 0);
+    entry.position_open = entry
+        .open_lots
+        .iter()
+        .any(|lot| lot.remaining_amount_raw > 0);
+    entry.remaining_cost_basis_lamports = entry.open_lots.iter().fold(0u64, |sum, lot| {
+        sum.saturating_add(lot.remaining_cost_basis_lamports)
+    });
+    if !entry.position_open {
+        entry.entry_preference = None;
+    }
+    if remaining_to_send > 0 {
+        entry.needs_resync = true;
     }
 }
 
@@ -947,16 +1228,43 @@ fn rebuild_trade_ledger_from_journal(
     let mut ledger = HashMap::new();
     let mut seen_event_ids = HashSet::new();
     let mut seen_token_transfer_ids = HashSet::new();
-    let mut entries = read_journal_entries(paths);
-    // Sort by (timestamp, wallet::mint, replay_rank) so that within a single
-    // millisecond trades apply before markers, and resets apply before
-    // force-closes. This mirrors the order the live path would have produced.
-    entries.sort_by(|left, right| {
-        left.timestamp()
-            .cmp(&right.timestamp())
-            .then_with(|| left.wallet_mint_key().cmp(&right.wallet_mint_key()))
-            .then_with(|| left.replay_rank().cmp(&right.replay_rank()))
-    });
+    let mut latest_incomplete_markers: HashMap<String, IncompleteBalanceAdjustmentMarkerEvent> =
+        HashMap::new();
+    let mut entries = Vec::new();
+    for entry in read_journal_entries(paths) {
+        match entry {
+            JournalEntry::IncompleteBalanceAdjustmentMarker(marker) => {
+                if marker.amount_raw == 0 {
+                    let clear_scope = incomplete_marker_clear_scope(&marker);
+                    latest_incomplete_markers.retain(|_, existing| {
+                        incomplete_marker_clear_scope(existing) != clear_scope
+                    });
+                    latest_incomplete_markers.insert(marker.event_id(), marker);
+                    continue;
+                }
+                let event_id = marker.event_id();
+                let should_replace =
+                    latest_incomplete_markers
+                        .get(&event_id)
+                        .map_or(true, |existing| {
+                            incomplete_marker_order_key(&marker)
+                                >= incomplete_marker_order_key(existing)
+                        });
+                if should_replace {
+                    latest_incomplete_markers.insert(event_id, marker);
+                }
+            }
+            other => entries.push(other),
+        }
+    }
+    entries.extend(
+        latest_incomplete_markers
+            .into_values()
+            .map(JournalEntry::IncompleteBalanceAdjustmentMarker),
+    );
+    // Keep rebuild ordering aligned with live resync replay so snapshots and
+    // journal-only recovery converge to the same FIFO lots.
+    entries.sort_by(compare_journal_entries);
     for entry in entries {
         match entry {
             JournalEntry::Trade(event) => {
@@ -999,6 +1307,33 @@ fn rebuild_trade_ledger_from_journal(
                     &marker.signature,
                     marker.applied_at_unix_ms,
                 );
+            }
+            JournalEntry::IncompleteBalanceAdjustmentMarker(marker) => {
+                if marker.amount_raw == 0 {
+                    continue;
+                }
+                match marker.adjustment_kind {
+                    IncompleteBalanceAdjustmentKind::ReceivedWithoutCostBasis => {
+                        mark_trade_ledger_received_without_cost_basis(
+                            &mut ledger,
+                            &marker.wallet_key,
+                            &marker.mint,
+                            marker.amount_raw,
+                            &marker.signature,
+                            marker.applied_at_unix_ms,
+                        );
+                    }
+                    IncompleteBalanceAdjustmentKind::SentWithoutProceeds => {
+                        mark_trade_ledger_sent_without_proceeds(
+                            &mut ledger,
+                            &marker.wallet_key,
+                            &marker.mint,
+                            marker.amount_raw,
+                            &marker.signature,
+                            marker.applied_at_unix_ms,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1500,7 +1835,7 @@ mod tests {
                 Some(TradeSettlementAsset::Sol),
             ),
         );
-        transfer_trade_ledger_position(
+        let moved = transfer_trade_ledger_position(
             &mut ledger,
             "wallet-a",
             "wallet-b",
@@ -1509,6 +1844,7 @@ mod tests {
             "sig-transfer",
             10,
         );
+        assert_eq!(moved, 40);
 
         let source = ledger.get("wallet-a::mint-a").expect("source entry");
         let destination = ledger.get("wallet-b::mint-a").expect("destination entry");
@@ -1521,6 +1857,23 @@ mod tests {
         assert_eq!(destination.remaining_cost_basis_lamports, 400);
         assert_eq!(destination.open_lots[0].remaining_amount_raw, 40);
         assert_eq!(destination.open_lots[0].signature, "sig-transfer");
+    }
+
+    #[test]
+    fn token_transfer_reports_zero_when_no_cost_basis_can_move() {
+        let mut ledger = HashMap::new();
+        let moved = transfer_trade_ledger_position(
+            &mut ledger,
+            "wallet-a",
+            "wallet-b",
+            "mint-a",
+            40,
+            "sig-transfer",
+            10,
+        );
+
+        assert_eq!(moved, 0);
+        assert!(ledger.is_empty());
     }
 
     #[test]
@@ -1959,6 +2312,350 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_balance_adjustment_markers_round_trip_and_rebuild() {
+        let temp = TempDirGuard::new("incomplete-adjustment-roundtrip");
+        let paths = test_paths(&temp.path);
+        let received = IncompleteBalanceAdjustmentMarkerEvent::received_without_cost_basis(
+            "wallet-a",
+            "mint-a",
+            25,
+            "sig-received",
+            100,
+            Some(10),
+        );
+        let sent = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-b",
+            "mint-a",
+            15,
+            "sig-sent",
+            200,
+            Some(20),
+        );
+        append_incomplete_balance_adjustment_marker(&paths, &received)
+            .expect("append received incomplete marker");
+        append_incomplete_balance_adjustment_marker(&paths, &sent)
+            .expect("append sent incomplete marker");
+
+        let entries = read_journal_entries(&paths);
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            entries[0],
+            JournalEntry::IncompleteBalanceAdjustmentMarker(_)
+        ));
+
+        let rebuilt = rebuild_trade_ledger_from_journal(&paths);
+        let received_entry = rebuilt.get("wallet-a::mint-a").expect("received entry");
+        let sent_entry = rebuilt.get("wallet-b::mint-a").expect("sent entry");
+        assert!(received_entry.needs_resync);
+        assert!(sent_entry.needs_resync);
+        assert_eq!(received_entry.last_trade_at_unix_ms, 100);
+        assert_eq!(sent_entry.last_trade_at_unix_ms, 200);
+    }
+
+    #[test]
+    fn reconciliation_markers_rebuild_with_latest_entry_only() {
+        let temp = TempDirGuard::new("reconcile-marker-latest");
+        let paths = test_paths(&temp.path);
+        let buy = ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-buy".to_string(),
+            slot: Some(5),
+            confirmed_at_unix_ms: 500,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        append_confirmed_trade_event(&paths, &buy).expect("append buy");
+        let older = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            30,
+            "resync-balance-reconcile:wallet-a:mint-a:1000",
+            1_000,
+            Some(10),
+        );
+        let newer = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            10,
+            "resync-balance-reconcile:sent_without_proceeds:wallet-a:mint-a",
+            2_000,
+            Some(20),
+        );
+        append_incomplete_balance_adjustment_marker(&paths, &older).expect("append older marker");
+        append_incomplete_balance_adjustment_marker(&paths, &newer).expect("append newer marker");
+
+        let rebuilt = rebuild_trade_ledger_from_journal(&paths);
+        let entry = rebuilt.get("wallet-a::mint-a").expect("rebuilt entry");
+        assert_eq!(entry.open_lots[0].remaining_amount_raw, 90);
+    }
+
+    #[test]
+    fn zero_reconciliation_marker_clears_prior_adjustment_on_rebuild() {
+        let temp = TempDirGuard::new("reconcile-marker-clear");
+        let paths = test_paths(&temp.path);
+        let buy = ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-buy".to_string(),
+            slot: Some(5),
+            confirmed_at_unix_ms: 500,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        append_confirmed_trade_event(&paths, &buy).expect("append buy");
+        let stale = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            30,
+            "resync-balance-reconcile:sent_without_proceeds:wallet-a:mint-a",
+            1_000,
+            Some(10),
+        );
+        let clear = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            0,
+            "resync-balance-reconcile:sent_without_proceeds:wallet-a:mint-a",
+            2_000,
+            Some(20),
+        );
+        append_incomplete_balance_adjustment_marker(&paths, &stale).expect("append stale marker");
+        append_incomplete_balance_adjustment_marker(&paths, &clear).expect("append clear marker");
+
+        let rebuilt = rebuild_trade_ledger_from_journal(&paths);
+        let entry = rebuilt.get("wallet-a::mint-a").expect("rebuilt entry");
+        assert_eq!(entry.open_lots[0].remaining_amount_raw, 100);
+    }
+
+    #[test]
+    fn known_transfer_clear_marker_replaces_prior_partial_fallback() {
+        let temp = TempDirGuard::new("known-transfer-clears-partial");
+        let paths = test_paths(&temp.path);
+        let buy = ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-buy".to_string(),
+            slot: Some(5),
+            confirmed_at_unix_ms: 500,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        append_confirmed_trade_event(&paths, &buy).expect("append buy");
+        let partial = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            40,
+            "sig-transfer:incomplete:sent_to:wallet-a:wallet-b",
+            1_000,
+            Some(10),
+        );
+        let transfer = TokenTransferMarkerEvent::new(
+            "wallet-a",
+            "wallet-b",
+            "mint-a",
+            40,
+            "sig-transfer",
+            2_000,
+        )
+        .with_slot(Some(20));
+        let clear = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            0,
+            "sig-transfer:incomplete:sent_to:wallet-a:wallet-b",
+            2_000,
+            Some(20),
+        );
+        append_incomplete_balance_adjustment_marker(&paths, &partial)
+            .expect("append partial marker");
+        append_token_transfer_marker(&paths, &transfer).expect("append transfer marker");
+        append_incomplete_balance_adjustment_marker(&paths, &clear).expect("append clear marker");
+
+        let rebuilt = rebuild_trade_ledger_from_journal(&paths);
+        let source = rebuilt.get("wallet-a::mint-a").expect("source entry");
+        let destination = rebuilt.get("wallet-b::mint-a").expect("destination entry");
+        assert_eq!(source.open_lots[0].remaining_amount_raw, 60);
+        assert_eq!(destination.open_lots[0].remaining_amount_raw, 40);
+    }
+
+    #[test]
+    fn reconciliation_marker_slot_keeps_future_buys_out_of_old_adjustment() {
+        let temp = TempDirGuard::new("reconcile-marker-slot-order");
+        let paths = test_paths(&temp.path);
+        let early_buy = ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-early-buy".to_string(),
+            slot: Some(10),
+            confirmed_at_unix_ms: 1_000,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        let later_buy = ConfirmedTradeEvent {
+            signature: "sig-later-buy".to_string(),
+            slot: Some(30),
+            confirmed_at_unix_ms: 3_000,
+            token_delta_raw: 25,
+            trade_value_lamports: 25,
+            ..early_buy.clone()
+        };
+        append_confirmed_trade_event(&paths, &later_buy).expect("append later buy first");
+        append_confirmed_trade_event(&paths, &early_buy).expect("append early buy second");
+        let marker = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            110,
+            "resync-balance-reconcile:sent_without_proceeds:wallet-a:mint-a",
+            2_000,
+            Some(20),
+        );
+        append_incomplete_balance_adjustment_marker(&paths, &marker).expect("append marker");
+
+        let rebuilt = rebuild_trade_ledger_from_journal(&paths);
+        let entry = rebuilt.get("wallet-a::mint-a").expect("rebuilt entry");
+        assert_eq!(entry.open_lots.len(), 1);
+        assert_eq!(entry.open_lots[0].signature, "sig-later-buy");
+        assert_eq!(entry.open_lots[0].remaining_amount_raw, 25);
+    }
+
+    #[test]
+    fn same_signature_incomplete_adjustments_do_not_collapse_on_rebuild() {
+        let temp = TempDirGuard::new("same-signature-incomplete");
+        let paths = test_paths(&temp.path);
+        let buy = ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-buy".to_string(),
+            slot: Some(1),
+            confirmed_at_unix_ms: 100,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        append_confirmed_trade_event(&paths, &buy).expect("append buy");
+        let first = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            30,
+            "sig-transfer:incomplete:sent_to:wallet-a:wallet-b",
+            1_000,
+            Some(10),
+        );
+        let second = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            20,
+            "sig-transfer:incomplete:sent_to:wallet-a:wallet-c",
+            1_000,
+            Some(10),
+        );
+        append_incomplete_balance_adjustment_marker(&paths, &first).expect("append first marker");
+        append_incomplete_balance_adjustment_marker(&paths, &second).expect("append second marker");
+
+        let rebuilt = rebuild_trade_ledger_from_journal(&paths);
+        let entry = rebuilt.get("wallet-a::mint-a").expect("rebuilt entry");
+        assert_eq!(entry.open_lots[0].remaining_amount_raw, 50);
+    }
+
+    #[test]
+    fn changed_incomplete_adjustment_amount_replaces_prior_amount_on_rebuild() {
+        let temp = TempDirGuard::new("changed-incomplete-amount");
+        let paths = test_paths(&temp.path);
+        let buy = ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-buy".to_string(),
+            slot: Some(1),
+            confirmed_at_unix_ms: 100,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        append_confirmed_trade_event(&paths, &buy).expect("append buy");
+        let older = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            40,
+            "sig-transfer:incomplete:sent_to:wallet-a:wallet-b",
+            1_000,
+            Some(10),
+        );
+        let newer = IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+            "wallet-a",
+            "mint-a",
+            10,
+            "sig-transfer:incomplete:sent_to:wallet-a:wallet-b",
+            2_000,
+            Some(20),
+        );
+        append_incomplete_balance_adjustment_marker(&paths, &older).expect("append older marker");
+        append_incomplete_balance_adjustment_marker(&paths, &newer).expect("append newer marker");
+
+        let rebuilt = rebuild_trade_ledger_from_journal(&paths);
+        let entry = rebuilt.get("wallet-a::mint-a").expect("rebuilt entry");
+        assert_eq!(entry.open_lots[0].remaining_amount_raw, 90);
+    }
+
+    #[test]
     fn journal_rebuild_applies_force_close_after_prior_buys() {
         let temp = TempDirGuard::new("rebuild-force-close");
         let paths = test_paths(&temp.path);
@@ -1995,5 +2692,147 @@ mod tests {
         assert_eq!(entry.realized_pnl_gross_lamports, -250);
         assert_eq!(entry.last_trade_at_unix_ms, 200);
         assert_eq!(entry.remaining_cost_basis_lamports, 0);
+    }
+
+    #[test]
+    fn no_slot_force_close_rebuilds_before_later_slotted_buy_by_timestamp() {
+        let temp = TempDirGuard::new("force-close-before-later-buy");
+        let paths = test_paths(&temp.path);
+        let early_buy = ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-early-buy".to_string(),
+            slot: Some(10),
+            confirmed_at_unix_ms: 1_000,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        let later_buy = ConfirmedTradeEvent {
+            signature: "sig-later-buy".to_string(),
+            slot: Some(30),
+            confirmed_at_unix_ms: 3_000,
+            token_delta_raw: 25,
+            trade_value_lamports: 25,
+            ..early_buy.clone()
+        };
+        append_confirmed_trade_event(&paths, &later_buy).expect("append later buy first");
+        append_confirmed_trade_event(&paths, &early_buy).expect("append early buy second");
+        append_force_close_marker(
+            &paths,
+            &ForceCloseMarkerEvent::new("wallet-a", "mint-a", 2_000, "rebuild-test"),
+        )
+        .expect("append force-close marker");
+
+        let ledger = rebuild_trade_ledger_from_journal(&paths);
+        let entry = ledger.get("wallet-a::mint-a").expect("rebuilt entry");
+        assert_eq!(entry.open_lots.len(), 1);
+        assert_eq!(entry.open_lots[0].signature, "sig-later-buy");
+        assert_eq!(entry.open_lots[0].remaining_amount_raw, 25);
+    }
+
+    #[test]
+    fn no_slot_token_transfer_rebuilds_before_later_slotted_sell_by_timestamp() {
+        let temp = TempDirGuard::new("transfer-before-later-sell");
+        let paths = test_paths(&temp.path);
+        let buy = ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-buy".to_string(),
+            slot: Some(10),
+            confirmed_at_unix_ms: 1_000,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        let sell_from_destination = ConfirmedTradeEvent {
+            signature: "sig-sell".to_string(),
+            slot: Some(30),
+            confirmed_at_unix_ms: 3_000,
+            wallet_key: "wallet-b".to_string(),
+            wallet_public_key: "wallet-b".to_string(),
+            side: TradeSide::Sell,
+            token_delta_raw: -40,
+            trade_value_lamports: 60,
+            ..buy.clone()
+        };
+        append_confirmed_trade_event(&paths, &sell_from_destination).expect("append sell first");
+        append_confirmed_trade_event(&paths, &buy).expect("append buy second");
+        append_token_transfer_marker(
+            &paths,
+            &TokenTransferMarkerEvent::new(
+                "wallet-a",
+                "wallet-b",
+                "mint-a",
+                40,
+                "sig-transfer",
+                2_000,
+            ),
+        )
+        .expect("append transfer marker");
+
+        let ledger = rebuild_trade_ledger_from_journal(&paths);
+        let source = ledger.get("wallet-a::mint-a").expect("source entry");
+        let destination = ledger.get("wallet-b::mint-a").expect("destination entry");
+        assert_eq!(source.open_lots[0].remaining_amount_raw, 60);
+        assert!(destination.open_lots.is_empty());
+        assert_eq!(destination.realized_pnl_gross_lamports, 20);
+    }
+
+    #[test]
+    fn journal_entry_comparator_is_transitive_for_mixed_slot_and_timestamp_order() {
+        let a = JournalEntry::Trade(ConfirmedTradeEvent {
+            schema_version: trade_ledger_schema_version(),
+            signature: "sig-a".to_string(),
+            slot: Some(5),
+            confirmed_at_unix_ms: 3_000,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a".to_string(),
+            mint: "mint-a".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 100,
+            token_decimals: Some(6),
+            trade_value_lamports: 100,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        });
+        let b = JournalEntry::Trade(ConfirmedTradeEvent {
+            signature: "sig-b".to_string(),
+            slot: Some(10),
+            confirmed_at_unix_ms: 1_000,
+            ..match &a {
+                JournalEntry::Trade(event) => event.clone(),
+                _ => unreachable!(),
+            }
+        });
+        let c = JournalEntry::ForceCloseMarker(ForceCloseMarkerEvent::new(
+            "wallet-a", "mint-a", 2_000, "test",
+        ));
+
+        assert!(compare_journal_entries(&b, &c).is_lt());
+        assert!(compare_journal_entries(&c, &a).is_lt());
+        assert!(compare_journal_entries(&b, &a).is_lt());
     }
 }

@@ -8,8 +8,7 @@ import {
   normalizeLaunchdeckHostBase,
   originPatternFromHostBase,
   setHostAuthToken,
-  setHostBase,
-  setLaunchdeckHostBase
+  setHostBase
 } from "../shared/host-client.js";
 import { callBackground } from "../shared/background-rpc.js";
 import { getSiteFeatures, saveSiteFeatures } from "../shared/site-features.js";
@@ -23,7 +22,12 @@ import {
   resolveSoundUrl,
   saveAppearance
 } from "../shared/appearance.js";
-import { APPEARANCE_STORAGE_KEY, OPTIONS_TARGET_SECTION_KEY } from "../shared/constants.js";
+import {
+  APPEARANCE_STORAGE_KEY,
+  OPTIONS_TARGET_SECTION_KEY,
+  RUNTIME_DIAGNOSTICS_REVISION_KEY,
+  RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY
+} from "../shared/constants.js";
 
 const BOOTSTRAP_REVISION_KEY = "trenchTools.bootstrapRevision";
 const WALLET_STATUS_REVISION_KEY = "trenchTools.walletStatusRevision";
@@ -61,7 +65,8 @@ const state = {
   editingLaunchdeckPresetId: null,
   walletEditModal: createEmptyWalletEditModalState(),
   createGroupModal: createEmptyCreateGroupModalState(),
-  engineSettingsDirty: false
+  engineSettingsDirty: false,
+  runtimeDiagnosticToastKeys: new Set()
 };
 
 const elements = {
@@ -71,7 +76,6 @@ const elements = {
   saveHostButton: document.getElementById("save-host-button"),
   testHostButton: document.getElementById("test-host-button"),
   launchdeckHostInput: document.getElementById("launchdeck-host-input"),
-  saveLaunchdeckHostButton: document.getElementById("save-launchdeck-host-button"),
   testLaunchdeckHostButton: document.getElementById("test-launchdeck-host-button"),
   reloadHostButton: document.getElementById("reload-host-button"),
   addExecutionPresetButton: document.getElementById("add-execution-preset-button"),
@@ -147,6 +151,7 @@ const elements = {
   engineRpcUrl: document.getElementById("engine-rpc-url"),
   engineWsUrl: document.getElementById("engine-ws-url"),
   engineWarmRpcUrl: document.getElementById("engine-warm-rpc-url"),
+  engineWarmWsUrl: document.getElementById("engine-warm-ws-url"),
   engineSharedRegion: document.getElementById("engine-shared-region"),
   engineHeliusRpcUrl: document.getElementById("engine-helius-rpc-url"),
   engineHeliusWsUrl: document.getElementById("engine-helius-ws-url"),
@@ -189,11 +194,15 @@ const elements = {
   siteAxiomEnabled: document.getElementById("site-axiom-enabled"),
   siteAxiomLauncher: document.getElementById("site-axiom-launcher"),
   siteAxiomInstantTrade: document.getElementById("site-axiom-instant-trade"),
+  siteAxiomInstantTradeButtonModeCount: document.getElementById("site-axiom-instant-trade-button-mode-count"),
   siteAxiomLaunchdeck: document.getElementById("site-axiom-launchdeck"),
   siteAxiomPulseQb: document.getElementById("site-axiom-pulse-qb"),
   siteAxiomPulsePanel: document.getElementById("site-axiom-pulse-panel"),
   siteAxiomPulseVamp: document.getElementById("site-axiom-pulse-vamp"),
+  siteAxiomVampIconMode: document.getElementById("site-axiom-vamp-icon-mode"),
   siteAxiomPulseVampMode: document.getElementById("site-axiom-pulse-vamp-mode"),
+  siteAxiomDexScreenerIconMode: document.getElementById("site-axiom-dexscreener-icon-mode"),
+  siteAxiomPostDeployAction: document.getElementById("site-axiom-post-deploy-action"),
   siteAxiomWalletTracker: document.getElementById("site-axiom-wallet-tracker"),
   siteAxiomWatchlist: document.getElementById("site-axiom-watchlist"),
   siteJ7Enabled: document.getElementById("site-j7-enabled"),
@@ -490,6 +499,175 @@ function optionsToastIconMarkup(type) {
   return '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M12 22C6.477 22 2 17.523 2 12S6.477 2 12 2s10 4.477 10 10-4.477 10-10 10zm0-2a8 8 0 1 0 0-16 8 8 0 0 0 0 16zm-1-11h2v2h-2V7zm0 4h2v6h-2v-6z"/></svg>';
 }
 
+function ensureRuntimeDiagnosticsPanel() {
+  let panel = document.getElementById("runtime-diagnostics-notice");
+  if (panel) return panel;
+  const stack = document.querySelector(".global-settings-stack");
+  if (!stack) return null;
+  panel = document.createElement("section");
+  panel.id = "runtime-diagnostics-notice";
+  panel.className = "settings-panel connection-panel connection-panel-warning";
+  panel.hidden = true;
+  panel.innerHTML = `
+    <div class="panel-heading">
+      <div>
+        <span class="eyebrow">Runtime diagnostics</span>
+        <h3>Endpoint warnings</h3>
+        <p class="muted" data-runtime-diagnostics-summary></p>
+      </div>
+    </div>
+    <div class="runtime-diagnostics-list" data-runtime-diagnostics-list></div>
+  `;
+  stack.prepend(panel);
+  return panel;
+}
+
+function runtimeDiagnosticKind(diagnostic) {
+  return String(diagnostic?.severity || "").toLowerCase() === "critical" ? "error" : "info";
+}
+
+function runtimeDiagnosticDetail(diagnostic) {
+  const parts = [];
+  if (diagnostic?.envVar) parts.push(diagnostic.envVar);
+  if (diagnostic?.host) parts.push(diagnostic.host);
+  if (diagnostic?.restartRequired) parts.push("Restart required after changing env-backed values.");
+  if (diagnostic?.detail) parts.push(diagnostic.detail);
+  return parts.join(" ");
+}
+
+function runtimeDiagnosticToastKey(diagnostic) {
+  const fingerprint = String(diagnostic?.fingerprint || diagnostic?.key || "").trim();
+  if (!fingerprint) return "";
+  const signature = [
+    diagnostic?.severity || "",
+    diagnostic?.source || "",
+    diagnostic?.code || "",
+    diagnostic?.message || "",
+    diagnostic?.detail || "",
+    diagnostic?.envVar || "",
+    diagnostic?.endpointKind || "",
+    diagnostic?.host || "",
+    diagnostic?.restartRequired ? "restart" : ""
+  ].map((part) => String(part || "").trim()).join("|");
+  return `${fingerprint}:${signature}`;
+}
+
+async function dismissRuntimeDiagnostic(fingerprint) {
+  try {
+    const result = await callBackground("trench:dismiss-runtime-diagnostic", { fingerprint });
+    if (result?.ok === false) {
+      throw new Error(result.error || "Diagnostic could not be dismissed.");
+    }
+    showOptionsToast("Diagnostic dismissed", "This exact warning stays hidden until it recovers or changes.", {
+      type: "info"
+    });
+  } catch (error) {
+    showOptionsToast("Dismiss failed", error?.message || "Diagnostic could not be dismissed.", {
+      type: "error"
+    });
+  }
+}
+
+async function disableWarmEndpoint(envVar) {
+  const normalized = String(envVar || "").trim().toUpperCase();
+  if (normalized !== "WARM_RPC_URL" && normalized !== "WARM_WS_URL") return;
+  if (state.engineSettingsDirty) {
+    showOptionsToast(
+      "Save engine settings first",
+      `Save or discard your current edits before disabling ${normalized}.`,
+      { type: "error" }
+    );
+    return;
+  }
+  const confirmed = window.confirm(
+    `Disable ${normalized}? This clears only ${normalized}. Restart local services if the running engine already loaded it.`
+  );
+  if (!confirmed) return;
+  try {
+    const latest = normalizeSettings(await callBackground("trench:get-settings"));
+    if (normalized === "WARM_RPC_URL") latest.warmRpcUrl = "";
+    if (normalized === "WARM_WS_URL") latest.warmWsUrl = "";
+    const saved = await callBackground("trench:save-settings", latest);
+    await bumpBootstrapRevision();
+    state.settings = normalizeSettings(saved);
+    renderEngineSettings();
+    setEngineSettingsDirty(false);
+    showOptionsToast(`${normalized} disabled`, "Restart local services if the warning remains active.", {
+      type: "success"
+    });
+  } catch (error) {
+    showOptionsToast(`${normalized} not disabled`, error?.message || "Engine settings could not be saved.", {
+      type: "error"
+    });
+  }
+}
+
+function renderRuntimeDiagnostics(snapshot = null) {
+  const panel = ensureRuntimeDiagnosticsPanel();
+  if (!panel) return;
+  const diagnostics = Array.isArray(snapshot?.diagnostics) ? snapshot.diagnostics : [];
+  const dismissed = snapshot?.dismissed && typeof snapshot.dismissed === "object"
+    ? snapshot.dismissed
+    : {};
+  const active = diagnostics
+    .filter((entry) => entry && entry.active !== false)
+    .filter((entry) => !dismissed[entry.fingerprint || entry.key]);
+  const activeKeys = new Set(active.map(runtimeDiagnosticToastKey).filter(Boolean));
+  for (const key of Array.from(state.runtimeDiagnosticToastKeys)) {
+    if (!activeKeys.has(key)) state.runtimeDiagnosticToastKeys.delete(key);
+  }
+  panel.hidden = active.length === 0;
+  const summary = panel.querySelector("[data-runtime-diagnostics-summary]");
+  const list = panel.querySelector("[data-runtime-diagnostics-list]");
+  if (summary) {
+    summary.textContent = active.length
+      ? "Warnings are sanitized and only show endpoint kind, env var name, host, and action needed."
+      : "";
+  }
+  if (!list) return;
+  list.innerHTML = "";
+  for (const diagnostic of active) {
+    const row = document.createElement("div");
+    row.className = "runtime-diagnostic-row";
+    const title = document.createElement("strong");
+    title.textContent = diagnostic.message || "Runtime diagnostic";
+    const detail = document.createElement("p");
+    detail.className = "muted";
+    detail.textContent = runtimeDiagnosticDetail(diagnostic);
+    const actions = document.createElement("div");
+    actions.className = "action-row compact";
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "secondary-button";
+    dismiss.textContent = "Dismiss";
+    dismiss.addEventListener("click", () => {
+      void dismissRuntimeDiagnostic(diagnostic.fingerprint || diagnostic.key);
+    });
+    actions.appendChild(dismiss);
+    if (diagnostic.envVar === "WARM_RPC_URL" || diagnostic.envVar === "WARM_WS_URL") {
+      const disable = document.createElement("button");
+      disable.type = "button";
+      disable.className = "secondary-button";
+      disable.textContent = diagnostic.envVar === "WARM_RPC_URL" ? "Disable Warm RPC" : "Disable Warm WS";
+      disable.addEventListener("click", () => void disableWarmEndpoint(diagnostic.envVar));
+      actions.appendChild(disable);
+    }
+    row.appendChild(title);
+    row.appendChild(detail);
+    row.appendChild(actions);
+    list.appendChild(row);
+    const fingerprint = String(diagnostic.fingerprint || diagnostic.key || "").trim();
+    const toastKey = runtimeDiagnosticToastKey(diagnostic);
+    if (fingerprint && toastKey && !dismissed[fingerprint] && !state.runtimeDiagnosticToastKeys.has(toastKey)) {
+      state.runtimeDiagnosticToastKeys.add(toastKey);
+      showOptionsToast(diagnostic.message || "Runtime diagnostic", runtimeDiagnosticDetail(diagnostic), {
+        type: runtimeDiagnosticKind(diagnostic),
+        timeoutMs: 5000
+      });
+    }
+  }
+}
+
 function lockField(element) {
   if (!element) return;
   if (
@@ -585,6 +763,7 @@ const ENGINE_SETTINGS_DIRTY_FIELD_IDS = [
   "engine-rpc-url",
   "engine-ws-url",
   "engine-warm-rpc-url",
+  "engine-warm-ws-url",
   "engine-endpoint-profile",
   "engine-endpoint-profile-custom",
   "engine-pnl-tracking-mode",
@@ -623,6 +802,7 @@ function wireGlobalSettingsLockedFields() {
     "engine-rpc-url",
     "engine-ws-url",
     "engine-warm-rpc-url",
+    "engine-warm-ws-url",
     "engine-endpoint-profile",
     "engine-endpoint-profile-custom",
     "engine-pnl-tracking-mode",
@@ -953,11 +1133,14 @@ for (const input of [
   elements.siteAxiomEnabled,
   elements.siteAxiomLauncher,
   elements.siteAxiomInstantTrade,
+  elements.siteAxiomInstantTradeButtonModeCount,
   elements.siteAxiomLaunchdeck,
   elements.siteAxiomPulseQb,
   elements.siteAxiomPulsePanel,
   elements.siteAxiomPulseVamp,
+  elements.siteAxiomVampIconMode,
   elements.siteAxiomPulseVampMode,
+  elements.siteAxiomDexScreenerIconMode,
   elements.siteAxiomWalletTracker,
   elements.siteAxiomWatchlist,
   elements.siteJ7Enabled
@@ -983,6 +1166,7 @@ async function init() {
   renderEngineSettings();
   await refreshAuthTokenMergeNotice();
   await refreshEngineData();
+  void callBackground("trench:get-runtime-diagnostics").then(renderRuntimeDiagnostics).catch(() => {});
   setInterval(() => {
     void callBackground("trench:get-runtime-status").catch(() => {});
   }, 15000);
@@ -1000,6 +1184,11 @@ async function init() {
       // migration may run after the Options page is already open), so refresh
       // the banner without requiring a manual reload.
       void refreshAuthTokenMergeNotice();
+    }
+    if (changes[RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY]) {
+      renderRuntimeDiagnostics(changes[RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY]?.newValue || null);
+    } else if (changes[RUNTIME_DIAGNOSTICS_REVISION_KEY]) {
+      void callBackground("trench:get-runtime-diagnostics").then(renderRuntimeDiagnostics).catch(() => {});
     }
   });
 }
@@ -1722,6 +1911,10 @@ function renderSiteSettings() {
   elements.siteAxiomInstantTrade.checked = Boolean(
     siteFeatures.axiom?.instantTrade ?? siteFeatures.axiom?.tokenDetailButton
   );
+  if (elements.siteAxiomInstantTradeButtonModeCount) {
+    const count = Number(siteFeatures.axiom?.instantTradeButtonModeCount);
+    elements.siteAxiomInstantTradeButtonModeCount.value = count === 1 || count === 2 ? String(count) : "3";
+  }
   if (elements.siteAxiomLaunchdeck) {
     elements.siteAxiomLaunchdeck.checked = Boolean(siteFeatures.axiom?.launchdeckInjection);
   }
@@ -1730,9 +1923,27 @@ function renderSiteSettings() {
   if (elements.siteAxiomPulseVamp) {
     elements.siteAxiomPulseVamp.checked = Boolean(siteFeatures.axiom?.pulseVamp);
   }
+  if (elements.siteAxiomVampIconMode) {
+    const mode = String(siteFeatures.axiom?.vampIconMode || "").trim().toLowerCase();
+    const fallback = siteFeatures.axiom?.pulseVamp === false ? "off" : "both";
+    elements.siteAxiomVampIconMode.value =
+      mode === "pulse" || mode === "token" || mode === "off" ? mode : fallback;
+  }
   if (elements.siteAxiomPulseVampMode) {
     const mode = String(siteFeatures.axiom?.pulseVampMode || "prefill");
     elements.siteAxiomPulseVampMode.value = mode === "insta" ? "insta" : "prefill";
+  }
+  if (elements.siteAxiomDexScreenerIconMode) {
+    const mode = String(siteFeatures.axiom?.dexScreenerIconMode || "both").trim().toLowerCase();
+    elements.siteAxiomDexScreenerIconMode.value =
+      mode === "pulse" || mode === "token" || mode === "off" ? mode : "both";
+  }
+  if (elements.siteAxiomPostDeployAction) {
+    const action = String(siteFeatures.axiom?.postDeployAction || "close_modal_toast").trim().toLowerCase();
+    elements.siteAxiomPostDeployAction.value =
+      action === "toast_only" || action === "open_tab_toast" || action === "open_window_toast"
+        ? action
+        : "close_modal_toast";
   }
   elements.siteAxiomWalletTracker.checked = Boolean(siteFeatures.axiom?.walletTracker);
   elements.siteAxiomWatchlist.checked = Boolean(siteFeatures.axiom?.watchlist);
@@ -2100,6 +2311,7 @@ function renderEngineSettings() {
   elements.engineRpcUrl.value = settings.rpcUrl || "";
   elements.engineWsUrl.value = settings.wsUrl || "";
   elements.engineWarmRpcUrl.value = settings.warmRpcUrl || "";
+  if (elements.engineWarmWsUrl) elements.engineWarmWsUrl.value = settings.warmWsUrl || "";
   elements.engineSharedRegion.value = settings.sharedRegion || "";
   elements.engineHeliusRpcUrl.value = settings.heliusRpcUrl || "";
   elements.engineHeliusWsUrl.value = settings.heliusWsUrl || "";
@@ -2643,16 +2855,47 @@ async function setDefaultDistributionMode(mode) {
 function collectSiteSettings() {
   const vampModeRaw = String(elements.siteAxiomPulseVampMode?.value || "").trim().toLowerCase();
   const pulseVampMode = vampModeRaw === "insta" ? "insta" : "prefill";
+  const vampIconModeRaw = String(elements.siteAxiomVampIconMode?.value || "").trim().toLowerCase();
+  const vampIconMode =
+    vampIconModeRaw === "pulse" ||
+    vampIconModeRaw === "token" ||
+    vampIconModeRaw === "off"
+      ? vampIconModeRaw
+      : "both";
+  const dexScreenerIconModeRaw = String(elements.siteAxiomDexScreenerIconMode?.value || "").trim().toLowerCase();
+  const dexScreenerIconMode =
+    dexScreenerIconModeRaw === "pulse" ||
+    dexScreenerIconModeRaw === "token" ||
+    dexScreenerIconModeRaw === "off"
+      ? dexScreenerIconModeRaw
+      : "both";
+  const instantTradeButtonModeCountRaw = Number(elements.siteAxiomInstantTradeButtonModeCount?.value);
+  const instantTradeButtonModeCount =
+    instantTradeButtonModeCountRaw === 1 || instantTradeButtonModeCountRaw === 2
+      ? instantTradeButtonModeCountRaw
+      : 3;
+  const postDeployActionRaw = String(elements.siteAxiomPostDeployAction?.value || "").trim().toLowerCase();
+  const postDeployAction =
+    postDeployActionRaw === "toast_only" ||
+    postDeployActionRaw === "open_tab_toast" ||
+    postDeployActionRaw === "open_window_toast"
+      ? postDeployActionRaw
+      : "close_modal_toast";
   return {
     axiom: {
       enabled: elements.siteAxiomEnabled.checked,
       floatingLauncher: elements.siteAxiomLauncher.checked,
       instantTrade: elements.siteAxiomInstantTrade.checked,
+      instantTradeButtonModeCount,
       launchdeckInjection: elements.siteAxiomLaunchdeck ? elements.siteAxiomLaunchdeck.checked : true,
       pulseButton: elements.siteAxiomPulseQb.checked,
       pulsePanel: elements.siteAxiomPulsePanel.checked,
-      pulseVamp: elements.siteAxiomPulseVamp ? elements.siteAxiomPulseVamp.checked : true,
+      pulseVamp: vampIconMode === "both" || vampIconMode === "pulse",
       pulseVampMode,
+      vampIconMode,
+      dexScreenerIconMode,
+      postDeployAction,
+      postDeployDestination: "axiom",
       walletTracker: elements.siteAxiomWalletTracker.checked,
       watchlist: elements.siteAxiomWatchlist.checked
     },
@@ -3627,6 +3870,7 @@ function emptySettings() {
     rpcUrl: "",
     wsUrl: "",
     warmRpcUrl: "",
+    warmWsUrl: "",
     sharedRegion: "",
     heliusRpcUrl: "",
     heliusWsUrl: "",
@@ -3658,6 +3902,7 @@ function collectEngineSettings() {
     rpcUrl: elements.engineRpcUrl.value.trim(),
     wsUrl: elements.engineWsUrl.value.trim(),
     warmRpcUrl: elements.engineWarmRpcUrl.value.trim(),
+    warmWsUrl: elements.engineWarmWsUrl?.value.trim() || "",
     // The region control is the single source of truth for where the user
     // wants to route. We mirror the same value into sharedRegion /
     // heliusSenderRegion so the engine does not need independent overrides.
@@ -3711,6 +3956,7 @@ function normalizeSettings(settings) {
     rpcUrl: String(settings?.rpcUrl ?? "").trim(),
     wsUrl: String(settings?.wsUrl ?? "").trim(),
     warmRpcUrl: String(settings?.warmRpcUrl ?? "").trim(),
+    warmWsUrl: String(settings?.warmWsUrl ?? "").trim(),
     sharedRegion: configuredRegion,
     heliusRpcUrl: String(settings?.heliusRpcUrl ?? "").trim(),
     heliusWsUrl: String(settings?.heliusWsUrl ?? "").trim(),

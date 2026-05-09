@@ -31,11 +31,48 @@ Current status:
 - Available, currently disabled: `j7tracker.io`
 - Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, X, and many more platforms
 
-Axiom currently includes token-page instant trade, Pulse quick buy, watchlist quick buy, wallet-tracker quick buy, floating launcher, Pulse panel, embedded LaunchDeck popout, and Pulse Vamp.
+Axiom currently includes token-page instant trade, Pulse quick buy, Pulse manual panel, watchlist quick buy, wallet-tracker quick buy, floating launcher, embedded LaunchDeck popout, Pulse/Token Vamp helpers, and DexScreener shortcuts.
 
 J7 is wired but disabled for now. It will be enabled again soon, so do not expect it to be live until the toggle ships back on.
 
 The foundation is ready. Adding more terminals, trackers, and web apps should be incremental rather than a rewrite.
+
+## Toolbar Popup
+
+The toolbar popup is the quickest place to check the local host and change the active trade selection.
+
+When connected, it shows:
+
+- host status and engine version
+- number of loaded presets, wallets, and wallet groups
+- quick-buy amount
+- active execution preset
+- active wallet group or selected wallets
+- `Open app` for the Options/app surface
+- `Disconnect` to clear the saved token from the extension
+
+If no auth token is saved, the popup shows a token gate. Paste the value from `.local/trench-tools/default-engine-token.txt`, then connect. The popup stores the same shared token used by the Options page.
+
+The popup, floating panel, and Axiom inline controls share the same quick-trade preferences. Changing the active preset, wallets, or quick-buy amount in the popup updates what the panel and inline buttons use.
+
+## Axiom Surfaces
+
+Axiom is the live production site integration today. Depending on which toggles are enabled in Options -> `Sites`, Trench Tools can show:
+
+- token-page instant-trade controls
+- floating token panel
+- Pulse quick-buy buttons
+- Pulse manual panel buttons
+- Pulse LaunchDeck toolbar entry
+- Pulse and token-page Vamp import helpers
+- Pulse and token-page DexScreener shortcuts
+- watchlist quick-buy buttons
+- wallet-tracker quick-buy buttons
+- embedded LaunchDeck popout
+
+The token-page instant panel can show Axiom controls, Trench Tools controls, or both. The extension remembers the panel's position/size where supported and mirrors the active preset and wallet selection into the Trench Tools controls.
+
+Pair addresses from Axiom are treated as route hints, not blind execution authority. When a pair is available, the extension sends it so the engine can classify the route directly from RPC owner/layout checks. If the engine cannot verify the pair as a supported route, it fails with a clear unsupported-pool message.
 
 ## Which Backend Mode?
 
@@ -214,7 +251,7 @@ For LaunchDeck presets:
 3. Set launch/snipe amounts and sell percentages.
 4. Save.
 
-The panel needs at least one usable preset and one wallet group before it can submit trades.
+The panel needs at least one usable execution preset and at least one selected wallet or wallet group before it can submit trades.
 
 ## Wallets And Wallet Groups
 
@@ -228,6 +265,35 @@ Use this page to:
 - decide how buy amounts are distributed across wallets
 
 Keep real private keys in `.env`. Do not paste them into docs, screenshots, support messages, or public issues.
+
+## Live PnL And Coin Actions
+
+The panel keeps live balance/PnL state for the active token while the execution engine is reachable. The coin-actions menu can:
+
+- toggle gross/net PnL display
+- resync the current coin from local execution history
+- reset local PnL for the current coin
+- open global settings
+- hide or show the compact preset and wallet-group rows
+
+Resync/reset only affect local Trench Tools PnL/history state. They do not change on-chain balances.
+
+## Token Split And Consolidate
+
+The wallet button in the panel opens wallet selection for the current token. Where the current token and wallets support it:
+
+- `Split Tokens` redistributes token balance across selected wallets.
+- `Consolidate` moves selected token balances into one destination wallet.
+
+Token distribution uses the selected execution preset for provider/fee behavior. It currently supports the recommended extension providers: `Helius Sender` and `Hello Moon`. It does not support every token program variant; Token-2022 transfer-hook mints are rejected for distribution.
+
+For split actions, select at least two wallets and at least one holder wallet. For consolidate, select exactly one destination wallet. Start with small balances until you are comfortable with the flow.
+
+## Latency And Prewarm
+
+The extension and engine use best-effort prewarm on user intent, such as opening a manual panel or hovering/clicking a supported control. Prewarm can reduce first-click work, but it is not required for correctness. The engine still verifies the route and current account state before building a trade.
+
+If a warm route is stale, unsupported, or invalidated after a trade, the next action can fall back to a fresh route plan. Logs may show route metrics and warm-cache status while this happens.
 
 ## Sites Tab
 

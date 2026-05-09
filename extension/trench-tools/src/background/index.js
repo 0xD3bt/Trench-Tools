@@ -28,6 +28,7 @@ import {
   createWalletGroup,
   updateWalletGroup,
   deleteWalletGroup,
+  postActiveMark,
   postPrewarm,
   previewBatch,
   resetPnlHistory,
@@ -51,8 +52,13 @@ import {
   invalidateBalancesAfterTrade
 } from "./balances-store.js";
 import { startEventsClient } from "./events-client.js";
+import {
+  applyRuntimeDiagnostics,
+  dismissDiagnostic,
+  getDiagnosticsSnapshot
+} from "./diagnostics-store.js";
 import { clearActiveMints, setActiveMints } from "./active-mints.js";
-import { markBalanceDemand } from "./balance-demand.js";
+import { markBalanceDemand, setBalanceDemandSource } from "./balance-demand.js";
 import { setTradeReadinessSurface } from "./trade-readiness.js";
 import {
   getHostAuthToken,
@@ -74,6 +80,7 @@ import "../shared/storage-migrations.js";
 // handlers await this promise so upgraded profiles cannot serve requests before
 // the one-shot storage migration updates stale host settings.
 const backgroundRuntimeReady = initializeBackgroundRuntime();
+const LAUNCHDECK_RUNTIME_STATUS_TIMEOUT_MS = 2500;
 
 async function initializeBackgroundRuntime() {
   try {
@@ -163,6 +170,55 @@ async function fetchLaunchdeckSettingsPayload() {
   return payload;
 }
 
+async function fetchLaunchdeckRuntimeStatusPayload() {
+  const { baseUrl, authToken } = await loadLaunchdeckConnection();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LAUNCHDECK_RUNTIME_STATUS_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(new URL("/api/runtime-status", baseUrl).toString(), {
+      method: "GET",
+      headers: { authorization: `Bearer ${authToken}` },
+      credentials: "omit",
+      cache: "no-cache",
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`LaunchDeck runtime status timed out after ${LAUNCHDECK_RUNTIME_STATUS_TIMEOUT_MS}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json")
+    ? await response.json().catch(() => ({}))
+    : await response.text().catch(() => "");
+  if (!response.ok) {
+    const message = typeof payload === "string"
+      ? payload
+      : payload?.error || `${response.status} ${response.statusText}`.trim();
+    throw new Error(message || "LaunchDeck runtime status request failed.");
+  }
+  return payload;
+}
+
+function launchdeckUnavailableDiagnostic(error) {
+  const message = String(error?.message || "LaunchDeck runtime status unavailable.").trim();
+  return {
+    fingerprint: "launchdeck-engine:runtime:::launchdeck_status_unreachable",
+    severity: "warning",
+    source: "launchdeck-engine",
+    code: "launchdeck_status_unreachable",
+    message: "LaunchDeck runtime status is unavailable.",
+    detail: message,
+    active: true,
+    restartRequired: false,
+    atMs: Date.now()
+  };
+}
+
 async function ensureOffscreenAudioDocument() {
   if (!chrome.offscreen?.createDocument) {
     return false;
@@ -223,6 +279,34 @@ const CONTENT_REINJECTION_TARGETS = [
   }
 ];
 
+async function openExternalUrl(payload = {}) {
+  const url = String(payload.url || "").trim();
+  const mode = String(payload.mode || "tab").trim().toLowerCase();
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (_error) {
+    throw new Error("Valid URL required.");
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error("Only http and https URLs can be opened.");
+  }
+  if (mode === "window") {
+    const width = Math.max(420, Math.min(1280, Number(payload.width) || 1100));
+    const height = Math.max(420, Math.min(1000, Number(payload.height) || 760));
+    await chrome.windows.create({
+      url: parsed.toString(),
+      type: "popup",
+      focused: true,
+      width,
+      height
+    });
+    return { opened: true, mode: "window" };
+  }
+  await chrome.tabs.create({ url: parsed.toString(), active: true });
+  return { opened: true, mode: "tab" };
+}
+
 async function handleMessage(message) {
   await backgroundRuntimeReady;
   switch (message?.type) {
@@ -235,8 +319,21 @@ async function handleMessage(message) {
       return { ok: true };
     case "trench:get-bootstrap":
       return fetchBootstrap();
-    case "trench:get-runtime-status":
-      return fetchRuntimeStatus();
+    case "trench:get-runtime-status": {
+      const status = await fetchRuntimeStatus();
+      await applyRuntimeDiagnostics(status?.diagnostics || [], "execution-engine");
+      try {
+        const launchdeckStatus = await fetchLaunchdeckRuntimeStatusPayload();
+        await applyRuntimeDiagnostics(launchdeckStatus?.diagnostics || [], "launchdeck-engine");
+      } catch (error) {
+        await applyRuntimeDiagnostics([launchdeckUnavailableDiagnostic(error)], "launchdeck-engine");
+      }
+      return status;
+    }
+    case "trench:get-runtime-diagnostics":
+      return getDiagnosticsSnapshot();
+    case "trench:dismiss-runtime-diagnostic":
+      return dismissDiagnostic(message.payload?.fingerprint);
     case "trench:get-launchdeck-host-settings":
     case "trench:get-launchdeck-settings":
       return fetchLaunchdeckSettingsPayload();
@@ -280,6 +377,17 @@ async function handleMessage(message) {
         setActiveMints(surfaceId, mints);
       }
       return { ok: true };
+    }
+    case "trench:set-active-mark": {
+      const payload = message.payload || {};
+      const surfaceId = String(payload.surfaceId || "default").trim() || "default";
+      const response = await postActiveMark(payload);
+      setBalanceDemandSource(
+        `active-mark:${surfaceId}`,
+        Boolean(payload.active),
+        "active-mark"
+      );
+      return response;
     }
     case "trench:invalidate-balances": {
       const payload = message.payload || {};
@@ -407,6 +515,8 @@ async function handleMessage(message) {
       }
       await chrome.runtime.openOptionsPage();
       return { opened: true };
+    case "trench:open-external-url":
+      return openExternalUrl(message.payload || {});
     case "trench:play-sound":
       return playSoundViaOffscreen(message.payload || {});
     default:

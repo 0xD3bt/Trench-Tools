@@ -13,6 +13,7 @@ use solana_sdk::{
     signature::Signer,
     transaction::VersionedTransaction,
 };
+use solana_system_interface::instruction::transfer;
 use spl_associated_token_account::{
     get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
@@ -23,6 +24,7 @@ use spl_token_2022_interface::{
 };
 
 use crate::{
+    provider_tip::{pick_tip_account_for_provider, provider_required_tip_lamports},
     rpc_client::{
         CompiledTransaction, configured_rpc_url, confirm_submitted_transactions_for_transport,
         fetch_account_owner_and_data, fetch_latest_blockhash,
@@ -38,12 +40,17 @@ const MINT_DECIMALS_OFFSET: usize = 44;
 const SPLIT_SPREAD_BPS: u64 = 1_200;
 const SPLIT_WEIGHT_SCALE_BPS: u64 = 10_000;
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
+const TOKEN_DISTRIBUTION_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenSplitRequest {
     #[serde(default)]
     pub client_request_id: Option<String>,
+    #[serde(default)]
+    pub preset_id: String,
     pub mint: String,
     #[serde(default)]
     pub wallet_keys: Vec<String>,
@@ -56,6 +63,8 @@ pub struct TokenSplitRequest {
 pub struct TokenConsolidateRequest {
     #[serde(default)]
     pub client_request_id: Option<String>,
+    #[serde(default)]
+    pub preset_id: String,
     pub mint: String,
     pub destination_wallet_key: String,
 }
@@ -65,6 +74,12 @@ pub struct TokenDistributionExecutionConfig {
     pub commitment: String,
     pub skip_preflight: bool,
     pub track_send_block_height: bool,
+    pub provider: String,
+    pub endpoint_profile: String,
+    pub mev_mode: String,
+    pub fee_sol: String,
+    pub tip_sol: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,20 +494,30 @@ async fn execute_planned_transfers(
     let mut results = Vec::with_capacity(planned.len());
     let mut confirmed_count = 0usize;
     let mut failed_count = 0usize;
-    let mut warnings = Vec::new();
+    let mut warnings = config.warnings.clone();
+    let provider = supported_distribution_provider(&config.provider)?;
+    let compute_unit_price_micro_lamports = priority_fee_sol_to_micro_lamports(&config.fee_sol)?;
     for (index, transfer) in planned.into_iter().enumerate() {
         let (blockhash, _) = fetch_latest_blockhash(&rpc_url, &config.commitment).await?;
-        let compiled_transaction =
-            compile_transfer_transaction(index, &metadata, &transfer, &wallet_by_key, blockhash)?;
+        let compiled_transaction = compile_transfer_transaction(
+            index,
+            &metadata,
+            &transfer,
+            &wallet_by_key,
+            blockhash,
+            &provider,
+            &config.tip_sol,
+            compute_unit_price_micro_lamports,
+        )?;
         let transport_plan = build_transport_plan(
             &ExecutionTransportConfig {
-                provider: "standard-rpc".to_string(),
-                endpoint_profile: "global".to_string(),
+                provider: provider.clone(),
+                endpoint_profile: config.endpoint_profile.clone(),
                 commitment: config.commitment.clone(),
                 skip_preflight: config.skip_preflight,
                 track_send_block_height: config.track_send_block_height,
-                mev_mode: "off".to_string(),
-                mev_protect: false,
+                mev_mode: config.mev_mode.clone(),
+                mev_protect: !config.mev_mode.trim().eq_ignore_ascii_case("off"),
             },
             1,
         );
@@ -580,6 +605,9 @@ fn compile_transfer_transaction(
     transfer: &PlannedTokenTransfer,
     wallet_by_key: &HashMap<String, WalletTokenBalance>,
     blockhash: solana_sdk::hash::Hash,
+    provider: &str,
+    tip_sol: &str,
+    compute_unit_price_micro_lamports: u64,
 ) -> Result<CompiledTransaction, String> {
     let source = wallet_by_key
         .get(&transfer.source_wallet_key)
@@ -598,7 +626,15 @@ fn compile_transfer_transaction(
             )
         })?;
     let payer = load_solana_wallet_by_env_key(&transfer.source_wallet_key)?;
-    let instructions = vec![
+    let mut instructions = vec![build_compute_unit_limit_instruction(
+        TOKEN_DISTRIBUTION_COMPUTE_UNIT_LIMIT,
+    )?];
+    if compute_unit_price_micro_lamports > 0 {
+        instructions.push(build_compute_unit_price_instruction(
+            compute_unit_price_micro_lamports,
+        )?);
+    }
+    instructions.extend([
         create_associated_token_account_idempotent(
             &source.owner,
             &destination.owner,
@@ -614,7 +650,16 @@ fn compile_transfer_transaction(
             transfer.amount_raw,
             metadata.decimals,
         )?,
-    ];
+    ]);
+    let (inline_tip_lamports, inline_tip_account) =
+        if let Some((tip_instruction, tip_lamports, tip_account)) =
+            resolve_inline_tip(&source.owner, provider, tip_sol)?
+        {
+            instructions.push(tip_instruction);
+            (Some(tip_lamports), Some(tip_account))
+        } else {
+            (None, None)
+        };
     let message = v0::Message::try_compile(&payer.pubkey(), &instructions, &[], blockhash)
         .map_err(|error| format!("Failed to compile token transfer transaction: {error}"))?;
     let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer])
@@ -634,10 +679,11 @@ fn compile_transfer_transaction(
         serialized_base64: BASE64.encode(serialized),
         signature,
         lookup_tables_used: Vec::new(),
-        compute_unit_limit: None,
-        compute_unit_price_micro_lamports: None,
-        inline_tip_lamports: None,
-        inline_tip_account: None,
+        compute_unit_limit: Some(u64::from(TOKEN_DISTRIBUTION_COMPUTE_UNIT_LIMIT)),
+        compute_unit_price_micro_lamports: (compute_unit_price_micro_lamports > 0)
+            .then_some(compute_unit_price_micro_lamports),
+        inline_tip_lamports,
+        inline_tip_account,
     })
 }
 
@@ -670,6 +716,121 @@ fn transfer_checked_instruction(
         ],
         data,
     })
+}
+
+fn supported_distribution_provider(provider: &str) -> Result<String, String> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "helius" | "helius-sender" => Ok("helius-sender".to_string()),
+        "hellomoon" | "hello-moon" | "lunar-lander" => Ok("hellomoon".to_string()),
+        other => Err(format!(
+            "Token distribution only supports Helius Sender or Hello Moon presets, got {other:?}."
+        )),
+    }
+}
+
+fn resolve_inline_tip(
+    payer: &Pubkey,
+    provider: &str,
+    tip_sol: &str,
+) -> Result<Option<(Instruction, u64, String)>, String> {
+    let tip_account = pick_tip_account_for_provider(provider);
+    if tip_account.trim().is_empty() {
+        return Ok(None);
+    }
+    let required_lamports = provider_required_tip_lamports(provider).unwrap_or(0);
+    let requested_lamports = parse_sol_lamports_field(tip_sol).unwrap_or(0);
+    let lamports = requested_lamports.max(required_lamports);
+    if lamports == 0 {
+        return Ok(None);
+    }
+    let tip_pubkey = parse_pubkey(&tip_account, "token distribution tip account")?;
+    Ok(Some((
+        transfer(payer, &tip_pubkey, lamports),
+        lamports,
+        tip_account,
+    )))
+}
+
+fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, String> {
+    let lamports = parse_sol_lamports_field(priority_fee_sol)?;
+    if lamports == 0 {
+        Ok(0)
+    } else {
+        Ok((lamports.saturating_mul(1_000_000)) / PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT)
+    }
+}
+
+fn parse_sol_lamports_field(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    if trimmed.starts_with('-') {
+        return Err("SOL fee field cannot be negative.".to_string());
+    }
+    let (whole, fraction) = trimmed.split_once('.').unwrap_or((trimmed, ""));
+    if whole.is_empty() || !whole.chars().all(|character| character.is_ascii_digit()) {
+        return Err(format!("Invalid SOL fee field: {trimmed}"));
+    }
+    if !fraction.chars().all(|character| character.is_ascii_digit()) {
+        return Err(format!("Invalid SOL fee field: {trimmed}"));
+    }
+    let whole_lamports = whole
+        .parse::<u64>()
+        .map_err(|_| format!("SOL fee field is too large: {trimmed}"))?
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| format!("SOL fee field is too large: {trimmed}"))?;
+    let mut fractional = fraction.to_string();
+    if fractional.len() > 9 {
+        if fractional[9..].chars().any(|character| character != '0') {
+            return Err(format!(
+                "SOL fee field has more than 9 decimal places: {trimmed}"
+            ));
+        }
+        fractional.truncate(9);
+    }
+    while fractional.len() < 9 {
+        fractional.push('0');
+    }
+    let fractional_lamports = if fractional.is_empty() {
+        0
+    } else {
+        fractional
+            .parse::<u64>()
+            .map_err(|_| format!("Invalid SOL fee field: {trimmed}"))?
+    };
+    whole_lamports
+        .checked_add(fractional_lamports)
+        .ok_or_else(|| format!("SOL fee field is too large: {trimmed}"))
+}
+
+fn build_compute_unit_limit_instruction(compute_unit_limit: u32) -> Result<Instruction, String> {
+    let mut data = vec![2];
+    data.extend_from_slice(&compute_unit_limit.to_le_bytes());
+    Ok(Instruction {
+        program_id: compute_budget_program_id()?,
+        accounts: vec![],
+        data,
+    })
+}
+
+fn build_compute_unit_price_instruction(micro_lamports: u64) -> Result<Instruction, String> {
+    let mut data = vec![3];
+    data.extend_from_slice(&micro_lamports.to_le_bytes());
+    Ok(Instruction {
+        program_id: compute_budget_program_id()?,
+        accounts: vec![],
+        data,
+    })
+}
+
+fn compute_budget_program_id() -> Result<Pubkey, String> {
+    Pubkey::from_str(COMPUTE_BUDGET_PROGRAM_ID)
+        .map_err(|error| format!("Invalid Compute Budget program id: {error}"))
+}
+
+fn parse_pubkey(value: &str, label: &str) -> Result<Pubkey, String> {
+    Pubkey::from_str(value).map_err(|error| format!("Invalid {label}: {error}"))
 }
 
 fn token_2022_program_id() -> Result<Pubkey, String> {
@@ -765,5 +926,37 @@ mod tests {
             transfer_checked_instruction(&token_2022, &source, &mint, &destination, &owner, 1, 6)
                 .expect("build token-2022 transfer");
         assert_eq!(instruction.program_id, token_2022);
+    }
+
+    #[test]
+    fn distribution_provider_support_is_limited_to_helius_sender_and_hellomoon() {
+        assert_eq!(
+            supported_distribution_provider("helius").unwrap(),
+            "helius-sender"
+        );
+        assert_eq!(
+            supported_distribution_provider("hello-moon").unwrap(),
+            "hellomoon"
+        );
+        assert!(supported_distribution_provider("standard-rpc").is_err());
+    }
+
+    #[test]
+    fn priority_fee_sol_maps_to_micro_lamports() {
+        assert_eq!(priority_fee_sol_to_micro_lamports("").unwrap(), 0);
+        assert_eq!(
+            priority_fee_sol_to_micro_lamports("0.001").unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn inline_tip_applies_provider_floor() {
+        let payer = Pubkey::new_unique();
+        let (_, lamports, account) = resolve_inline_tip(&payer, "hellomoon", "0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lamports, 1_000_000);
+        assert!(!account.trim().is_empty());
     }
 }

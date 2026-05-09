@@ -39,8 +39,19 @@ struct CachedBagsImportContext {
     fetched_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct CachedBagsFollowBuyContext {
+    context: launchdeck_bags::BagsFollowBuyContext,
+    fetched_at: Instant,
+}
+
 fn bags_import_context_cache() -> &'static Mutex<HashMap<String, CachedBagsImportContext>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedBagsImportContext>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bags_follow_buy_context_cache() -> &'static Mutex<HashMap<String, CachedBagsFollowBuyContext>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedBagsFollowBuyContext>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -103,6 +114,40 @@ async fn cache_bags_import_context(
     bags_import_context_cache().lock().await.insert(
         bags_import_context_cache_key(rpc_url, &request.mint, request.pinned_pool.as_deref()),
         CachedBagsImportContext {
+            context: context.clone(),
+            fetched_at: Instant::now(),
+        },
+    );
+}
+
+async fn warmed_bags_follow_buy_context(
+    request: &TradeRuntimeRequest,
+) -> Option<launchdeck_bags::BagsFollowBuyContext> {
+    let warm_key = request.warm_key.as_deref()?.trim();
+    if warm_key.is_empty() {
+        return None;
+    }
+    let mut cache = bags_follow_buy_context_cache().lock().await;
+    if let Some(entry) = cache.get(warm_key) {
+        if entry.fetched_at.elapsed() <= BAGS_IMPORT_CONTEXT_TTL {
+            return Some(entry.context.clone());
+        }
+    }
+    cache.remove(warm_key);
+    None
+}
+
+async fn cache_bags_follow_buy_context(
+    warm_key: &str,
+    context: &launchdeck_bags::BagsFollowBuyContext,
+) {
+    let key = warm_key.trim();
+    if key.is_empty() {
+        return;
+    }
+    bags_follow_buy_context_cache().lock().await.insert(
+        key.to_string(),
+        CachedBagsFollowBuyContext {
             context: context.clone(),
             fetched_at: Instant::now(),
         },
@@ -183,17 +228,10 @@ async fn plan_meteora_trade_with_cache_mode(
     let Some(context) = load_bags_import_context(rpc_url, request, cache_mode).await? else {
         return Ok(None);
     };
-    let bags_launch = if let Some(metadata) = context.launchMetadata.clone() {
-        metadata
-    } else {
-        launchdeck_bags::summarize_bags_launch_metadata_from_config(
-            rpc_url,
-            &request.mint,
-            &context.configKey,
-            &request.policy.commitment,
-        )
-        .await?
-    };
+    let bags_launch = context
+        .launchMetadata
+        .clone()
+        .unwrap_or_else(|| launch_metadata_from_context(&context));
     Ok(Some(map_bags_context_to_selector(
         request,
         context,
@@ -226,7 +264,11 @@ pub async fn compile_meteora_trade(
     let launchdeck_execution = to_launchdeck_execution(&request.policy);
     let tip_account = pick_tip_account_for_provider(&request.policy.provider);
     let bags_launch = selector_to_bags_launch(selector);
-    let launch_creator = selector_launch_creator(selector).unwrap_or_default();
+    let direct_protocol_target = selector
+        .direct_protocol_target
+        .as_deref()
+        .unwrap_or_else(|| selector.family.label());
+    let quote_asset = selector.quote_asset.label();
     let compiled =
         match request.side {
             TradeSide::Buy => {
@@ -234,24 +276,40 @@ pub async fn compile_meteora_trade(
                     .buy_amount_sol
                     .as_deref()
                     .ok_or_else(|| "Missing buyAmountSol for Meteora buy request.".to_string())?;
-                let follow_buy_context = launchdeck_bags::load_follow_buy_context(
-                    &rpc_url,
-                    &request.mint,
-                    &launchdeck_execution.commitment,
-                    Some(&bags_launch),
-                )
-                .await?;
-                launchdeck_bags::compile_follow_buy_transaction(
+                let context_started_at = Instant::now();
+                let follow_buy_context = match warmed_bags_follow_buy_context(request).await {
+                    Some(context) => Some(context),
+                    None => {
+                        let loaded = launchdeck_bags::load_follow_buy_context(
+                            &rpc_url,
+                            &request.mint,
+                            &launchdeck_execution.commitment,
+                            Some(&bags_launch),
+                        )
+                        .await?;
+                        if let (Some(warm_key), Some(context)) =
+                            (request.warm_key.as_deref(), loaded.as_ref())
+                        {
+                            cache_bags_follow_buy_context(warm_key, context).await;
+                        }
+                        loaded
+                    }
+                };
+                crate::route_metrics::record_phase_ms(
+                    "context_fetch",
+                    context_started_at.elapsed().as_millis(),
+                );
+                launchdeck_bags::compile_follow_buy_transaction_for_meteora_target(
                     &rpc_url,
                     &launchdeck_execution,
-                    false,
                     &tip_account,
                     &owner_bytes,
                     &request.mint,
-                    launch_creator.as_str(),
                     buy_amount_sol,
                     Some(&bags_launch),
                     follow_buy_context.as_ref(),
+                    direct_protocol_target,
+                    quote_asset,
                 )
                 .await?
             }
@@ -260,20 +318,18 @@ pub async fn compile_meteora_trade(
                     parse_sell_percent(request.sell_intent.as_ref().ok_or_else(|| {
                         "Missing sell intent for Meteora sell request.".to_string()
                     })?)?;
-                launchdeck_bags::compile_follow_sell_transaction(
+                launchdeck_bags::compile_follow_sell_transaction_for_meteora_target(
                     &rpc_url,
                     &launchdeck_execution,
-                    false,
                     &tip_account,
                     &owner_bytes,
                     &request.mint,
-                    launch_creator.as_str(),
                     sell_percent,
-                    false,
                     Some(&bags_launch),
+                    direct_protocol_target,
+                    quote_asset,
                 )
                 .await?
-                .ok_or_else(|| "Meteora sell compiler returned no transaction.".to_string())?
             }
         };
     Ok(CompiledAdapterTrade {
@@ -282,6 +338,37 @@ pub async fn compile_meteora_trade(
         dependency_mode: TransactionDependencyMode::Independent,
         entry_preference_asset: None,
     })
+}
+
+pub async fn warm_meteora_compile_snapshot(
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    warm_key: &str,
+) -> Result<bool, String> {
+    let key = warm_key.trim();
+    if key.is_empty() || !matches!(request.side, TradeSide::Buy) {
+        return Ok(false);
+    }
+    let rpc_url = crate::rpc_client::configured_rpc_url();
+    let launchdeck_execution = to_launchdeck_execution(&request.policy);
+    let bags_launch = selector_to_bags_launch(selector);
+    let context_started_at = Instant::now();
+    let Some(context) = launchdeck_bags::load_follow_buy_context(
+        &rpc_url,
+        &request.mint,
+        &launchdeck_execution.commitment,
+        Some(&bags_launch),
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    crate::route_metrics::record_phase_ms(
+        "context_fetch",
+        context_started_at.elapsed().as_millis(),
+    );
+    cache_bags_follow_buy_context(key, &context).await;
+    Ok(true)
 }
 
 fn map_bags_context_to_selector(
@@ -309,6 +396,11 @@ fn map_bags_context_to_selector(
     if !context.creator.trim().is_empty() {
         wrapper_accounts.push(context.creator.clone());
     }
+    let quote_asset = match context.quoteAsset.trim().to_ascii_lowercase().as_str() {
+        "usdc" => PlannerQuoteAsset::Usdc,
+        "wsol" => PlannerQuoteAsset::Wsol,
+        _ => PlannerQuoteAsset::Sol,
+    };
     LifecycleAndCanonicalMarket {
         lifecycle: if is_damm {
             TradeLifecycle::PostMigration
@@ -317,7 +409,7 @@ fn map_bags_context_to_selector(
         },
         family,
         canonical_market_key: context.marketKey,
-        quote_asset: PlannerQuoteAsset::Sol,
+        quote_asset,
         verification_source: PlannerVerificationSource::OnchainDerived,
         wrapper_action,
         wrapper_accounts,
@@ -339,6 +431,33 @@ fn map_bags_context_to_selector(
         runtime_bundle: Some(PlannerRuntimeBundle::Bags(BagsRuntimeBundle {
             bags_launch,
         })),
+    }
+}
+
+fn launch_metadata_from_context(
+    context: &launchdeck_bags::BagsImportContext,
+) -> BagsLaunchMetadata {
+    let is_damm = context.venue.to_ascii_lowercase().contains("damm");
+    BagsLaunchMetadata {
+        configKey: context.configKey.clone(),
+        migrationFeeOption: None,
+        expectedMigrationFamily: if is_damm {
+            "damm-v2".to_string()
+        } else {
+            "dbc".to_string()
+        },
+        expectedDammConfigKey: context.configKey.clone(),
+        expectedDammDerivationMode: context.mode.clone(),
+        preMigrationDbcPoolAddress: if is_damm {
+            String::new()
+        } else {
+            context.marketKey.clone()
+        },
+        postMigrationDammPoolAddress: if is_damm {
+            context.marketKey.clone()
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -389,9 +508,13 @@ pub(crate) fn selector_to_bags_import_context(
         _ => return None,
     };
     Some(launchdeck_bags::BagsImportContext {
-        launchpad: "bagsapp".to_string(),
+        launchpad: "meteora".to_string(),
         mode: selector.market_subtype.clone().unwrap_or_default(),
-        quoteAsset: "sol".to_string(),
+        quoteAsset: match selector.quote_asset {
+            PlannerQuoteAsset::Usdc => "usdc".to_string(),
+            PlannerQuoteAsset::Wsol => "wsol".to_string(),
+            _ => "sol".to_string(),
+        },
         creator: selector_launch_creator(selector).unwrap_or_default(),
         marketKey: selector.canonical_market_key.clone(),
         configKey: selector

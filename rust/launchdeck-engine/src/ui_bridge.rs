@@ -29,9 +29,11 @@ use std::{
 
 const FIXED_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const MAX_FEE_SPLIT_RECIPIENTS: usize = 10;
+const BONK_IMAGE_UPLOAD_URL: &str = "https://nft-storage.letsbonk22.workers.dev/upload/img";
+const BONK_METADATA_UPLOAD_URL: &str = "https://nft-storage.letsbonk22.workers.dev/upload/meta";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataUploadProvider {
-    PumpFun,
+    LaunchpadDefault,
     Pinata,
 }
 
@@ -43,10 +45,10 @@ pub struct MetadataUploadOutcome {
 
 fn parse_metadata_upload_provider(value: &str) -> Result<MetadataUploadProvider, String> {
     match value.trim().to_lowercase().as_str() {
-        "" | "pump-fun" | "pumpfun" => Ok(MetadataUploadProvider::PumpFun),
+        "" | "default" | "pump-fun" | "pumpfun" => Ok(MetadataUploadProvider::LaunchpadDefault),
         "pinata" | "custom" => Ok(MetadataUploadProvider::Pinata),
         other => Err(format!(
-            "Unsupported metadata upload provider: {other}. Expected pump-fun or pinata."
+            "Unsupported metadata upload provider: {other}. Expected default, pump-fun, or pinata."
         )),
     }
 }
@@ -641,6 +643,18 @@ fn uploaded_image_details(config: &RawConfig) -> Result<(String, PathBuf), Strin
     Ok((image_file_name, image_path))
 }
 
+fn is_bonk_launchpad(config: &RawConfig) -> bool {
+    config.launchpad.trim().eq_ignore_ascii_case("bonk")
+}
+
+fn launch_metadata_created_on(config: &RawConfig) -> &'static str {
+    if is_bonk_launchpad(config) {
+        "https://bonk.fun"
+    } else {
+        "https://pump.fun"
+    }
+}
+
 fn build_launch_metadata_json(config: &RawConfig, image_uri: &str) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert("name".to_string(), Value::String(config.token.name.clone()));
@@ -653,11 +667,13 @@ fn build_launch_metadata_json(config: &RawConfig, image_uri: &str) -> Value {
         Value::String(config.token.description.clone()),
     );
     payload.insert("image".to_string(), Value::String(image_uri.to_string()));
-    payload.insert("showName".to_string(), Value::Bool(true));
     payload.insert(
         "createdOn".to_string(),
-        Value::String("https://pump.fun".to_string()),
+        Value::String(launch_metadata_created_on(config).to_string()),
     );
+    if !is_bonk_launchpad(config) {
+        payload.insert("showName".to_string(), Value::Bool(true));
+    }
     if !config.token.website.trim().is_empty() {
         payload.insert(
             "website".to_string(),
@@ -830,6 +846,76 @@ async fn upload_metadata_to_pump_fun(config: &RawConfig) -> Result<String, Strin
         .ok_or_else(|| "Metadata upload did not return metadataUri.".to_string())
 }
 
+async fn upload_metadata_to_bonk_fun(config: &RawConfig) -> Result<String, String> {
+    let (image_file_name, image_path) = uploaded_image_details(config)?;
+    let image_bytes = fs::read(&image_path).map_err(|error| {
+        format!(
+            "Failed to read uploaded image {}: {error}",
+            image_path.display()
+        )
+    })?;
+    let image_part = multipart::Part::bytes(image_bytes)
+        .file_name(image_file_name)
+        .mime_str(image_mime(&image_path))
+        .map_err(|error| format!("Failed to prepare Bonk launch image: {error}"))?;
+    let client = Client::new();
+    let image_response = client
+        .post(BONK_IMAGE_UPLOAD_URL)
+        .multipart(multipart::Form::new().part("image", image_part))
+        .send()
+        .await
+        .map_err(|error| format!("Bonk image upload failed: {error}"))?;
+    if !image_response.status().is_success() {
+        let status = image_response.status();
+        let body = image_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Bonk image upload failed with status {status}: {}",
+            if body.trim().is_empty() {
+                "empty response".to_string()
+            } else {
+                body
+            }
+        ));
+    }
+    let image_uri = image_response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read Bonk image upload response: {error}"))?
+        .trim()
+        .to_string();
+    if image_uri.is_empty() {
+        return Err("Bonk image upload returned an empty URI.".to_string());
+    }
+    let metadata_response = client
+        .post(BONK_METADATA_UPLOAD_URL)
+        .json(&build_launch_metadata_json(config, &image_uri))
+        .send()
+        .await
+        .map_err(|error| format!("Bonk metadata upload failed: {error}"))?;
+    if !metadata_response.status().is_success() {
+        let status = metadata_response.status();
+        let body = metadata_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Bonk metadata upload failed with status {status}: {}",
+            if body.trim().is_empty() {
+                "empty response".to_string()
+            } else {
+                body
+            }
+        ));
+    }
+    let metadata_uri = metadata_response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read Bonk metadata upload response: {error}"))?;
+    let normalized = normalize_metadata_uri(&metadata_uri);
+    if normalized.trim().is_empty() {
+        Err("Bonk metadata upload returned an empty URI.".to_string())
+    } else {
+        Ok(normalized)
+    }
+}
+
 async fn upload_metadata_to_pinata(config: &RawConfig) -> Result<String, String> {
     let jwt = configured_pinata_jwt()?;
     let client = Client::new();
@@ -886,10 +972,26 @@ async fn upload_metadata_to_pinata(config: &RawConfig) -> Result<String, String>
     ))
 }
 
+async fn upload_metadata_to_launchpad_default(config: &RawConfig) -> Result<String, String> {
+    if is_bonk_launchpad(config) {
+        upload_metadata_to_bonk_fun(config).await
+    } else {
+        upload_metadata_to_pump_fun(config).await
+    }
+}
+
+fn launchpad_default_upload_label(config: &RawConfig) -> &'static str {
+    if is_bonk_launchpad(config) {
+        "Bonk"
+    } else {
+        "pump-fun"
+    }
+}
+
 async fn upload_metadata(config: &RawConfig) -> Result<MetadataUploadOutcome, String> {
     match configured_metadata_upload_provider()? {
-        MetadataUploadProvider::PumpFun => Ok(MetadataUploadOutcome {
-            metadata_uri: upload_metadata_to_pump_fun(config).await?,
+        MetadataUploadProvider::LaunchpadDefault => Ok(MetadataUploadOutcome {
+            metadata_uri: upload_metadata_to_launchpad_default(config).await?,
             warning: None,
         }),
         MetadataUploadProvider::Pinata => match upload_metadata_to_pinata(config).await {
@@ -898,16 +1000,18 @@ async fn upload_metadata(config: &RawConfig) -> Result<MetadataUploadOutcome, St
                 warning: None,
             }),
             Err(pinata_error) => {
-                let pump_fun_uri =
-                    upload_metadata_to_pump_fun(config).await.map_err(|pump_error| {
+                let fallback_label = launchpad_default_upload_label(config);
+                let fallback_uri = upload_metadata_to_launchpad_default(config).await.map_err(
+                    |fallback_error| {
                         format!(
-                            "Pinata metadata upload failed and pump-fun fallback also failed. Pinata: {pinata_error} | pump-fun: {pump_error}"
+                            "Pinata metadata upload failed and {fallback_label} fallback also failed. Pinata: {pinata_error} | {fallback_label}: {fallback_error}"
                         )
-                    })?;
+                    },
+                )?;
                 Ok(MetadataUploadOutcome {
-                    metadata_uri: pump_fun_uri,
+                    metadata_uri: fallback_uri,
                     warning: Some(format!(
-                        "Pinata upload failed and LaunchDeck fell back to pump-fun automatically: {pinata_error}"
+                        "Pinata upload failed and LaunchDeck fell back to {fallback_label} automatically: {pinata_error}"
                     )),
                 })
             }
@@ -1656,8 +1760,8 @@ pub async fn build_raw_config_from_form(
 mod tests {
     use super::{
         MetadataUploadProvider, UiFollowLaunch, UiFollowLaunchSell, UiForm, UiRecipientInput,
-        UiSniperWalletInput, build_raw_config_from_ui_form, normalize_metadata_uri,
-        parse_metadata_upload_provider,
+        UiSniperWalletInput, build_launch_metadata_json, build_raw_config_from_ui_form,
+        normalize_metadata_uri, parse_metadata_upload_provider,
     };
     use serde_json::json;
 
@@ -1694,10 +1798,18 @@ mod tests {
     }
 
     #[test]
-    fn metadata_upload_provider_defaults_to_pump_fun() {
+    fn metadata_upload_provider_defaults_to_launchpad_default() {
         assert_eq!(
             parse_metadata_upload_provider("").expect("provider"),
-            MetadataUploadProvider::PumpFun
+            MetadataUploadProvider::LaunchpadDefault
+        );
+    }
+
+    #[test]
+    fn metadata_upload_provider_accepts_pump_fun_as_launchpad_default() {
+        assert_eq!(
+            parse_metadata_upload_provider("pump-fun").expect("provider"),
+            MetadataUploadProvider::LaunchpadDefault
         );
     }
 
@@ -1707,6 +1819,52 @@ mod tests {
             parse_metadata_upload_provider("pinata").expect("provider"),
             MetadataUploadProvider::Pinata
         );
+    }
+
+    #[tokio::test]
+    async fn bonk_metadata_uses_bonk_created_on_without_show_name() {
+        let mut raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                launchpad: "bonk".to_string(),
+                name: "Bonk Token".to_string(),
+                symbol: "BONK".to_string(),
+                description: "Bonk description".to_string(),
+                website: "https://example.com".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("bonk form should build");
+        raw.token.uri = "ipfs://metadata".to_string();
+
+        let metadata = build_launch_metadata_json(&raw, "https://ipfs.io/ipfs/image");
+
+        assert_eq!(metadata["createdOn"], json!("https://bonk.fun"));
+        assert_eq!(metadata["image"], json!("https://ipfs.io/ipfs/image"));
+        assert!(metadata.get("showName").is_none());
+    }
+
+    #[tokio::test]
+    async fn pump_metadata_keeps_pump_created_on_and_show_name() {
+        let mut raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                launchpad: "pump".to_string(),
+                name: "Pump Token".to_string(),
+                symbol: "PUMP".to_string(),
+                description: "Pump description".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("pump form should build");
+        raw.token.uri = "ipfs://metadata".to_string();
+
+        let metadata = build_launch_metadata_json(&raw, "ipfs://image");
+
+        assert_eq!(metadata["createdOn"], json!("https://pump.fun"));
+        assert_eq!(metadata["showName"], json!(true));
     }
 
     #[tokio::test]

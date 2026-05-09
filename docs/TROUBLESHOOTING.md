@@ -182,7 +182,7 @@ Common issues:
 - VPS is far from the selected provider region
 - `USER_REGION` points to a region far from the VPS
 
-If warm traffic is draining your main RPC budget, use a separate `WARM_RPC_URL`.
+`WARM_RPC_URL` moves compatible warm/cache traffic off the main RPC budget.
 
 ## Provider Rejections
 
@@ -208,6 +208,54 @@ Check:
 - `execution-engine` is running if trade surfaces need live data
 
 `j7tracker.io` is available in the codebase but currently disabled. Terminal and GMGN are coming later.
+
+## Axiom Button Shows Unsupported Pool Or Pair
+
+Axiom can show a `pair` address that is useful context, but Trench Tools still verifies the account owner and layout before trading. If you see:
+
+```text
+Address ... is not a token mint or supported pool/pair account.
+```
+
+or a similar unsupported-route message, the engine could not classify that address as a supported route.
+
+Common causes:
+
+- the pair is an Orca Whirlpool or another pool family that is not generally supported
+- the pair is a generic Raydium CLMM/CPMM pool outside the supported route rules
+- the pair is a non-canonical Pump AMM pool and non-canonical trading is blocked
+- the page provided a stale pair after migration
+- the RPC could not read or verify the account
+
+Open [SUPPORTED_POOLS.md](SUPPORTED_POOLS.md) for the current support matrix. When in doubt, start from the token mint or the verified pool address and use a small test amount.
+
+## Token Split Or Consolidate Fails
+
+Token distribution is an extension/runtime feature for the active token.
+
+Check:
+
+- the selected execution preset uses `Helius Sender` or `Hello Moon`
+- split has at least two selected wallets
+- split has at least one selected wallet that currently holds the token
+- consolidate has exactly one destination wallet selected
+- the token is a normal SPL Token or supported Token-2022 mint without a transfer hook
+- the selected source wallets have enough SOL for fees and any provider tip
+
+The split/consolidate buttons use the active execution preset. If the wrong provider, fee, or tip is used, change the active preset in the toolbar popup or panel before trying again.
+
+## Pump Creator-vault Custom 2006 Errors
+
+Pump routes can occasionally hit a creator-vault race where the first build/send sees a custom `2006`-style error. The default runtime has a narrow one-shot retry path for this class of Pump creator-vault issue.
+
+If it keeps happening:
+
+- update to the latest branch version
+- make sure the token/pair is current and not a stale page route
+- check `execution-engine` logs for `pump-creator-vault retry`
+- leave `EXECUTION_ENGINE_ENABLE_PUMP_CREATOR_VAULT_AUTO_RETRY` blank unless you intentionally need to disable the retry for debugging
+
+LaunchDeck follow buys/sells have separate Pump creator-vault retry switches documented in [.env.advanced](../.env.advanced).
 
 ## VPS Tunnel Issues
 

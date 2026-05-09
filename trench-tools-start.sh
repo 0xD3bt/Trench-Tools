@@ -93,7 +93,7 @@ display_name_for_binary() {
   case "$1" in
     execution-engine) printf '%s\n' "Execution Engine" ;;
     launchdeck-engine) printf '%s\n' "LaunchDeck Engine" ;;
-    launchdeck-follow-daemon) printf '%s\n' "LaunchDeck Follow Daemon" ;;
+    launchdeck-follow-daemon) printf '%s\n' "Follow Daemon" ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
@@ -107,11 +107,44 @@ description_for_binary() {
   esac
 }
 
+now_ms() {
+  date +%s%3N
+}
+
+format_elapsed_ms() {
+  local ms="$1"
+  if (( ms < 1000 )); then
+    printf '%sms\n' "$ms"
+  elif (( ms < 60000 )); then
+    printf '%s.%ss\n' "$((ms / 1000))" "$(((ms % 1000) / 100))"
+  else
+    printf '%sm %02ss\n' "$((ms / 60000))" "$(((ms % 60000) / 1000))"
+  fi
+}
+
+print_step_row() {
+  local status="$1"
+  local label="$2"
+  local detail="${3:-}"
+  printf '  %-5s %-28s %s\n' "$status" "$label" "$detail"
+}
+
+step_begin() {
+  current_step_label="$1"
+  current_step_started_at="$(now_ms)"
+  print_step_row "${2:-WAIT}" "$current_step_label" "${3:-}"
+}
+
+step_ok() {
+  local elapsed
+  elapsed="$(( $(now_ms) - current_step_started_at ))"
+  print_step_row "OK" "$current_step_label" "$(format_elapsed_ms "$elapsed")"
+}
+
 print_startup_overview() {
   local mode="$1"
   local logs="$2"
-  shift 2
-  local mode_description spec binary
+  local mode_description
 
   case "$mode" in
     ee) mode_description="Execution Engine only" ;;
@@ -120,28 +153,11 @@ print_startup_overview() {
   esac
 
   echo
-  echo "Starting Trench Tools"
+  echo "Trench Tools startup"
   echo "Mode: $mode ($mode_description)"
+  echo "Logs: $logs"
   echo
-  echo "This script will:"
-  echo "  1. Stop any old Trench Tools processes for this mode."
-  echo "  2. Build the selected apps in release mode."
-  echo "  3. Launch the local services in the background."
-  echo "  4. Check that each service is ready before it finishes."
-  echo
-  echo "Services selected:"
-  for spec in "$@"; do
-    [[ -n "$spec" ]] || continue
-    binary="${spec##*:}"
-    printf '  - %s (%s): %s on port %s\n' \
-      "$(display_name_for_binary "$binary")" \
-      "$binary" \
-      "$(description_for_binary "$binary")" \
-      "$(port_for_binary "$binary")"
-  done
-  echo
-  echo "Logs will be saved in: $logs"
-  echo
+  echo "Steps"
 }
 
 target_specs_for_mode() {
@@ -191,9 +207,7 @@ build_targets() {
     binary_names+=("$binary")
   done
 
-  echo "Step 2/4: Building selected apps in release mode."
-  echo "Building: ${binary_names[*]}"
-  echo "This can take a minute on the first run."
+  step_begin "Build services" "BUILD" "${binary_names[*]}"
   (
     cd "$project_root"
     cargo "${cargo_args[@]}"
@@ -208,6 +222,7 @@ build_targets() {
       return 1
     fi
   done
+  step_ok
 }
 
 wait_for_health_endpoint() {
@@ -291,20 +306,20 @@ print_browser_tunnel_guidance() {
 
   echo
   echo "Browser tunnel"
-  echo "  - If your browser runs on another machine, forward local port(s) $forwarded_ports to this VPS."
-  echo "  - Recommended: add LocalForward entries to your SSH config so Cursor/SSH opens them automatically."
-  echo "  - One-off tunnel:"
-  echo "    $manual_tunnel"
-  echo "  - Windows check from the browser machine:"
-  echo "    $check_commands"
-  echo "  - Do not expose ports 8788, 8789, or 8790 directly to the public internet."
+  echo "  Remote browser: forward local port(s) $forwarded_ports to this VPS."
+  echo "  One-off: $manual_tunnel"
+  echo "  Do not expose ports 8788, 8789, or 8790 publicly."
 }
 
 print_final_summary() {
   local token_path index binary pid log_path port
 
   echo
-  echo "Trench Tools is ready."
+  echo "Trench Tools services are ready."
+  if [[ "${TRENCH_TOOLS_FINAL_DIAGNOSTICS:-}" == "1" ]]; then
+    print_browser_tunnel_guidance
+    return 0
+  fi
   echo
   echo "Launched services:"
   for index in "${!started_binaries[@]}"; do
@@ -334,11 +349,8 @@ print_final_summary() {
     return 0
   fi
 
-  echo "  1. Open this token file:"
-  echo "     $token_path"
-  echo "  2. Copy the token inside the file."
-  echo "  3. Paste it into the Trench Tools / LaunchDeck browser extension when it asks for authentication."
-  echo "  4. Keep the file and token private. Anyone with the token can connect to your local engine."
+  echo "  Token file: $token_path"
+  echo "  Paste this token into the extension. Keep it private."
 }
 
 wait_for_started_targets_healthy() {
@@ -386,7 +398,6 @@ wait_for_started_targets_healthy() {
       esac
 
       if (( healthy )); then
-        printf '  Ready: %s (%s)\n' "$(display_name_for_binary "$binary")" "$binary"
         continue
       fi
 
@@ -490,8 +501,9 @@ fi
 mapfile -t target_specs < <(target_specs_for_mode "$mode")
 print_startup_overview "$mode" "$log_dir" "${target_specs[@]}"
 
-echo "Step 1/4: Stopping old Trench Tools processes for mode '$mode'."
+step_begin "Stop old processes" "WAIT" "mode $mode"
 bash "$project_root/trench-tools-stop.sh" --mode "$mode" >/dev/null 2>&1 || true
+step_ok
 
 started_binaries=()
 started_pids=()
@@ -503,14 +515,14 @@ if ! build_targets "${target_specs[@]}"; then
 fi
 
 echo
-echo "Step 3/4: Launching local services in the background."
+echo "Launched"
+step_begin "Launch services" "WAIT"
 for spec in "${target_specs[@]}"; do
   [[ -n "$spec" ]] || continue
   binary="${spec##*:}"
   log_path="$log_dir/$binary.log"
   binary_path="$(get_binary_path "$binary")"
   rotate_log "$log_path"
-  printf '  Launching %s (%s)...\n' "$(display_name_for_binary "$binary")" "$binary"
 
   (
     cd "$project_root"
@@ -521,13 +533,20 @@ for spec in "${target_specs[@]}"; do
   started_binaries+=("$binary")
   started_pids+=("$pid")
   started_logs+=("$log_path")
-  printf '    Started process %s. Logs: %s\n' "$pid" "$log_path"
+  printf '  OK    %-24s http://127.0.0.1:%-5s pid %-8s logs %s\n' \
+    "$(display_name_for_binary "$binary")" \
+    "$(port_for_binary "$binary")" \
+    "$pid" \
+    "$log_path"
 done
+step_ok
 
 echo
-echo "Step 4/4: Checking that each service is ready."
+step_begin "Wait for readiness" "WAIT"
 if ! wait_for_started_targets_healthy; then
   start_failed=1
+else
+  step_ok
 fi
 
 if (( start_failed )); then

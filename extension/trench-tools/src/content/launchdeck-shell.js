@@ -1,6 +1,6 @@
 import "../../launchdeck/layout.js";
 
-export function createLaunchdeckShellController() {
+export function createLaunchdeckShellController({ onPostDeploySuccess = null } = {}) {
   const Layout = globalThis.LaunchDeckLayout || {};
   const layoutTokens = Layout.TOKENS || {};
   const createOverlayTokens = layoutTokens.createOverlay || {};
@@ -8,6 +8,7 @@ export function createLaunchdeckShellController() {
   const OVERLAY_FRAME_ID = "trench-tools-launchdeck-frame";
   const CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE = "trench-tools-launchdeck";
   const CREATE_OVERLAY_RESIZE_MESSAGE_TYPE = "resize-create-overlay";
+  const POST_DEPLOY_MESSAGE_TYPE = "post-deploy-success";
   const CREATE_OVERLAY_VIEWPORT_GAP = createOverlayTokens.viewportGap || 64;
   const CREATE_OVERLAY_DEFAULT_WIDTH = createOverlayTokens.width || 532;
   const CREATE_OVERLAY_DEFAULT_HEIGHT = createOverlayTokens.height || 717;
@@ -52,6 +53,14 @@ export function createLaunchdeckShellController() {
       const data = event.data;
       if (!data || typeof data !== "object") return;
       if (data.source !== CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE) return;
+      if (data.type === POST_DEPLOY_MESSAGE_TYPE) {
+        if (typeof onPostDeploySuccess === "function") {
+          onPostDeploySuccess(data, {
+            closeOverlay: () => setOverlayOpen(false),
+          });
+        }
+        return;
+      }
       if (data.type !== CREATE_OVERLAY_RESIZE_MESSAGE_TYPE) return;
       if (iframe.dataset.overlayMode !== "create") return;
       applyCreateOverlaySize(iframe, data.width, data.height);

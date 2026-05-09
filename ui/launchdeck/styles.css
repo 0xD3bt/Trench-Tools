@@ -9311,3 +9311,65 @@ textarea:focus-visible,
 .popout-mode .settings-region-row {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
+
+.post-deploy-toast-host {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  z-index: 2147483647;
+  width: calc(100vw - 24px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.post-deploy-toast {
+  width: max-content;
+  max-width: min(92vw, 520px);
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 8px;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  padding: 12px;
+  background: #080808;
+  color: #fafafa;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+  font: inherit;
+  opacity: 0;
+  pointer-events: auto;
+  transform: translateY(-8px);
+  transition: transform 0.22s ease, opacity 0.22s ease;
+}
+
+.post-deploy-toast.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.post-deploy-toast.is-clickable {
+  cursor: pointer;
+}
+
+.post-deploy-toast-icon {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  object-fit: contain;
+}
+
+.post-deploy-toast-copy {
+  min-width: 0;
+  color: #fafafa;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+  overflow-wrap: anywhere;
+  text-align: left;
+}

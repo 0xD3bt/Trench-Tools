@@ -8,9 +8,11 @@ import { ensureSecureTransport, getCachedHostBase } from "./execution-client.js"
 import {
   applyServerSnapshot,
   applyServerBalanceEvent,
+  applyServerMarkEvent,
   applyServerConnectionState,
   handleTradeEvent,
 } from "./balances-store.js";
+import { applyServerDiagnosticEvent } from "./diagnostics-store.js";
 
 const SSE_PATH = "/api/extension/events/stream";
 const HOST_AUTH_TOKEN_STORAGE_KEY = "trenchTools.hostAuthToken";
@@ -190,6 +192,9 @@ function dispatchEvent({ event, data }) {
     case "trade":
       handleTradeEvent(data);
       break;
+    case "mark":
+      applyServerMarkEvent(data);
+      break;
     case "connectionState":
       if (data && typeof data === "object") {
         applyServerConnectionState({
@@ -197,6 +202,9 @@ function dispatchEvent({ event, data }) {
           error: typeof data.error === "string" ? data.error : null,
         });
       }
+      break;
+    case "diagnostic":
+      void applyServerDiagnosticEvent(data);
       break;
     default:
       break;

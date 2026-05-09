@@ -1,5 +1,5 @@
 (function installTrenchToolsAxiomOverride() {
-  const OVERRIDE_VERSION = "pulse-row-cache-v8";
+  const OVERRIDE_VERSION = "pulse-row-cache-v9";
   const previousOverrideVersion = window.__trenchToolsAxiomOverrideVersion;
   if (previousOverrideVersion === OVERRIDE_VERSION) {
     return;
@@ -86,6 +86,7 @@
   const PULSE_BACKFILL_BACKOFF_INTERVAL_MS = 5000;
   const PULSE_BRIDGE_RECOVERY_INTERVAL_MS = 5000;
   const PULSE_RESCAN_EVENT = "trench-tools:axiom-pulse-rescan";
+  const TOKEN_DETAIL_NATIVE_HOVER_EVENT = "trench-tools:axiom-token-detail-native-hover";
   const PULSE_ROW_SEED_MAX_CARDS = 40;
   const PULSE_ROW_SEED_MAX_NODES = 180;
   const PULSE_ROW_SEED_MAX_KEYS = 80;
@@ -124,6 +125,7 @@
       visibilityChangeHandler = null;
     }
     document.removeEventListener(PULSE_RESCAN_EVENT, handlePulseRescanRequest);
+    document.removeEventListener(TOKEN_DETAIL_NATIVE_HOVER_EVENT, handleTokenDetailNativeHoverRequest, true);
     window.removeEventListener("popstate", handlePathChange);
     if (window.history?.pushState?.__trenchToolsWrappedHistoryMethod) {
       window.history.pushState = window.history.pushState.__trenchToolsWrappedHistoryMethod;
@@ -144,6 +146,7 @@
 
   clearScheduledWork.__trenchToolsRestoresGlobals = true;
   window.__trenchToolsAxiomOverrideCleanup = clearScheduledWork;
+  document.addEventListener(TOKEN_DETAIL_NATIVE_HOVER_EVENT, handleTokenDetailNativeHoverRequest, true);
 
   function getCachedPulseData() {
     const now = Date.now();
@@ -153,6 +156,96 @@
       cacheTimestamp = now;
     }
     return cachedPulseData;
+  }
+
+  function handleTokenDetailNativeHoverRequest(event) {
+    const action = event?.detail?.action;
+    if (action !== "enter" && action !== "leave") {
+      return;
+    }
+    const nativeControl = event.target;
+    if (!(nativeControl instanceof HTMLElement)) {
+      return;
+    }
+    const handlerName = action === "leave" ? "onMouseLeave" : "onMouseEnter";
+    if (invokeTokenDetailNativeReactHoverHandler(nativeControl, handlerName, event)) {
+      event.preventDefault();
+      return;
+    }
+    if (dispatchTokenDetailNativeHoverFallback(nativeControl, action)) {
+      event.preventDefault();
+    }
+  }
+
+  function invokeTokenDetailNativeReactHoverHandler(nativeControl, handlerName, sourceEvent) {
+    const reactProps = tokenDetailNativeReactProps(nativeControl);
+    const handler = reactProps?.[handlerName];
+    if (typeof handler !== "function") {
+      return false;
+    }
+    try {
+      handler({
+        currentTarget: nativeControl,
+        target: nativeControl,
+        relatedTarget: null,
+        type: handlerName === "onMouseLeave" ? "mouseleave" : "mouseenter",
+        nativeEvent: sourceEvent || null,
+        preventDefault() {},
+        stopPropagation() {},
+        isDefaultPrevented: () => false,
+        isPropagationStopped: () => false,
+        persist() {}
+      });
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function tokenDetailNativeReactProps(nativeControl) {
+    const propsKey = Object.keys(nativeControl).find((key) => key.startsWith("__reactProps$"));
+    return propsKey ? nativeControl[propsKey] : null;
+  }
+
+  function dispatchTokenDetailNativeHoverFallback(nativeControl, action) {
+    const eventTypes = action === "leave"
+      ? ["pointerout", "pointerleave", "mouseout", "mouseleave"]
+      : ["pointerover", "pointerenter", "mouseover", "mouseenter"];
+    const rect = nativeControl.getBoundingClientRect();
+    const clientX = rect.width > 0 ? rect.left + rect.width / 2 : 0;
+    const clientY = rect.height > 0 ? rect.top + rect.height / 2 : 0;
+    try {
+      eventTypes.forEach((eventType) => {
+        const pointerLike = eventType.startsWith("pointer");
+        const init = {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          view: window,
+          clientX,
+          clientY,
+          screenX: window.screenX + clientX,
+          screenY: window.screenY + clientY,
+          button: 0,
+          buttons: 0
+        };
+        const hoverEvent = pointerLike && typeof PointerEvent === "function"
+          ? new PointerEvent(eventType, {
+            ...init,
+            pointerId: 1,
+            pointerType: "mouse",
+            isPrimary: true,
+            width: 1,
+            height: 1,
+            pressure: 0
+          })
+          : new MouseEvent(eventType, init);
+        nativeControl.dispatchEvent(hoverEvent);
+      });
+      return true;
+    } catch (_error) {
+      return false;
+    }
   }
 
   function normalizePulseEntry(entry, currentTimestamp) {

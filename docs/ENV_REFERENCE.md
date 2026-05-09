@@ -14,12 +14,14 @@ These are the values most users may need.
 - `SOLANA_RPC_URL` - primary HTTP RPC for reads, confirmations, and general runtime behavior. Recommended Helius Gatekeeper format: `https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`.
 - `SOLANA_WS_URL` - primary websocket for live watchers. Recommended Helius format: `wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`.
 - `USER_REGION` - default region profile for region-aware providers. Groups: `global`, `us`, `eu`, `asia`. Metros: `slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo`.
-- `WARM_RPC_URL` - optional low-priority warm/cache/block-height RPC. Blank reuses `SOLANA_RPC_URL`. Shyft is a good fit here.
-- `WARM_WS_URL` - optional low-priority websocket for non-critical balance/account subscriptions. Blank reuses `SOLANA_WS_URL`.
+- `WARM_RPC_URL` - best-effort warm/cache RPC for compatible background reads. When set, those reads can move off `SOLANA_RPC_URL`. Execution, confirmations, visible balances, and quotes stay on `SOLANA_RPC_URL`.
+- `WARM_WS_URL` - best-effort websocket for warm probes or non-authoritative observers. When set, those probes can move off `SOLANA_WS_URL`. Live visible subscriptions and confirmations stay on `SOLANA_WS_URL`.
 - `HELLOMOON_API_KEY` - optional Hello Moon Lunar Lander API key.
 - `BAGS_API_KEY` - optional Bags API key for Bags launchpad flows.
-- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` - blank/default uses pump-fun metadata upload. Set `pinata` to use Pinata.
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` - blank/default uses the launchpad's native metadata flow. Set `pinata` to use Pinata for Pump/Bonk.
 - `PINATA_JWT` - required only when metadata provider is `pinata`.
+
+For per-launchpad metadata/IPFS behavior and local Pump/Bonk vanity mint queue formatting, see [launchdeck/METADATA_AND_VANITY.md](launchdeck/METADATA_AND_VANITY.md).
 
 ## Launcher / Host Overrides
 
@@ -57,6 +59,13 @@ Most users should leave these blank because the launcher sets safe defaults.
 - `LAUNCHDECK_BAGS_SETUP_JITO_TIP_CAP_LAMPORTS` - maximum Bags setup Jito tip. Blank uses code default.
 - `LAUNCHDECK_BAGS_SETUP_CONFIRM_TIMEOUT_SECS` - Bags setup confirmation timeout. Blank uses code default.
 - `LAUNCHDECK_BAGS_SETUP_GATE_COMMITMENT` - commitment gate before Bags final launch build. Supported: `processed`, `confirmed`, `finalized`.
+- `LAUNCHDECK_BONK_STARTUP_WARM_BACKEND` - Bonk startup warm backend override. Advanced/debug only; blank uses the current Rust-native default.
+- `LAUNCHDECK_BAGSAPP_STARTUP_WARM_BACKEND` - Bagsapp startup warm backend override. Advanced/debug only; blank uses the current Rust-native default.
+- `BONK_USD1_ROUTE_SETUP_CACHE_TTL_MS` - Bonk SOL/USD1 route setup cache TTL. Advanced tuning only.
+- `BONK_USD1_SEARCH_TOLERANCE_BPS` - Bonk USD1 route input search tolerance. Advanced tuning only.
+- `BONK_USD1_SEARCH_MIN_LAMPORTS` - Bonk USD1 route input search lower bound. Advanced tuning only.
+- `BONK_USD1_MIN_REMAINING_SOL` - minimum remaining SOL cushion for Bonk USD1 route work. Blank uses code default.
+- `BONK_USD1_MAX_INPUT_SEARCH_ITERATIONS` - maximum Bonk USD1 input search iterations. Advanced tuning only.
 
 ## Warmup / Keep-warm
 
@@ -72,7 +81,13 @@ Most users should leave these blank because the launcher sets safe defaults.
 - `LAUNCHDECK_LAUNCHPAD_WARM_CONTEXT` - build warm context during launch requests. Blank/default enabled.
 - `LAUNCHDECK_LAUNCHPAD_PARALLEL_WARM_FETCH` - opt-in parallel warm fetch. Blank/default disabled.
 - `LAUNCHDECK_LAUNCHPAD_WARM_MAX_PARALLEL_FETCH` - parallel warm fetch cap. Blank uses code default.
-- `EXECUTION_ENGINE_WARM_PUMP`, `EXECUTION_ENGINE_WARM_BONK`, `EXECUTION_ENGINE_WARM_BAGS` - execution-engine per-family warm toggles. Operational safety switches; normally blank.
+- `EXECUTION_ENGINE_WARM_PUMP` - Pump-family execution-engine warm toggle. Operational safety switch; normally blank.
+- `EXECUTION_ENGINE_WARM_RAYDIUM_AMM_V4` - Raydium AMM v4 execution-engine warm toggle. Operational safety switch; normally blank.
+- `EXECUTION_ENGINE_WARM_RAYDIUM_CPMM` - Raydium CPMM execution-engine warm toggle. Operational safety switch; normally blank.
+- `EXECUTION_ENGINE_WARM_RAYDIUM_LAUNCHLAB` - Raydium LaunchLab execution-engine warm toggle. Operational safety switch; normally blank.
+- `EXECUTION_ENGINE_WARM_BONK` - Bonk execution-engine warm toggle. Operational safety switch; normally blank.
+- `EXECUTION_ENGINE_WARM_BAGS` - Meteora DBC/DAMM/Bags-family execution-engine warm toggle. Operational safety switch; normally blank.
+- `EXECUTION_ENGINE_WARM_TRUSTED_STABLE_SWAP` - trusted stable route warm toggle. Operational safety switch; normally blank.
 
 ## Block Height / Follow Timing
 
@@ -119,9 +134,14 @@ Use the shorter names for new installs.
 ## Execution-engine Rollout / Safety
 
 - `EXECUTION_ENGINE_ENABLE_PUMP_NATIVE` - enable/disable native Pump family path. Operational safety switch.
+- `EXECUTION_ENGINE_ENABLE_RAYDIUM_AMM_V4_NATIVE` - enable/disable native Raydium AMM v4 path. Operational safety switch.
+- `EXECUTION_ENGINE_ENABLE_RAYDIUM_CPMM_NATIVE` - enable/disable native Raydium CPMM path. Operational safety switch.
+- `EXECUTION_ENGINE_ENABLE_RAYDIUM_LAUNCHLAB_NATIVE` - enable/disable native Raydium LaunchLab path. Operational safety switch.
 - `EXECUTION_ENGINE_ENABLE_BONK_NATIVE` - enable/disable native Bonk family path. Operational safety switch.
 - `EXECUTION_ENGINE_ENABLE_METEORA_NATIVE` - enable/disable native Meteora family path. Operational safety switch.
-- `EXECUTION_ENGINE_ALLOW_NON_CANONICAL_POOL_TRADES` - allow pinned non-canonical Pump AMM pool trades. Keep off unless you understand the risk.
+- `EXECUTION_ENGINE_ENABLE_TRUSTED_STABLE_SWAP` - enable/disable trusted stable swap route path. Operational safety switch.
+- `EXECUTION_ENGINE_ALLOW_NON_CANONICAL_POOL_TRADES` - allow pinned non-canonical Pump AMM pool trades where the source path supports it. Current safe behavior is fail-closed; keep this off unless source and docs both confirm the intended route.
+- `EXECUTION_ENGINE_ENABLE_PUMP_CREATOR_VAULT_AUTO_RETRY` - Pump bonding-curve creator-vault retry path. Blank/default enabled.
 
 ## Follow Daemon
 
@@ -132,6 +152,7 @@ Use the shorter names for new installs.
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES` - max concurrent follow compiles. Blank/0 means uncapped.
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS` - max concurrent follow sends. Blank/0 means uncapped.
 - `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS` - wait time for daemon capacity. Only matters when caps are set.
+- `LAUNCHDECK_SOL_USD_HTTP_PRICE_URL` - follow-daemon SOL/USD HTTP fallback price URL for market-cap-trigger paths.
 - `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY` - Pump buy creator-vault retry path. Blank/default enabled.
 - `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY` - Pump sell creator-vault retry path. Blank/default enabled.
 
@@ -144,6 +165,7 @@ Use the shorter names for new installs.
 - `LAUNCHDECK_SNIPER_BUY_COMPUTE_UNIT_LIMIT` - sniper-buy compute unit override.
 - `LAUNCHDECK_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT` - dev-auto-sell compute unit override.
 - `LAUNCHDECK_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT` - USD1 top-up compute unit override.
+- `LAUNCHDECK_BONK_USD1_SELL_TO_SOL_COMPUTE_UNIT_LIMIT` - Bonk USD1 sell-to-SOL compute unit override.
 
 ## Local State / Token Overrides
 

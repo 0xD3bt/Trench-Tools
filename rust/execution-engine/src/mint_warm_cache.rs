@@ -11,9 +11,9 @@
 //!   UI signals intent (token page mount, panel open, hover on an
 //!   actionable control) and expire quickly so we don't keep hundreds of
 //!   Pulse rows warm.
-//! - **Family-specific variants.** Pump, Bonk, and Bags have genuinely
+//! - **Family-specific variants.** Pump, Bonk, and Meteora have genuinely
 //!   different hot paths — Pump needs pool + creator, Bonk needs pool +
-//!   config + quote-asset route, Bags needs DBC/DAMM selection. The
+//!   config + quote-asset route, Meteora needs DBC/DAMM selection. The
 //!   `VenueWarmData` enum carries the shape each family actually wants.
 //! - **Canonical warm key.** We fingerprint each entry by
 //!   `(mint, pinned_pool, rpc, commitment, route_policy, allow_non_canonical)`
@@ -110,6 +110,12 @@ pub enum VenueWarmData {
     RaydiumAmmV4 {
         pool: String,
     },
+    RaydiumCpmm {
+        pool: String,
+    },
+    RaydiumLaunchLab {
+        pool: String,
+    },
 }
 
 /// A prewarmed mint entry. Carries the resolved trade plan plus the
@@ -179,9 +185,10 @@ impl PrewarmedMint {
                         }
                     })
                 }
-                VenueWarmData::Stable { .. } | VenueWarmData::RaydiumAmmV4 { .. } => {
-                    Some(TradeLifecycle::PostMigration)
-                }
+                VenueWarmData::Stable { .. }
+                | VenueWarmData::RaydiumAmmV4 { .. }
+                | VenueWarmData::RaydiumCpmm { .. } => Some(TradeLifecycle::PostMigration),
+                VenueWarmData::RaydiumLaunchLab { .. } => Some(TradeLifecycle::PreMigration),
             })
     }
 }
@@ -441,6 +448,20 @@ pub fn prewarmed_from_plan(
                 .clone()
                 .unwrap_or_else(|| plan.selector.canonical_market_key.clone()),
         },
+        crate::trade_planner::TradeVenueFamily::RaydiumCpmm => VenueWarmData::RaydiumCpmm {
+            pool: plan
+                .resolved_pinned_pool
+                .clone()
+                .unwrap_or_else(|| plan.selector.canonical_market_key.clone()),
+        },
+        crate::trade_planner::TradeVenueFamily::RaydiumLaunchLab => {
+            VenueWarmData::RaydiumLaunchLab {
+                pool: plan
+                    .resolved_pinned_pool
+                    .clone()
+                    .unwrap_or_else(|| plan.selector.canonical_market_key.clone()),
+            }
+        }
         crate::trade_planner::TradeVenueFamily::MeteoraDbc
         | crate::trade_planner::TradeVenueFamily::MeteoraDammV2 => VenueWarmData::Bags {
             lifecycle: Some(plan.selector.lifecycle.clone()),
@@ -469,9 +490,11 @@ pub fn venue_family_label(venue: &VenueWarmData) -> &'static str {
     match venue {
         VenueWarmData::Pump { .. } => "pump",
         VenueWarmData::Bonk { .. } => "bonk",
-        VenueWarmData::Bags { .. } => "bags",
+        VenueWarmData::Bags { .. } => "meteora",
         VenueWarmData::Stable { .. } => "stable",
         VenueWarmData::RaydiumAmmV4 { .. } => "raydium-amm-v4",
+        VenueWarmData::RaydiumCpmm { .. } => "raydium-cpmm",
+        VenueWarmData::RaydiumLaunchLab { .. } => "raydium-launchlab",
     }
 }
 

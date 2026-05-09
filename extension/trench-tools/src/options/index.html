@@ -57,59 +57,171 @@
               </div>
               <div class="site-feature-groups">
                 <section class="site-feature-group">
-                  <h4>Trading buttons</h4>
-                  <div class="site-feature-grid">
-                    <label class="site-feature-chip" for="site-axiom-instant-trade">
-                      <span>Token page instant trade</span>
-                      <input id="site-axiom-instant-trade" class="site-toggle" type="checkbox" />
-                    </label>
-                    <label class="site-feature-chip" for="site-axiom-pulse-qb">
-                      <span>Pulse quick buy</span>
+                  <h4>Pulse Cards</h4>
+                  <div class="site-feature-grid site-feature-grid-three">
+                    <label
+                      class="site-feature-chip"
+                      for="site-axiom-pulse-qb"
+                      title="Adds the Trench Tools quick-buy button beside Axiom's buy button on each Pulse card."
+                    >
+                      <span>Pulse QB</span>
                       <input id="site-axiom-pulse-qb" class="site-toggle" type="checkbox" />
                     </label>
-                    <label class="site-feature-chip" for="site-axiom-watchlist">
-                      <span>Watchlist quick buy</span>
+                    <label
+                      class="site-feature-chip"
+                      for="site-axiom-pulse-panel"
+                      title="Adds a small Trench Tools icon button on each Pulse card. Clicking it opens the manual trading panel anchored to that card."
+                    >
+                      <span>Pulse Manual Panel</span>
+                      <input id="site-axiom-pulse-panel" class="site-toggle" type="checkbox" />
+                    </label>
+                    <label
+                      class="site-feature-chip"
+                      for="site-axiom-launchdeck"
+                      title="Adds the LaunchDeck toolbar to Axiom Pulse, including Deploy, Vamp, and Webapp."
+                    >
+                      <span>Pulse LaunchDeck Toolbar</span>
+                      <input id="site-axiom-launchdeck" class="site-toggle" type="checkbox" />
+                    </label>
+                  </div>
+                </section>
+                <section class="site-feature-group">
+                  <h4>Token Pages</h4>
+                  <div class="site-feature-grid">
+                    <label
+                      class="site-feature-chip"
+                      for="site-axiom-launcher"
+                      title="Shows the floating Trench Tools button on Axiom token pages. Clicking it opens the full manual trading panel for the current token."
+                    >
+                      <span>Trenchtools Instant Panel</span>
+                      <input id="site-axiom-launcher" class="site-toggle" type="checkbox" />
+                    </label>
+                    <label
+                      class="site-feature-chip"
+                      for="site-axiom-instant-trade"
+                      title="Adds a Trench Tools button to Axiom's own token-page trade panel, next to Axiom's normal Buy/Sell form."
+                    >
+                      <span>Axioms instant panel</span>
+                      <input id="site-axiom-instant-trade" class="site-toggle" type="checkbox" />
+                    </label>
+                    <label
+                      class="site-feature-chip site-feature-chip-compound"
+                      for="site-axiom-instant-trade-button-mode-count"
+                      title="Controls how many states the TT button cycles through inside Axiom's instant panel."
+                    >
+                      <span class="site-feature-chip-main">
+                        <span>Instant Panel TT Button Modes</span>
+                      </span>
+                      <select
+                        id="site-axiom-instant-trade-button-mode-count"
+                        class="site-feature-chip-select"
+                        aria-label="Axiom instant panel TT button mode count"
+                        title="3 modes: Axiom only, TT only, and both. 2 modes: TT only and both. 1 mode: TT only."
+                      >
+                        <option value="3">3 modes: Axiom / TT / Both</option>
+                        <option value="2">2 modes: TT / Both</option>
+                        <option value="1">1 mode: TT only</option>
+                      </select>
+                    </label>
+                  </div>
+                </section>
+                <section class="site-feature-group">
+                  <h4>Token Rows</h4>
+                  <div class="site-feature-grid">
+                    <label
+                      class="site-feature-chip"
+                      for="site-axiom-watchlist"
+                      title="Adds Trench Tools quick-buy buttons to Axiom Watchlist token rows."
+                    >
+                      <span>Watchlist QB</span>
                       <input id="site-axiom-watchlist" class="site-toggle" type="checkbox" />
                     </label>
-                    <label class="site-feature-chip" for="site-axiom-wallet-tracker">
-                      <span>Portfolio / wallet tracker quick buy</span>
+                    <label
+                      class="site-feature-chip"
+                      for="site-axiom-wallet-tracker"
+                      title="Adds Trench Tools quick-buy buttons to Axiom wallet tracker and portfolio token rows."
+                    >
+                      <span>Wallet Tracker QB</span>
                       <input id="site-axiom-wallet-tracker" class="site-toggle" type="checkbox" />
                     </label>
                   </div>
                 </section>
                 <section class="site-feature-group">
-                  <h4>Panels</h4>
+                  <h4>External Links & LaunchDeck Icons</h4>
                   <div class="site-feature-grid">
-                    <label class="site-feature-chip" for="site-axiom-launcher">
-                      <span>Floating launcher</span>
-                      <input id="site-axiom-launcher" class="site-toggle" type="checkbox" />
+                    <label
+                      class="site-feature-chip site-feature-chip-compound"
+                      for="site-axiom-vamp-icon-mode"
+                      title="Controls where the Vamp icon appears. The action dropdown controls what Pulse Vamp does when clicked."
+                    >
+                      <span class="site-feature-chip-main">
+                        <span>Vamp Icon Placement</span>
+                      </span>
+                      <span class="site-feature-chip-control-row">
+                        <select
+                          id="site-axiom-vamp-icon-mode"
+                          class="site-feature-chip-select"
+                          aria-label="Vamp icon placement"
+                          title="Where to show Vamp icons on Axiom: Pulse cards, token pages, both, or off."
+                        >
+                          <option value="both">Show on Pulse + Token</option>
+                          <option value="pulse">Show on Pulse Cards</option>
+                          <option value="token">Show on Token Page</option>
+                          <option value="off">Hide Vamp Icon</option>
+                        </select>
+                        <select
+                          id="site-axiom-pulse-vamp-mode"
+                          class="site-feature-chip-select"
+                          aria-label="Pulse Vamp click behavior"
+                          title="What happens when the Vamp icon on a Pulse card is clicked."
+                        >
+                          <option value="prefill">Pulse click: Prefill Deploy</option>
+                          <option value="insta">Pulse click: Insta-launch</option>
+                        </select>
+                      </span>
                     </label>
-                    <label class="site-feature-chip" for="site-axiom-pulse-panel">
-                      <span>Pulse panel</span>
-                      <input id="site-axiom-pulse-panel" class="site-toggle" type="checkbox" />
+                    <label
+                      class="site-feature-chip site-feature-chip-compound"
+                      for="site-axiom-dexscreener-icon-mode"
+                      title="Controls where the Dexscreener icon appears. Clicking it opens the token's Dexscreener page."
+                    >
+                      <span class="site-feature-chip-main">
+                        <span>Dexscreener Icon Placement</span>
+                      </span>
+                      <select
+                        id="site-axiom-dexscreener-icon-mode"
+                        class="site-feature-chip-select"
+                        aria-label="Dexscreener icon placement"
+                        title="Where to show Dexscreener icons on Axiom: Pulse cards, token pages, both, or off."
+                      >
+                        <option value="both">Show on Pulse + Token</option>
+                        <option value="pulse">Show on Pulse Cards</option>
+                        <option value="token">Show on Token Page</option>
+                        <option value="off">Hide Dexscreener Icon</option>
+                      </select>
                     </label>
                   </div>
                 </section>
                 <section class="site-feature-group">
-                  <h4>LaunchDeck</h4>
+                  <h4>LaunchDeck Deploy</h4>
                   <div class="site-feature-grid">
-                    <label class="site-feature-chip" for="site-axiom-launchdeck">
-                      <span>LaunchDeck injection enabled</span>
-                      <input id="site-axiom-launchdeck" class="site-toggle" type="checkbox" />
-                    </label>
-                    <label class="site-feature-chip site-feature-chip-compound" for="site-axiom-pulse-vamp">
+                    <label
+                      class="site-feature-chip site-feature-chip-compound"
+                      for="site-axiom-post-deploy-action"
+                      title="Controls what LaunchDeck does after a successful deploy from Axiom."
+                    >
                       <span class="site-feature-chip-main">
-                        <span>Pulse Vamp</span>
-                        <input id="site-axiom-pulse-vamp" class="site-toggle" type="checkbox" />
+                        <span>After Deploy</span>
                       </span>
                       <select
-                        id="site-axiom-pulse-vamp-mode"
+                        id="site-axiom-post-deploy-action"
                         class="site-feature-chip-select"
-                        aria-label="Pulse Vamp click behavior"
-                        title="What happens when the vamp icon on a Pulse card is clicked."
+                        aria-label="Axiom after deploy behavior"
                       >
-                        <option value="prefill">Open deploy w/ prefill</option>
-                        <option value="insta">Insta-launch</option>
+                        <option value="close_modal_toast">Close modal + toast</option>
+                        <option value="toast_only">Toast only</option>
+                        <option value="open_tab_toast">Open Axiom in new tab + toast</option>
+                        <option value="open_window_toast">Open Axiom in new window + toast</option>
                       </select>
                     </label>
                   </div>
@@ -661,7 +773,7 @@
               <div class="panel-heading">
                 <div>
                   <h3>Network endpoints</h3>
-                  <p class="muted">Primary RPC paths used by the engine and warming layer.</p>
+                  <p class="muted">Primary Helius endpoints handle visible and execution paths. Warm endpoints are optional best-effort cost savers for compatible background probes.</p>
                 </div>
               </div>
               <div class="compact-grid compact-grid-3">
@@ -676,6 +788,10 @@
                 <label class="field">
                   <span>Warm RPC URL</span>
                   <input id="engine-warm-rpc-url" type="text" placeholder="https://..." />
+                </label>
+                <label class="field">
+                  <span>Warm Websocket URL</span>
+                  <input id="engine-warm-ws-url" type="text" placeholder="wss://..." />
                 </label>
               </div>
             </section>

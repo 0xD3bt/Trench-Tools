@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "execution-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "axum",
  "base64",
@@ -787,6 +787,7 @@ dependencies = [
  "shared-execution-routing",
  "shared-extension-runtime",
  "shared-fee-market",
+ "shared-raydium-launchlab",
  "shared-transaction-submit",
  "solana-address-lookup-table-interface",
  "solana-sdk",
@@ -2489,6 +2490,17 @@ dependencies = [
  "shared-execution-routing",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "shared-raydium-launchlab"
+version = "0.1.0"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "solana-sdk",
+ "solana-system-interface 3.1.0",
+ "spl-token",
 ]
 
 [[package]]

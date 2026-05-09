@@ -20,7 +20,7 @@ use shared_extension_runtime::balance_stream::StreamEvent;
 use std::{convert::Infallible, time::Duration};
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::extension_api::AppState;
+use crate::extension_api::{AppState, ExtensionActiveMarkRequest};
 
 const SSE_HEARTBEAT_SECS: u64 = 15;
 
@@ -69,21 +69,7 @@ pub async fn events_stream(
             Ok(event) => event,
             Err(_) => return None,
         };
-        let (name, data) = match event {
-            StreamEvent::Balance(payload) => ("balance", serde_json::to_string(&payload).ok()?),
-            StreamEvent::Trade(payload) => ("trade", serde_json::to_string(&payload).ok()?),
-            StreamEvent::ConnectionState {
-                state: connection_state,
-                error,
-            } => (
-                "connectionState",
-                serde_json::to_string(&ConnectionStatePayload {
-                    state: connection_state,
-                    error,
-                })
-                .ok()?,
-            ),
-        };
+        let (name, data) = stream_event_to_sse(event)?;
         Some(Ok::<_, Infallible>(Event::default().event(name).data(data)))
     });
 
@@ -95,6 +81,30 @@ pub async fn events_stream(
             .interval(Duration::from_secs(SSE_HEARTBEAT_SECS))
             .text("ping"),
     )
+}
+
+fn stream_event_to_sse(event: StreamEvent) -> Option<(&'static str, String)> {
+    match event {
+        StreamEvent::Balance(payload) => Some(("balance", serde_json::to_string(&payload).ok()?)),
+        StreamEvent::TokenBalanceCache(_) => None,
+        StreamEvent::Trade(payload) => Some(("trade", serde_json::to_string(&payload).ok()?)),
+        StreamEvent::Mark(payload) => Some(("mark", serde_json::to_string(&payload).ok()?)),
+        StreamEvent::MarketAccount(_) => None,
+        StreamEvent::Diagnostic(payload) => {
+            Some(("diagnostic", serde_json::to_string(&payload).ok()?))
+        }
+        StreamEvent::ConnectionState {
+            state: connection_state,
+            error,
+        } => Some((
+            "connectionState",
+            serde_json::to_string(&ConnectionStatePayload {
+                state: connection_state,
+                error,
+            })
+            .ok()?,
+        )),
+    }
 }
 
 /// `POST /api/extension/events/active-mint`
@@ -135,10 +145,88 @@ pub async fn set_balance_presence(
     ))
 }
 
+/// `POST /api/extension/events/active-mark`
+///
+/// Registers the currently visible open position whose PnL display should be
+/// marked from Rust-owned route and market data.
+pub async fn set_active_mark(
+    State(state): State<AppState>,
+    Json(request): Json<ExtensionActiveMarkRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    state
+        .set_active_mark_target(request)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectionStatePayload {
     state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_extension_runtime::balance_stream::{
+        MarkEventPayload, MarketAccountEventPayload, TokenBalanceCacheEventPayload,
+    };
+
+    #[test]
+    fn stream_event_maps_mark_to_sse_mark() {
+        let payload = MarkEventPayload {
+            surface_id: Some("content:test".to_string()),
+            mark_revision: 1,
+            mint: "Mint111".to_string(),
+            wallet_keys: vec!["wallet1".to_string()],
+            wallet_group_id: None,
+            token_balance: Some(1.0),
+            token_balance_raw: Some(1),
+            holding_value_sol: Some(0.5),
+            holding: Some(0.5),
+            pnl_gross: Some(0.1),
+            pnl_net: Some(0.09),
+            pnl_percent_gross: Some(10.0),
+            pnl_percent_net: Some(9.0),
+            quote_source: Some("live-mark:test".to_string()),
+            commitment: Some("processed".to_string()),
+            slot: Some(7),
+            at_ms: 8,
+        };
+
+        let (name, data) =
+            stream_event_to_sse(StreamEvent::Mark(payload)).expect("mark event maps");
+
+        assert_eq!(name, "mark");
+        assert!(data.contains("\"holdingValueSol\":0.5"));
+    }
+
+    #[test]
+    fn stream_event_does_not_expose_internal_market_account_events() {
+        let event = StreamEvent::MarketAccount(MarketAccountEventPayload {
+            account: "Account111".to_string(),
+            slot: Some(1),
+            at_ms: 2,
+        });
+
+        assert!(stream_event_to_sse(event).is_none());
+    }
+
+    #[test]
+    fn stream_event_does_not_expose_internal_token_cache_events() {
+        let event = StreamEvent::TokenBalanceCache(TokenBalanceCacheEventPayload {
+            env_key: "SOLANA_PRIVATE_KEY".to_string(),
+            token_mint: "Mint111".to_string(),
+            token_balance: 42.0,
+            commitment: "confirmed".to_string(),
+            source: Some("accountSubscribe".to_string()),
+            slot: Some(1),
+            at_ms: 2,
+        });
+
+        assert!(stream_event_to_sse(event).is_none());
+    }
 }

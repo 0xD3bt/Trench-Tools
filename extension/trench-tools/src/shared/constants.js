@@ -6,3 +6,6 @@ export const LAUNCHDECK_HOST_STORAGE_KEY = "trenchTools.launchdeckHostBaseUrl";
 export const SITE_FEATURES_STORAGE_KEY = "trenchTools.siteFeatures";
 export const OPTIONS_TARGET_SECTION_KEY = "trenchTools.optionsTargetSection";
 export const APPEARANCE_STORAGE_KEY = "trenchTools.appearance";
+export const RUNTIME_DIAGNOSTICS_REVISION_KEY = "trenchTools.runtimeDiagnosticsRevision";
+export const RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY = "trenchTools.runtimeDiagnosticsSnapshot";
+export const RUNTIME_DIAGNOSTICS_DISMISSED_KEY = "trenchTools.runtimeDiagnosticsDismissed";

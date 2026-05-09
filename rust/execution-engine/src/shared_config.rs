@@ -18,6 +18,8 @@ pub struct SharedRpcConfig {
     pub rpc_url: String,
     pub ws_url: String,
     pub warm_rpc_url: String,
+    #[serde(default)]
+    pub warm_ws_url: String,
     pub shared_region: String,
     pub helius_rpc_url: String,
     pub helius_ws_url: String,
@@ -79,6 +81,7 @@ impl SharedConfigManager {
                     rpc_url: DEFAULT_RPC_URL.to_string(),
                     ws_url: String::new(),
                     warm_rpc_url: DEFAULT_RPC_URL.to_string(),
+                    warm_ws_url: String::new(),
                     shared_region: String::new(),
                     helius_rpc_url: String::new(),
                     helius_ws_url: String::new(),
@@ -251,6 +254,10 @@ impl SharedConfigManager {
         updates.insert(
             "WARM_RPC_URL".to_string(),
             optional_env_value(&rpc.warm_rpc_url),
+        );
+        updates.insert(
+            "WARM_WS_URL".to_string(),
+            optional_env_value(&rpc.warm_ws_url),
         );
         updates.insert(
             "USER_REGION".to_string(),
@@ -543,6 +550,12 @@ fn parse_rpc_config(values: &BTreeMap<String, String>) -> SharedRpcConfig {
         .unwrap_or(rpc_url.as_str())
         .trim()
         .to_string();
+    let warm_ws_url = values
+        .get("WARM_WS_URL")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let shared_region = values
         .get("USER_REGION")
         .map(String::as_str)
@@ -581,6 +594,7 @@ fn parse_rpc_config(values: &BTreeMap<String, String>) -> SharedRpcConfig {
         rpc_url,
         ws_url,
         warm_rpc_url,
+        warm_ws_url,
         shared_region,
         helius_rpc_url,
         helius_ws_url,

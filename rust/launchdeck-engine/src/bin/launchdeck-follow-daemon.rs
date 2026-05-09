@@ -32,6 +32,7 @@ use launchdeck_engine::{
         FollowBuyCompileRequest, FollowSellCompileRequest, LaunchpadMarketSnapshot,
         compile_follow_buy_for_launchpad, compile_follow_sell_for_launchpad,
         derive_follow_owner_token_account_for_launchpad, fetch_market_snapshot_for_launchpad,
+        wrap_follow_buy_transaction_for_launchpad,
     },
     observability::{
         record_outbound_provider_http_request, update_persisted_follow_daemon_snapshot,
@@ -59,6 +60,7 @@ use launchdeck_engine::{
         fetch_balance_lamports, fetch_token_balance, load_solana_wallet_by_env_key,
         public_key_from_secret, selected_wallet_key_or_default,
     },
+    wrapper_compile::refresh_shared_lookup_tables,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -315,6 +317,7 @@ struct AppState {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct CachedFollowBuyRuntime {
     prepared: PreparedFollowBuyRuntime,
     refreshed_at_ms: u128,
@@ -420,6 +423,9 @@ const WATCHER_BACKOFF_BASE_MS: u64 = 200;
 const FOLLOW_BUY_PRECHECK_BUFFER_LAMPORTS: u64 = 2_000_000;
 const HOT_FOLLOW_BUY_REFRESH_MS: u64 = 250;
 const HOT_FOLLOW_BUY_MAX_AGE_MS: u128 = 900;
+const BONK_FOLLOW_BUY_CONTEXT_MAX_AGE_MS: u128 = 10_000;
+const BONK_USD1_ROUTE_SETUP_MAX_AGE_MS: u128 = HOT_FOLLOW_BUY_MAX_AGE_MS;
+const BAGS_FOLLOW_BUY_CONTEXT_MAX_AGE_MS: u128 = 10_000;
 const FOLLOW_REPORT_SYNC_DEBOUNCE_MS: u64 = 150;
 const FOLLOW_READY_WATCH_REFRESH_MS: u64 = 5_000;
 const FOLLOW_READY_WATCH_TTL_MS: u128 = 10_000;
@@ -792,8 +798,29 @@ fn shared_trigger_buy_compile_context_key(
     format!("{trace_id}:{observed_slot}:{launchpad}:{quote_asset}:{launch_mode}:{route_policy}")
 }
 
+fn shared_job_buy_compile_context_key(
+    trace_id: &str,
+    launchpad: &str,
+    quote_asset: &str,
+    launch_mode: &str,
+    route_policy: &str,
+) -> String {
+    format!("{trace_id}:job:{launchpad}:{quote_asset}:{launch_mode}:{route_policy}")
+}
+
+fn job_buy_compile_context_key(job: &FollowJobRecord) -> String {
+    shared_job_buy_compile_context_key(
+        &job.traceId,
+        &job.launchpad,
+        &job.quoteAsset,
+        &job.launchMode,
+        &follow_buy_route_policy_label(&job.execution, job.wrapperDefaultFeeBps),
+    )
+}
+
 fn follow_buy_route_policy_label(
     execution: &launchdeck_engine::config::NormalizedExecution,
+    wrapper_fee_bps: u16,
 ) -> String {
     let funding_policy = execution
         .buyFundingPolicy
@@ -801,13 +828,14 @@ fn follow_buy_route_policy_label(
         .to_ascii_lowercase()
         .replace('-', "_")
         .replace(' ', "_");
+    let conversion = if funding_policy.is_empty() || funding_policy == "sol_only" {
+        "none"
+    } else {
+        "to_sol_in"
+    };
     format!(
-        "buy:{}",
-        if funding_policy.is_empty() {
-            "sol_only"
-        } else {
-            &funding_policy
-        }
+        "buy:sol_only:wrapper_fee_bps={}:conversion={}",
+        wrapper_fee_bps, conversion
     )
 }
 
@@ -822,6 +850,7 @@ async fn cache_prepared_follow_buy(
     cache.insert(key, prepared);
 }
 
+#[allow(dead_code)]
 async fn get_prepared_follow_buy(
     state: &Arc<AppState>,
     trace_id: &str,
@@ -904,6 +933,7 @@ async fn cache_bags_follow_buy_context(
     );
 }
 
+#[allow(dead_code)]
 async fn get_hot_follow_buy_runtime(
     state: &Arc<AppState>,
     trace_id: &str,
@@ -918,6 +948,7 @@ async fn get_hot_follow_buy_runtime(
         .cloned()
 }
 
+#[allow(dead_code)]
 async fn get_shared_hot_follow_buy_runtime(
     state: &Arc<AppState>,
     compile_context_key: &str,
@@ -948,12 +979,55 @@ async fn get_bonk_usd1_route_setup(
     cache.get(key).cloned()
 }
 
+fn cache_entry_is_fresh(now_ms: u128, refreshed_at_ms: u128, max_age_ms: u128) -> bool {
+    now_ms.saturating_sub(refreshed_at_ms) <= max_age_ms
+}
+
+async fn get_fresh_bonk_follow_buy_context(
+    state: &Arc<AppState>,
+    key: &str,
+) -> Option<CachedBonkFollowBuyContext> {
+    let cached = get_bonk_follow_buy_context(state, key).await?;
+    cache_entry_is_fresh(
+        now_ms(),
+        cached.refreshed_at_ms,
+        BONK_FOLLOW_BUY_CONTEXT_MAX_AGE_MS,
+    )
+    .then_some(cached)
+}
+
+async fn get_fresh_bonk_usd1_route_setup(
+    state: &Arc<AppState>,
+    key: &str,
+) -> Option<CachedBonkUsd1RouteSetup> {
+    let cached = get_bonk_usd1_route_setup(state, key).await?;
+    cache_entry_is_fresh(
+        now_ms(),
+        cached.refreshed_at_ms,
+        BONK_USD1_ROUTE_SETUP_MAX_AGE_MS,
+    )
+    .then_some(cached)
+}
+
 async fn get_bags_follow_buy_context(
     state: &Arc<AppState>,
     key: &str,
 ) -> Option<CachedBagsFollowBuyContext> {
     let cache = state.bags_follow_buy_contexts.lock().await;
     cache.get(key).cloned()
+}
+
+async fn get_fresh_bags_follow_buy_context(
+    state: &Arc<AppState>,
+    key: &str,
+) -> Option<CachedBagsFollowBuyContext> {
+    let cached = get_bags_follow_buy_context(state, key).await?;
+    cache_entry_is_fresh(
+        now_ms(),
+        cached.refreshed_at_ms,
+        BAGS_FOLLOW_BUY_CONTEXT_MAX_AGE_MS,
+    )
+    .then_some(cached)
 }
 
 async fn cache_bags_market_snapshot(
@@ -1040,6 +1114,102 @@ async fn clear_follow_buy_cache_entries_only(state: &Arc<AppState>, trace_id: &s
     }
 }
 
+async fn warm_bonk_follow_buy_contexts(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    compile_context_key: &str,
+) {
+    let Some(mint) = job.mint.as_deref() else {
+        return;
+    };
+    if get_fresh_bonk_follow_buy_context(state, compile_context_key)
+        .await
+        .is_none()
+    {
+        match detect_bonk_import_context_with_quote_asset(&state.rpc_url, mint, &job.quoteAsset)
+            .await
+        {
+            Ok(Some(context)) => {
+                cache_bonk_follow_buy_context(state, compile_context_key, context.poolId).await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                record_warn(
+                    "follow-daemon",
+                    "Failed to warm Bonk follow-buy context.",
+                    Some(json!({
+                        "traceId": job.traceId,
+                        "compileContextKey": compile_context_key,
+                        "error": error,
+                    })),
+                );
+            }
+        }
+    }
+    if job.quoteAsset.eq_ignore_ascii_case("usd1")
+        && get_fresh_bonk_usd1_route_setup(state, compile_context_key)
+            .await
+            .is_none()
+    {
+        match load_live_follow_buy_usd1_route_setup(&state.rpc_url).await {
+            Ok(setup) => {
+                cache_bonk_usd1_route_setup(state, compile_context_key, setup).await;
+            }
+            Err(error) => {
+                record_warn(
+                    "follow-daemon",
+                    "Failed to warm Bonk USD1 route setup.",
+                    Some(json!({
+                        "traceId": job.traceId,
+                        "compileContextKey": compile_context_key,
+                        "error": error,
+                    })),
+                );
+            }
+        }
+    }
+}
+
+async fn warm_bags_follow_buy_context(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    compile_context_key: &str,
+) {
+    let Some(mint) = job.mint.as_deref() else {
+        return;
+    };
+    if get_fresh_bags_follow_buy_context(state, compile_context_key)
+        .await
+        .is_some()
+    {
+        return;
+    }
+    match load_follow_buy_context(
+        &state.rpc_url,
+        mint,
+        &job.execution.commitment,
+        job.bagsLaunch.as_ref(),
+    )
+    .await
+    {
+        Ok(Some(context)) => {
+            cache_bags_follow_buy_context(state, compile_context_key, context).await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            record_warn(
+                "follow-daemon",
+                "Failed to warm Bags follow-buy context.",
+                Some(json!({
+                    "traceId": job.traceId,
+                    "compileContextKey": compile_context_key,
+                    "error": error,
+                })),
+            );
+        }
+    }
+}
+
 async fn spawn_hot_follow_buy_refresh_if_needed(state: Arc<AppState>, trace_id: String) {
     let mut tasks = state.hot_follow_buy_tasks.lock().await;
     if tasks.contains_key(&trace_id) {
@@ -1071,23 +1241,36 @@ async fn spawn_hot_follow_buy_refresh_if_needed(state: Arc<AppState>, trace_id: 
                 sleep(Duration::from_millis(HOT_FOLLOW_BUY_REFRESH_MS)).await;
                 continue;
             };
-            for prefer_post_setup_creator_vault in [false, true] {
-                if let Ok(prepared) = prepare_follow_buy_runtime(
-                    &task_state.rpc_url,
-                    mint,
-                    launch_creator,
-                    prefer_post_setup_creator_vault,
-                )
-                .await
-                {
-                    cache_hot_follow_buy_runtime(
-                        &task_state,
-                        &task_trace_id,
-                        prefer_post_setup_creator_vault,
-                        prepared,
-                    )
-                    .await;
+            match job.launchpad.as_str() {
+                "pump" => {
+                    for prefer_post_setup_creator_vault in [false, true] {
+                        if let Ok(prepared) = prepare_follow_buy_runtime(
+                            &task_state.rpc_url,
+                            mint,
+                            launch_creator,
+                            prefer_post_setup_creator_vault,
+                        )
+                        .await
+                        {
+                            cache_hot_follow_buy_runtime(
+                                &task_state,
+                                &task_trace_id,
+                                prefer_post_setup_creator_vault,
+                                prepared,
+                            )
+                            .await;
+                        }
+                    }
                 }
+                "bonk" => {
+                    let compile_context_key = job_buy_compile_context_key(&job);
+                    warm_bonk_follow_buy_contexts(&task_state, &job, &compile_context_key).await;
+                }
+                "bagsapp" => {
+                    let compile_context_key = job_buy_compile_context_key(&job);
+                    warm_bags_follow_buy_context(&task_state, &job, &compile_context_key).await;
+                }
+                _ => {}
             }
             sleep(Duration::from_millis(HOT_FOLLOW_BUY_REFRESH_MS)).await;
         }
@@ -1160,8 +1343,40 @@ async fn prepare_follow_job_buy_caches(state: Arc<AppState>, job: &FollowJobReco
     if buy_actions.is_empty() {
         return;
     }
+    if job.launchpad == "bonk" {
+        if buy_actions
+            .iter()
+            .any(action_needs_trigger_time_buy_compile_prep)
+        {
+            let compile_context_key = job_buy_compile_context_key(job);
+            warm_bonk_follow_buy_contexts(&state, job, &compile_context_key).await;
+            spawn_hot_follow_buy_refresh_if_needed(state, job.traceId.clone()).await;
+        }
+        return;
+    }
+    if job.launchpad == "bagsapp" {
+        if buy_actions
+            .iter()
+            .any(action_needs_trigger_time_buy_compile_prep)
+        {
+            let compile_context_key = job_buy_compile_context_key(job);
+            warm_bags_follow_buy_context(&state, job, &compile_context_key).await;
+            spawn_hot_follow_buy_refresh_if_needed(state, job.traceId.clone()).await;
+        }
+        return;
+    }
     if job.launchpad != "pump" {
         return;
+    }
+    if let Err(error) = refresh_shared_lookup_tables(&state.rpc_url).await {
+        record_warn(
+            "follow-daemon",
+            "Failed to warm LaunchDeck wrapper lookup table for pump follow buys.",
+            Some(json!({
+                "traceId": job.traceId,
+                "error": error,
+            })),
+        );
     }
     for prefer_post_setup_creator_vault in [false, true] {
         if let Ok(prepared_runtime) = prepare_follow_buy_runtime(
@@ -1221,6 +1436,7 @@ async fn prepare_follow_job_buy_caches(state: Arc<AppState>, job: &FollowJobReco
     spawn_hot_follow_buy_refresh_if_needed(state, job.traceId.clone()).await;
 }
 
+#[allow(dead_code)]
 async fn resolve_prepared_follow_buy(
     state: &Arc<AppState>,
     job: &FollowJobRecord,
@@ -1250,6 +1466,7 @@ async fn resolve_prepared_follow_buy(
     Ok(prepared)
 }
 
+#[allow(dead_code)]
 async fn resolve_hot_follow_buy_runtime_for_job(
     state: &Arc<AppState>,
     job: &FollowJobRecord,
@@ -1264,7 +1481,7 @@ async fn resolve_hot_follow_buy_runtime_for_job(
             &job.launchpad,
             &job.quoteAsset,
             &job.launchMode,
-            &follow_buy_route_policy_label(&job.execution),
+            &follow_buy_route_policy_label(&job.execution, job.wrapperDefaultFeeBps),
         );
         if let Some(cached) = get_shared_hot_follow_buy_runtime(
             state,
@@ -1316,12 +1533,19 @@ async fn resolve_shared_bonk_follow_buy_pool_id_for_job(
         &job.launchpad,
         &job.quoteAsset,
         &job.launchMode,
-        &follow_buy_route_policy_label(&job.execution),
+        &follow_buy_route_policy_label(&job.execution, job.wrapperDefaultFeeBps),
     );
-    let cached = get_bonk_follow_buy_context(state, &key).await?;
-    if now_ms().saturating_sub(cached.refreshed_at_ms) > HOT_FOLLOW_BUY_MAX_AGE_MS {
-        return None;
-    }
+    let cached = if let Some(cached) = get_bonk_follow_buy_context(state, &key).await
+        && cache_entry_is_fresh(
+            now_ms(),
+            cached.refreshed_at_ms,
+            BONK_FOLLOW_BUY_CONTEXT_MAX_AGE_MS,
+        ) {
+        cached
+    } else {
+        let job_key = job_buy_compile_context_key(job);
+        get_fresh_bonk_follow_buy_context(state, &job_key).await?
+    };
     if let Some(locked_pool_id) = action
         .poolId
         .as_deref()
@@ -1356,12 +1580,19 @@ async fn resolve_shared_bonk_usd1_route_setup_for_job(
         &job.launchpad,
         &job.quoteAsset,
         &job.launchMode,
-        &follow_buy_route_policy_label(&job.execution),
+        &follow_buy_route_policy_label(&job.execution, job.wrapperDefaultFeeBps),
     );
-    let cached = get_bonk_usd1_route_setup(state, &key).await?;
-    if now_ms().saturating_sub(cached.refreshed_at_ms) > HOT_FOLLOW_BUY_MAX_AGE_MS {
-        return None;
-    }
+    let cached = if let Some(cached) = get_bonk_usd1_route_setup(state, &key).await
+        && cache_entry_is_fresh(
+            now_ms(),
+            cached.refreshed_at_ms,
+            BONK_USD1_ROUTE_SETUP_MAX_AGE_MS,
+        ) {
+        cached
+    } else {
+        let job_key = job_buy_compile_context_key(job);
+        get_fresh_bonk_usd1_route_setup(state, &job_key).await?
+    };
     Some(cached.setup)
 }
 
@@ -1377,12 +1608,19 @@ async fn resolve_shared_bags_follow_buy_context_for_job(
         &job.launchpad,
         &job.quoteAsset,
         &job.launchMode,
-        &follow_buy_route_policy_label(&job.execution),
+        &follow_buy_route_policy_label(&job.execution, job.wrapperDefaultFeeBps),
     );
-    let cached = get_bags_follow_buy_context(state, &key).await?;
-    if now_ms().saturating_sub(cached.refreshed_at_ms) > HOT_FOLLOW_BUY_MAX_AGE_MS {
-        return None;
-    }
+    let cached = if let Some(cached) = get_bags_follow_buy_context(state, &key).await
+        && cache_entry_is_fresh(
+            now_ms(),
+            cached.refreshed_at_ms,
+            BAGS_FOLLOW_BUY_CONTEXT_MAX_AGE_MS,
+        ) {
+        cached
+    } else {
+        let job_key = job_buy_compile_context_key(job);
+        get_fresh_bags_follow_buy_context(state, &job_key).await?
+    };
     Some(cached.context)
 }
 
@@ -1412,7 +1650,7 @@ async fn prepare_trigger_time_buy_compile_batch(
         &job.launchpad,
         &job.quoteAsset,
         &job.launchMode,
-        &follow_buy_route_policy_label(&job.execution),
+        &follow_buy_route_policy_label(&job.execution, job.wrapperDefaultFeeBps),
     );
     if let Err(error) = fetch_latest_blockhash_fresh_or_recent(
         &state.rpc_url,
@@ -1433,6 +1671,17 @@ async fn prepare_trigger_time_buy_compile_batch(
     }
     match job.launchpad.as_str() {
         "pump" => {
+            if let Err(error) = refresh_shared_lookup_tables(&state.rpc_url).await {
+                record_warn(
+                    "follow-daemon",
+                    "Failed to refresh LaunchDeck wrapper lookup table for trigger-time pump follow buys.",
+                    Some(json!({
+                        "traceId": job.traceId,
+                        "compileContextKey": compile_context_key,
+                        "error": error,
+                    })),
+                );
+            }
             let Some(mint) = job.mint.as_deref() else {
                 return;
             };
@@ -1459,46 +1708,18 @@ async fn prepare_trigger_time_buy_compile_batch(
             }
         }
         "bonk" => {
-            let Some(mint) = job.mint.as_deref() else {
-                return;
-            };
-            match detect_bonk_import_context_with_quote_asset(&state.rpc_url, mint, &job.quoteAsset)
-                .await
-            {
-                Ok(Some(context)) => {
-                    cache_bonk_follow_buy_context(state, &compile_context_key, context.poolId)
-                        .await;
-                    if job.quoteAsset.eq_ignore_ascii_case("usd1") {
-                        match load_live_follow_buy_usd1_route_setup(&state.rpc_url).await {
-                            Ok(setup) => {
-                                cache_bonk_usd1_route_setup(state, &compile_context_key, setup)
-                                    .await;
-                            }
-                            Err(error) => {
-                                record_warn(
-                                    "follow-daemon",
-                                    "Failed to prime shared Bonk USD1 route setup for compile batch.",
-                                    Some(json!({
-                                        "traceId": job.traceId,
-                                        "compileContextKey": compile_context_key,
-                                        "error": error,
-                                    })),
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    record_warn(
-                        "follow-daemon",
-                        "Failed to prime shared Bonk follow-buy context for compile batch.",
-                        Some(json!({
-                            "traceId": job.traceId,
-                            "compileContextKey": compile_context_key,
-                            "error": error,
-                        })),
-                    );
+            let job_context_key = job_buy_compile_context_key(job);
+            if let Some(cached) = get_fresh_bonk_follow_buy_context(state, &job_context_key).await {
+                cache_bonk_follow_buy_context(state, &compile_context_key, cached.pool_id).await;
+            } else {
+                warm_bonk_follow_buy_contexts(state, job, &compile_context_key).await;
+            }
+            if job.quoteAsset.eq_ignore_ascii_case("usd1") {
+                if let Some(cached) = get_fresh_bonk_usd1_route_setup(state, &job_context_key).await
+                {
+                    cache_bonk_usd1_route_setup(state, &compile_context_key, cached.setup).await;
+                } else {
+                    warm_bonk_follow_buy_contexts(state, job, &compile_context_key).await;
                 }
             }
         }
@@ -1506,29 +1727,11 @@ async fn prepare_trigger_time_buy_compile_batch(
             let Some(mint) = job.mint.as_deref() else {
                 return;
             };
-            match load_follow_buy_context(
-                &state.rpc_url,
-                mint,
-                &job.execution.commitment,
-                job.bagsLaunch.as_ref(),
-            )
-            .await
-            {
-                Ok(Some(context)) => {
-                    cache_bags_follow_buy_context(state, &compile_context_key, context).await;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    record_warn(
-                        "follow-daemon",
-                        "Failed to prime shared Bags follow-buy context for compile batch.",
-                        Some(json!({
-                            "traceId": job.traceId,
-                            "compileContextKey": compile_context_key,
-                            "error": error,
-                        })),
-                    );
-                }
+            let job_context_key = job_buy_compile_context_key(job);
+            if let Some(cached) = get_fresh_bags_follow_buy_context(state, &job_context_key).await {
+                cache_bags_follow_buy_context(state, &compile_context_key, cached.context).await;
+            } else {
+                warm_bags_follow_buy_context(state, job, &compile_context_key).await;
             }
             match fetch_market_snapshot_for_launchpad(
                 "bagsapp",
@@ -3948,37 +4151,48 @@ async fn execute_action(
                         }
                     })
                 } else {
-                    let prepared = resolve_prepared_follow_buy(
-                        &state,
-                        job,
-                        &effective_action,
-                        &wallet_secret,
-                        launch_creator,
-                        amount,
-                    )
-                    .await?;
-                    let runtime = resolve_hot_follow_buy_runtime_for_job(
-                        &state,
-                        job,
-                        &effective_action,
-                        launch_creator,
-                        prefer_post_setup_creator_vault_for_buy,
-                    )
-                    .await?;
-                    Some(CompiledFollowActionBatch {
-                        transactions: vec![
-                            finalize_follow_buy_transaction(
-                                &state.rpc_url,
-                                &job.execution,
-                                job.tokenMayhemMode,
-                                &wallet_secret,
-                                &prepared,
-                                &runtime,
-                            )
-                            .await?,
-                        ],
-                        primary_tx_index: 0,
-                        requires_ordered_execution: false,
+                    Some({
+                        let prepared = resolve_prepared_follow_buy(
+                            &state,
+                            job,
+                            &effective_action,
+                            &wallet_secret,
+                            launch_creator,
+                            amount,
+                        )
+                        .await?;
+                        let runtime = resolve_hot_follow_buy_runtime_for_job(
+                            &state,
+                            job,
+                            &effective_action,
+                            launch_creator,
+                            prefer_post_setup_creator_vault_for_buy,
+                        )
+                        .await?;
+                        let native_tx = finalize_follow_buy_transaction(
+                            &state.rpc_url,
+                            &action_execution,
+                            job.tokenMayhemMode,
+                            &wallet_secret,
+                            &prepared,
+                            &runtime,
+                            job.wrapperDefaultFeeBps,
+                        )
+                        .await?;
+                        let wrapped_tx = wrap_follow_buy_transaction_for_launchpad(
+                            &state.rpc_url,
+                            &wallet_secret,
+                            &job.launchpad,
+                            native_tx,
+                            amount,
+                            job.wrapperDefaultFeeBps,
+                        )
+                        .await?;
+                        CompiledFollowActionBatch {
+                            transactions: vec![wrapped_tx],
+                            primary_tx_index: 0,
+                            requires_ordered_execution: false,
+                        }
                     })
                 }
             }
@@ -7386,6 +7600,63 @@ mod tests {
         assert!(should_request_full_transaction_details(&buy));
         assert!(should_request_full_transaction_details(&sniper_sell));
         assert!(should_request_full_transaction_details(&dev_auto_sell));
+    }
+
+    #[test]
+    fn bonk_usd1_route_setup_uses_hot_freshness_window() {
+        assert_eq!(BONK_USD1_ROUTE_SETUP_MAX_AGE_MS, HOT_FOLLOW_BUY_MAX_AGE_MS);
+        assert!(BONK_USD1_ROUTE_SETUP_MAX_AGE_MS < BONK_FOLLOW_BUY_CONTEXT_MAX_AGE_MS);
+
+        let now = 10_000;
+        assert!(cache_entry_is_fresh(
+            now,
+            now - BONK_USD1_ROUTE_SETUP_MAX_AGE_MS,
+            BONK_USD1_ROUTE_SETUP_MAX_AGE_MS
+        ));
+        assert!(!cache_entry_is_fresh(
+            now,
+            now - BONK_USD1_ROUTE_SETUP_MAX_AGE_MS - 1,
+            BONK_USD1_ROUTE_SETUP_MAX_AGE_MS
+        ));
+    }
+
+    #[tokio::test]
+    async fn bonk_trigger_compile_reuses_early_warmed_pool_context() {
+        let state_path = test_state_path();
+        let state = test_app_state("http://127.0.0.1:9/".to_string(), state_path.clone());
+        let mut job = sample_job();
+        job.launchpad = "bonk".to_string();
+        job.quoteAsset = "usd1".to_string();
+        job.mint = Some("mint".to_string());
+        let mut action = sample_sniper_buy_action("buy-a", "SOLANA_PRIVATE_KEY2", 0);
+        action.eligibilityObservedSlot = Some(777);
+
+        let warm_key = job_buy_compile_context_key(&job);
+        cache_bonk_follow_buy_context(&state, &warm_key, "warm-pool".to_string()).await;
+
+        let pool_id = resolve_shared_bonk_follow_buy_pool_id_for_job(&state, &job, &action).await;
+        assert_eq!(pool_id.as_deref(), Some("warm-pool"));
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn bonk_trigger_compile_respects_locked_pool_when_using_early_warm() {
+        let state_path = test_state_path();
+        let state = test_app_state("http://127.0.0.1:9/".to_string(), state_path.clone());
+        let mut job = sample_job();
+        job.launchpad = "bonk".to_string();
+        job.quoteAsset = "usd1".to_string();
+        job.mint = Some("mint".to_string());
+        let mut action = sample_sniper_buy_action("buy-a", "SOLANA_PRIVATE_KEY2", 0);
+        action.eligibilityObservedSlot = Some(777);
+        action.poolId = Some("locked-pool".to_string());
+
+        let warm_key = job_buy_compile_context_key(&job);
+        cache_bonk_follow_buy_context(&state, &warm_key, "other-pool".to_string()).await;
+
+        let pool_id = resolve_shared_bonk_follow_buy_pool_id_for_job(&state, &job, &action).await;
+        assert_eq!(pool_id, None);
+        let _ = std::fs::remove_file(state_path);
     }
 
     async fn set_test_slot_watch_value(

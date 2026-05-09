@@ -15,12 +15,16 @@ use shared_extension_runtime::{
 use shared_transaction_submit::{
     JitoWarmResult, prewarm_helius_transaction_subscribe_endpoint,
     prewarm_hellomoon_bundle_endpoint, prewarm_hellomoon_quic_endpoint,
-    prewarm_jito_bundle_endpoint, prewarm_rpc_endpoint, prewarm_watch_websocket_endpoint,
+    prewarm_jito_bundle_endpoint, prewarm_watch_websocket_endpoint, record_warm_rpc_failure,
+    record_warm_rpc_success, reserve_warm_rpc_call, warm_rpc_cooldown_remaining_ms,
+    warm_rpc_error_should_cooldown,
 };
 use tokio::time::{Duration, sleep, timeout};
 
 use crate::endpoint_profile::parse_config_endpoint_profile;
-use crate::rpc_client::{configured_rpc_url, configured_warm_rpc_url};
+use crate::rpc_client::{
+    configured_rpc_url, configured_warm_rpc_url, rpc_request_with_client, shared_rpc_http_client,
+};
 use crate::transport::{
     configured_enable_helius_transaction_subscribe, configured_helius_sender_endpoints_for_profile,
     configured_hellomoon_bundle_endpoints_for_profile, configured_hellomoon_mev_protect,
@@ -348,10 +352,21 @@ pub fn warm_runtime_payload(registry: &SharedLaunchdeckWarmRegistry) -> Value {
     let state_targets = payload_warm_targets(warm, "state", active);
     let endpoint_targets = payload_warm_targets(warm, "endpoint", active);
     let watch_targets = payload_warm_targets(warm, "watch-endpoint", active);
+    let main_rpc_url = configured_rpc_url();
+    let warm_rpc_url = configured_warm_rpc_url();
+    let warm_rpc_configured = warm_rpc_url.trim() != main_rpc_url.trim();
+    let warm_rpc_cooldown_ms = if warm_rpc_configured {
+        warm_rpc_cooldown_remaining_ms(&warm_rpc_url)
+    } else {
+        None
+    };
     json!({
         "startupEnabled": configured_startup_warm_enabled(),
         "continuousEnabled": configured_continuous_warm_enabled(),
         "idleSuspendEnabled": configured_idle_warm_suspend_enabled(),
+        "warmRpcConfigured": warm_rpc_configured,
+        "warmRpcCooldownRemainingMs": warm_rpc_cooldown_ms,
+        "warmRpcMode": if warm_rpc_configured { "best-effort" } else { "primary" },
         "intervalMs": configured_continuous_warm_interval_ms(),
         "idleTimeoutMs": configured_idle_warm_timeout_ms(),
         "active": active,
@@ -751,7 +766,6 @@ fn apply_warm_target_attempts(
             }
             WarmAttemptResult::RateLimited(message) => {
                 entry.status = WarmTargetHealth::RateLimited;
-                entry.last_success_at_ms = Some(attempt_at_ms);
                 entry.last_rate_limited_at_ms = Some(attempt_at_ms);
                 entry.last_rate_limit_message = Some(message.clone());
                 entry.last_error = None;
@@ -867,10 +881,7 @@ fn prune_stale_warm_targets_after_attempt(
 }
 
 fn attempt_succeeded(result: &WarmAttemptResult) -> bool {
-    matches!(
-        result,
-        WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)
-    )
+    matches!(result, WarmAttemptResult::Success)
 }
 
 fn attempt_error_message(result: &WarmAttemptResult) -> String {
@@ -923,20 +934,55 @@ async fn collect_state_warm_attempts(
     warm_rpc_url: &str,
 ) -> Vec<WarmTargetAttempt> {
     let mut attempts = Vec::new();
-    let warm_rpc_target = warm_rpc_url.to_string();
-    let warm_rpc_result =
-        warm_attempt_result(async move { prewarm_rpc_endpoint(&warm_rpc_target).await }).await;
+    let warm_rpc_label = if main_rpc_url.trim() == warm_rpc_url.trim() {
+        "Primary RPC"
+    } else {
+        "Warm RPC"
+    };
+    let warm_rpc_result = if warm_rpc_url.trim() != main_rpc_url.trim()
+        && !reserve_warm_rpc_call(warm_rpc_url, "getVersion")
+    {
+        WarmAttemptResult::RateLimited(
+            "optional warm RPC rate limit/cooldown active; skipping Shyft probe".to_string(),
+        )
+    } else {
+        let warm_rpc_target = warm_rpc_url.to_string();
+        let result =
+            warm_attempt_result(
+                async move { prewarm_execution_rpc_endpoint(&warm_rpc_target).await },
+            )
+            .await;
+        if warm_rpc_url.trim() != main_rpc_url.trim() {
+            match &result {
+                WarmAttemptResult::Success => record_warm_rpc_success(warm_rpc_url),
+                WarmAttemptResult::Error(error) => record_warm_rpc_failure(warm_rpc_url, error),
+                WarmAttemptResult::RateLimited(_) => {}
+            }
+        }
+        match result {
+            WarmAttemptResult::Error(error)
+                if warm_rpc_url.trim() != main_rpc_url.trim()
+                    && warm_rpc_error_should_cooldown(&error) =>
+            {
+                WarmAttemptResult::RateLimited(error)
+            }
+            result => result,
+        }
+    };
     attempts.push(build_warm_target_attempt(
         "state",
         None,
-        "Warm RPC",
+        warm_rpc_label,
         warm_rpc_url.to_string(),
         warm_rpc_result,
     ));
     if should_prewarm_primary_rpc_separately(main_rpc_url, warm_rpc_url) {
         let primary_target = main_rpc_url.to_string();
         let primary_result =
-            warm_attempt_result(async move { prewarm_rpc_endpoint(&primary_target).await }).await;
+            warm_attempt_result(
+                async move { prewarm_execution_rpc_endpoint(&primary_target).await },
+            )
+            .await;
         attempts.push(build_warm_target_attempt(
             "state",
             None,
@@ -957,9 +1003,10 @@ async fn collect_endpoint_warm_attempts(
     if routes.iter().any(|route| route.provider == "standard-rpc") {
         for endpoint in configured_standard_rpc_warm_endpoints(main_rpc_url) {
             let endpoint_target = endpoint.clone();
-            let result =
-                warm_attempt_result(async move { prewarm_rpc_endpoint(&endpoint_target).await })
-                    .await;
+            let result = warm_attempt_result(async move {
+                prewarm_execution_rpc_endpoint(&endpoint_target).await
+            })
+            .await;
             attempts.push(build_warm_target_attempt(
                 "endpoint",
                 Some("standard-rpc"),
@@ -1244,6 +1291,12 @@ async fn prewarm_helius_sender_endpoint(rpc_url: &str) -> Result<(), String> {
             .unwrap_or_else(|_| String::from("(body unavailable)"));
         return Err(format!("Sender ping failed with status {status}: {body}"));
     }
+    Ok(())
+}
+
+async fn prewarm_execution_rpc_endpoint(rpc_url: &str) -> Result<(), String> {
+    let _ =
+        rpc_request_with_client(shared_rpc_http_client(), rpc_url, "getVersion", json!([])).await?;
     Ok(())
 }
 

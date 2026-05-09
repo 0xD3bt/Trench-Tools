@@ -562,6 +562,7 @@ mod tests {
             rpc_url: String::new(),
             ws_url: String::new(),
             warm_rpc_url: String::new(),
+            warm_ws_url: String::new(),
             shared_region: String::new(),
             helius_rpc_url: String::new(),
             helius_ws_url: String::new(),

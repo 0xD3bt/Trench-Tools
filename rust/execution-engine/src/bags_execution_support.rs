@@ -1,7 +1,6 @@
 #![allow(non_snake_case, dead_code)]
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use futures_util::future::join_all;
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
@@ -32,19 +31,35 @@ use std::{
 use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
-use shared_execution_routing::execution::NormalizedExecution;
+use shared_execution_routing::{
+    alt_manifest::RAYDIUM_SOL_USDC_POOL, execution::NormalizedExecution,
+};
 use shared_extension_runtime::follow_contract::BagsLaunchMetadata;
 use shared_transaction_submit::{
     CompiledTransaction, fetch_latest_blockhash_cached, precompute_transaction_signature,
 };
 
-use crate::paths;
+use crate::{
+    bonk_execution_support::build_trusted_raydium_clmm_swap_exact_in,
+    paths,
+    rollout::{wrapper_default_fee_bps, wrapper_fee_vault_pubkey},
+    stable_native::trusted_stable_route_for_pool,
+    wrapper_abi::{
+        ABI_VERSION as WRAPPER_ABI_VERSION, EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT,
+        EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT, ExecuteAccounts, ExecuteSwapRouteAccounts,
+        ExecuteSwapRouteRequest, SWAP_ROUTE_NO_PATCH_OFFSET, SwapLegInputSource,
+        SwapRouteDirection, SwapRouteFeeMode, SwapRouteLeg, SwapRouteMode, SwapRouteSettlement,
+        TOKEN_PROGRAM_ID as WRAPPER_TOKEN_PROGRAM_ID, build_execute_swap_route_instruction,
+        config_pda, instructions_sysvar_id, route_wsol_pda,
+    },
+    wrapper_compile::estimate_sol_in_fee_lamports,
+};
 
 const DEFAULT_LAUNCH_COMPUTE_UNIT_LIMIT: u64 = 340_000;
-const DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT: u64 = 200_000;
-const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 200_000;
-const DEFAULT_PRE_MIGRATION_BUY_COMPUTE_UNIT_LIMIT: u64 = 200_000;
-const MIN_BAGS_COMPUTE_UNIT_LIMIT: u64 = 200_000;
+const DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT: u64 = 280_000;
+const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 280_000;
+const DEFAULT_PRE_MIGRATION_BUY_COMPUTE_UNIT_LIMIT: u64 = 280_000;
+const MIN_BAGS_COMPUTE_UNIT_LIMIT: u64 = 280_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeCompileTimings {
@@ -132,6 +147,7 @@ const BAGS_CONFIG_TYPE_025_PRE_1_POST: &str = "d16d3585-6488-4a6c-9a6f-e6c39ca0f
 const BAGS_CONFIG_TYPE_1_PRE_025_POST: &str = "a7c8e1f2-3d4b-5a6c-9e0f-1b2c3d4e5f6a";
 const BAGS_FEE_SHARE_V2_MAX_CLAIMERS_NON_LUT: usize = 15;
 const BAGS_NATIVE_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const BAGS_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const BAGS_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
@@ -484,6 +500,11 @@ struct RpcAccountInfoResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct RpcMultipleAccountsResult {
+    value: Vec<Option<RpcAccountValue>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct RpcProgramAccount {
     pubkey: String,
     account: RpcAccountValue,
@@ -659,6 +680,7 @@ impl CachedBagsLaunchHints {
 #[derive(Debug, Clone)]
 struct NativeBagsImportMarket {
     mode: String,
+    quote_asset: String,
     market_key: String,
     config_key: String,
     venue: String,
@@ -1635,13 +1657,9 @@ async fn resolve_lookup_table_accounts_for_bags_transaction(
 
 async fn load_shared_lookup_table_for_bags_transaction(
     rpc_url: &str,
-    commitment: &str,
+    _commitment: &str,
 ) -> Result<Vec<AddressLookupTableAccount>, String> {
-    let shared = Pubkey::from_str(SHARED_SUPER_LOOKUP_TABLE)
-        .map_err(|error| format!("Invalid shared Bags lookup table address: {error}"))?;
-    Ok(vec![
-        load_lookup_table_account_for_bags_transaction(rpc_url, &shared, commitment).await?,
-    ])
+    crate::pump_native::load_shared_super_lookup_tables(rpc_url).await
 }
 
 fn validate_bags_shared_lookup_tables_only(
@@ -1799,11 +1817,15 @@ async fn ensure_tx_config_on_bags_versioned_transaction(
         existing_compute_unit_limit,
         existing_compute_unit_price_micro_lamports,
     ) = split_compute_budget_instructions(instructions);
-    if tx_config.jitodontfront {
-        let dontfront = bags_jitodontfront_pubkey()?;
-        for instruction in &mut filtered_instructions {
-            apply_jitodontfront_to_instruction(instruction, &dontfront);
-        }
+    if tx_config.jitodontfront
+        && !filtered_instructions.iter().any(|instruction| {
+            instruction
+                .accounts
+                .iter()
+                .any(|meta| meta.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+        })
+    {
+        filtered_instructions.insert(0, build_jitodontfront_noop_instruction(&owner.pubkey())?);
     }
     let tip_instruction = build_inline_tip_instruction(
         &owner.pubkey(),
@@ -2018,21 +2040,17 @@ fn build_follow_sell_tx_config(
     })
 }
 
-fn apply_jitodontfront_to_instruction(instruction: &mut Instruction, dontfront: &Pubkey) {
-    if instruction
-        .accounts
-        .iter()
-        .any(|meta| meta.pubkey == *dontfront)
-    {
-        return;
-    }
-    instruction
-        .accounts
-        .push(AccountMeta::new_readonly(*dontfront, false));
+fn build_jitodontfront_noop_instruction(payer: &Pubkey) -> Result<Instruction, String> {
+    let mut instruction = transfer(payer, payer, 0);
+    instruction.accounts.push(AccountMeta::new_readonly(
+        bags_jitodontfront_pubkey()?,
+        false,
+    ));
+    Ok(instruction)
 }
 
 fn build_native_follow_instructions(
-    mut core_instructions: Vec<Instruction>,
+    core_instructions: Vec<Instruction>,
     tx_config: &NativeFollowTxConfig,
     payer: &Pubkey,
 ) -> Result<Vec<Instruction>, String> {
@@ -2047,11 +2065,15 @@ fn build_native_follow_instructions(
             tx_config.compute_unit_price_micro_lamports,
         )?);
     }
-    if tx_config.jitodontfront {
-        let dontfront = bags_jitodontfront_pubkey()?;
-        for instruction in &mut core_instructions {
-            apply_jitodontfront_to_instruction(instruction, &dontfront);
-        }
+    if tx_config.jitodontfront
+        && !core_instructions.iter().any(|instruction| {
+            instruction
+                .accounts
+                .iter()
+                .any(|meta| meta.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+        })
+    {
+        instructions.push(build_jitodontfront_noop_instruction(payer)?);
     }
     instructions.extend(core_instructions);
     if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty() {
@@ -2071,6 +2093,137 @@ fn build_bags_uniqueness_memo_instruction(label: &str) -> Result<Instruction, St
     })
 }
 
+fn route_account_index(
+    route_accounts: &[AccountMeta],
+    pubkey: &Pubkey,
+    context: &str,
+) -> Result<u16, String> {
+    route_accounts
+        .iter()
+        .position(|account| account.pubkey == *pubkey)
+        .ok_or_else(|| format!("{context} account was missing from Meteora route accounts"))?
+        .try_into()
+        .map_err(|_| format!("{context} route account index does not fit in u16"))
+}
+
+fn route_len_u16(len: usize, context: &str) -> Result<u16, String> {
+    len.try_into()
+        .map_err(|_| format!("{context} route account count does not fit in u16"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_meteora_usdc_dynamic_route_instruction(
+    owner: &Pubkey,
+    first_leg_ix: Instruction,
+    second_leg_ix: Instruction,
+    intermediate_account: &Pubkey,
+    final_output_account: &Pubkey,
+    first_leg_input_source: SwapLegInputSource,
+    first_leg_input_amount: u64,
+    first_leg_patch_offset: u16,
+    second_leg_min_input_amount: u64,
+    min_net_output: u64,
+    direction: SwapRouteDirection,
+    settlement: SwapRouteSettlement,
+    fee_mode: SwapRouteFeeMode,
+    gross_sol_in_lamports: u64,
+    fee_bps: u16,
+) -> Result<Instruction, String> {
+    let (route_wsol_account, _) = route_wsol_pda(owner, 0);
+    let mut route_accounts = vec![
+        AccountMeta::new_readonly(first_leg_ix.program_id, false),
+        AccountMeta::new_readonly(second_leg_ix.program_id, false),
+    ];
+    let first_program_index = 0u16;
+    let second_program_index = 1u16;
+    let first_accounts_start = route_len_u16(route_accounts.len(), "Meteora USDC first route leg")?;
+    route_accounts.extend(first_leg_ix.accounts.iter().cloned());
+    let first_accounts_len =
+        route_len_u16(first_leg_ix.accounts.len(), "Meteora USDC first route leg")?;
+    let first_output_index = route_account_index(
+        &route_accounts,
+        intermediate_account,
+        "Meteora USDC intermediate output",
+    )?;
+    let second_accounts_start =
+        route_len_u16(route_accounts.len(), "Meteora USDC second route leg")?;
+    route_accounts.extend(second_leg_ix.accounts.iter().cloned());
+    let second_accounts_len = route_len_u16(
+        second_leg_ix.accounts.len(),
+        "Meteora USDC second route leg",
+    )?;
+    let second_output_index = route_account_index(
+        &route_accounts,
+        final_output_account,
+        "Meteora USDC final output",
+    )?;
+    let fee_vault = wrapper_fee_vault_pubkey();
+    let fee_vault_wsol_ata = if matches!(fee_mode, SwapRouteFeeMode::WsolPost) {
+        get_associated_token_address_with_program_id(
+            &fee_vault,
+            &bags_native_mint_pubkey()?,
+            &bags_token_program_pubkey()?,
+        )
+    } else {
+        Pubkey::new_from_array([0; 32])
+    };
+    let (config_pda_pubkey, _config_bump) = config_pda();
+    let instructions_sysvar = instructions_sysvar_id();
+    let execute_accounts = ExecuteAccounts {
+        user: owner,
+        config_pda: &config_pda_pubkey,
+        fee_vault: &fee_vault,
+        fee_vault_wsol_ata: &fee_vault_wsol_ata,
+        user_wsol_ata: &route_wsol_account,
+        instructions_sysvar: &instructions_sysvar,
+        inner_program: &first_leg_ix.program_id,
+        token_program: &WRAPPER_TOKEN_PROGRAM_ID,
+    };
+    let swap_route_accounts = ExecuteSwapRouteAccounts {
+        execute: execute_accounts,
+        token_fee_vault_ata: None,
+    };
+    let request = ExecuteSwapRouteRequest {
+        version: WRAPPER_ABI_VERSION,
+        route_mode: SwapRouteMode::Mixed,
+        direction,
+        settlement,
+        fee_mode,
+        wsol_lane: 0,
+        fee_bps,
+        gross_sol_in_lamports,
+        gross_token_in_amount: 0,
+        min_net_output,
+        route_accounts_offset: EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT
+            + EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT,
+        intermediate_account_index: first_output_index,
+        token_fee_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+        legs: vec![
+            SwapRouteLeg {
+                program_account_index: first_program_index,
+                accounts_start: first_accounts_start,
+                accounts_len: first_accounts_len,
+                input_source: first_leg_input_source,
+                input_amount: first_leg_input_amount,
+                input_patch_offset: first_leg_patch_offset,
+                output_account_index: first_output_index,
+                ix_data: first_leg_ix.data,
+            },
+            SwapRouteLeg {
+                program_account_index: second_program_index,
+                accounts_start: second_accounts_start,
+                accounts_len: second_accounts_len,
+                input_source: SwapLegInputSource::PreviousTokenDelta,
+                input_amount: second_leg_min_input_amount,
+                input_patch_offset: 8,
+                output_account_index: second_output_index,
+                ix_data: second_leg_ix.data,
+            },
+        ],
+    };
+    build_execute_swap_route_instruction(&swap_route_accounts, &request, &route_accounts)
+}
+
 async fn compile_shared_alt_follow_transaction(
     label: &str,
     rpc_url: &str,
@@ -2082,9 +2235,16 @@ async fn compile_shared_alt_follow_transaction(
     let mut instructions =
         build_native_follow_instructions(core_instructions, tx_config, &owner.pubkey())?;
     instructions.push(build_bags_uniqueness_memo_instruction(label)?);
+    let lookup_tables_started_at = Instant::now();
     let lookup_tables = load_shared_lookup_table_for_bags_transaction(rpc_url, commitment).await?;
+    crate::route_metrics::record_phase_ms(
+        "context_fetch",
+        lookup_tables_started_at.elapsed().as_millis(),
+    );
+    let blockhash_started_at = Instant::now();
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, commitment).await?;
+    crate::route_metrics::record_phase_ms("blockhash", blockhash_started_at.elapsed().as_millis());
     let hash = Hash::from_str(&blockhash)
         .map_err(|error| format!("Invalid blockhash for follow transaction: {error}"))?;
     let message = v0::Message::try_compile(&owner.pubkey(), &instructions, &lookup_tables, hash)
@@ -2345,6 +2505,40 @@ fn bags_native_mint_pubkey() -> Result<Pubkey, String> {
     Pubkey::from_str(BAGS_NATIVE_MINT).map_err(|error| format!("Invalid Bags native mint: {error}"))
 }
 
+fn usdc_mint_pubkey() -> Result<Pubkey, String> {
+    Pubkey::from_str(USDC_MINT).map_err(|error| format!("Invalid USDC mint: {error}"))
+}
+
+fn quote_asset_label_for_mint(mint: &Pubkey) -> Result<Option<&'static str>, String> {
+    if *mint == bags_native_mint_pubkey()? {
+        Ok(Some("sol"))
+    } else if *mint == usdc_mint_pubkey()? {
+        Ok(Some("usdc"))
+    } else {
+        Ok(None)
+    }
+}
+
+fn meteora_provenance_label_for_mint(mint: &Pubkey) -> &'static str {
+    let value = mint.to_string();
+    if value.ends_with("brrr") {
+        "printr"
+    } else if value.ends_with("BAGS") {
+        "bagsapp"
+    } else if value.ends_with("moon") {
+        "moonshot"
+    } else if value.ends_with("daos") {
+        "daos"
+    } else {
+        "generic-meteora"
+    }
+}
+
+fn raydium_sol_usdc_route() -> Result<&'static crate::stable_native::TrustedStableRoute, String> {
+    trusted_stable_route_for_pool(RAYDIUM_SOL_USDC_POOL)
+        .ok_or_else(|| "Trusted Raydium SOL/USDC route is not configured.".to_string())
+}
+
 pub fn classify_bags_pool_address(
     address: &str,
     owner: &Pubkey,
@@ -2371,13 +2565,18 @@ pub fn classify_bags_pool_address(
             Ok(pool) => pool,
             Err(_) => return Ok(None),
         };
-        let native_mint = bags_native_mint_pubkey()?.to_string();
-        let mint_a = pool.token_a_mint.to_string();
-        let mint_b = pool.token_b_mint.to_string();
-        let mint = if mint_a == native_mint && mint_b != native_mint {
-            mint_b
-        } else if mint_b == native_mint && mint_a != native_mint {
-            mint_a
+        let native_mint = bags_native_mint_pubkey()?;
+        let usdc_mint = usdc_mint_pubkey()?;
+        let mint = if (pool.token_a_mint == native_mint || pool.token_a_mint == usdc_mint)
+            && pool.token_b_mint != native_mint
+            && pool.token_b_mint != usdc_mint
+        {
+            pool.token_b_mint.to_string()
+        } else if (pool.token_b_mint == native_mint || pool.token_b_mint == usdc_mint)
+            && pool.token_a_mint != native_mint
+            && pool.token_a_mint != usdc_mint
+        {
+            pool.token_a_mint.to_string()
         } else {
             return Ok(None);
         };
@@ -2472,7 +2671,6 @@ fn derive_canonical_damm_pool_address(
     mint: &Pubkey,
     config: &DecodedDbcPoolConfig,
 ) -> Result<Option<Pubkey>, String> {
-    let native_mint = bags_native_mint_pubkey()?;
     match config.migration_fee_option {
         0..=6 => {
             let config_address = Pubkey::from_str(
@@ -2482,7 +2680,7 @@ fn derive_canonical_damm_pool_address(
             Ok(Some(derive_damm_pool_address(
                 &config_address,
                 mint,
-                &native_mint,
+                &config.quote_mint,
             )?))
         }
         _ => Ok(None),
@@ -2526,6 +2724,7 @@ async fn rpc_fetch_damm_config_addresses(
     rpc_url: &str,
     commitment: &str,
 ) -> Result<Vec<Pubkey>, String> {
+    crate::route_metrics::record_rpc_method("getProgramAccounts");
     let payload = json!({
         "jsonrpc": "2.0",
         "id": "launchdeck-bags-damm-configs",
@@ -2624,14 +2823,26 @@ fn validate_damm_pool_for_mint(
     mint: &Pubkey,
 ) -> Result<(), String> {
     let native_mint = bags_native_mint_pubkey()?;
-    if !((pool.token_a_mint == *mint && pool.token_b_mint == native_mint)
-        || (pool.token_b_mint == *mint && pool.token_a_mint == native_mint))
+    let usdc_mint = usdc_mint_pubkey()?;
+    let valid_quote = |value: Pubkey| value == native_mint || value == usdc_mint;
+    if !((pool.token_a_mint == *mint && valid_quote(pool.token_b_mint))
+        || (pool.token_b_mint == *mint && valid_quote(pool.token_a_mint)))
     {
         return Err(format!(
-            "Bags DAMM pool {pool_address} does not trade mint {mint} against SOL."
+            "Meteora DAMM pool {pool_address} does not trade mint {mint} against SOL/USDC."
         ));
     }
     Ok(())
+}
+
+fn damm_quote_mint_for_base(pool: &DecodedDammPool, mint: &Pubkey) -> Option<Pubkey> {
+    if pool.token_a_mint == *mint {
+        Some(pool.token_b_mint)
+    } else if pool.token_b_mint == *mint {
+        Some(pool.token_a_mint)
+    } else {
+        None
+    }
 }
 
 async fn load_derived_damm_route(
@@ -2650,30 +2861,80 @@ async fn load_derived_damm_route(
     Ok(Some((route, pool)))
 }
 
+async fn load_derived_damm_routes_batch(
+    rpc_url: &str,
+    mint: &Pubkey,
+    commitment: &str,
+    routes: Vec<DerivedDammRoute>,
+) -> Result<Vec<(DerivedDammRoute, DecodedDammPool)>, String> {
+    if routes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let addresses = routes
+        .iter()
+        .map(|route| route.pool_address)
+        .collect::<Vec<_>>();
+    let accounts =
+        rpc_fetch_multiple_account_data(rpc_url, &addresses, commitment, "damm-v2-pool").await?;
+    let mut matches = Vec::new();
+    for (route, account) in routes.into_iter().zip(accounts.into_iter()) {
+        let Some(pool_bytes) = account else {
+            continue;
+        };
+        let pool = decode_damm_pool(&pool_bytes)?;
+        validate_damm_pool_for_mint(&route.pool_address, &pool, mint)?;
+        matches.push((route, pool));
+    }
+    Ok(matches)
+}
+
 async fn scan_derived_damm_routes(
     rpc_url: &str,
     mint: &Pubkey,
     commitment: &str,
 ) -> Result<Option<(DerivedDammRoute, DecodedDammPool)>, String> {
-    let mut routes = known_damm_routes_for_mint(mint)?;
-    routes.extend(rpc_damm_config_routes_for_mint(rpc_url, mint, commitment).await?);
-    let results = join_all(
-        routes
-            .into_iter()
-            .map(|route| load_derived_damm_route(rpc_url, mint, commitment, route)),
-    )
-    .await;
-    let mut matches = Vec::new();
-    for result in results {
-        if let Some(route) = result? {
-            matches.push(route);
-        }
-    }
+    let routes = known_damm_routes_for_mint(mint)?;
+    let mut matches = load_derived_damm_routes_batch(rpc_url, mint, commitment, routes).await?;
     match matches.len() {
-        0 => Ok(None),
+        0 => scan_mint_filtered_damm_routes(rpc_url, mint, commitment).await,
         1 => Ok(matches.pop()),
         _ => Err(format!(
             "Multiple derived Bags DAMM v2 pools were found for mint {mint}; canonical route could not be proven from RPC."
+        )),
+    }
+}
+
+async fn scan_mint_filtered_damm_routes(
+    rpc_url: &str,
+    mint: &Pubkey,
+    commitment: &str,
+) -> Result<Option<(DerivedDammRoute, DecodedDammPool)>, String> {
+    let mut candidates = rpc_fetch_damm_pool_addresses_by_mint(rpc_url, mint, commitment).await?;
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [pool_address] => {
+            let Some(pool_bytes) =
+                rpc_fetch_account_data(rpc_url, pool_address, commitment, "damm-v2-pool").await?
+            else {
+                return Ok(None);
+            };
+            let pool = decode_damm_pool(&pool_bytes)?;
+            validate_damm_pool_for_mint(pool_address, &pool, mint)?;
+            Ok(Some((
+                DerivedDammRoute {
+                    pool_address: *pool_address,
+                    migration_fee_option: None,
+                    expected_config_key: None,
+                    expected_migration_family: "damm-v2",
+                    derivation_mode: "mint-filtered-pool-scan",
+                },
+                pool,
+            )))
+        }
+        _ => Err(format!(
+            "Multiple DAMM v2 pools were found for mint {mint}; canonical route requires a pinned pool."
         )),
     }
 }
@@ -2687,6 +2948,7 @@ async fn rpc_fetch_first_dbc_pool_by_mint(
     mint: &Pubkey,
     commitment: &str,
 ) -> Result<Option<(Pubkey, Vec<u8>)>, String> {
+    crate::route_metrics::record_rpc_method("getProgramAccounts");
     let payload = json!({
         "jsonrpc": "2.0",
         "id": "launchdeck-bags-dbc-pool-by-mint",
@@ -2738,6 +3000,63 @@ async fn rpc_fetch_first_dbc_pool_by_mint(
         .decode(account.account.data.0.trim())
         .map_err(|error| format!("Failed to decode Bags DBC pool account: {error}"))?;
     Ok(Some((pubkey, bytes)))
+}
+
+async fn rpc_fetch_damm_pool_addresses_by_mint(
+    rpc_url: &str,
+    mint: &Pubkey,
+    commitment: &str,
+) -> Result<Vec<Pubkey>, String> {
+    let mut addresses = Vec::new();
+    for offset in [168usize, 200usize] {
+        crate::route_metrics::record_rpc_method("getProgramAccounts");
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": "launchdeck-bags-damm-pool-by-mint",
+            "method": "getProgramAccounts",
+            "params": [
+                BAGS_DAMM_V2_PROGRAM_ID,
+                {
+                    "commitment": commitment,
+                    "encoding": "base64",
+                    "dataSlice": {
+                        "offset": 0,
+                        "length": 0
+                    },
+                    "filters": [
+                        {
+                            "memcmp": {
+                                "offset": offset,
+                                "bytes": mint.to_string()
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        let response = bags_fee_http_client()
+            .post(rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| format!("Failed to fetch DAMM v2 pools by mint: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Failed to fetch DAMM v2 pools by mint: RPC returned status {}.",
+                response.status()
+            ));
+        }
+        let parsed: RpcResponse<Vec<RpcProgramAccount>> = response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse DAMM v2 pool-by-mint response: {error}"))?;
+        for account in parsed.result {
+            let pubkey = Pubkey::from_str(account.pubkey.trim())
+                .map_err(|error| format!("Invalid DAMM v2 pool pubkey: {error}"))?;
+            addresses.push(pubkey);
+        }
+    }
+    Ok(addresses)
 }
 
 async fn resolve_local_damm_market_account(
@@ -2799,14 +3118,7 @@ async fn resolve_local_damm_market_account(
         ));
     };
     let pool = decode_damm_pool(&pool_bytes)?;
-    let native_mint = bags_native_mint_pubkey()?;
-    if !((pool.token_a_mint == *mint && pool.token_b_mint == native_mint)
-        || (pool.token_b_mint == *mint && pool.token_a_mint == native_mint))
-    {
-        return Err(format!(
-            "Canonical Bags DAMM pool {pool_address} does not trade mint {mint} against SOL."
-        ));
-    }
+    validate_damm_pool_for_mint(&pool_address, &pool, mint)?;
     Ok(Some((pool_address, pool, config_address)))
 }
 
@@ -2816,6 +3128,7 @@ async fn rpc_fetch_account_data(
     commitment: &str,
     label: &str,
 ) -> Result<Option<Vec<u8>>, String> {
+    crate::route_metrics::record_rpc_method("getAccountInfo");
     let payload = json!({
         "jsonrpc": "2.0",
         "id": format!("launchdeck-bags-{label}-account"),
@@ -2851,6 +3164,60 @@ async fn rpc_fetch_account_data(
         .decode(value.data.0.trim())
         .map_err(|error| format!("Failed to decode Bags {label} account: {error}"))?;
     Ok(Some(bytes))
+}
+
+async fn rpc_fetch_multiple_account_data(
+    rpc_url: &str,
+    addresses: &[Pubkey],
+    commitment: &str,
+    label: &str,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::route_metrics::record_rpc_method("getMultipleAccounts");
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": format!("launchdeck-bags-{label}-accounts"),
+        "method": "getMultipleAccounts",
+        "params": [
+            addresses.iter().map(Pubkey::to_string).collect::<Vec<_>>(),
+            {
+                "encoding": "base64",
+                "commitment": commitment
+            }
+        ]
+    });
+    let response = bags_fee_http_client()
+        .post(rpc_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to fetch Bags {label} accounts: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to fetch Bags {label} accounts: RPC returned status {}.",
+            response.status()
+        ));
+    }
+    let parsed: RpcResponse<RpcMultipleAccountsResult> = response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to parse Bags {label} accounts response: {error}"))?;
+    parsed
+        .result
+        .value
+        .into_iter()
+        .map(|value| {
+            value
+                .map(|account| {
+                    BASE64
+                        .decode(account.data.0.as_bytes())
+                        .map_err(|error| format!("Failed to decode Bags {label} account: {error}"))
+                })
+                .transpose()
+        })
+        .collect()
 }
 
 async fn rpc_get_slot(rpc_url: &str, commitment: &str) -> Result<u64, String> {
@@ -3067,7 +3434,13 @@ async fn maybe_create_ata_instruction(
     label: &str,
 ) -> Result<(Pubkey, Option<Instruction>), String> {
     let ata = get_associated_token_address_with_program_id(owner, mint, token_program);
-    if rpc_account_exists(rpc_url, &ata, commitment, label).await? {
+    let ata_check_started_at = Instant::now();
+    let exists = rpc_account_exists(rpc_url, &ata, commitment, label).await?;
+    crate::route_metrics::record_phase_ms(
+        "ata_context_fetch",
+        ata_check_started_at.elapsed().as_millis(),
+    );
+    if exists {
         Ok((ata, None))
     } else {
         Ok((
@@ -3125,7 +3498,7 @@ fn build_dbc_swap_instruction(
     config: &DecodedDbcPoolConfig,
     input_token_account: &Pubkey,
     output_token_account: &Pubkey,
-    swap_base_for_quote: bool,
+    _swap_base_for_quote: bool,
     amount_in: u64,
     minimum_amount_out: u64,
 ) -> Result<Instruction, String> {
@@ -3133,11 +3506,6 @@ fn build_dbc_swap_instruction(
     let event_authority = derive_anchor_event_authority(&program_id);
     let base_token_program = token_program_for_flag(pool.pool_type)?;
     let quote_token_program = token_program_for_flag(config.quote_token_flag)?;
-    let (token_base_program, token_quote_program) = if swap_base_for_quote {
-        (base_token_program, quote_token_program)
-    } else {
-        (quote_token_program, base_token_program)
-    };
     Ok(Instruction {
         program_id,
         accounts: vec![
@@ -3151,8 +3519,8 @@ fn build_dbc_swap_instruction(
             AccountMeta::new_readonly(pool.base_mint, false),
             AccountMeta::new_readonly(config.quote_mint, false),
             AccountMeta::new_readonly(*owner, true),
-            AccountMeta::new_readonly(token_base_program, false),
-            AccountMeta::new_readonly(token_quote_program, false),
+            AccountMeta::new_readonly(base_token_program, false),
+            AccountMeta::new_readonly(quote_token_program, false),
             AccountMeta::new(program_id, false),
             AccountMeta::new_readonly(event_authority, false),
             AccountMeta::new_readonly(program_id, false),
@@ -3772,13 +4140,50 @@ pub async fn quote_bags_holding_value_sol(
     commitment: &str,
     bags_launch: Option<&BagsLaunchMetadata>,
 ) -> Result<u64, String> {
+    quote_bags_holding_value_sol_with_cache(
+        rpc_url,
+        mint,
+        token_amount_raw,
+        commitment,
+        bags_launch,
+        true,
+    )
+    .await
+}
+
+pub async fn quote_bags_holding_value_sol_fresh(
+    rpc_url: &str,
+    mint: &str,
+    token_amount_raw: u64,
+    commitment: &str,
+    bags_launch: Option<&BagsLaunchMetadata>,
+) -> Result<u64, String> {
+    quote_bags_holding_value_sol_with_cache(
+        rpc_url,
+        mint,
+        token_amount_raw,
+        commitment,
+        bags_launch,
+        false,
+    )
+    .await
+}
+
+async fn quote_bags_holding_value_sol_with_cache(
+    rpc_url: &str,
+    mint: &str,
+    token_amount_raw: u64,
+    commitment: &str,
+    bags_launch: Option<&BagsLaunchMetadata>,
+    use_cache: bool,
+) -> Result<u64, String> {
     if token_amount_raw == 0 {
         return Ok(0);
     }
     let mint_pubkey =
         Pubkey::from_str(mint).map_err(|error| format!("Invalid Bags quote mint: {error}"))?;
     let cache_key = bags_quote_snapshot_key(rpc_url, mint, commitment, bags_launch);
-    {
+    if use_cache {
         let cache = bags_quote_snapshot_cache().lock().await;
         if let Some(entry) = cache.get(&cache_key)
             && entry.fetched_at.elapsed() <= Duration::from_millis(1_500)
@@ -3796,7 +4201,7 @@ pub async fn quote_bags_holding_value_sol(
                 config,
                 current_point,
             };
-            {
+            if use_cache {
                 let mut cache = bags_quote_snapshot_cache().lock().await;
                 cache.insert(
                     cache_key,
@@ -3829,7 +4234,7 @@ pub async fn quote_bags_holding_value_sol(
         pool,
         current_point,
     };
-    {
+    if use_cache {
         let mut cache = bags_quote_snapshot_cache().lock().await;
         cache.insert(
             cache_key,
@@ -3878,7 +4283,7 @@ async fn load_canonical_dbc_market(
         return Ok(None);
     };
     let config = decode_dbc_pool_config(&config_bytes)?;
-    if config.quote_mint != bags_native_mint_pubkey()? {
+    if quote_asset_label_for_mint(&config.quote_mint)?.is_none() {
         return Ok(None);
     }
     let derived_pool = derive_dbc_pool_address(&config.quote_mint, mint, &config_key)?;
@@ -4042,16 +4447,18 @@ async fn detect_local_canonical_import_market(
     let Some((pool_address, pool, config)) =
         load_canonical_dbc_market(rpc_url, mint, commitment, None).await?
     else {
-        if !mint.to_string().ends_with("BAGS") {
-            return Ok(None);
-        }
-        let Some((route, _pool)) = scan_derived_damm_routes(rpc_url, mint, commitment).await?
+        let Some((route, pool)) = scan_mint_filtered_damm_routes(rpc_url, mint, commitment).await?
         else {
             return Ok(None);
         };
         let launch_metadata = derived_damm_launch_metadata(&route);
+        let quote_mint = damm_quote_mint_for_base(&pool, mint)
+            .ok_or_else(|| format!("Meteora DAMM route did not include mint {mint}."))?;
+        let quote_asset = quote_asset_label_for_mint(&quote_mint)?
+            .ok_or_else(|| format!("Unsupported Meteora DAMM quote mint {quote_mint}."))?;
         return Ok(Some(NativeBagsImportMarket {
             mode: launch_metadata.expectedMigrationFamily.clone(),
+            quote_asset: quote_asset.to_string(),
             market_key: route.pool_address.to_string(),
             config_key: launch_metadata.expectedDammConfigKey.clone(),
             venue: "Meteora DAMM v2".to_string(),
@@ -4069,6 +4476,9 @@ async fn detect_local_canonical_import_market(
                 config.creator_trading_fee_percentage,
                 config.creator_migration_fee_percentage,
             ),
+            quote_asset: quote_asset_label_for_mint(&config.quote_mint)?
+                .unwrap_or("sol")
+                .to_string(),
             market_key: pool_address.to_string(),
             config_key: pool.config.to_string(),
             venue: "Meteora Dynamic Bonding Curve".to_string(),
@@ -4101,6 +4511,9 @@ async fn detect_local_canonical_import_market(
                 config.creator_trading_fee_percentage,
                 config.creator_migration_fee_percentage,
             ),
+            quote_asset: quote_asset_label_for_mint(&config.quote_mint)?
+                .unwrap_or("sol")
+                .to_string(),
             market_key: damm_pool.to_string(),
             config_key: pool.config.to_string(),
             venue: "Meteora DAMM v2".to_string(),
@@ -4253,11 +4666,12 @@ async fn native_detect_bags_import_context(
             Ok(value) => value,
             Err(error) => return Err(error),
         };
-    let (mode, market_key, config_key, venue, detection_source, launch_metadata) =
+    let (mode, quote_asset, market_key, config_key, venue, detection_source, launch_metadata) =
         if let Some(local_market) = local_market {
             notes.extend(local_market.notes.clone());
             (
                 local_market.mode,
+                local_market.quote_asset,
                 local_market.market_key,
                 local_market.config_key,
                 local_market.venue,
@@ -4270,6 +4684,7 @@ async fn native_detect_bags_import_context(
             );
             (
                 String::new(),
+                "sol".to_string(),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -4293,9 +4708,9 @@ async fn native_detect_bags_import_context(
         return Ok(None);
     }
     Ok(Some(BagsImportContext {
-        launchpad: "bagsapp".to_string(),
+        launchpad: meteora_provenance_label_for_mint(&mint_pubkey).to_string(),
         mode,
-        quoteAsset: "sol".to_string(),
+        quoteAsset: quote_asset,
         creator: creator_wallet,
         marketKey: market_key,
         configKey: config_key,
@@ -5847,13 +6262,14 @@ async fn native_fail_closed_bags_trade_error(
         ));
     };
     let config = decode_dbc_pool_config(&config_bytes)?;
-    if config.quote_mint != bags_native_mint_pubkey()? {
+    if quote_asset_label_for_mint(&config.quote_mint)?.is_none() {
         return Ok(build_local_trade_fail_closed_error(
-            "dbc_config_not_found",
-            &format!("Canonical Bags {action} could not load the expected local DBC config."),
+            "unsupported_quote_asset",
+            &format!("Canonical Meteora {action} resolved an unsupported DBC quote mint."),
             &[
                 ("mint", mint.to_string()),
                 ("configKey", config_key.to_string()),
+                ("quoteMint", config.quote_mint.to_string()),
             ],
         ));
     }
@@ -6009,6 +6425,9 @@ async fn native_try_build_local_dbc_follow_buy(
         {
             return Ok(None);
         }
+        if config.quote_mint != bags_native_mint_pubkey()? {
+            return Ok(None);
+        }
         let current_point = current_point_for_dbc_config(rpc_url, &config, commitment).await?;
         (pool_address, pool, config, current_point)
     } else {
@@ -6018,6 +6437,9 @@ async fn native_try_build_local_dbc_follow_buy(
             return Ok(None);
         };
         if pool.is_migrated || is_completed_dbc_pool(&pool, &config) {
+            return Ok(None);
+        }
+        if config.quote_mint != bags_native_mint_pubkey()? {
             return Ok(None);
         }
         let current_point = current_point_for_dbc_config(rpc_url, &config, commitment).await?;
@@ -6114,12 +6536,13 @@ async fn native_try_build_local_dbc_follow_sell(
     if pool.is_migrated || is_completed_dbc_pool(&pool, &config) {
         return Ok(None);
     }
+    if config.quote_mint != bags_native_mint_pubkey()? {
+        return Ok(None);
+    }
     let owner_pubkey = owner.pubkey();
-    let owner_token_account = get_associated_token_address_with_program_id(
-        &owner_pubkey,
-        mint,
-        &bags_token_program_pubkey()?,
-    );
+    let input_token_program = token_program_for_flag(pool.pool_type)?;
+    let owner_token_account =
+        get_associated_token_address_with_program_id(&owner_pubkey, mint, &input_token_program);
     let raw_amount =
         match fetch_bags_token_account_amount(rpc_url, &owner_token_account, commitment).await {
             Ok(value) => value,
@@ -6141,7 +6564,6 @@ async fn native_try_build_local_dbc_follow_sell(
         slippage_bps,
         current_point,
     )?;
-    let input_token_program = token_program_for_flag(pool.pool_type)?;
     let output_token_program = token_program_for_flag(config.quote_token_flag)?;
     let (input_token_account, create_input_ata) = maybe_create_ata_instruction(
         rpc_url,
@@ -6195,6 +6617,280 @@ async fn native_try_build_local_dbc_follow_sell(
     )))
 }
 
+async fn native_try_build_usdc_dbc_follow_buy(
+    rpc_url: &str,
+    commitment: &str,
+    owner: &Keypair,
+    mint: &Pubkey,
+    buy_amount_sol: &str,
+    slippage_bps: u64,
+    tx_config: &NativeFollowTxConfig,
+    bags_launch: Option<&BagsLaunchMetadata>,
+    context_override: Option<&BagsDbcFollowBuyContext>,
+) -> Result<Option<CompiledTransaction>, String> {
+    let (pool_address, pool, config, current_point) = if let Some(context) = context_override {
+        if context.pool.is_migrated
+            || is_completed_dbc_pool(&context.pool, &context.config)
+            || context.config.quote_mint != usdc_mint_pubkey()?
+        {
+            return Ok(None);
+        }
+        (
+            context.pool_address,
+            context.pool.clone(),
+            context.config.clone(),
+            context.current_point,
+        )
+    } else {
+        let Some((pool_address, pool, config)) =
+            load_canonical_dbc_market(rpc_url, mint, commitment, bags_launch).await?
+        else {
+            return Ok(None);
+        };
+        if pool.is_migrated
+            || is_completed_dbc_pool(&pool, &config)
+            || config.quote_mint != usdc_mint_pubkey()?
+        {
+            return Ok(None);
+        }
+        let current_point = current_point_for_dbc_config(rpc_url, &config, commitment).await?;
+        (pool_address, pool, config, current_point)
+    };
+    let gross_sol = parse_decimal_to_u128(buy_amount_sol, 9, "buy amount")?;
+    if gross_sol == 0 {
+        return Ok(None);
+    }
+    let gross_sol = u64::try_from(gross_sol).map_err(|_| "buy amount is too large.".to_string())?;
+    let fee_bps = wrapper_default_fee_bps();
+    let fee_lamports = estimate_sol_in_fee_lamports(gross_sol, fee_bps);
+    let net_sol = gross_sol
+        .checked_sub(fee_lamports)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Meteora USDC buy net SOL input resolved to zero after fee.".to_string())?;
+    let owner_pubkey = owner.pubkey();
+    let spl_token_program = bags_token_program_pubkey()?;
+    let (route_wsol_account, _) = route_wsol_pda(&owner_pubkey, 0);
+    let (usdc_account, create_usdc_ata) = maybe_create_ata_instruction(
+        rpc_url,
+        commitment,
+        &owner_pubkey,
+        &owner_pubkey,
+        &usdc_mint_pubkey()?,
+        &spl_token_program,
+        "meteora-usdc-buy-usdc-ata",
+    )
+    .await?;
+    let output_token_program = token_program_for_flag(pool.pool_type)?;
+    let (output_token_account, create_output_ata) = maybe_create_ata_instruction(
+        rpc_url,
+        commitment,
+        &owner_pubkey,
+        &owner_pubkey,
+        mint,
+        &output_token_program,
+        "meteora-usdc-buy-output-ata",
+    )
+    .await?;
+    let conversion_quote = build_trusted_raydium_clmm_swap_exact_in(
+        rpc_url,
+        raydium_sol_usdc_route()?.pool,
+        commitment,
+        &owner_pubkey,
+        &route_wsol_account,
+        &usdc_account,
+        &bags_native_mint_pubkey()?,
+        &usdc_mint_pubkey()?,
+        net_sol,
+        slippage_bps,
+    )
+    .await?;
+    let (_out_amount, minimum_amount_out) = bags_dbc_swap_quote_exact_in(
+        &pool,
+        &config,
+        false,
+        conversion_quote.min_out,
+        slippage_bps,
+        current_point,
+    )?;
+    let mut instructions = Vec::new();
+    if let Some(ix) = create_usdc_ata {
+        instructions.push(ix);
+    }
+    if let Some(ix) = create_output_ata {
+        instructions.push(ix);
+    }
+    let dbc_ix = build_dbc_swap_instruction(
+        &owner_pubkey,
+        &pool_address,
+        &pool,
+        &config,
+        &usdc_account,
+        &output_token_account,
+        false,
+        conversion_quote.min_out,
+        minimum_amount_out,
+    )?;
+    instructions.push(build_meteora_usdc_dynamic_route_instruction(
+        &owner_pubkey,
+        conversion_quote.instruction,
+        dbc_ix,
+        &usdc_account,
+        &output_token_account,
+        SwapLegInputSource::GrossSolNetOfFee,
+        net_sol,
+        8,
+        conversion_quote.min_out,
+        minimum_amount_out,
+        SwapRouteDirection::Buy,
+        SwapRouteSettlement::Token,
+        SwapRouteFeeMode::SolPre,
+        gross_sol,
+        fee_bps,
+    )?);
+    let mut tx_config = tx_config.clone();
+    tx_config.compute_unit_limit = tx_config.compute_unit_limit.max(520_000);
+    Ok(Some(
+        compile_shared_alt_follow_transaction(
+            "meteora-usdc-buy",
+            rpc_url,
+            commitment,
+            owner,
+            &tx_config,
+            instructions,
+        )
+        .await?,
+    ))
+}
+
+async fn native_try_build_usdc_dbc_follow_sell(
+    rpc_url: &str,
+    commitment: &str,
+    owner: &Keypair,
+    mint: &Pubkey,
+    sell_percent: u8,
+    slippage_bps: u64,
+    tx_config: &NativeFollowTxConfig,
+    bags_launch: Option<&BagsLaunchMetadata>,
+) -> Result<Option<Option<CompiledTransaction>>, String> {
+    let Some((pool_address, pool, config)) =
+        load_canonical_dbc_market(rpc_url, mint, commitment, bags_launch).await?
+    else {
+        return Ok(None);
+    };
+    if pool.is_migrated
+        || is_completed_dbc_pool(&pool, &config)
+        || config.quote_mint != usdc_mint_pubkey()?
+    {
+        return Ok(None);
+    }
+    let owner_pubkey = owner.pubkey();
+    let fee_bps = wrapper_default_fee_bps();
+    let input_token_program = token_program_for_flag(pool.pool_type)?;
+    let input_token_account =
+        get_associated_token_address_with_program_id(&owner_pubkey, mint, &input_token_program);
+    let raw_amount =
+        match fetch_bags_token_account_amount(rpc_url, &input_token_account, commitment).await {
+            Ok(value) => value,
+            Err(_) => return Ok(Some(None)),
+        };
+    if raw_amount == 0 {
+        return Ok(Some(None));
+    }
+    let sell_amount = ((u128::from(raw_amount) * u128::from(sell_percent)) / 100u128) as u64;
+    if sell_amount == 0 {
+        return Ok(Some(None));
+    }
+    let current_point = current_point_for_dbc_config(rpc_url, &config, commitment).await?;
+    let (_out_amount, minimum_usdc_out) = bags_dbc_swap_quote_exact_in(
+        &pool,
+        &config,
+        true,
+        sell_amount,
+        slippage_bps,
+        current_point,
+    )?;
+    let spl_token_program = bags_token_program_pubkey()?;
+    let (usdc_account, create_usdc_ata) = maybe_create_ata_instruction(
+        rpc_url,
+        commitment,
+        &owner_pubkey,
+        &owner_pubkey,
+        &usdc_mint_pubkey()?,
+        &spl_token_program,
+        "meteora-usdc-sell-usdc-ata",
+    )
+    .await?;
+    let (route_wsol_account, _) = route_wsol_pda(&owner_pubkey, 0);
+    let conversion_quote = build_trusted_raydium_clmm_swap_exact_in(
+        rpc_url,
+        raydium_sol_usdc_route()?.pool,
+        commitment,
+        &owner_pubkey,
+        &usdc_account,
+        &route_wsol_account,
+        &usdc_mint_pubkey()?,
+        &bags_native_mint_pubkey()?,
+        minimum_usdc_out,
+        slippage_bps,
+    )
+    .await?;
+    let min_net_sol_out = conversion_quote
+        .min_out
+        .checked_sub(estimate_sol_in_fee_lamports(
+            conversion_quote.min_out,
+            fee_bps,
+        ))
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "Meteora USDC sell minimum SOL output resolves to zero after fee.".to_string()
+        })?;
+    let mut instructions = Vec::new();
+    if let Some(ix) = create_usdc_ata {
+        instructions.push(ix);
+    }
+    let dbc_ix = build_dbc_swap_instruction(
+        &owner_pubkey,
+        &pool_address,
+        &pool,
+        &config,
+        &input_token_account,
+        &usdc_account,
+        true,
+        sell_amount,
+        minimum_usdc_out,
+    )?;
+    instructions.push(build_meteora_usdc_dynamic_route_instruction(
+        &owner_pubkey,
+        dbc_ix,
+        conversion_quote.instruction,
+        &usdc_account,
+        &route_wsol_account,
+        SwapLegInputSource::Fixed,
+        sell_amount,
+        SWAP_ROUTE_NO_PATCH_OFFSET,
+        minimum_usdc_out,
+        min_net_sol_out,
+        SwapRouteDirection::Sell,
+        SwapRouteSettlement::Wsol,
+        SwapRouteFeeMode::WsolPost,
+        0,
+        fee_bps,
+    )?);
+    let mut tx_config = tx_config.clone();
+    tx_config.compute_unit_limit = tx_config.compute_unit_limit.max(520_000);
+    Ok(Some(Some(
+        compile_shared_alt_follow_transaction(
+            "meteora-usdc-sell",
+            rpc_url,
+            commitment,
+            owner,
+            &tx_config,
+            instructions,
+        )
+        .await?,
+    )))
+}
+
 async fn native_try_build_local_damm_follow_buy(
     rpc_url: &str,
     commitment: &str,
@@ -6215,6 +6911,9 @@ async fn native_try_build_local_damm_follow_buy(
         if pool_address != context.pool_address {
             return Ok(None);
         }
+        if damm_quote_mint_for_base(&pool, mint) != Some(bags_native_mint_pubkey()?) {
+            return Ok(None);
+        }
         let (current_slot, current_time) = current_time_for_damm(rpc_url, commitment).await?;
         let current_point = if pool.activation_type == 0 {
             current_slot
@@ -6228,6 +6927,9 @@ async fn native_try_build_local_damm_follow_buy(
         else {
             return Ok(None);
         };
+        if damm_quote_mint_for_base(&pool, mint) != Some(bags_native_mint_pubkey()?) {
+            return Ok(None);
+        }
         let (current_slot, current_time) = current_time_for_damm(rpc_url, commitment).await?;
         let current_point = if pool.activation_type == 0 {
             current_slot
@@ -6331,12 +7033,17 @@ async fn native_try_build_local_damm_follow_sell(
     else {
         return Ok(None);
     };
+    if damm_quote_mint_for_base(&pool, mint) != Some(bags_native_mint_pubkey()?) {
+        return Ok(None);
+    }
     let owner_pubkey = owner.pubkey();
-    let owner_token_account = get_associated_token_address_with_program_id(
-        &owner_pubkey,
-        mint,
-        &bags_token_program_pubkey()?,
-    );
+    let input_token_program = if pool.token_a_mint == *mint {
+        token_program_for_flag(pool.token_a_flag)?
+    } else {
+        token_program_for_flag(pool.token_b_flag)?
+    };
+    let owner_token_account =
+        get_associated_token_address_with_program_id(&owner_pubkey, mint, &input_token_program);
     let raw_amount =
         match fetch_bags_token_account_amount(rpc_url, &owner_token_account, commitment).await {
             Ok(value) => value,
@@ -6360,11 +7067,6 @@ async fn native_try_build_local_damm_follow_sell(
             .to_u64()
             .ok_or_else(|| "Bags DAMM follow quote overflowed u64.".to_string())?;
     let minimum_amount_out = helper_slippage_minimum_amount(out_amount, slippage_bps);
-    let input_token_program = if pool.token_a_mint == *mint {
-        token_program_for_flag(pool.token_a_flag)?
-    } else {
-        token_program_for_flag(pool.token_b_flag)?
-    };
     let output_token_program = if pool.token_a_mint == bags_native_mint_pubkey()? {
         token_program_for_flag(pool.token_a_flag)?
     } else {
@@ -6420,6 +7122,284 @@ async fn native_try_build_local_damm_follow_sell(
     )))
 }
 
+async fn native_try_build_usdc_damm_follow_buy(
+    rpc_url: &str,
+    commitment: &str,
+    owner: &Keypair,
+    mint: &Pubkey,
+    buy_amount_sol: &str,
+    slippage_bps: u64,
+    tx_config: &NativeFollowTxConfig,
+    bags_launch: Option<&BagsLaunchMetadata>,
+    context_override: Option<&BagsDammFollowBuyContext>,
+) -> Result<Option<CompiledTransaction>, String> {
+    let (pool_address, pool, current_point) = if let Some(context) = context_override {
+        if damm_quote_mint_for_base(&context.pool, mint) != Some(usdc_mint_pubkey()?) {
+            return Ok(None);
+        }
+        (
+            context.pool_address,
+            context.pool.clone(),
+            context.current_point,
+        )
+    } else {
+        let Some((pool_address, pool, _config_address)) =
+            load_local_damm_market(rpc_url, mint, commitment, bags_launch).await?
+        else {
+            return Ok(None);
+        };
+        if damm_quote_mint_for_base(&pool, mint) != Some(usdc_mint_pubkey()?) {
+            return Ok(None);
+        }
+        let (current_slot, current_time) = current_time_for_damm(rpc_url, commitment).await?;
+        let current_point = if pool.activation_type == 0 {
+            current_slot
+        } else {
+            current_time
+        };
+        (pool_address, pool, current_point)
+    };
+    let gross_sol = parse_decimal_to_u128(buy_amount_sol, 9, "buy amount")?;
+    if gross_sol == 0 {
+        return Ok(None);
+    }
+    let gross_sol = u64::try_from(gross_sol).map_err(|_| "buy amount is too large.".to_string())?;
+    let fee_bps = wrapper_default_fee_bps();
+    let fee_lamports = estimate_sol_in_fee_lamports(gross_sol, fee_bps);
+    let net_sol = gross_sol
+        .checked_sub(fee_lamports)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "Meteora USDC DAMM buy net SOL input resolved to zero after fee.".to_string()
+        })?;
+    let owner_pubkey = owner.pubkey();
+    let spl_token_program = bags_token_program_pubkey()?;
+    let (route_wsol_account, _) = route_wsol_pda(&owner_pubkey, 0);
+    let (usdc_account, create_usdc_ata) = maybe_create_ata_instruction(
+        rpc_url,
+        commitment,
+        &owner_pubkey,
+        &owner_pubkey,
+        &usdc_mint_pubkey()?,
+        &spl_token_program,
+        "meteora-usdc-damm-buy-usdc-ata",
+    )
+    .await?;
+    let output_token_program = if pool.token_a_mint == *mint {
+        token_program_for_flag(pool.token_a_flag)?
+    } else {
+        token_program_for_flag(pool.token_b_flag)?
+    };
+    let (output_token_account, create_output_ata) = maybe_create_ata_instruction(
+        rpc_url,
+        commitment,
+        &owner_pubkey,
+        &owner_pubkey,
+        mint,
+        &output_token_program,
+        "meteora-usdc-damm-buy-output-ata",
+    )
+    .await?;
+    let conversion_quote = build_trusted_raydium_clmm_swap_exact_in(
+        rpc_url,
+        raydium_sol_usdc_route()?.pool,
+        commitment,
+        &owner_pubkey,
+        &route_wsol_account,
+        &usdc_account,
+        &bags_native_mint_pubkey()?,
+        &usdc_mint_pubkey()?,
+        net_sol,
+        slippage_bps,
+    )
+    .await?;
+    let out_amount = cpamm_swap_amount_out(
+        &BigUint::from(conversion_quote.min_out),
+        &usdc_mint_pubkey()?,
+        &pool,
+        current_point,
+    )?
+    .to_u64()
+    .ok_or_else(|| "Meteora USDC DAMM buy quote overflowed u64.".to_string())?;
+    let minimum_amount_out = helper_slippage_minimum_amount(out_amount, slippage_bps);
+    let mut instructions = Vec::new();
+    if let Some(ix) = create_usdc_ata {
+        instructions.push(ix);
+    }
+    if let Some(ix) = create_output_ata {
+        instructions.push(ix);
+    }
+    let damm_ix = build_damm_swap_instruction(
+        &owner_pubkey,
+        &pool_address,
+        &pool,
+        &usdc_account,
+        &output_token_account,
+        conversion_quote.min_out,
+        minimum_amount_out,
+    )?;
+    instructions.push(build_meteora_usdc_dynamic_route_instruction(
+        &owner_pubkey,
+        conversion_quote.instruction,
+        damm_ix,
+        &usdc_account,
+        &output_token_account,
+        SwapLegInputSource::GrossSolNetOfFee,
+        net_sol,
+        8,
+        conversion_quote.min_out,
+        minimum_amount_out,
+        SwapRouteDirection::Buy,
+        SwapRouteSettlement::Token,
+        SwapRouteFeeMode::SolPre,
+        gross_sol,
+        fee_bps,
+    )?);
+    let mut tx_config = tx_config.clone();
+    tx_config.compute_unit_limit = tx_config.compute_unit_limit.max(520_000);
+    Ok(Some(
+        compile_shared_alt_follow_transaction(
+            "meteora-usdc-damm-buy",
+            rpc_url,
+            commitment,
+            owner,
+            &tx_config,
+            instructions,
+        )
+        .await?,
+    ))
+}
+
+async fn native_try_build_usdc_damm_follow_sell(
+    rpc_url: &str,
+    commitment: &str,
+    owner: &Keypair,
+    mint: &Pubkey,
+    sell_percent: u8,
+    slippage_bps: u64,
+    tx_config: &NativeFollowTxConfig,
+    bags_launch: Option<&BagsLaunchMetadata>,
+) -> Result<Option<Option<CompiledTransaction>>, String> {
+    let Some((pool_address, pool, _config_address)) =
+        load_local_damm_market(rpc_url, mint, commitment, bags_launch).await?
+    else {
+        return Ok(None);
+    };
+    if damm_quote_mint_for_base(&pool, mint) != Some(usdc_mint_pubkey()?) {
+        return Ok(None);
+    }
+    let owner_pubkey = owner.pubkey();
+    let fee_bps = wrapper_default_fee_bps();
+    let input_token_program = if pool.token_a_mint == *mint {
+        token_program_for_flag(pool.token_a_flag)?
+    } else {
+        token_program_for_flag(pool.token_b_flag)?
+    };
+    let input_token_account =
+        get_associated_token_address_with_program_id(&owner_pubkey, mint, &input_token_program);
+    let raw_amount =
+        match fetch_bags_token_account_amount(rpc_url, &input_token_account, commitment).await {
+            Ok(value) => value,
+            Err(_) => return Ok(Some(None)),
+        };
+    if raw_amount == 0 {
+        return Ok(Some(None));
+    }
+    let sell_amount = ((u128::from(raw_amount) * u128::from(sell_percent)) / 100u128) as u64;
+    if sell_amount == 0 {
+        return Ok(Some(None));
+    }
+    let (current_slot, current_time) = current_time_for_damm(rpc_url, commitment).await?;
+    let current_point = if pool.activation_type == 0 {
+        current_slot
+    } else {
+        current_time
+    };
+    let out_amount =
+        cpamm_swap_amount_out(&BigUint::from(sell_amount), mint, &pool, current_point)?
+            .to_u64()
+            .ok_or_else(|| "Meteora USDC DAMM sell quote overflowed u64.".to_string())?;
+    let minimum_usdc_out = helper_slippage_minimum_amount(out_amount, slippage_bps);
+    let spl_token_program = bags_token_program_pubkey()?;
+    let (usdc_account, create_usdc_ata) = maybe_create_ata_instruction(
+        rpc_url,
+        commitment,
+        &owner_pubkey,
+        &owner_pubkey,
+        &usdc_mint_pubkey()?,
+        &spl_token_program,
+        "meteora-usdc-damm-sell-usdc-ata",
+    )
+    .await?;
+    let (route_wsol_account, _) = route_wsol_pda(&owner_pubkey, 0);
+    let conversion_quote = build_trusted_raydium_clmm_swap_exact_in(
+        rpc_url,
+        raydium_sol_usdc_route()?.pool,
+        commitment,
+        &owner_pubkey,
+        &usdc_account,
+        &route_wsol_account,
+        &usdc_mint_pubkey()?,
+        &bags_native_mint_pubkey()?,
+        minimum_usdc_out,
+        slippage_bps,
+    )
+    .await?;
+    let min_net_sol_out = conversion_quote
+        .min_out
+        .checked_sub(estimate_sol_in_fee_lamports(
+            conversion_quote.min_out,
+            fee_bps,
+        ))
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "Meteora USDC DAMM sell minimum SOL output resolves to zero after fee.".to_string()
+        })?;
+    let mut instructions = Vec::new();
+    if let Some(ix) = create_usdc_ata {
+        instructions.push(ix);
+    }
+    let damm_ix = build_damm_swap_instruction(
+        &owner_pubkey,
+        &pool_address,
+        &pool,
+        &input_token_account,
+        &usdc_account,
+        sell_amount,
+        minimum_usdc_out,
+    )?;
+    instructions.push(build_meteora_usdc_dynamic_route_instruction(
+        &owner_pubkey,
+        damm_ix,
+        conversion_quote.instruction,
+        &usdc_account,
+        &route_wsol_account,
+        SwapLegInputSource::Fixed,
+        sell_amount,
+        SWAP_ROUTE_NO_PATCH_OFFSET,
+        minimum_usdc_out,
+        min_net_sol_out,
+        SwapRouteDirection::Sell,
+        SwapRouteSettlement::Wsol,
+        SwapRouteFeeMode::WsolPost,
+        0,
+        fee_bps,
+    )?);
+    let mut tx_config = tx_config.clone();
+    tx_config.compute_unit_limit = tx_config.compute_unit_limit.max(520_000);
+    Ok(Some(Some(
+        compile_shared_alt_follow_transaction(
+            "meteora-usdc-damm-sell",
+            rpc_url,
+            commitment,
+            owner,
+            &tx_config,
+            instructions,
+        )
+        .await?,
+    )))
+}
+
 pub async fn compile_follow_buy_transaction(
     rpc_url: &str,
     execution: &NormalizedExecution,
@@ -6455,7 +7435,43 @@ pub async fn compile_follow_buy_transaction(
     {
         return Ok(compiled);
     }
+    if let Some(compiled) = native_try_build_usdc_dbc_follow_buy(
+        rpc_url,
+        &execution.commitment,
+        &owner,
+        &mint_pubkey,
+        buy_amount_sol,
+        slippage_bps,
+        &tx_config,
+        bags_launch,
+        match context_override {
+            Some(BagsFollowBuyContext::Dbc(context)) => Some(context),
+            _ => None,
+        },
+    )
+    .await?
+    {
+        return Ok(compiled);
+    }
     if let Some(compiled) = native_try_build_local_damm_follow_buy(
+        rpc_url,
+        &execution.commitment,
+        &owner,
+        &mint_pubkey,
+        buy_amount_sol,
+        slippage_bps,
+        &tx_config,
+        bags_launch,
+        match context_override {
+            Some(BagsFollowBuyContext::Damm(context)) => Some(context),
+            _ => None,
+        },
+    )
+    .await?
+    {
+        return Ok(compiled);
+    }
+    if let Some(compiled) = native_try_build_usdc_damm_follow_buy(
         rpc_url,
         &execution.commitment,
         &owner,
@@ -6481,6 +7497,187 @@ pub async fn compile_follow_buy_transaction(
         "buy",
     )
     .await?)
+}
+
+pub async fn compile_follow_buy_transaction_for_meteora_target(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    buy_amount_sol: &str,
+    bags_launch: Option<&BagsLaunchMetadata>,
+    context_override: Option<&BagsFollowBuyContext>,
+    direct_protocol_target: &str,
+    quote_asset: &str,
+) -> Result<CompiledTransaction, String> {
+    let mint_pubkey =
+        Pubkey::from_str(mint).map_err(|error| format!("Invalid Bags mint address: {error}"))?;
+    let owner = parse_owner_keypair(wallet_secret)?;
+    let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
+    let tx_config = build_follow_buy_tx_config(execution, jito_tip_account)?;
+    let target = direct_protocol_target.trim().to_ascii_lowercase();
+    let quote = quote_asset.trim().to_ascii_uppercase();
+    let use_usdc = quote == "USDC" || quote == "USD1" || quote == "USDT";
+    let compiled = if target.contains("dbc") {
+        if use_usdc {
+            native_try_build_usdc_dbc_follow_buy(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                &mint_pubkey,
+                buy_amount_sol,
+                slippage_bps,
+                &tx_config,
+                bags_launch,
+                match context_override {
+                    Some(BagsFollowBuyContext::Dbc(context)) => Some(context),
+                    _ => None,
+                },
+            )
+            .await?
+        } else {
+            native_try_build_local_dbc_follow_buy(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                &mint_pubkey,
+                buy_amount_sol,
+                slippage_bps,
+                &tx_config,
+                bags_launch,
+                match context_override {
+                    Some(BagsFollowBuyContext::Dbc(context)) => Some(context),
+                    _ => None,
+                },
+            )
+            .await?
+        }
+    } else if target.contains("damm") {
+        if use_usdc {
+            native_try_build_usdc_damm_follow_buy(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                &mint_pubkey,
+                buy_amount_sol,
+                slippage_bps,
+                &tx_config,
+                bags_launch,
+                match context_override {
+                    Some(BagsFollowBuyContext::Damm(context)) => Some(context),
+                    _ => None,
+                },
+            )
+            .await?
+        } else {
+            native_try_build_local_damm_follow_buy(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                &mint_pubkey,
+                buy_amount_sol,
+                slippage_bps,
+                &tx_config,
+                bags_launch,
+                match context_override {
+                    Some(BagsFollowBuyContext::Damm(context)) => Some(context),
+                    _ => None,
+                },
+            )
+            .await?
+        }
+    } else {
+        None
+    };
+    compiled.ok_or_else(|| {
+        format!(
+            "Meteora directed buy compiler could not build target={} quote={} for mint {}.",
+            direct_protocol_target, quote_asset, mint
+        )
+    })
+}
+
+pub async fn compile_follow_sell_transaction_for_meteora_target(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    sell_percent: u8,
+    bags_launch: Option<&BagsLaunchMetadata>,
+    direct_protocol_target: &str,
+    quote_asset: &str,
+) -> Result<CompiledTransaction, String> {
+    let mint_pubkey =
+        Pubkey::from_str(mint).map_err(|error| format!("Invalid Bags mint address: {error}"))?;
+    let owner = parse_owner_keypair(wallet_secret)?;
+    let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
+    let tx_config = build_follow_sell_tx_config(execution, jito_tip_account)?;
+    let target = direct_protocol_target.trim().to_ascii_lowercase();
+    let quote = quote_asset.trim().to_ascii_uppercase();
+    let use_usdc = quote == "USDC" || quote == "USD1" || quote == "USDT";
+    let compiled = if target.contains("dbc") {
+        if use_usdc {
+            native_try_build_usdc_dbc_follow_sell(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                &mint_pubkey,
+                sell_percent,
+                slippage_bps,
+                &tx_config,
+                bags_launch,
+            )
+            .await?
+        } else {
+            native_try_build_local_dbc_follow_sell(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                &mint_pubkey,
+                sell_percent,
+                slippage_bps,
+                &tx_config,
+                bags_launch,
+            )
+            .await?
+        }
+    } else if target.contains("damm") {
+        if use_usdc {
+            native_try_build_usdc_damm_follow_sell(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                &mint_pubkey,
+                sell_percent,
+                slippage_bps,
+                &tx_config,
+                bags_launch,
+            )
+            .await?
+        } else {
+            native_try_build_local_damm_follow_sell(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                &mint_pubkey,
+                sell_percent,
+                slippage_bps,
+                &tx_config,
+                bags_launch,
+            )
+            .await?
+        }
+    } else {
+        None
+    };
+    compiled.flatten().ok_or_else(|| {
+        format!(
+            "Meteora directed sell compiler could not build target={} quote={} for mint {}.",
+            direct_protocol_target, quote_asset, mint
+        )
+    })
 }
 
 pub async fn compile_atomic_follow_buy_transaction(
@@ -6541,7 +7738,35 @@ pub async fn compile_follow_sell_transaction(
     {
         return Ok(local);
     }
+    if let Some(local) = native_try_build_usdc_dbc_follow_sell(
+        rpc_url,
+        &execution.commitment,
+        &owner,
+        &mint_pubkey,
+        sell_percent,
+        slippage_bps,
+        &tx_config,
+        bags_launch,
+    )
+    .await?
+    {
+        return Ok(local);
+    }
     if let Some(local) = native_try_build_local_damm_follow_sell(
+        rpc_url,
+        &execution.commitment,
+        &owner,
+        &mint_pubkey,
+        sell_percent,
+        slippage_bps,
+        &tx_config,
+        bags_launch,
+    )
+    .await?
+    {
+        return Ok(local);
+    }
+    if let Some(local) = native_try_build_usdc_damm_follow_sell(
         rpc_url,
         &execution.commitment,
         &owner,
@@ -6763,6 +7988,13 @@ pub async fn detect_bags_import_context_from_pool(
         Err(_) => return Ok(None),
     };
     validate_damm_pool_for_mint(&pool_pubkey, &pool, &mint_pubkey)?;
+    let quote_mint = if pool.token_a_mint == mint_pubkey {
+        pool.token_b_mint
+    } else {
+        pool.token_a_mint
+    };
+    let quote_asset = quote_asset_label_for_mint(&quote_mint)?
+        .ok_or_else(|| format!("Unsupported Meteora DAMM quote mint {quote_mint}."))?;
     let launch_metadata = if let Some((dbc_pool_address, dbc_pool, dbc_config)) =
         load_canonical_dbc_market(rpc_url, &mint_pubkey, commitment, None).await?
     {
@@ -6812,9 +8044,9 @@ pub async fn detect_bags_import_context_from_pool(
         }
     };
     Ok(Some(BagsImportContext {
-        launchpad: "bagsapp".to_string(),
+        launchpad: meteora_provenance_label_for_mint(&mint_pubkey).to_string(),
         mode: launch_metadata.expectedMigrationFamily.clone(),
-        quoteAsset: "sol".to_string(),
+        quoteAsset: quote_asset.to_string(),
         creator: pool.creator.to_string(),
         marketKey: pool_pubkey.to_string(),
         configKey: if launch_metadata.configKey.trim().is_empty() {
@@ -6848,6 +8080,7 @@ pub async fn poll_bags_market_cap_lamports(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use borsh::BorshDeserialize;
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
 
@@ -6896,6 +8129,83 @@ mod tests {
         assert_eq!(slippage_bps_from_percent("100").expect("100%"), 10_000);
         slippage_bps_from_percent("99.999").expect_err("too many decimals");
         slippage_bps_from_percent("100.01").expect_err("above 100%");
+    }
+
+    #[test]
+    fn meteora_usdc_route_uses_previous_token_delta_for_second_leg() {
+        let owner = Pubkey::new_unique();
+        let usdc_account = Pubkey::new_unique();
+        let token_account = Pubkey::new_unique();
+        let (route_wsol_account, _) = route_wsol_pda(&owner, 0);
+        let first_program = Pubkey::new_unique();
+        let second_program = Pubkey::new_unique();
+        let mut first_data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        first_data.extend_from_slice(&900u64.to_le_bytes());
+        first_data.extend_from_slice(&800u64.to_le_bytes());
+        let mut second_data = vec![9, 10, 11, 12, 13, 14, 15, 16];
+        second_data.extend_from_slice(&800u64.to_le_bytes());
+        second_data.extend_from_slice(&700u64.to_le_bytes());
+        let first_ix = Instruction {
+            program_id: first_program,
+            accounts: vec![
+                AccountMeta::new_readonly(owner, true),
+                AccountMeta::new(route_wsol_account, false),
+                AccountMeta::new(usdc_account, false),
+            ],
+            data: first_data,
+        };
+        let second_ix = Instruction {
+            program_id: second_program,
+            accounts: vec![
+                AccountMeta::new_readonly(owner, true),
+                AccountMeta::new(usdc_account, false),
+                AccountMeta::new(token_account, false),
+            ],
+            data: second_data,
+        };
+
+        let wrapper_ix = build_meteora_usdc_dynamic_route_instruction(
+            &owner,
+            first_ix,
+            second_ix,
+            &usdc_account,
+            &token_account,
+            SwapLegInputSource::GrossSolNetOfFee,
+            900,
+            8,
+            800,
+            700,
+            SwapRouteDirection::Buy,
+            SwapRouteSettlement::Token,
+            SwapRouteFeeMode::SolPre,
+            1_000,
+            10,
+        )
+        .expect("dynamic route instruction");
+
+        assert_eq!(
+            wrapper_ix.data.first().copied(),
+            Some(crate::wrapper_abi::EXECUTE_SWAP_ROUTE_DISCRIMINATOR)
+        );
+        let request = ExecuteSwapRouteRequest::try_from_slice(&wrapper_ix.data[1..])
+            .expect("decode wrapper route");
+        assert_eq!(request.legs.len(), 2);
+        assert_eq!(
+            request.legs[1].input_source,
+            SwapLegInputSource::PreviousTokenDelta
+        );
+        assert_eq!(request.legs[1].input_amount, 800);
+        assert_eq!(request.legs[1].input_patch_offset, 8);
+        let intermediate_index =
+            usize::from(request.route_accounts_offset + request.intermediate_account_index);
+        assert_eq!(wrapper_ix.accounts[intermediate_index].pubkey, usdc_account);
+    }
+
+    #[test]
+    fn meteora_usdc_conversion_uses_wrapper_allowed_stable_route() {
+        let route = raydium_sol_usdc_route().expect("Raydium SOL/USDC route");
+        assert_eq!(route.pool, RAYDIUM_SOL_USDC_POOL);
+        assert_eq!(route.label, "raydium-wsol-usdc");
     }
 
     #[test]
@@ -7018,6 +8328,39 @@ mod tests {
             .expect("follow quote");
         assert_eq!(actual, expected);
         assert_eq!(minimum, expected);
+    }
+
+    #[test]
+    fn dbc_swap_keeps_token_program_accounts_in_base_quote_order() {
+        let (mut pool, config) = sample_initial_dbc_follow_state("bags-2-2");
+        pool.pool_type = 1;
+        let owner = Pubkey::new_unique();
+        let input = Pubkey::new_unique();
+        let output = Pubkey::new_unique();
+        let pool_address = Pubkey::new_unique();
+
+        for swap_base_for_quote in [false, true] {
+            let instruction = build_dbc_swap_instruction(
+                &owner,
+                &pool_address,
+                &pool,
+                &config,
+                &input,
+                &output,
+                swap_base_for_quote,
+                1_000,
+                900,
+            )
+            .expect("dbc swap instruction");
+            assert_eq!(
+                instruction.accounts[10].pubkey,
+                bags_token_2022_program_pubkey().expect("token-2022 program")
+            );
+            assert_eq!(
+                instruction.accounts[11].pubkey,
+                bags_token_program_pubkey().expect("token program")
+            );
+        }
     }
 
     #[test]

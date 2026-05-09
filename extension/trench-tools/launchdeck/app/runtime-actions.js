@@ -56,6 +56,7 @@
       renderBackendRegionSummary,
       queueWarmActivity,
       hideSettingsModal,
+      handlePostDeploySuccess = () => {},
     } = config;
 
     function formatBootTaskList(labels) {
@@ -85,6 +86,14 @@
         return true;
       }
       return status >= 500 || status === 408 || status === 425 || status === 429;
+    }
+
+    function conciseStatusError(error, fallback = "Action failed") {
+      const message = String(error && error.message ? error.message : error || fallback).trim();
+      if (!message) return fallback;
+      const normalized = message.replace(/\s+/g, " ");
+      if (normalized.length <= 156) return normalized;
+      return `${normalized.slice(0, 153).trimEnd()}...`;
     }
 
     async function probeLaunchdeckHostOnBoot() {
@@ -319,10 +328,15 @@
             applyVanityValue("", { publicKey: "" });
           }
           refreshWalletStatus(true, true).catch(() => {});
+          await Promise.resolve(handlePostDeploySuccess({
+            report: payload.report || null,
+            formPayload,
+          })).catch(() => {});
         }
       } catch (error) {
-        setStatusLabel("Error");
-        output.textContent = error.message;
+        const message = conciseStatusError(error);
+        setStatusLabel(message);
+        output.textContent = String(error && error.message ? error.message : message);
       } finally {
         if (buttons.some((button) => button.disabled)) {
           setBusy(false, currentStatusLabel());

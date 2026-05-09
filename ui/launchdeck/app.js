@@ -315,6 +315,15 @@ let lastCreateOverlayPostedWidth = 0;
 let lastCreateOverlayPostedHeight = 0;
 const CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE = "trench-tools-launchdeck";
 const CREATE_OVERLAY_RESIZE_MESSAGE_TYPE = "resize-create-overlay";
+const POST_DEPLOY_MESSAGE_TYPE = "post-deploy-success";
+const SITE_FEATURES_STORAGE_KEY = "trenchTools.siteFeatures";
+const POST_DEPLOY_ACTIONS = new Set([
+  "close_modal_toast",
+  "toast_only",
+  "open_tab_toast",
+  "open_window_toast",
+]);
+const POST_DEPLOY_DESTINATIONS = new Set(["axiom"]);
 const LIVE_SYNC_SOURCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const RequestUtils = window.LaunchDeckRequestUtils || {};
 const RenderUtils = window.LaunchDeckRenderUtils || {};
@@ -2445,6 +2454,7 @@ const runtimeActions = RuntimeActionsModule.createRuntimeActions({
   applyRuntimeStatusPayload,
   reportsTerminalOutput,
   reportsTerminalSection,
+  handlePostDeploySuccess,
 });
 
 function normalizeSniperDraftState(value) {
@@ -5373,6 +5383,230 @@ function showDeployModal() {
 
 function hideDeployModal() {
   deployModal.hidden = true;
+}
+
+function normalizePostDeployAction(value, fallback = "close_modal_toast") {
+  const action = String(value || "").trim().toLowerCase();
+  return POST_DEPLOY_ACTIONS.has(action) ? action : fallback;
+}
+
+function normalizePostDeployDestination(value, fallback = "axiom") {
+  const destination = String(value || "").trim().toLowerCase();
+  return POST_DEPLOY_DESTINATIONS.has(destination) ? destination : fallback;
+}
+
+function defaultPostDeployPreferences() {
+  return {
+    action: "close_modal_toast",
+    destination: "axiom",
+  };
+}
+
+function normalizePostDeployPreferences(value) {
+  const defaults = defaultPostDeployPreferences();
+  return {
+    action: normalizePostDeployAction(value && value.action, defaults.action),
+    destination: normalizePostDeployDestination(value && value.destination, defaults.destination),
+  };
+}
+
+async function loadPostDeployPreferences() {
+  if (!extensionShellConfig || !window.chrome || !chrome.storage || !chrome.storage.local) {
+    return defaultPostDeployPreferences();
+  }
+  try {
+    const stored = await chrome.storage.local.get(SITE_FEATURES_STORAGE_KEY);
+    const axiom = stored && stored[SITE_FEATURES_STORAGE_KEY] && stored[SITE_FEATURES_STORAGE_KEY].axiom;
+    return normalizePostDeployPreferences({
+      action: axiom && axiom.postDeployAction,
+      destination: axiom && axiom.postDeployDestination,
+    });
+  } catch (_error) {
+    return defaultPostDeployPreferences();
+  }
+}
+
+function normalizeRouteAddressValue(value) {
+  const text = String(value || "").trim();
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text) ? text : "";
+}
+
+function readNestedString(value, path) {
+  let current = value;
+  for (const key of path) {
+    if (!current || typeof current !== "object") return "";
+    current = current[key];
+  }
+  return typeof current === "string" ? current : "";
+}
+
+function resolvePostDeployRoute(destination, report) {
+  const normalizedDestination = normalizePostDeployDestination(destination);
+  if (normalizedDestination !== "axiom" || !report || typeof report !== "object") {
+    return "";
+  }
+  const candidates = [
+    report.pair,
+    report.pairAddress,
+    report.routeAddress,
+    report.poolAddress,
+    report.poolId,
+    report.launchpadPoolAddress,
+    report.bondingCurve,
+    report.bondingCurveAddress,
+    report.marketKey,
+    report.marketAddress,
+    report.preMigrationDbcPoolAddress,
+    report.postMigrationDammPoolAddress,
+    readNestedString(report, ["launch", "pairAddress"]),
+    readNestedString(report, ["launch", "routeAddress"]),
+    readNestedString(report, ["launch", "poolAddress"]),
+    readNestedString(report, ["bagsLaunch", "preMigrationDbcPoolAddress"]),
+    readNestedString(report, ["bagsLaunch", "postMigrationDammPoolAddress"]),
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeRouteAddressValue(candidate);
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function buildPostDeployUrl(destination, report) {
+  const route = resolvePostDeployRoute(destination, report);
+  if (!route) return "";
+  const normalizedDestination = normalizePostDeployDestination(destination);
+  if (normalizedDestination === "axiom") {
+    return `https://axiom.trade/meme/${encodeURIComponent(route)}`;
+  }
+  return "";
+}
+
+function normalizePostDeployTicker(value) {
+  const ticker = String(value || "").trim().replace(/^\$+/, "");
+  return ticker ? ticker.toUpperCase().slice(0, 24) : "";
+}
+
+function resolvePostDeployTicker(report, formPayload) {
+  return normalizePostDeployTicker(
+    (report && (report.symbol || report.ticker || report.tokenSymbol || (report.token && report.token.symbol)))
+    || (formPayload && (formPayload.symbol || formPayload.ticker))
+    || ""
+  );
+}
+
+function buildPostDeployToastTitle(report, formPayload) {
+  const ticker = resolvePostDeployTicker(report, formPayload);
+  return ticker ? `$${ticker} successfully deployed` : "Token successfully deployed";
+}
+
+function postDeployToastIconUrl() {
+  if (window.chrome && chrome.runtime && typeof chrome.runtime.getURL === "function") {
+    return chrome.runtime.getURL("assets/confirmed-icon.png");
+  }
+  return "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='12' fill='%233cbf24'/%3E%3Cpath d='M6 12.4 10 16.4 18.5 7.9' fill='none' stroke='%23000' stroke-width='2.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
+}
+
+function ensurePostDeployToastHost() {
+  let host = document.getElementById("post-deploy-toast-host");
+  if (host instanceof HTMLElement) {
+    return host;
+  }
+  host = document.createElement("div");
+  host.id = "post-deploy-toast-host";
+  host.className = "post-deploy-toast-host";
+  document.body.appendChild(host);
+  return host;
+}
+
+function showPostDeployToast({ title, url = "", ttlMs = 5000 } = {}) {
+  const host = ensurePostDeployToastHost();
+  const toast = document.createElement(url ? "button" : "div");
+  toast.className = url ? "post-deploy-toast is-clickable" : "post-deploy-toast";
+  if (url) {
+    toast.type = "button";
+    toast.title = "Open deployed token on Axiom";
+    toast.addEventListener("click", () => {
+      openPostDeployUrl(url, "tab");
+      toast.remove();
+    });
+  }
+  const icon = document.createElement("img");
+  icon.className = "post-deploy-toast-icon";
+  icon.src = postDeployToastIconUrl();
+  icon.alt = "";
+  icon.setAttribute("aria-hidden", "true");
+  const copy = document.createElement("div");
+  copy.className = "post-deploy-toast-copy";
+  copy.textContent = title || "Token successfully deployed";
+  toast.append(icon, copy);
+  host.prepend(toast);
+  window.setTimeout(() => toast.classList.add("is-visible"), 0);
+  window.setTimeout(() => {
+    toast.classList.remove("is-visible");
+    window.setTimeout(() => toast.remove(), 220);
+  }, ttlMs);
+}
+
+function openPostDeployUrl(url, mode = "tab") {
+  const normalizedUrl = String(url || "").trim();
+  if (!normalizedUrl) return;
+  const normalizedMode = mode === "window" ? "window" : "tab";
+  if (window.chrome && chrome.runtime && typeof chrome.runtime.sendMessage === "function") {
+    chrome.runtime.sendMessage({
+      type: "trench:open-external-url",
+      payload: {
+        url: normalizedUrl,
+        mode: normalizedMode,
+      },
+    }, (response) => {
+      if (chrome.runtime.lastError || !response || response.ok === false) {
+        openPostDeployUrlWithWindow(normalizedUrl, normalizedMode);
+      }
+    });
+    return;
+  }
+  openPostDeployUrlWithWindow(normalizedUrl, normalizedMode);
+}
+
+function openPostDeployUrlWithWindow(url, mode) {
+  if (mode === "window") {
+    window.open(url, "_blank", "popup=yes,width=1100,height=760,resizable=yes,scrollbars=yes");
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function postPostDeploySuccessToHost(payload) {
+  if (!isOverlayMode || window.parent === window) return false;
+  window.parent.postMessage({
+    source: CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE,
+    type: POST_DEPLOY_MESSAGE_TYPE,
+    ...payload,
+  }, "*");
+  return true;
+}
+
+async function handlePostDeploySuccess({ report, formPayload } = {}) {
+  const preferences = await loadPostDeployPreferences();
+  const url = buildPostDeployUrl(preferences.destination, report);
+  const title = buildPostDeployToastTitle(report, formPayload);
+  if (postPostDeploySuccessToHost({
+    report,
+    title,
+    url,
+    action: preferences.action,
+    destination: preferences.destination,
+  })) {
+    return;
+  }
+  showPostDeployToast({ title, url });
+  if (preferences.action === "close_modal_toast") {
+    hideDeployModal();
+  } else if (preferences.action === "open_tab_toast" && url) {
+    openPostDeployUrl(url, "tab");
+  } else if (preferences.action === "open_window_toast" && url) {
+    openPostDeployUrl(url, "window");
+  }
 }
 
 function buildOutputMetaTextFromReport(report) {

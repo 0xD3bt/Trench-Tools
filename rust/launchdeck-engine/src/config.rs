@@ -11,11 +11,11 @@ const TOKEN_NAME_MAX_LENGTH: usize = 32;
 const TOKEN_SYMBOL_MAX_LENGTH: usize = 10;
 const MAX_FEE_SPLIT_RECIPIENTS: usize = 10;
 const DEFAULT_LAUNCH_COMPUTE_UNIT_LIMIT: u64 = 340_000;
-const DEFAULT_AGENT_SETUP_COMPUTE_UNIT_LIMIT: u64 = 180_000;
-const DEFAULT_FOLLOW_UP_COMPUTE_UNIT_LIMIT: u64 = 175_000;
-const DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT: u64 = 120_000;
-const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 240_000;
-const DEFAULT_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT: u64 = 175_000;
+const DEFAULT_AGENT_SETUP_COMPUTE_UNIT_LIMIT: u64 = 280_000;
+const DEFAULT_FOLLOW_UP_COMPUTE_UNIT_LIMIT: u64 = 280_000;
+const DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT: u64 = 280_000;
+const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 280_000;
+const DEFAULT_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT: u64 = 280_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchpadActionBackendMode {
@@ -2286,6 +2286,60 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn default_compute_budgets_keep_buy_and_sell_at_280k() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            env::remove_var("LAUNCHDECK_AGENT_SETUP_COMPUTE_UNIT_LIMIT");
+            env::remove_var("LAUNCHDECK_FOLLOW_UP_COMPUTE_UNIT_LIMIT");
+            env::remove_var("LAUNCHDECK_SNIPER_BUY_COMPUTE_UNIT_LIMIT");
+            env::remove_var("LAUNCHDECK_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT");
+            env::remove_var("LAUNCHDECK_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT");
+        }
+
+        assert_eq!(configured_default_launch_compute_unit_limit(), 340_000);
+        assert_eq!(configured_default_agent_setup_compute_unit_limit(), 280_000);
+        assert_eq!(configured_default_follow_up_compute_unit_limit(), 280_000);
+        assert_eq!(configured_default_sniper_buy_compute_unit_limit(), 280_000);
+        assert_eq!(
+            configured_default_dev_auto_sell_compute_unit_limit(),
+            280_000
+        );
+        assert_eq!(
+            configured_default_launch_usd1_topup_compute_unit_limit(),
+            280_000
+        );
+    }
+
+    #[test]
+    fn compute_budget_env_overrides_cannot_lower_default_floor() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            env::set_var("LAUNCHDECK_SNIPER_BUY_COMPUTE_UNIT_LIMIT", "120000");
+            env::set_var("LAUNCHDECK_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT", "240000");
+            env::set_var("LAUNCHDECK_FOLLOW_UP_COMPUTE_UNIT_LIMIT", "175000");
+            env::set_var("LAUNCHDECK_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT", "175000");
+        }
+
+        assert_eq!(configured_default_sniper_buy_compute_unit_limit(), 280_000);
+        assert_eq!(
+            configured_default_dev_auto_sell_compute_unit_limit(),
+            280_000
+        );
+        assert_eq!(configured_default_follow_up_compute_unit_limit(), 280_000);
+        assert_eq!(
+            configured_default_launch_usd1_topup_compute_unit_limit(),
+            280_000
+        );
+
+        unsafe {
+            env::remove_var("LAUNCHDECK_SNIPER_BUY_COMPUTE_UNIT_LIMIT");
+            env::remove_var("LAUNCHDECK_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT");
+            env::remove_var("LAUNCHDECK_FOLLOW_UP_COMPUTE_UNIT_LIMIT");
+            env::remove_var("LAUNCHDECK_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT");
+        }
     }
 
     fn sample_raw_config() -> RawConfig {
