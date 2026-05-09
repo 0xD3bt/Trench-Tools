@@ -46,6 +46,9 @@ use crate::{
         fetch_multiple_account_exists,
     },
     transport::TransportPlan,
+    vanity_pool::{
+        VanityLaunchpad, VanityReservation, append_vanity_report_note, reserve_vanity_mint,
+    },
     wallet::read_keypair_bytes,
     wrapper_compile::{estimate_sol_in_fee_lamports, wrapper_fee_vault},
 };
@@ -83,6 +86,7 @@ pub struct NativePumpArtifacts {
     pub compile_timings: NativeCompileTimings,
     pub mint: String,
     pub launch_creator: String,
+    pub vanity_reservation: Option<VanityReservation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -174,6 +178,7 @@ pub async fn try_compile_native_pump(
     built_at: String,
     creator_public_key: String,
     config_path: Option<String>,
+    allow_queued_vanity: bool,
     launch_blockhash_prime: Option<(String, u64)>,
 ) -> Result<Option<NativePumpArtifacts>, String> {
     if !supports_native_pump_compile(config) {
@@ -183,9 +188,12 @@ pub async fn try_compile_native_pump(
     let creator_keypair = keypair_from_secret_bytes(wallet_secret)?;
     let creator = creator_keypair.pubkey();
     let agent_authority = resolve_agent_authority(config, &creator)?;
-    let mint_keypair = resolve_mint_keypair(config)?;
+    let resolved_mint =
+        resolve_mint_keypair_for_launch(rpc_url, config, allow_queued_vanity).await?;
+    let mint_keypair = resolved_mint.keypair;
     let mint = mint_keypair.pubkey();
-    ensure_vanity_mint_unused(rpc_url, config, &mint).await?;
+    ensure_vanity_mint_unused(rpc_url, resolved_mint.requires_unused_check, &mint).await?;
+    let vanity_reservation = resolved_mint.vanity_reservation;
     let separate_tip_transaction =
         transport_plan.separateTipTransaction && config.tx.jitoTipLamports > 0;
     let has_follow_up_transaction = has_launch_follow_up(config);
@@ -477,7 +485,12 @@ pub async fn try_compile_native_pump(
         &compile_metrics,
     )?;
     let text = render_report(&report);
-    let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
+    let mut report = serde_json::to_value(report).map_err(|error| error.to_string())?;
+    let bonding_curve_address = bonding_curve_pda(&mint)?.to_string();
+    report["pairAddress"] = serde_json::Value::String(bonding_curve_address.clone());
+    report["routeAddress"] = serde_json::Value::String(bonding_curve_address.clone());
+    report["bondingCurveAddress"] = serde_json::Value::String(bonding_curve_address);
+    append_vanity_report_note(&mut report, vanity_reservation.as_ref());
 
     Ok(Some(NativePumpArtifacts {
         compiled_transactions,
@@ -488,6 +501,7 @@ pub async fn try_compile_native_pump(
         compile_timings,
         mint: mint.to_string(),
         launch_creator: launch_creator.to_string(),
+        vanity_reservation,
     }))
 }
 
@@ -697,6 +711,12 @@ fn keypair_from_secret_bytes(bytes: &[u8]) -> Result<Keypair, String> {
     Keypair::try_from(bytes).map_err(|error| error.to_string())
 }
 
+struct ResolvedMintKeypair {
+    keypair: Keypair,
+    vanity_reservation: Option<VanityReservation>,
+    requires_unused_check: bool,
+}
+
 fn resolve_mint_keypair(config: &NormalizedConfig) -> Result<Keypair, String> {
     let vanity_private_key = config.vanityPrivateKey.trim();
     if vanity_private_key.is_empty() {
@@ -708,12 +728,41 @@ fn resolve_mint_keypair(config: &NormalizedConfig) -> Result<Keypair, String> {
         .map_err(|error| format!("Invalid vanity private key: {error}"))
 }
 
-async fn ensure_vanity_mint_unused(
+async fn resolve_mint_keypair_for_launch(
     rpc_url: &str,
     config: &NormalizedConfig,
+    allow_queued_vanity: bool,
+) -> Result<ResolvedMintKeypair, String> {
+    let vanity_private_key = config.vanityPrivateKey.trim();
+    if !vanity_private_key.is_empty() {
+        return Ok(ResolvedMintKeypair {
+            keypair: resolve_mint_keypair(config)?,
+            vanity_reservation: None,
+            requires_unused_check: true,
+        });
+    }
+    if allow_queued_vanity
+        && let Some(reserved) = reserve_vanity_mint(VanityLaunchpad::Pump, rpc_url).await?
+    {
+        return Ok(ResolvedMintKeypair {
+            keypair: reserved.keypair,
+            vanity_reservation: Some(reserved.reservation),
+            requires_unused_check: false,
+        });
+    }
+    Ok(ResolvedMintKeypair {
+        keypair: Keypair::new(),
+        vanity_reservation: None,
+        requires_unused_check: false,
+    })
+}
+
+async fn ensure_vanity_mint_unused(
+    rpc_url: &str,
+    requires_unused_check: bool,
     mint: &Pubkey,
 ) -> Result<(), String> {
-    if config.vanityPrivateKey.trim().is_empty() {
+    if !requires_unused_check {
         return Ok(());
     }
     match fetch_account_data(rpc_url, &mint.to_string(), "confirmed").await {
@@ -1623,6 +1672,17 @@ fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
     Ok(percent.min(10_000))
 }
 
+fn wrapper_net_sol_input(gross_lamports: u64, wrapper_fee_bps: u16) -> Result<u64, String> {
+    let fee_lamports = estimate_sol_in_fee_lamports(gross_lamports, wrapper_fee_bps);
+    let net_lamports = gross_lamports
+        .checked_sub(fee_lamports)
+        .ok_or_else(|| "Pump wrapper fee exceeds gross SOL input.".to_string())?;
+    if gross_lamports > 0 && net_lamports == 0 {
+        return Err("Pump wrapper net SOL input resolves to zero.".to_string());
+    }
+    Ok(net_lamports)
+}
+
 pub async fn compile_follow_buy_transaction(
     rpc_url: &str,
     execution: &NormalizedExecution,
@@ -1633,6 +1693,7 @@ pub async fn compile_follow_buy_transaction(
     launch_creator: &str,
     buy_amount_sol: &str,
     prefer_post_setup_creator_vault: bool,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let prepared = prepare_follow_buy_static(
         rpc_url,
@@ -1658,6 +1719,7 @@ pub async fn compile_follow_buy_transaction(
         wallet_secret,
         &prepared,
         &runtime,
+        wrapper_fee_bps,
     )
     .await
 }
@@ -1768,14 +1830,15 @@ pub async fn finalize_follow_buy_transaction(
     wallet_secret: &[u8],
     prepared: &PreparedFollowBuyStatic,
     runtime: &PreparedFollowBuyRuntime,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let user_keypair = keypair_from_secret_bytes(wallet_secret)?;
     let user = user_keypair.pubkey();
     if user != prepared.user {
         return Err("Prepared follow buy no longer matches the active wallet secret.".to_string());
     }
-    let token_amount =
-        quote_buy_tokens_from_curve(&runtime.curve, &runtime.global, prepared.sol_amount);
+    let net_sol_amount = wrapper_net_sol_input(prepared.sol_amount, wrapper_fee_bps)?;
+    let token_amount = quote_buy_tokens_from_curve(&runtime.curve, &runtime.global, net_sol_amount);
     let min_tokens_out = apply_buy_token_slippage(
         token_amount,
         slippage_bps_from_percent(&execution.buySlippagePercent)?,
@@ -1833,6 +1896,7 @@ pub async fn compile_atomic_follow_buy_transaction(
     buy_amount_sol: &str,
     predicted_prior_buy_token_amount: Option<u64>,
     cashback_enabled_override: Option<bool>,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let user_keypair = keypair_from_secret_bytes(wallet_secret)?;
     let user = user_keypair.pubkey();
@@ -1842,6 +1906,7 @@ pub async fn compile_atomic_follow_buy_transaction(
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
     let sol_amount = parse_decimal_u64(buy_amount_sol, 9, "followLaunch.snipes.buyAmountSol")?;
+    let net_sol_amount = wrapper_net_sol_input(sol_amount, wrapper_fee_bps)?;
     let buy_slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
     let tokens_out = if let Some(token_amount) = predicted_prior_buy_token_amount {
         let curve = synthetic_curve_after_buy_tokens(
@@ -1850,9 +1915,9 @@ pub async fn compile_atomic_follow_buy_transaction(
             token_amount,
             cashback_enabled_override.unwrap_or(false),
         );
-        quote_buy_tokens_from_curve(&curve, &global, sol_amount)
+        quote_buy_tokens_from_curve(&curve, &global, net_sol_amount)
     } else {
-        quote_buy_tokens_from_sol(&global, sol_amount)
+        quote_buy_tokens_from_sol(&global, net_sol_amount)
     };
     let instructions = vec![
         build_create_token_ata_instruction(&user, &mint)?,
@@ -2820,6 +2885,7 @@ fn with_tx_settings(
     instructions.extend(apply_jitodontfront(
         core_instructions,
         jitodontfront_enabled,
+        payer,
     )?);
     if tx_config.jito_tip_lamports > 0 {
         let tip_account = parse_pubkey(&tx_config.jito_tip_account, "tx.jitoTipAccount")?;
@@ -2835,23 +2901,25 @@ fn with_tx_settings(
 fn apply_jitodontfront(
     mut instructions: Vec<Instruction>,
     enabled: bool,
+    payer: &Pubkey,
 ) -> Result<Vec<Instruction>, String> {
     if !enabled {
         return Ok(instructions);
     }
     let dontfront = parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront")?;
-    for instruction in &mut instructions {
-        if instruction
+    if instructions.iter().any(|instruction| {
+        instruction
             .accounts
             .iter()
             .any(|meta| meta.pubkey == dontfront)
-        {
-            continue;
-        }
-        instruction
-            .accounts
-            .push(AccountMeta::new_readonly(dontfront, false));
+    }) {
+        return Ok(instructions);
     }
+    let mut instruction = transfer(payer, payer, 0);
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(dontfront, false));
+    instructions.insert(0, instruction);
     Ok(instructions)
 }
 
@@ -4154,6 +4222,18 @@ mod tests {
         )
         .expect("buy exact sol instruction");
         assert_eq!(&instruction.data[8..16], &spend_lamports.to_le_bytes());
+    }
+
+    #[test]
+    fn wrapper_net_sol_input_subtracts_fee_for_follow_quotes() {
+        assert_eq!(
+            wrapper_net_sol_input(1_000_000_000, 10).unwrap(),
+            999_000_000
+        );
+        assert_eq!(
+            wrapper_net_sol_input(1_000_000_000, 0).unwrap(),
+            1_000_000_000
+        );
     }
 
     #[test]

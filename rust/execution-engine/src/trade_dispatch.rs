@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use solana_sdk::pubkey::Pubkey;
 use spl_token_2022_interface::{extension::PodStateWithExtensions, pod::PodMint};
 
@@ -17,16 +18,27 @@ use crate::{
         PrewarmedMint, build_fingerprint, prewarmed_from_plan, shared_mint_warm_cache,
     },
     pump_native::{
-        bonding_curve_pda, classify_pump_bonding_curve_address, compile_pump_trade,
-        decode_pump_amm_pool_state, plan_pump_trade, pump_amm_program_id,
+        bonding_curve_pda, canonical_pump_amm_pool, classify_pump_bonding_curve_address,
+        compile_pump_trade, decode_pump_amm_pool_state, plan_pump_trade, pump_amm_program_id,
     },
     raydium_amm_v4_native::{
         classify_raydium_amm_v4_pool_address, compile_raydium_amm_v4_trade,
         plan_raydium_amm_v4_trade, raydium_amm_v4_program_id,
     },
+    raydium_cpmm_native::{
+        classify_raydium_cpmm_pool_address, compile_raydium_cpmm_trade, plan_raydium_cpmm_trade,
+        raydium_cpmm_program_id,
+    },
+    raydium_launchlab_native::{
+        classify_raydium_launchlab_pool_address, compile_raydium_launchlab_trade,
+        plan_raydium_launchlab_trade, raydium_launchlab_program_id,
+    },
     rollout::{TradeExecutionBackend, family_warm_enabled, preferred_execution_backend},
     route_index::{RouteIndexEntry, RouteIndexKey, RouteIndexLookup, shared_route_index},
-    rpc_client::{CompiledTransaction, configured_rpc_url, fetch_account_owner_and_data},
+    rpc_client::{
+        CompiledTransaction, configured_rpc_url, fetch_account_owner_and_data,
+        fetch_multiple_account_owner_and_data,
+    },
     stable_native::{
         compile_trusted_stable_trade, plan_trusted_stable_trade, trusted_stable_route_for_pool,
     },
@@ -42,6 +54,8 @@ use crate::{
 pub enum TradeAdapter {
     PumpNative,
     RaydiumAmmV4Native,
+    RaydiumCpmmNative,
+    RaydiumLaunchLabNative,
     BonkNative,
     MeteoraNative,
     StableNative,
@@ -52,6 +66,8 @@ impl TradeAdapter {
         match self {
             Self::PumpNative => "pump-native",
             Self::RaydiumAmmV4Native => "raydium-amm-v4-native",
+            Self::RaydiumCpmmNative => "raydium-cpmm-native",
+            Self::RaydiumLaunchLabNative => "raydium-launchlab-native",
             Self::BonkNative => "bonk-native",
             Self::MeteoraNative => "meteora-native",
             Self::StableNative => "stable-native",
@@ -148,6 +164,8 @@ pub fn adapter_for_selector(
             Ok(TradeAdapter::PumpNative)
         }
         TradeVenueFamily::RaydiumAmmV4 => Ok(TradeAdapter::RaydiumAmmV4Native),
+        TradeVenueFamily::RaydiumCpmm => Ok(TradeAdapter::RaydiumCpmmNative),
+        TradeVenueFamily::RaydiumLaunchLab => Ok(TradeAdapter::RaydiumLaunchLabNative),
         TradeVenueFamily::TrustedStableSwap => Ok(TradeAdapter::StableNative),
         TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium => {
             Ok(TradeAdapter::BonkNative)
@@ -270,6 +288,68 @@ async fn try_classify_route_descriptor(
             }));
         }
     }
+    if owner == raydium_launchlab_program_id()?
+        && let Some(classified) = classify_raydium_launchlab_pool_address(input, &owner, &data)?
+    {
+        if matches!(
+            classified.status,
+            shared_raydium_launchlab::LaunchLabPoolStatus::Migrating
+        ) {
+            return Err(route_error(
+                "migration_in_progress",
+                format!(
+                    "Raydium LaunchLab pool {} for mint {} is migrating and cannot be traded.",
+                    classified.pool_id, classified.mint
+                ),
+            ));
+        }
+        let lifecycle = match classified.status {
+            shared_raydium_launchlab::LaunchLabPoolStatus::Trading => TradeLifecycle::PreMigration,
+            shared_raydium_launchlab::LaunchLabPoolStatus::Migrated => {
+                TradeLifecycle::PostMigration
+            }
+            shared_raydium_launchlab::LaunchLabPoolStatus::Unknown(status) => {
+                return Err(route_error(
+                    "unsupported_lifecycle",
+                    format!(
+                        "Raydium LaunchLab pool {} has unsupported status {}.",
+                        classified.pool_id, status
+                    ),
+                ));
+            }
+            shared_raydium_launchlab::LaunchLabPoolStatus::Migrating => {
+                unreachable!("handled above")
+            }
+        };
+        return Ok(Some(RouteDescriptor {
+            raw_address: input.trim().to_string(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: classified.mint,
+            resolved_pair: Some(classified.pool_id.clone()),
+            route_locked_pair: Some(classified.pool_id.clone()),
+            family: Some(TradeVenueFamily::RaydiumLaunchLab),
+            lifecycle: Some(lifecycle),
+            quote_asset: Some(PlannerQuoteAsset::Sol),
+            canonical_market_key: Some(classified.pool_id),
+            non_canonical: false,
+        }));
+    }
+    if owner == raydium_cpmm_program_id()?
+        && let Some(classified) = classify_raydium_cpmm_pool_address(input, &owner, &data)?
+    {
+        return Ok(Some(RouteDescriptor {
+            raw_address: input.trim().to_string(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: classified.mint,
+            resolved_pair: Some(classified.pool_id.clone()),
+            route_locked_pair: Some(classified.pool_id.clone()),
+            family: Some(TradeVenueFamily::RaydiumCpmm),
+            lifecycle: Some(TradeLifecycle::PostMigration),
+            quote_asset: Some(classified.quote_asset),
+            canonical_market_key: Some(classified.pool_id),
+            non_canonical: false,
+        }));
+    }
     if let Some(classified) = classify_bonk_pool_address(input, &owner, &data)? {
         let family = match classified.family.as_str() {
             "launchpad" => TradeVenueFamily::BonkLaunchpad,
@@ -312,7 +392,7 @@ async fn try_classify_route_descriptor(
             route_locked_pair: Some(input.trim().to_string()),
             family: Some(family),
             lifecycle: Some(lifecycle),
-            quote_asset: Some(PlannerQuoteAsset::Sol),
+            quote_asset: None,
             canonical_market_key: Some(input.trim().to_string()),
             non_canonical: false,
         }));
@@ -460,6 +540,15 @@ fn build_dispatch_plan(
     {
         expected_pair = None;
     }
+    if matches!(
+        selector.family,
+        TradeVenueFamily::RaydiumAmmV4 | TradeVenueFamily::RaydiumCpmm
+    ) && descriptor.is_some_and(|value| {
+        matches!(value.family, Some(TradeVenueFamily::RaydiumLaunchLab))
+            && matches!(value.lifecycle, Some(TradeLifecycle::PostMigration))
+    }) {
+        expected_pair = Some(selector.canonical_market_key.clone());
+    }
     if let Some(pair_lock) = expected_pair.as_deref() {
         if non_canonical {
             return Err(route_error(
@@ -574,6 +663,10 @@ async fn resolve_family_plan(
             plan_pump_trade(rpc_url, request).await
         }
         (TradeVenueFamily::RaydiumAmmV4, _) => plan_raydium_amm_v4_trade(rpc_url, request).await,
+        (TradeVenueFamily::RaydiumCpmm, _) => plan_raydium_cpmm_trade(rpc_url, request).await,
+        (TradeVenueFamily::RaydiumLaunchLab, _) => {
+            plan_raydium_launchlab_trade(rpc_url, request).await
+        }
         (
             TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium,
             RouteCacheMode::AllowCached,
@@ -600,6 +693,40 @@ fn selector_from_authoritative_descriptor(
     request: &TradeRuntimeRequest,
     descriptor: &RouteDescriptor,
 ) -> Result<Option<LifecycleAndCanonicalMarket>, String> {
+    if matches!(descriptor.family, Some(TradeVenueFamily::RaydiumLaunchLab)) {
+        if matches!(descriptor.lifecycle, Some(TradeLifecycle::PostMigration)) {
+            return Ok(None);
+        }
+        let Some(pool) = descriptor.resolved_pair.as_deref().or_else(|| {
+            descriptor
+                .canonical_market_key
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        }) else {
+            return Ok(None);
+        };
+        return Ok(Some(LifecycleAndCanonicalMarket {
+            lifecycle: TradeLifecycle::PreMigration,
+            family: TradeVenueFamily::RaydiumLaunchLab,
+            canonical_market_key: pool.to_string(),
+            quote_asset: PlannerQuoteAsset::Sol,
+            verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+            wrapper_action: match request.side {
+                crate::extension_api::TradeSide::Buy => {
+                    crate::trade_planner::WrapperAction::RaydiumLaunchLabSolBuy
+                }
+                crate::extension_api::TradeSide::Sell => {
+                    crate::trade_planner::WrapperAction::RaydiumLaunchLabSolSell
+                }
+            },
+            wrapper_accounts: vec![pool.to_string()],
+            market_subtype: Some("launchlab-active".to_string()),
+            direct_protocol_target: Some("raydium-launchlab".to_string()),
+            input_amount_hint: request.buy_amount_sol.clone(),
+            minimum_output_hint: None,
+            runtime_bundle: None,
+        }));
+    }
     if !matches!(descriptor.family, Some(TradeVenueFamily::BonkRaydium)) {
         return Ok(None);
     }
@@ -626,6 +753,7 @@ fn planner_family_order() -> Vec<TradeVenueFamily> {
     vec![
         TradeVenueFamily::PumpBondingCurve,
         TradeVenueFamily::BonkLaunchpad,
+        TradeVenueFamily::RaydiumLaunchLab,
         TradeVenueFamily::MeteoraDbc,
     ]
 }
@@ -636,56 +764,203 @@ fn preferred_family_for_mint_suffix(mint: &str) -> Option<TradeVenueFamily> {
         Some(TradeVenueFamily::PumpBondingCurve)
     } else if trimmed.ends_with("bonk") {
         Some(TradeVenueFamily::BonkLaunchpad)
-    } else if trimmed.ends_with("BAGS") {
+    } else if trimmed.ends_with("BAGS")
+        || trimmed.ends_with("brrr")
+        || trimmed.ends_with("moon")
+        || trimmed.ends_with("daos")
+    {
         Some(TradeVenueFamily::MeteoraDbc)
     } else {
         None
     }
 }
 
-fn first_successful_family(
-    family_order: &[TradeVenueFamily],
-    pump: Option<LifecycleAndCanonicalMarket>,
-    bonk: Option<LifecycleAndCanonicalMarket>,
-    bags: Option<LifecycleAndCanonicalMarket>,
+#[derive(Debug, Clone)]
+enum FamilyPlanRaceStatus {
+    Pending,
+    Miss,
+    Hit(LifecycleAndCanonicalMarket),
+    Failed(String),
+}
+
+fn first_priority_ready_selector(
+    statuses: &[FamilyPlanRaceStatus],
 ) -> Option<LifecycleAndCanonicalMarket> {
-    for family in family_order {
-        match family {
-            TradeVenueFamily::PumpBondingCurve | TradeVenueFamily::PumpAmm => {
-                if let Some(selector) = pump.clone() {
-                    return Some(selector);
-                }
-            }
-            TradeVenueFamily::RaydiumAmmV4 => {}
-            TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium => {
-                if let Some(selector) = bonk.clone() {
-                    return Some(selector);
-                }
-            }
-            TradeVenueFamily::MeteoraDbc | TradeVenueFamily::MeteoraDammV2 => {
-                if let Some(selector) = bags.clone() {
-                    return Some(selector);
-                }
-            }
-            TradeVenueFamily::TrustedStableSwap => {}
+    for status in statuses {
+        match status {
+            FamilyPlanRaceStatus::Pending => return None,
+            FamilyPlanRaceStatus::Hit(selector) => return Some(selector.clone()),
+            FamilyPlanRaceStatus::Miss | FamilyPlanRaceStatus::Failed(_) => {}
         }
     }
     None
 }
 
+async fn race_no_suffix_family_plans(
+    rpc_url: &str,
+    request: &TradeRuntimeRequest,
+    cache_mode: RouteCacheMode,
+) -> Result<Option<LifecycleAndCanonicalMarket>, String> {
+    let family_order = planner_family_order();
+    let mut statuses = vec![FamilyPlanRaceStatus::Pending; family_order.len()];
+    let mut futures = FuturesUnordered::new();
+    for (index, family) in family_order.iter().cloned().enumerate() {
+        futures.push(async move {
+            let result = resolve_family_plan(rpc_url, request, &family, cache_mode).await;
+            (index, family, result)
+        });
+    }
+
+    while let Some((index, family, result)) = futures.next().await {
+        match result {
+            Ok(Some(selector)) => {
+                eprintln!(
+                    "[execution-engine][dispatch] priority-race branch resolved mint={} family={}",
+                    request.mint,
+                    family.label()
+                );
+                statuses[index] = FamilyPlanRaceStatus::Hit(selector);
+            }
+            Ok(None) => {
+                statuses[index] = FamilyPlanRaceStatus::Miss;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[execution-engine][dispatch] priority-race branch failed for mint {} family={}: {}",
+                    request.mint,
+                    family.label(),
+                    error
+                );
+                statuses[index] = FamilyPlanRaceStatus::Failed(error);
+            }
+        }
+
+        if let Some(selector) = first_priority_ready_selector(&statuses) {
+            eprintln!(
+                "[execution-engine][dispatch] priority-race selected mint={} family={} aborting_lower_priority=true",
+                request.mint,
+                selector.family.label()
+            );
+            return Ok(Some(selector));
+        }
+    }
+
+    let branch_errors = family_order
+        .iter()
+        .zip(statuses.iter())
+        .filter_map(|(family, status)| match status {
+            FamilyPlanRaceStatus::Failed(error) => Some(format!("{}: {error}", family.label())),
+            FamilyPlanRaceStatus::Pending
+            | FamilyPlanRaceStatus::Miss
+            | FamilyPlanRaceStatus::Hit(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if !branch_errors.is_empty() {
+        return Err(route_error(
+            "route_resolution_failed",
+            format!(
+                "No canonical route could be resolved for mint {}. Branch failures: {}",
+                request.mint,
+                branch_errors.join(" | ")
+            ),
+        ));
+    }
+    Ok(None)
+}
+
+async fn race_no_suffix_family_plans_with_optional_prefetch(
+    rpc_url: &str,
+    request: &TradeRuntimeRequest,
+    cache_mode: RouteCacheMode,
+) -> Result<Option<LifecycleAndCanonicalMarket>, String> {
+    if !no_suffix_pda_prefetch_enabled() || request.pinned_pool.is_some() {
+        return race_no_suffix_family_plans(rpc_url, request, cache_mode).await;
+    }
+
+    let prefetch = prefetch_no_suffix_deterministic_accounts(rpc_url, request);
+    let race = race_no_suffix_family_plans(rpc_url, request, cache_mode);
+    tokio::pin!(prefetch);
+    tokio::pin!(race);
+    tokio::select! {
+        result = &mut race => result,
+        _ = &mut prefetch => race.await,
+    }
+}
+
 pub async fn resolve_trade_plan(
     request: &TradeRuntimeRequest,
 ) -> Result<TradeDispatchPlan, String> {
-    resolve_trade_plan_with_route_index(request).await
+    let (result, metrics) =
+        crate::route_metrics::collect_route_metrics(resolve_trade_plan_with_route_index(request))
+            .await;
+    log_route_plan_metrics(request, &result, false, &metrics);
+    result
 }
 
 pub(crate) async fn resolve_trade_plan_fresh(
     request: &TradeRuntimeRequest,
 ) -> Result<TradeDispatchPlan, String> {
-    let rpc_url = configured_rpc_url();
-    let key = route_index_key_for_request(request, &rpc_url);
-    shared_route_index().invalidate(&key).await;
-    resolve_trade_plan_with_cache_mode(request, RouteCacheMode::BypassCached).await
+    let (result, metrics) = crate::route_metrics::collect_route_metrics(async {
+        let rpc_url = configured_rpc_url();
+        let key = route_index_key_for_request(request, &rpc_url);
+        shared_route_index().invalidate(&key).await;
+        resolve_trade_plan_with_cache_mode(request, RouteCacheMode::BypassCached).await
+    })
+    .await;
+    log_route_plan_metrics(request, &result, true, &metrics);
+    result
+}
+
+fn log_route_plan_metrics(
+    request: &TradeRuntimeRequest,
+    result: &Result<TradeDispatchPlan, String>,
+    force_fresh: bool,
+    metrics: &crate::route_metrics::RouteMetricsSnapshot,
+) {
+    let input_kind = route_metrics_input_kind(request, result);
+    match result {
+        Ok(plan) => {
+            eprintln!(
+                "[execution-engine][route-metrics] phase=plan mint={} family={} lifecycle={} input_kind={} force_fresh={} elapsed_ms={} rpc_total={} rpc_methods={}",
+                request.mint,
+                plan.selector.family.label(),
+                plan.selector.lifecycle.label(),
+                input_kind,
+                force_fresh,
+                metrics.elapsed_ms,
+                metrics.rpc_total(),
+                metrics.rpc_methods_json()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "[execution-engine][route-metrics] phase=plan mint={} family=unresolved input_kind={} force_fresh={} elapsed_ms={} rpc_total={} rpc_methods={} error_code={:?}",
+                request.mint,
+                input_kind,
+                force_fresh,
+                metrics.elapsed_ms,
+                metrics.rpc_total(),
+                metrics.rpc_methods_json(),
+                route_error_code(error)
+            );
+        }
+    }
+}
+
+fn route_metrics_input_kind(
+    request: &TradeRuntimeRequest,
+    result: &Result<TradeDispatchPlan, String>,
+) -> &'static str {
+    if request.pinned_pool.as_deref().is_some_and(|pool| {
+        let pool = pool.trim();
+        !pool.is_empty() && pool != request.mint.trim()
+    }) {
+        return "mint+pair";
+    }
+    match result {
+        Ok(plan) => plan.resolved_input_kind.label(),
+        Err(_) => "raw",
+    }
 }
 
 async fn resolve_trade_plan_with_route_index(
@@ -812,6 +1087,80 @@ fn route_error_message(error: &str) -> &str {
         .unwrap_or(error)
 }
 
+async fn prefetch_classifier_accounts(
+    rpc_url: &str,
+    mint: &str,
+    pinned_pool: Option<&str>,
+    commitment: &str,
+) {
+    let Some(pool) = pinned_pool.map(str::trim).filter(|value| {
+        !value.is_empty() && *value != mint.trim() && trusted_stable_route_for_pool(value).is_none()
+    }) else {
+        return;
+    };
+    let accounts = vec![mint.trim().to_string(), pool.to_string()];
+    if let Err(error) = fetch_multiple_account_owner_and_data(rpc_url, &accounts, commitment).await
+    {
+        eprintln!(
+            "[execution-engine][dispatch] classifier prefetch ignored mint={} pair={} error={}",
+            mint, pool, error
+        );
+    }
+}
+
+fn no_suffix_pda_prefetch_enabled() -> bool {
+    std::env::var("ROUTE_PDA_PREFLIGHT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn prefetch_no_suffix_deterministic_accounts(rpc_url: &str, request: &TradeRuntimeRequest) {
+    if !no_suffix_pda_prefetch_enabled() || request.pinned_pool.is_some() {
+        return;
+    }
+    let Ok(mint) = Pubkey::from_str(request.mint.trim()) else {
+        return;
+    };
+    let mut accounts = vec![mint.to_string()];
+    if let Ok(bonding_curve) = bonding_curve_pda(&mint) {
+        accounts.push(bonding_curve.to_string());
+    }
+    if let Ok(pump_amm_pool) = canonical_pump_amm_pool(&mint) {
+        accounts.push(pump_amm_pool.to_string());
+    }
+    accounts.sort();
+    accounts.dedup();
+    if accounts.len() <= 1 {
+        return;
+    }
+    let started_at = std::time::Instant::now();
+    match fetch_multiple_account_owner_and_data(rpc_url, &accounts, &request.policy.commitment)
+        .await
+    {
+        Ok(results) => {
+            let existing = results.iter().filter(|entry| entry.is_some()).count();
+            eprintln!(
+                "[execution-engine][dispatch] no-suffix-pda-prefetch mint={} accounts={} existing={} elapsed_ms={}",
+                request.mint,
+                accounts.len(),
+                existing,
+                started_at.elapsed().as_millis()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "[execution-engine][dispatch] no-suffix-pda-prefetch ignored mint={} error={}",
+                request.mint, error
+            );
+        }
+    }
+}
+
 async fn resolve_trade_plan_with_cache_mode(
     request: &TradeRuntimeRequest,
     cache_mode: RouteCacheMode,
@@ -851,6 +1200,13 @@ async fn resolve_trade_plan_with_cache_mode(
             let pool = pool.trim();
             !pool.is_empty() && pool != request.mint.trim()
         }) {
+            prefetch_classifier_accounts(
+                &rpc_url,
+                &request.mint,
+                request.pinned_pool.as_deref(),
+                &request.policy.commitment,
+            )
+            .await;
             let (primary, companion) = tokio::join!(
                 try_classify_route_descriptor(&rpc_url, &request.mint, &request.policy.commitment),
                 try_classify_companion_pair_descriptor(
@@ -1078,89 +1434,13 @@ async fn resolve_trade_plan_with_cache_mode(
         }
     }
 
-    let family_order = planner_family_order();
     let resolved_selector = {
         eprintln!(
-            "[execution-engine][dispatch] mint-fallback mode=concurrent mint={}",
+            "[execution-engine][dispatch] mint-fallback mode=priority-race mint={}",
             effective_request.mint
         );
-        let (pump_result, bonk_result, bags_result) = tokio::join!(
-            resolve_family_plan(
-                &rpc_url,
-                &effective_request,
-                &TradeVenueFamily::PumpBondingCurve,
-                cache_mode
-            ),
-            resolve_family_plan(
-                &rpc_url,
-                &effective_request,
-                &TradeVenueFamily::BonkLaunchpad,
-                cache_mode
-            ),
-            resolve_family_plan(
-                &rpc_url,
-                &effective_request,
-                &TradeVenueFamily::MeteoraDbc,
-                cache_mode
-            ),
-        );
-        let mut branch_errors = Vec::new();
-        let pump_selector = match pump_result {
-            Ok(selector) => selector,
-            Err(error) => {
-                eprintln!(
-                    "[execution-engine][dispatch] concurrent pump branch failed for mint {}: {}",
-                    effective_request.mint, error
-                );
-                branch_errors.push(format!("pump: {error}"));
-                None
-            }
-        };
-        let bonk_selector = match bonk_result {
-            Ok(selector) => selector,
-            Err(error) => {
-                eprintln!(
-                    "[execution-engine][dispatch] concurrent bonk branch failed for mint {}: {}",
-                    effective_request.mint, error
-                );
-                branch_errors.push(format!("bonk: {error}"));
-                None
-            }
-        };
-        let bags_selector = match bags_result {
-            Ok(selector) => selector,
-            Err(error) => {
-                eprintln!(
-                    "[execution-engine][dispatch] concurrent bags branch failed for mint {}: {}",
-                    effective_request.mint, error
-                );
-                branch_errors.push(format!("bags: {error}"));
-                None
-            }
-        };
-        let success_count = usize::from(pump_selector.is_some())
-            + usize::from(bonk_selector.is_some())
-            + usize::from(bags_selector.is_some());
-        if success_count == 0 && !branch_errors.is_empty() {
-            return Err(route_error(
-                "route_resolution_failed",
-                format!(
-                    "No canonical route could be resolved for mint {}. Branch failures: {}",
-                    effective_request.mint,
-                    branch_errors.join(" | ")
-                ),
-            ));
-        }
-        if success_count > 1 {
-            return Err(route_error(
-                "ambiguous_canonical_route",
-                format!(
-                    "Multiple canonical route families matched mint {}; refusing to choose a fallback order.",
-                    effective_request.mint
-                ),
-            ));
-        }
-        first_successful_family(&family_order, pump_selector, bonk_selector, bags_selector)
+        race_no_suffix_family_plans_with_optional_prefetch(&rpc_url, &effective_request, cache_mode)
+            .await?
     };
 
     if let Some(selector) = resolved_selector {
@@ -1188,7 +1468,7 @@ async fn resolve_trade_plan_with_cache_mode(
     }
     shared_warm_metrics().record_unresolved();
     eprintln!(
-        "[execution-engine][dispatch] no adapter matched address {} (probed pump, bonk, bags/meteora mint discovery; explicit Raydium v4 requires a pool address)",
+        "[execution-engine][dispatch] no adapter matched address {} (probed pump, bonk, launchlab, bags/meteora mint discovery; explicit Raydium v4 requires a pool address)",
         request.mint
     );
     Err(route_error(
@@ -1201,7 +1481,7 @@ async fn resolve_trade_plan_with_cache_mode(
             "unsupported_address"
         },
         format!(
-            "No supported execution venue for address {}. Mint inputs probe Pump, Bonk, and Bags only; Raydium AMM v4 requires submitting the verified pool address.",
+            "No supported execution venue for address {}. Mint inputs probe Pump, Bonk, LaunchLab, and Bags; Raydium AMM v4 requires submitting the verified pool address.",
             request.mint
         ),
     ))
@@ -1331,6 +1611,18 @@ fn selector_matches_trade_side(
             crate::trade_planner::WrapperAction::RaydiumAmmV4WsolSell,
             crate::extension_api::TradeSide::Sell
         ) | (
+            crate::trade_planner::WrapperAction::RaydiumCpmmWsolBuy,
+            crate::extension_api::TradeSide::Buy
+        ) | (
+            crate::trade_planner::WrapperAction::RaydiumCpmmWsolSell,
+            crate::extension_api::TradeSide::Sell
+        ) | (
+            crate::trade_planner::WrapperAction::RaydiumLaunchLabSolBuy,
+            crate::extension_api::TradeSide::Buy
+        ) | (
+            crate::trade_planner::WrapperAction::RaydiumLaunchLabSolSell,
+            crate::extension_api::TradeSide::Sell
+        ) | (
             crate::trade_planner::WrapperAction::BonkLaunchpadSolBuy,
             crate::extension_api::TradeSide::Buy
         ) | (
@@ -1393,19 +1685,42 @@ fn sell_settlement_asset_label(asset: TradeSettlementAsset) -> &'static str {
 }
 
 fn route_policy_label(request: &TradeRuntimeRequest) -> String {
+    let fee_bps = crate::rollout::wrapper_default_fee_bps();
     match request.side {
         crate::extension_api::TradeSide::Buy => {
             format!(
-                "buy:{}",
-                buy_funding_policy_label(request.policy.buy_funding_policy)
+                "buy:{}:wrapper_fee_bps={}:conversion={}",
+                buy_funding_policy_label(request.policy.buy_funding_policy),
+                fee_bps,
+                route_policy_conversion_label(request)
             )
         }
         crate::extension_api::TradeSide::Sell => {
             format!(
-                "sell:{}",
-                sell_settlement_asset_label(request.policy.sell_settlement_asset)
+                "sell:{}:wrapper_fee_bps={}:conversion={}",
+                sell_settlement_asset_label(request.policy.sell_settlement_asset),
+                fee_bps,
+                route_policy_conversion_label(request)
             )
         }
+    }
+}
+
+fn route_policy_conversion_label(request: &TradeRuntimeRequest) -> &'static str {
+    match request.side {
+        crate::extension_api::TradeSide::Buy
+            if request.policy.buy_funding_policy
+                != crate::extension_api::BuyFundingPolicy::SolOnly =>
+        {
+            "to_sol_in"
+        }
+        crate::extension_api::TradeSide::Sell
+            if request.policy.sell_settlement_asset
+                != crate::extension_api::TradeSettlementAsset::Sol =>
+        {
+            "to_sol_out"
+        }
+        _ => "none",
     }
 }
 
@@ -1426,6 +1741,12 @@ pub async fn compile_trade_for_adapter(
         TradeAdapter::PumpNative => compile_pump_trade(selector, request, wallet_key).await,
         TradeAdapter::RaydiumAmmV4Native => {
             compile_raydium_amm_v4_trade(selector, request, wallet_key).await
+        }
+        TradeAdapter::RaydiumCpmmNative => {
+            compile_raydium_cpmm_trade(selector, request, wallet_key).await
+        }
+        TradeAdapter::RaydiumLaunchLabNative => {
+            compile_raydium_launchlab_trade(selector, request, wallet_key).await
         }
         TradeAdapter::BonkNative => compile_bonk_trade(selector, request, wallet_key).await,
         TradeAdapter::MeteoraNative => compile_meteora_trade(selector, request, wallet_key).await,
@@ -1484,6 +1805,17 @@ mod tests {
         )
     }
 
+    #[test]
+    fn route_policy_ignores_source_platform_label() {
+        let mut axiom = test_runtime_request();
+        axiom.platform_label = Some("axiom".to_string());
+        let mut j7 = test_runtime_request();
+        j7.platform_label = Some("j7".to_string());
+
+        assert_eq!(route_policy_label(&axiom), route_policy_label(&j7));
+        assert!(!route_policy_label(&axiom).contains("platform="));
+    }
+
     fn test_bonk_selector(canonical_market_key: &str) -> LifecycleAndCanonicalMarket {
         LifecycleAndCanonicalMarket {
             lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
@@ -1495,6 +1827,111 @@ mod tests {
             wrapper_accounts: vec![canonical_market_key.to_string()],
             market_subtype: Some("canonical-raydium".to_string()),
             direct_protocol_target: Some("raydium".to_string()),
+            input_amount_hint: Some("0.5".to_string()),
+            minimum_output_hint: None,
+            runtime_bundle: None,
+        }
+    }
+
+    #[test]
+    fn priority_race_waits_for_higher_priority_branches() {
+        let bonk = test_bonk_selector("bonk-pool");
+        let mut statuses = vec![
+            FamilyPlanRaceStatus::Pending,
+            FamilyPlanRaceStatus::Hit(bonk.clone()),
+            FamilyPlanRaceStatus::Pending,
+            FamilyPlanRaceStatus::Pending,
+        ];
+        assert!(first_priority_ready_selector(&statuses).is_none());
+
+        statuses[0] = FamilyPlanRaceStatus::Miss;
+        let selected = first_priority_ready_selector(&statuses).expect("bonk ready");
+        assert_eq!(selected.family, TradeVenueFamily::BonkRaydium);
+        assert_eq!(selected.canonical_market_key, "bonk-pool");
+    }
+
+    #[test]
+    fn route_metrics_input_kind_labels_pair_and_mint_pair() {
+        let mut mint_request = test_runtime_request();
+        mint_request.pinned_pool = None;
+        let mut pair_plan = TradeDispatchPlan {
+            adapter: TradeAdapter::BonkNative,
+            selector: test_bonk_selector("bonk-pool"),
+            execution_backend: crate::rollout::TradeExecutionBackend::Native,
+            raw_address: "bonk-pool".to_string(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: "Mint111".to_string(),
+            resolved_pinned_pool: Some("bonk-pool".to_string()),
+            non_canonical: false,
+        };
+        assert_eq!(
+            route_metrics_input_kind(&mint_request, &Ok(pair_plan.clone())),
+            "pair"
+        );
+
+        pair_plan.resolved_input_kind = TradeInputKind::Mint;
+        assert_eq!(
+            route_metrics_input_kind(&mint_request, &Ok(pair_plan)),
+            "mint"
+        );
+
+        let mut mint_pair_request = test_runtime_request();
+        mint_pair_request.mint = "Mint111".to_string();
+        mint_pair_request.pinned_pool = Some("Pool222".to_string());
+        assert_eq!(
+            route_metrics_input_kind(
+                &mint_pair_request,
+                &Err("[unsupported_mint] unsupported".to_string())
+            ),
+            "mint+pair"
+        );
+    }
+
+    fn test_launchlab_selector(canonical_market_key: &str) -> LifecycleAndCanonicalMarket {
+        LifecycleAndCanonicalMarket {
+            lifecycle: crate::trade_planner::TradeLifecycle::PreMigration,
+            family: TradeVenueFamily::RaydiumLaunchLab,
+            canonical_market_key: canonical_market_key.to_string(),
+            quote_asset: crate::trade_planner::PlannerQuoteAsset::Sol,
+            verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+            wrapper_action: crate::trade_planner::WrapperAction::RaydiumLaunchLabSolBuy,
+            wrapper_accounts: vec![canonical_market_key.to_string()],
+            market_subtype: Some("launchlab-active".to_string()),
+            direct_protocol_target: Some("raydium-launchlab".to_string()),
+            input_amount_hint: Some("0.5".to_string()),
+            minimum_output_hint: None,
+            runtime_bundle: None,
+        }
+    }
+
+    fn test_raydium_amm_v4_selector(canonical_market_key: &str) -> LifecycleAndCanonicalMarket {
+        LifecycleAndCanonicalMarket {
+            lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
+            family: TradeVenueFamily::RaydiumAmmV4,
+            canonical_market_key: canonical_market_key.to_string(),
+            quote_asset: crate::trade_planner::PlannerQuoteAsset::Wsol,
+            verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+            wrapper_action: crate::trade_planner::WrapperAction::RaydiumAmmV4WsolBuy,
+            wrapper_accounts: vec![canonical_market_key.to_string()],
+            market_subtype: Some("amm-v4".to_string()),
+            direct_protocol_target: Some("raydium-amm-v4".to_string()),
+            input_amount_hint: Some("0.5".to_string()),
+            minimum_output_hint: None,
+            runtime_bundle: None,
+        }
+    }
+
+    fn test_raydium_cpmm_selector(canonical_market_key: &str) -> LifecycleAndCanonicalMarket {
+        LifecycleAndCanonicalMarket {
+            lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
+            family: TradeVenueFamily::RaydiumCpmm,
+            canonical_market_key: canonical_market_key.to_string(),
+            quote_asset: crate::trade_planner::PlannerQuoteAsset::Wsol,
+            verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+            wrapper_action: crate::trade_planner::WrapperAction::RaydiumCpmmWsolBuy,
+            wrapper_accounts: vec![canonical_market_key.to_string()],
+            market_subtype: Some("cpmm".to_string()),
+            direct_protocol_target: Some("raydium-cpmm".to_string()),
             input_amount_hint: Some("0.5".to_string()),
             minimum_output_hint: None,
             runtime_bundle: None,
@@ -1615,6 +2052,25 @@ mod tests {
             })
             .expect("adapter"),
             TradeAdapter::RaydiumAmmV4Native
+        ));
+        assert!(matches!(
+            adapter_for_selector(&LifecycleAndCanonicalMarket {
+                lifecycle: crate::trade_planner::TradeLifecycle::PreMigration,
+                family: TradeVenueFamily::RaydiumLaunchLab,
+                canonical_market_key: "pool".to_string(),
+                quote_asset: crate::trade_planner::PlannerQuoteAsset::Sol,
+                verification_source:
+                    crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+                wrapper_action: crate::trade_planner::WrapperAction::RaydiumLaunchLabSolBuy,
+                wrapper_accounts: Vec::new(),
+                market_subtype: Some("launchlab-active".to_string()),
+                direct_protocol_target: Some("raydium-launchlab".to_string()),
+                input_amount_hint: None,
+                minimum_output_hint: None,
+                runtime_bundle: None,
+            })
+            .expect("adapter"),
+            TradeAdapter::RaydiumLaunchLabNative
         ));
     }
 
@@ -2103,18 +2559,37 @@ mod tests {
     }
 
     #[test]
-    fn planner_family_order_is_hint_free() {
+    fn planner_family_order_includes_launchlab_without_suffix_fast_path() {
         let order = planner_family_order();
 
         assert!(matches!(
             order.first(),
             Some(TradeVenueFamily::PumpBondingCurve)
         ));
+        assert!(matches!(
+            order.get(2),
+            Some(TradeVenueFamily::RaydiumLaunchLab)
+        ));
+        assert_eq!(preferred_family_for_mint_suffix("TokenLaunchLab"), None);
+    }
+
+    #[test]
+    fn meteora_suffixes_use_generic_meteora_fast_path() {
+        for mint in [
+            "5pmJkpsb78BbGKczXzzXwmQ1xuZS4prUkm6YwrQKbrrr",
+            "4168osQ3gt5hLET4vFJxiJ3Tw1ZJA1anHbjdex5Amoon",
+            "B816wyHj3bcfFnYzGRGkRpFEfE974CHLHSptzo9sdaos",
+            "CkAmbNo5pLZT4eziCrvckpXcPRPMPuqDqpifmzT7BAGS",
+        ] {
+            assert_eq!(
+                preferred_family_for_mint_suffix(mint),
+                Some(TradeVenueFamily::MeteoraDbc)
+            );
+        }
     }
 
     #[test]
     fn concurrent_family_tiebreak_uses_stable_order() {
-        let order = planner_family_order();
         let pump_selector = LifecycleAndCanonicalMarket {
             lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
             family: TradeVenueFamily::PumpAmm,
@@ -2130,15 +2605,101 @@ mod tests {
             runtime_bundle: None,
         };
 
-        let selected = first_successful_family(
-            &order,
-            Some(pump_selector),
-            None,
-            Some(test_bags_selector("bags-pool")),
-        )
-        .expect("expected selector");
+        let statuses = vec![
+            FamilyPlanRaceStatus::Hit(pump_selector),
+            FamilyPlanRaceStatus::Miss,
+            FamilyPlanRaceStatus::Miss,
+            FamilyPlanRaceStatus::Hit(test_bags_selector("bags-pool")),
+        ];
+        let selected = first_priority_ready_selector(&statuses).expect("expected selector");
 
         assert!(matches!(selected.family, TradeVenueFamily::PumpAmm));
         assert_eq!(selected.canonical_market_key, "pump-pool");
+    }
+
+    #[test]
+    fn launchlab_tiebreaks_before_bags_when_both_match() {
+        let statuses = vec![
+            FamilyPlanRaceStatus::Miss,
+            FamilyPlanRaceStatus::Miss,
+            FamilyPlanRaceStatus::Hit(test_launchlab_selector("launchlab-pool")),
+            FamilyPlanRaceStatus::Hit(test_bags_selector("bags-pool")),
+        ];
+        let selected = first_priority_ready_selector(&statuses).expect("expected selector");
+
+        assert!(matches!(
+            selected.family,
+            TradeVenueFamily::RaydiumLaunchLab
+        ));
+        assert_eq!(selected.canonical_market_key, "launchlab-pool");
+    }
+
+    #[test]
+    fn migrated_launchlab_pair_resolves_to_verified_raydium_destination() {
+        let request = test_runtime_request();
+        let descriptor = RouteDescriptor {
+            raw_address: "launchlab-pool".to_string(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: "Mint111".to_string(),
+            resolved_pair: Some("launchlab-pool".to_string()),
+            route_locked_pair: Some("launchlab-pool".to_string()),
+            family: Some(TradeVenueFamily::RaydiumLaunchLab),
+            lifecycle: Some(crate::trade_planner::TradeLifecycle::PostMigration),
+            quote_asset: Some(crate::trade_planner::PlannerQuoteAsset::Sol),
+            canonical_market_key: Some("launchlab-pool".to_string()),
+            non_canonical: false,
+        };
+
+        let plan = build_dispatch_plan(
+            "launchlab-pool",
+            &request,
+            Some(&descriptor),
+            test_raydium_amm_v4_selector("raydium-amm-v4-pool"),
+        )
+        .expect("plan");
+
+        assert_eq!(
+            plan.resolved_pinned_pool.as_deref(),
+            Some("raydium-amm-v4-pool")
+        );
+        assert!(matches!(
+            plan.selector.family,
+            TradeVenueFamily::RaydiumAmmV4
+        ));
+    }
+
+    #[test]
+    fn migrated_launchlab_pair_resolves_to_verified_cpmm_destination() {
+        let request = test_runtime_request();
+        let descriptor = RouteDescriptor {
+            raw_address: "launchlab-pool".to_string(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: "Mint111".to_string(),
+            resolved_pair: Some("launchlab-pool".to_string()),
+            route_locked_pair: Some("launchlab-pool".to_string()),
+            family: Some(TradeVenueFamily::RaydiumLaunchLab),
+            lifecycle: Some(crate::trade_planner::TradeLifecycle::PostMigration),
+            quote_asset: Some(crate::trade_planner::PlannerQuoteAsset::Sol),
+            canonical_market_key: Some("launchlab-pool".to_string()),
+            non_canonical: false,
+        };
+
+        let plan = build_dispatch_plan(
+            "launchlab-pool",
+            &request,
+            Some(&descriptor),
+            test_raydium_cpmm_selector("raydium-cpmm-pool"),
+        )
+        .expect("plan");
+
+        assert_eq!(
+            plan.resolved_pinned_pool.as_deref(),
+            Some("raydium-cpmm-pool")
+        );
+        assert!(matches!(plan.adapter, TradeAdapter::RaydiumCpmmNative));
+        assert!(matches!(
+            plan.selector.family,
+            TradeVenueFamily::RaydiumCpmm
+        ));
     }
 }

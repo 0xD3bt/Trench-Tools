@@ -1,6 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use shared_execution_routing::alt_manifest::{
     AltManifestEntry, PUMP_APR28_FEE_RECIPIENTS, lookup_table_address_content_hash,
+    shared_alt_manifest_entries,
 };
 use shared_transaction_submit::{compiled_transaction_signers, fetch_multiple_account_data};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
@@ -23,7 +24,7 @@ use spl_token::instruction::{
     close_account as close_spl_account, initialize_account3, sync_native,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     str::FromStr,
@@ -150,17 +151,15 @@ const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
-const PUMP_BUY_COMPUTE_UNIT_LIMIT: u32 = 200_000;
-const PUMP_SELL_COMPUTE_UNIT_LIMIT: u32 = 200_000;
-const PUMP_AMM_BUY_COMPUTE_UNIT_LIMIT: u32 = 220_000;
-const PUMP_AMM_SELL_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+const PUMP_BUY_COMPUTE_UNIT_LIMIT: u32 = 280_000;
+const PUMP_SELL_COMPUTE_UNIT_LIMIT: u32 = 280_000;
+const PUMP_AMM_BUY_COMPUTE_UNIT_LIMIT: u32 = 280_000;
+const PUMP_AMM_SELL_COMPUTE_UNIT_LIMIT: u32 = 280_000;
 const SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const SHARED_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc";
-const SHARED_SUPER_LOOKUP_TABLE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 struct SharedLookupTableCacheEntry {
-    fetched_at: Instant,
     table: AddressLookupTableAccount,
 }
 
@@ -176,6 +175,8 @@ struct PersistedLookupTableEntry {
     address_count: Option<usize>,
     #[serde(default)]
     content_hash: Option<String>,
+    #[serde(default)]
+    manifest_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -492,24 +493,13 @@ pub async fn compile_pump_trade(
         .await;
     }
 
-    let global = fetch_global_state(&rpc_url).await?;
     let curve = curve.expect("bonding-curve state present when not complete");
-    let (creator_vault_authority, is_mayhem_mode, is_cashback_coin) =
-        match selector.runtime_bundle.as_ref() {
-            Some(PlannerRuntimeBundle::PumpBondingCurve(bundle)) => (
-                parse_pubkey(
-                    &bundle.creator_vault_authority,
-                    "pump creator vault authority",
-                )?,
-                bundle.is_mayhem_mode,
-                bundle.is_cashback_coin,
-            ),
-            _ => (
-                resolve_follow_creator_vault_authority(&rpc_url, &mint, &curve.creator).await?,
-                curve.is_mayhem_mode,
-                curve.cashback_enabled,
-            ),
-        };
+    let (global, creator_vault_authority) = tokio::try_join!(
+        fetch_global_state(&rpc_url),
+        resolve_follow_creator_vault_authority(&rpc_url, &mint, &curve.creator),
+    )?;
+    let is_mayhem_mode = curve.is_mayhem_mode;
+    let is_cashback_coin = curve.cashback_enabled;
     let slippage_bps = parse_slippage_bps(Some(request.policy.slippage_percent.as_str()))?;
     let compute_unit_limit = match request.side {
         TradeSide::Buy => PUMP_BUY_COMPUTE_UNIT_LIMIT,
@@ -577,7 +567,7 @@ pub async fn compile_pump_trade(
         }
     };
     if jitodontfront_enabled {
-        apply_jitodontfront(&mut core_instructions)?;
+        apply_jitodontfront(&mut core_instructions, &owner_pubkey)?;
     }
 
     let mut instructions = vec![build_compute_unit_limit_instruction(compute_unit_limit)?];
@@ -755,6 +745,14 @@ fn load_persisted_shared_lookup_table_account(address: &str) -> Option<AddressLo
         .ok()
         .and_then(|raw| serde_json::from_str::<PersistedLookupTableCache>(&raw).ok())?;
     let entry = cache.tables.get(address)?;
+    let manifest_hash = shared_alt_manifest_hash();
+    if entry.manifest_hash.as_deref() != Some(manifest_hash.as_str()) {
+        eprintln!(
+            "[execution-engine][alt-cache] ignoring stale shared ALT snapshot {} due to manifest hash mismatch",
+            address
+        );
+        return None;
+    }
     if entry.address_count != Some(entry.addresses.len()) {
         eprintln!(
             "[execution-engine][alt-cache] ignoring stale shared ALT snapshot {} due to missing/mismatched address count",
@@ -777,7 +775,15 @@ fn load_persisted_shared_lookup_table_account(address: &str) -> Option<AddressLo
         .map(|value| parse_pubkey(value, "shared super alt address entry"))
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
-    Some(AddressLookupTableAccount { key, addresses })
+    let table = AddressLookupTableAccount { key, addresses };
+    if !shared_lookup_table_satisfies_manifest(&table) {
+        eprintln!(
+            "[execution-engine][alt-cache] ignoring stale shared ALT snapshot {} because it is missing current manifest addresses",
+            address
+        );
+        return None;
+    }
+    Some(table)
 }
 
 fn persist_shared_lookup_table_account(
@@ -796,12 +802,14 @@ fn persist_shared_lookup_table_account(
         .collect::<Vec<_>>();
     let address_count = addresses.len();
     let content_hash = lookup_table_address_content_hash(&addresses);
+    let manifest_hash = shared_alt_manifest_hash();
     cache.tables.insert(
         address.to_string(),
         PersistedLookupTableEntry {
             addresses,
             address_count: Some(address_count),
             content_hash: Some(content_hash),
+            manifest_hash: Some(manifest_hash),
         },
     );
     if let Some(parent) = path.parent() {
@@ -814,48 +822,139 @@ fn persist_shared_lookup_table_account(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn load_shared_super_lookup_tables(
+fn shared_lookup_table_missing_manifest_addresses(
+    table: &AddressLookupTableAccount,
+) -> Vec<String> {
+    let loaded = table
+        .addresses
+        .iter()
+        .map(Pubkey::to_string)
+        .collect::<HashSet<_>>();
+    shared_alt_manifest_entries()
+        .into_iter()
+        .filter(|entry| entry.required)
+        .filter(|entry| entry.family != "shared-alt")
+        .map(|entry| entry.address)
+        .filter(|address| !loaded.contains(address))
+        .collect()
+}
+
+fn shared_lookup_table_satisfies_manifest(table: &AddressLookupTableAccount) -> bool {
+    shared_lookup_table_missing_manifest_addresses(table).is_empty()
+}
+
+fn shared_alt_manifest_hash() -> String {
+    let manifest_fingerprint = shared_alt_manifest_entries()
+        .into_iter()
+        .filter(|entry| entry.required)
+        .filter(|entry| entry.family != "shared-alt")
+        .map(|entry| {
+            format!(
+                "{}|{}|{}|{}",
+                entry.address, entry.family, entry.label, entry.required
+            )
+        })
+        .collect::<Vec<_>>();
+    lookup_table_address_content_hash(&manifest_fingerprint)
+}
+
+async fn fetch_live_shared_lookup_table_account(
     rpc_url: &str,
-) -> Result<Vec<AddressLookupTableAccount>, String> {
-    let address = configured_shared_super_lookup_table();
-    if let Ok(cache) = shared_lookup_table_cache().lock() {
-        if let Some(entry) = cache
-            .get(&address)
-            .filter(|entry| entry.fetched_at.elapsed() <= SHARED_SUPER_LOOKUP_TABLE_CACHE_TTL)
-        {
-            return Ok(vec![entry.table.clone()]);
-        }
-    }
-    if let Some(table) = load_persisted_shared_lookup_table_account(&address) {
-        if let Ok(mut cache) = shared_lookup_table_cache().lock() {
-            cache.insert(
-                address.clone(),
-                SharedLookupTableCacheEntry {
-                    fetched_at: Instant::now(),
-                    table: table.clone(),
-                },
-            );
-        }
-        return Ok(vec![table]);
-    }
-    let data = fetch_account_data(rpc_url, &address, "confirmed").await?;
+    address: &str,
+) -> Result<AddressLookupTableAccount, String> {
+    let data = fetch_account_data(rpc_url, address, "confirmed").await?;
     let table = AddressLookupTable::deserialize(&data)
         .map_err(|error| format!("Failed to decode shared super ALT {address}: {error}"))?;
     let account = AddressLookupTableAccount {
-        key: parse_pubkey(&address, "shared super alt address")?,
+        key: parse_pubkey(address, "shared super alt address")?,
         addresses: table.addresses.to_vec(),
     };
+    let missing = shared_lookup_table_missing_manifest_addresses(&account);
+    if !missing.is_empty() {
+        return Err(format!(
+            "Shared ALT {address} is missing {} current manifest address(es), including {}. Extend the table before compiling shared-ALT routes.",
+            missing.len(),
+            missing.first().cloned().unwrap_or_default()
+        ));
+    }
+    Ok(account)
+}
+
+pub(crate) async fn load_shared_super_lookup_tables(
+    _rpc_url: &str,
+) -> Result<Vec<AddressLookupTableAccount>, String> {
+    let address = configured_shared_super_lookup_table();
+    if let Ok(cache) = shared_lookup_table_cache().lock() {
+        if let Some(entry) = cache.get(&address) {
+            if shared_lookup_table_satisfies_manifest(&entry.table) {
+                return Ok(vec![entry.table.clone()]);
+            }
+            eprintln!(
+                "[execution-engine][alt-cache] ignoring stale in-memory shared ALT snapshot {} because it is missing current manifest addresses",
+                address
+            );
+        }
+    }
+    let account = load_persisted_shared_lookup_table_account(&address).ok_or_else(|| {
+        format!(
+            "Shared ALT {address} was not refreshed at startup and no manifest-matched disk snapshot is available."
+        )
+    })?;
     if let Ok(mut cache) = shared_lookup_table_cache().lock() {
         cache.insert(
-            address,
+            address.clone(),
             SharedLookupTableCacheEntry {
-                fetched_at: Instant::now(),
+                table: account.clone(),
+            },
+        );
+    }
+    Ok(vec![account])
+}
+
+pub(crate) async fn refresh_shared_super_lookup_tables(
+    rpc_url: &str,
+) -> Result<Vec<AddressLookupTableAccount>, String> {
+    let address = configured_shared_super_lookup_table();
+    let account = fetch_live_shared_lookup_table_account(rpc_url, &address).await?;
+    if let Ok(mut cache) = shared_lookup_table_cache().lock() {
+        cache.insert(
+            address.clone(),
+            SharedLookupTableCacheEntry {
                 table: account.clone(),
             },
         );
     }
     let _ = persist_shared_lookup_table_account(&account.key.to_string(), &account);
     Ok(vec![account])
+}
+
+pub(crate) async fn initialize_shared_super_lookup_tables(
+    rpc_url: &str,
+) -> Result<Vec<AddressLookupTableAccount>, String> {
+    match refresh_shared_super_lookup_tables(rpc_url).await {
+        Ok(tables) => Ok(tables),
+        Err(live_error) => {
+            let address = configured_shared_super_lookup_table();
+            let Some(account) = load_persisted_shared_lookup_table_account(&address) else {
+                return Err(format!(
+                    "live shared ALT refresh failed and no manifest-matched disk snapshot is available: {live_error}"
+                ));
+            };
+            eprintln!(
+                "[execution-engine][alt-cache] live shared ALT refresh failed for {}; using manifest-matched disk fallback: {}",
+                address, live_error
+            );
+            if let Ok(mut cache) = shared_lookup_table_cache().lock() {
+                cache.insert(
+                    address,
+                    SharedLookupTableCacheEntry {
+                        table: account.clone(),
+                    },
+                );
+            }
+            Ok(vec![account])
+        }
+    }
 }
 
 fn compile_pump_transaction_candidate(
@@ -1029,22 +1128,33 @@ async fn compile_pump_amm_trade(
         );
     }
 
-    let base_reserve = read_token_account_amount(
-        &fetch_account_data(
-            rpc_url,
-            &pool.pool_base_token_account.to_string(),
-            "confirmed",
+    let reserve_accounts = vec![
+        pool.pool_base_token_account.to_string(),
+        pool.pool_quote_token_account.to_string(),
+    ];
+    let reserve_datas =
+        fetch_multiple_account_data(rpc_url, &reserve_accounts, "confirmed").await?;
+    if reserve_datas.len() != reserve_accounts.len() {
+        return Err(format!(
+            "Pump AMM reserve batch returned {} accounts for {} requested reserves.",
+            reserve_datas.len(),
+            reserve_accounts.len()
+        ));
+    }
+    let base_reserve_data = reserve_datas[0].as_ref().ok_or_else(|| {
+        format!(
+            "Pump AMM base reserve account {} was not found.",
+            reserve_accounts[0]
         )
-        .await?,
-    )?;
-    let quote_reserve = read_token_account_amount(
-        &fetch_account_data(
-            rpc_url,
-            &pool.pool_quote_token_account.to_string(),
-            "confirmed",
+    })?;
+    let quote_reserve_data = reserve_datas[1].as_ref().ok_or_else(|| {
+        format!(
+            "Pump AMM quote reserve account {} was not found.",
+            reserve_accounts[1]
         )
-        .await?,
-    )?;
+    })?;
+    let base_reserve = read_token_account_amount(base_reserve_data)?;
+    let quote_reserve = read_token_account_amount(quote_reserve_data)?;
     if base_reserve == 0 || quote_reserve == 0 {
         return Err("Pump AMM pool reserves are empty.".to_string());
     }
@@ -1288,7 +1398,7 @@ async fn compile_pump_amm_trade(
             (None, None)
         };
     if matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure) {
-        apply_jitodontfront(&mut instructions)?;
+        apply_jitodontfront(&mut instructions, &owner_pubkey)?;
     }
 
     let label = match request.side {
@@ -1510,12 +1620,49 @@ pub(crate) async fn quote_pump_holding_value_sol(
     token_amount_raw: u64,
     commitment: &str,
 ) -> Result<u64, String> {
+    quote_pump_holding_value_sol_with_cache(
+        rpc_url,
+        selector,
+        mint,
+        token_amount_raw,
+        commitment,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn quote_pump_holding_value_sol_fresh(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    mint: &str,
+    token_amount_raw: u64,
+    commitment: &str,
+) -> Result<u64, String> {
+    quote_pump_holding_value_sol_with_cache(
+        rpc_url,
+        selector,
+        mint,
+        token_amount_raw,
+        commitment,
+        false,
+    )
+    .await
+}
+
+async fn quote_pump_holding_value_sol_with_cache(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    mint: &str,
+    token_amount_raw: u64,
+    commitment: &str,
+    use_cache: bool,
+) -> Result<u64, String> {
     if token_amount_raw == 0 {
         return Ok(0);
     }
     let cache_key = pump_quote_snapshot_key(rpc_url, selector, mint, commitment);
-    let cache_ttl = pump_quote_snapshot_ttl(selector);
-    {
+    if use_cache {
+        let cache_ttl = pump_quote_snapshot_ttl(selector);
         let cache = pump_quote_snapshot_cache().lock().await;
         if let Some(entry) = cache.get(&cache_key)
             && entry.fetched_at.elapsed() <= cache_ttl
@@ -1610,7 +1757,7 @@ pub(crate) async fn quote_pump_holding_value_sol(
             selector.family.label()
         ))?,
     };
-    {
+    if use_cache {
         let mut cache = pump_quote_snapshot_cache().lock().await;
         cache.insert(
             cache_key,
@@ -2540,20 +2687,21 @@ fn configured_tip_account() -> Result<Option<Pubkey>, String> {
     }
 }
 
-fn apply_jitodontfront(instructions: &mut [Instruction]) -> Result<(), String> {
-    let dontfront = parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront")?;
-    for instruction in instructions {
-        if instruction
-            .accounts
-            .iter()
-            .any(|account| account.pubkey == dontfront)
-        {
-            continue;
-        }
+fn apply_jitodontfront(instructions: &mut Vec<Instruction>, payer: &Pubkey) -> Result<(), String> {
+    if instructions.iter().any(|instruction| {
         instruction
             .accounts
-            .push(AccountMeta::new_readonly(dontfront, false));
+            .iter()
+            .any(|account| account.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+    }) {
+        return Ok(());
     }
+    let dontfront = parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront")?;
+    let mut instruction = transfer(payer, payer, 0);
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(dontfront, false));
+    instructions.insert(0, instruction);
     Ok(())
 }
 

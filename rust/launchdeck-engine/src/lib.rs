@@ -42,6 +42,7 @@ pub mod transport;
 pub mod ui_bridge;
 pub mod ui_config;
 pub mod vamp;
+pub mod vanity_pool;
 pub mod wallet;
 pub mod warm_manager;
 pub mod wrapper_compile;

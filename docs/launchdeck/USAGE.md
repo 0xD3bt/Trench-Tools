@@ -33,7 +33,7 @@ http://127.0.0.1:8789
 ## First Run Flow
 
 1. Load at least one wallet through `SOLANA_PRIVATE_KEY*`.
-2. Set `SOLANA_RPC_URL`, `SOLANA_WS_URL`, `USER_REGION`, and optionally `WARM_RPC_URL`.
+2. Set `SOLANA_RPC_URL`, `SOLANA_WS_URL`, and `USER_REGION`.
 3. Start with `Helius Sender` or `Hello Moon`.
 4. Create or choose a LaunchDeck preset.
 5. Build.
@@ -56,9 +56,11 @@ LaunchDeck presets control launchpad defaults:
 
 LaunchDeck presets can be edited inside LaunchDeck and from the extension Options page.
 
+Execution-engine presets are separate. Extension token split/consolidate actions use the active execution preset, not the LaunchDeck preset.
+
 ## Metadata And Images
 
-Metadata upload defaults to pump-fun when `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` is blank.
+Metadata upload defaults to the launchpad's native uploader when `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` is blank: pump-fun for Pump, Bonk's upload endpoints for Bonk, and Bags API prepare for Bagsapp.
 
 Use Pinata only when you want it:
 
@@ -68,6 +70,10 @@ PINATA_JWT=YOUR_PINATA_JWT
 ```
 
 The image library is local state. Do not commit uploaded local assets or metadata that you do not intend to publish.
+
+Pump and Bonk use LaunchDeck's shared metadata/IPFS flow. Bagsapp uses the Bags API prepare flow because Bags returns the mint and metadata URI. Pump and Bonk can also use local vanity mint queue files.
+
+See [METADATA_AND_VANITY.md](METADATA_AND_VANITY.md).
 
 ## Reports
 
@@ -81,6 +87,19 @@ Use the Dashboard/Reports surface to review:
 
 See [REPORTING.md](REPORTING.md).
 
+## Runtime Diagnostics
+
+Runtime status and diagnostics can show:
+
+- LaunchDeck host health
+- follow daemon health
+- launchpad backend support status
+- warm-state status
+- vanity queue diagnostics
+- RPC traffic counters when enabled
+
+Use these diagnostics before changing advanced settings. Most first-run issues are `.env`, provider access, auth token, tunnel, or RPC health problems.
+
 ## Follow Automation
 
 Delayed buys, confirmed-block actions, dev-auto-sells, and follow sells are owned by the follow daemon. The browser request does not need to stay open for those actions to continue, but the daemon must be running and connected to healthy RPC/websocket infrastructure.
@@ -92,7 +111,7 @@ See [FOLLOW_DAEMON.md](FOLLOW_DAEMON.md) and [STRATEGIES.md](STRATEGIES.md).
 High-level support:
 
 - Pump: primary verified path
-- Bonk: supported helper-backed path
-- Bagsapp: supported when Bags credentials are configured
+- Bonk: supported Rust-native path, including SOL and USD1 quote-asset behavior where configured by the launch flow
+- Bagsapp: supported Rust-native path when Bags credentials are configured; Bags uses wallet identity and its own prepare flow
 
 See [LAUNCHPADS.md](LAUNCHPADS.md).

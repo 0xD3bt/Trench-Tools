@@ -3,7 +3,7 @@ use std::{
     fs,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,7 +33,8 @@ use uuid::Uuid;
 
 use shared_extension_runtime::{
     balance_stream::{
-        BalanceStreamHandle, StreamConfig as BalanceStreamConfig, StreamEvent, TradeEventPayload,
+        BalanceStreamHandle, DiagnosticEventPayload, MarkEventPayload,
+        StreamConfig as BalanceStreamConfig, StreamEvent, TradeEventPayload,
         spawn as spawn_balance_stream,
     },
     catalog::{
@@ -42,9 +43,9 @@ use shared_extension_runtime::{
     },
     crypto::install_rustls_crypto_provider,
     wallet::{
-        WalletRuntimeConfig, WalletStatusSummary, configure_wallet_runtime,
-        enrich_wallet_statuses_with_balance_options, invalidate_wallet_balance_cache,
-        list_solana_env_wallets,
+        WalletRuntimeConfig, WalletStatusSummary, WalletSummary as RuntimeWalletSummary,
+        configure_wallet_runtime, enrich_wallet_statuses_with_balance_options,
+        invalidate_wallet_balance_cache,
     },
 };
 
@@ -78,8 +79,9 @@ use crate::rewards::{
     RewardWallet, RewardsClaimRequest, RewardsClaimResponse, RewardsExecutionConfig,
     RewardsSummaryRequest, RewardsSummaryResponse, claim_rewards, summarize_rewards,
 };
-use crate::rollout::{family_execution_enabled, family_guard_warning, runtime_execution_backend};
-use crate::rpc_client::{configured_rpc_url, configured_warm_rpc_url};
+use crate::rollout::family_execution_enabled;
+use crate::rollout::family_guard_warning;
+use crate::rpc_client::configured_rpc_url;
 use crate::shared_config::{SharedRpcConfig, shared_config_manager};
 use crate::token_distribution::{
     TokenConsolidateRequest, TokenDistributionExecutionConfig, TokenDistributionResponse,
@@ -88,14 +90,17 @@ use crate::token_distribution::{
 };
 use crate::trade_dispatch::resolve_trade_plan;
 use crate::trade_ledger::{
-    EventProvenance, ExplicitFeeBreakdown, ForceCloseMarkerEvent, PlatformTag,
-    RecordConfirmedTradeParams, StoredEntryPreference, TradeLedgerPaths, aggregate_trade_ledger,
-    append_confirmed_trade_event, append_force_close_marker, append_reset_marker,
+    EventProvenance, ExplicitFeeBreakdown, ForceCloseMarkerEvent,
+    IncompleteBalanceAdjustmentMarkerEvent, JournalEntry, PlatformTag, RecordConfirmedTradeParams,
+    StoredEntryPreference, TradeLedgerPaths, aggregate_trade_ledger, append_confirmed_trade_event,
+    append_force_close_marker, append_incomplete_balance_adjustment_marker, append_reset_marker,
     force_close_trade_ledger_position, load_trade_ledger, load_trade_ledger_known_event_ids,
-    persist_trade_ledger, platform_tag_from_label, read_confirmed_trade_events,
-    record_confirmed_trade, reset_trade_ledger_position, trade_ledger_paths,
+    persist_trade_ledger, platform_tag_from_label, read_journal_entries, record_confirmed_trade,
+    reset_trade_ledger_position, trade_ledger_paths,
 };
-use crate::trade_planner::{LifecycleAndCanonicalMarket, PlannerQuoteAsset, TradeVenueFamily};
+use crate::trade_planner::{
+    LifecycleAndCanonicalMarket, PlannerQuoteAsset, PlannerRuntimeBundle, TradeVenueFamily,
+};
 use crate::trade_runtime::{
     RuntimeExecutionPolicy, RuntimeSellIntent, TradeRuntimeRequest, compile_wallet_trade,
 };
@@ -125,12 +130,170 @@ const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 
 const RPC_RESYNC_PAGE_SIZE: usize = 1000;
+const HELIUS_RESYNC_PAGE_SIZE: usize = 100;
 const RPC_RESYNC_MAX_PAGES: usize = 10;
 const RPC_RESYNC_MAX_SIGNATURES: usize = 10_000;
 const RPC_RESYNC_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
+const RESYNC_WALLET_CONCURRENCY: usize = 4;
 const AUTO_RESYNC_COOLDOWN_MS: u64 = 5 * 60 * 1000;
 const FORCE_CLOSE_COOLDOWN_MS: u64 = 60 * 60 * 1000;
 const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeDiagnostic {
+    pub key: String,
+    pub fingerprint: String,
+    pub severity: String,
+    pub source: String,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_var: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub active: bool,
+    pub restart_required: bool,
+    pub first_seen_at_ms: u64,
+    pub last_seen_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+#[cfg(test)]
+struct RuntimeDiagnosticInput {
+    severity: &'static str,
+    source: &'static str,
+    code: &'static str,
+    message: String,
+    detail: Option<String>,
+    env_var: Option<&'static str>,
+    endpoint_kind: Option<&'static str>,
+    endpoint_url: Option<String>,
+    restart_required: bool,
+}
+
+fn runtime_diagnostics_store() -> &'static Mutex<HashMap<String, RuntimeDiagnostic>> {
+    static STORE: OnceLock<Mutex<HashMap<String, RuntimeDiagnostic>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn sanitized_endpoint_host(endpoint_url: &str) -> Option<String> {
+    let trimmed = endpoint_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    reqwest::Url::parse(trimmed)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .or_else(|| Some("<invalid-url>".to_string()))
+}
+
+#[cfg(test)]
+fn diagnostic_fingerprint(
+    source: &str,
+    endpoint_kind: Option<&str>,
+    env_var: Option<&str>,
+    host: Option<&str>,
+    code: &str,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        source,
+        endpoint_kind.unwrap_or("runtime"),
+        env_var.unwrap_or(""),
+        host.unwrap_or(""),
+        code
+    )
+}
+
+#[cfg(test)]
+fn record_runtime_diagnostic(input: RuntimeDiagnosticInput) {
+    let host = input
+        .endpoint_url
+        .as_deref()
+        .and_then(sanitized_endpoint_host);
+    let fingerprint = diagnostic_fingerprint(
+        input.source,
+        input.endpoint_kind,
+        input.env_var,
+        host.as_deref(),
+        input.code,
+    );
+    let now = now_unix_ms();
+    let mut store = runtime_diagnostics_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match store.get_mut(&fingerprint) {
+        Some(existing) => {
+            existing.severity = input.severity.to_string();
+            existing.message = input.message;
+            existing.detail = input.detail;
+            existing.active = true;
+            existing.restart_required = input.restart_required;
+            existing.last_seen_at_ms = now;
+        }
+        None => {
+            store.insert(
+                fingerprint.clone(),
+                RuntimeDiagnostic {
+                    key: fingerprint.clone(),
+                    fingerprint,
+                    severity: input.severity.to_string(),
+                    source: input.source.to_string(),
+                    code: input.code.to_string(),
+                    message: input.message,
+                    detail: input.detail,
+                    env_var: input.env_var.map(str::to_string),
+                    endpoint_kind: input.endpoint_kind.map(str::to_string),
+                    host,
+                    active: true,
+                    restart_required: input.restart_required,
+                    first_seen_at_ms: now,
+                    last_seen_at_ms: now,
+                },
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn clear_runtime_diagnostic(
+    source: &str,
+    endpoint_kind: Option<&str>,
+    env_var: Option<&str>,
+    endpoint_url: Option<&str>,
+    code: &str,
+) {
+    let host = endpoint_url.and_then(sanitized_endpoint_host);
+    let fingerprint = diagnostic_fingerprint(source, endpoint_kind, env_var, host.as_deref(), code);
+    let mut store = runtime_diagnostics_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    store.remove(&fingerprint);
+}
+
+fn runtime_diagnostics_snapshot() -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = runtime_diagnostics_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .filter(|diagnostic| diagnostic.active)
+        .cloned()
+        .collect::<Vec<_>>();
+    diagnostics.sort_by(|left, right| {
+        left.severity
+            .cmp(&right.severity)
+            .then(left.source.cmp(&right.source))
+            .then(left.code.cmp(&right.code))
+            .then(left.fingerprint.cmp(&right.fingerprint))
+    });
+    diagnostics
+}
 
 pub fn execution_engine_port() -> u16 {
     std::env::var("EXECUTION_ENGINE_PORT")
@@ -252,6 +415,7 @@ pub struct AppState {
     executor: ExecutionExecutor,
     auth: Arc<AuthManager>,
     balance_stream: BalanceStreamHandle,
+    live_mark_targets: Arc<RwLock<HashMap<String, LiveMarkTarget>>>,
     persist_failures: Arc<PersistFailureCounters>,
 }
 
@@ -265,6 +429,116 @@ impl AppState {
     /// outside the normal request middleware.
     pub fn auth_manager(&self) -> Arc<AuthManager> {
         self.auth.clone()
+    }
+
+    async fn clear_active_mark_target(&self, surface_id: &str) {
+        let accounts = {
+            let mut targets = self.live_mark_targets.write().await;
+            targets.remove(surface_id);
+            live_mark_accounts_from_targets(targets.values())
+        };
+        self.balance_stream().set_mark_accounts(accounts);
+    }
+
+    pub async fn set_active_mark_target(
+        &self,
+        request: ExtensionActiveMarkRequest,
+    ) -> Result<(), String> {
+        let surface_id = active_mark_surface_id(&request);
+        if !request.active {
+            self.clear_active_mark_target(&surface_id).await;
+            return Ok(());
+        }
+
+        let Some(mint) = request
+            .mint
+            .as_deref()
+            .and_then(trimmed_option)
+            .map(str::to_string)
+        else {
+            self.clear_active_mark_target(&surface_id).await;
+            return Err("mint is required for active mark target.".to_string());
+        };
+        let wallet_request = active_mark_wallet_status_request(&request, &mint);
+        let engine = self.engine.read().await.clone();
+        let target = match resolve_wallet_status_target(
+            &build_effective_wallets(&engine),
+            &build_effective_wallet_groups(&engine),
+            &wallet_request,
+        ) {
+            Ok(target) => target,
+            Err((_, error)) => {
+                self.clear_active_mark_target(&surface_id).await;
+                return Err(error);
+            }
+        };
+        if target.wallet_keys.is_empty() {
+            self.clear_active_mark_target(&surface_id).await;
+            return Ok(());
+        }
+
+        let selector =
+            match resolve_wallet_status_quote_selector(&engine, &wallet_request, &mint).await {
+                Ok(selector) => selector,
+                Err(error) => {
+                    self.clear_active_mark_target(&surface_id).await;
+                    return Err(error);
+                }
+            };
+        let watch_accounts = live_mark_watch_accounts(&selector);
+        if watch_accounts.is_empty() {
+            self.clear_active_mark_target(&surface_id).await;
+            return Ok(());
+        }
+
+        let selected_wallet_keys = target.wallet_keys.iter().cloned().collect::<HashSet<_>>();
+        let token_balance_ui_by_wallet = request
+            .wallet_token_balances
+            .iter()
+            .filter_map(|entry| {
+                let env_key = entry.env_key.trim();
+                let amount = entry.token_balance?;
+                if env_key.is_empty()
+                    || !selected_wallet_keys.contains(env_key)
+                    || !amount.is_finite()
+                    || amount < 0.0
+                {
+                    return None;
+                }
+                Some((env_key.to_string(), amount))
+            })
+            .collect::<HashMap<_, _>>();
+        let token_balance_raw = request
+            .token_balance_raw
+            .or_else(|| {
+                aggregate_live_mark_raw(&token_balance_ui_by_wallet, request.token_decimals)
+            })
+            .or_else(|| {
+                request
+                    .token_balance
+                    .and_then(|amount| live_mark_ui_amount_to_raw(amount, request.token_decimals))
+            });
+
+        let live_target = LiveMarkTarget {
+            surface_id: surface_id.clone(),
+            mark_revision: 1,
+            mint,
+            wallet_keys: target.wallet_keys,
+            wallet_group_id: target.wallet_group_id,
+            selector,
+            watch_accounts: watch_accounts.clone(),
+            token_decimals: request.token_decimals,
+            token_balance_raw,
+            token_balance_ui_by_wallet,
+        };
+        let accounts = {
+            let mut targets = self.live_mark_targets.write().await;
+            targets.insert(surface_id, live_target.clone());
+            live_mark_accounts_from_targets(targets.values())
+        };
+        self.balance_stream().set_mark_accounts(accounts);
+        publish_live_mark(self, live_target, None).await;
+        Ok(())
     }
 
     /// Register a trade-activity tick against the continuous transport warm
@@ -284,6 +558,72 @@ impl AppState {
             tokio::spawn(async move {
                 execute_immediate_warm_pass(warm).await;
             });
+        }
+    }
+}
+
+fn refresh_shared_alt_at_startup(rpc_url: &str) -> Result<(), String> {
+    let rpc_url = rpc_url.to_string();
+    let result = std::thread::Builder::new()
+        .name("shared-alt-startup-refresh".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("failed to create shared ALT startup runtime: {error}"))?;
+            runtime
+                .block_on(crate::pump_native::initialize_shared_super_lookup_tables(
+                    &rpc_url,
+                ))
+                .map(|_| ())
+        })
+        .map_err(|error| format!("failed to spawn shared ALT startup refresh: {error}"))
+        .and_then(|handle| {
+            handle
+                .join()
+                .map_err(|_| "shared ALT startup refresh panicked".to_string())?
+        });
+    match result {
+        Ok(()) => {
+            eprintln!("[execution-engine][startup] shared ALT cache is ready");
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("[execution-engine][startup] shared ALT refresh failed: {error}");
+            Err(error)
+        }
+    }
+}
+
+fn refresh_shared_fee_market_at_startup() -> Result<(), String> {
+    let result = std::thread::Builder::new()
+        .name("shared-fee-market-startup-refresh".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    format!("failed to create shared fee-market startup runtime: {error}")
+                })?;
+            runtime.block_on(shared_fee_market_runtime().initialize_fee_market_snapshot())
+        })
+        .map_err(|error| format!("failed to spawn shared fee-market startup refresh: {error}"))
+        .and_then(|handle| {
+            handle
+                .join()
+                .map_err(|_| "shared fee-market startup refresh panicked".to_string())?
+        });
+    match result {
+        Ok(status) => {
+            eprintln!(
+                "[execution-engine][startup] shared fee market is ready helius_age_ms={:?} jito_age_ms={:?}",
+                status.helius_age_ms, status.jito_age_ms
+            );
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("[execution-engine][startup] shared fee-market refresh failed: {error}");
+            Err(error)
         }
     }
 }
@@ -309,6 +649,8 @@ impl AppState {
         let trade_ledger = load_trade_ledger(&trade_ledger_paths);
         let trade_ledger_event_ids = load_trade_ledger_known_event_ids(&trade_ledger_paths);
         let rpc_url = configured_rpc_url();
+        refresh_shared_alt_at_startup(&rpc_url)?;
+        refresh_shared_fee_market_at_startup()?;
         let launchdeck_warm = new_launchdeck_warm_registry(default_warm_routes);
         let auth = Arc::new(AuthManager::new().map_err(|error| {
             format!(
@@ -332,13 +674,11 @@ impl AppState {
         spawn_shared_fee_market_refresh_task();
         spawn_continuous_warm_task(launchdeck_warm.clone());
 
-        let balance_stream = spawn_balance_stream(BalanceStreamConfig::new(
-            resolve_balance_stream_ws_url(),
-            configured_warm_rpc_url(),
-            USD1_MINT,
-        ));
-        // Seed the stream's subscription set with the current wallet list.
-        balance_stream.resync_wallets(list_solana_env_wallets());
+        let initial_runtime_wallets = runtime_wallets_from_engine(&engine);
+        let balance_stream = spawn_balance_stream(
+            BalanceStreamConfig::new(resolve_solana_ws_url(), configured_rpc_url(), USD1_MINT)
+                .with_initial_wallets(initial_runtime_wallets),
+        );
 
         // Hook the wallet-token balance cache up to the stream so the
         // sell-sizing path can reuse recently observed ATA balances
@@ -368,9 +708,11 @@ impl AppState {
             executor: ExecutionExecutor::default(),
             auth,
             balance_stream,
+            live_mark_targets: Arc::new(RwLock::new(HashMap::new())),
             persist_failures: Arc::new(PersistFailureCounters::default()),
         };
         spawn_batch_trade_reconciliation_task(state.clone());
+        spawn_live_mark_task(state.clone());
         Ok(state)
     }
 
@@ -402,15 +744,6 @@ fn resolve_solana_ws_url() -> String {
         return format!("ws://{rest}");
     }
     rpc
-}
-
-fn resolve_balance_stream_ws_url() -> String {
-    if let Ok(value) = std::env::var("WARM_WS_URL")
-        && !value.trim().is_empty()
-    {
-        return value.trim().to_string();
-    }
-    resolve_solana_ws_url()
 }
 
 fn configure_shared_extension_runtime() {
@@ -548,6 +881,10 @@ fn build_router_with_state(state: AppState) -> Router {
             post(crate::events_stream::set_balance_presence),
         )
         .route(
+            "/api/extension/events/active-mark",
+            post(crate::events_stream::set_active_mark),
+        )
+        .route(
             "/api/extension/events/stream",
             get(crate::events_stream::events_stream),
         )
@@ -656,6 +993,8 @@ pub struct EngineSettings {
     #[serde(default)]
     pub warm_rpc_url: String,
     #[serde(default)]
+    pub warm_ws_url: String,
+    #[serde(default)]
     pub shared_region: String,
     #[serde(default)]
     pub helius_rpc_url: String,
@@ -739,6 +1078,8 @@ pub struct ExtensionRuntimeStatusResponse {
     pub auto_fee: Value,
     #[serde(default)]
     pub providers: BTreeMap<String, LaunchdeckProviderAvailability>,
+    #[serde(default)]
+    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -795,6 +1136,80 @@ struct ExtensionWalletStatusRequest {
     include_sol_balance: Option<bool>,
     #[serde(default)]
     include_usd1_balance: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionActiveMarkRequest {
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    surface_id: Option<String>,
+    #[serde(default)]
+    wallet_key: Option<String>,
+    #[serde(default)]
+    wallet_keys: Option<Vec<String>>,
+    #[serde(default)]
+    wallet_group_id: Option<String>,
+    #[serde(default)]
+    mint: Option<String>,
+    #[serde(default)]
+    preset_id: Option<String>,
+    #[serde(default)]
+    buy_funding_policy: Option<BuyFundingPolicy>,
+    #[serde(default)]
+    sell_settlement_policy: Option<SellSettlementPolicy>,
+    #[serde(default)]
+    route_address: Option<String>,
+    #[serde(default)]
+    pair: Option<String>,
+    #[serde(default)]
+    warm_key: Option<String>,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    lifecycle: Option<String>,
+    #[serde(default)]
+    quote_asset: Option<String>,
+    #[serde(default)]
+    canonical_market_key: Option<String>,
+    #[serde(default)]
+    surface: Option<String>,
+    #[serde(default)]
+    page_url: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    token_balance: Option<f64>,
+    #[serde(default)]
+    token_balance_raw: Option<u64>,
+    #[serde(default)]
+    token_decimals: Option<u8>,
+    #[serde(default)]
+    wallet_token_balances: Vec<ActiveMarkWalletTokenBalance>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveMarkWalletTokenBalance {
+    #[serde(default)]
+    env_key: String,
+    #[serde(default)]
+    token_balance: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveMarkTarget {
+    surface_id: String,
+    mark_revision: u64,
+    mint: String,
+    wallet_keys: Vec<String>,
+    wallet_group_id: Option<String>,
+    selector: LifecycleAndCanonicalMarket,
+    watch_accounts: Vec<String>,
+    token_decimals: Option<u8>,
+    token_balance_raw: Option<u64>,
+    token_balance_ui_by_wallet: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1855,6 +2270,15 @@ async fn get_runtime_status(State(state): State<AppState>) -> Json<ExtensionRunt
         let batches = state.batches.read().await;
         active_batch_count(&batches)
     };
+    let mut diagnostics = runtime_diagnostics_snapshot();
+    diagnostics.extend(
+        state
+            .balance_stream()
+            .diagnostics_snapshot()
+            .await
+            .into_iter()
+            .map(runtime_diagnostic_from_balance_stream),
+    );
     Json(ExtensionRuntimeStatusResponse {
         contract_version: EXTENSION_CONTRACT_VERSION.to_string(),
         version: engine.version.clone(),
@@ -1876,7 +2300,28 @@ async fn get_runtime_status(State(state): State<AppState>) -> Json<ExtensionRunt
         warm: build_combined_warm_payload(&state.launchdeck_warm, &state.persist_failures),
         auto_fee: shared_fee_market_status_payload(shared_fee_market_runtime().config()),
         providers: provider_availability_registry(),
+        diagnostics,
     })
+}
+
+fn runtime_diagnostic_from_balance_stream(payload: DiagnosticEventPayload) -> RuntimeDiagnostic {
+    let at_ms = payload.at_ms.min(u128::from(u64::MAX)) as u64;
+    RuntimeDiagnostic {
+        key: payload.fingerprint.clone(),
+        fingerprint: payload.fingerprint,
+        severity: payload.severity,
+        source: payload.source,
+        code: payload.code,
+        message: payload.message,
+        detail: payload.detail,
+        env_var: payload.env_var,
+        endpoint_kind: payload.endpoint_kind,
+        host: payload.host,
+        active: payload.active,
+        restart_required: payload.restart_required,
+        first_seen_at_ms: at_ms,
+        last_seen_at_ms: at_ms,
+    }
 }
 
 fn build_combined_warm_payload(
@@ -2385,6 +2830,14 @@ async fn resync_pnl_history(
         .into_iter()
         .map(|wallet| (wallet.key, wallet.public_key))
         .collect::<HashMap<_, _>>();
+    let known_wallets = public_keys_by_wallet_key
+        .iter()
+        .map(|(wallet_key, public_key)| KnownWalletIdentity {
+            wallet_key: wallet_key.clone(),
+            public_key: public_key.clone(),
+        })
+        .collect::<Vec<_>>();
+    let helius_config = configured_helius_resync_config();
     let selected_wallet_keys = target.wallet_keys.iter().cloned().collect::<HashSet<_>>();
     let current_ledger = state.trade_ledger.read().await.clone();
     let reset_baselines_by_wallet = target
@@ -2398,9 +2851,13 @@ async fn resync_pnl_history(
             (wallet_key.clone(), baseline)
         })
         .collect::<HashMap<_, _>>();
-    let mut seen_journal_event_ids = HashSet::new();
-    let journal_events = read_confirmed_trade_events(&state.trade_ledger_paths)
-        .into_iter()
+    let journal_entries = read_journal_entries(&state.trade_ledger_paths);
+    let journal_events = journal_entries
+        .iter()
+        .filter_map(|entry| match entry {
+            JournalEntry::Trade(event) => Some(event.clone()),
+            _ => None,
+        })
         .filter(|event| event.mint == mint && selected_wallet_keys.contains(&event.wallet_key))
         .filter(|event| {
             let (reset_baseline_unix_ms, reset_baseline_slot) = reset_baselines_by_wallet
@@ -2414,107 +2871,193 @@ async fn resync_pnl_history(
                 reset_baseline_slot,
             )
         })
-        .filter(|event| seen_journal_event_ids.insert(event.event_id()))
         .collect::<Vec<_>>();
-
-    let mut known_event_ids = journal_events
+    let local_events_by_id = journal_events
         .iter()
-        .map(crate::trade_ledger::ConfirmedTradeEvent::event_id)
+        .map(|event| (event.event_id(), event.clone()))
+        .collect::<HashMap<_, _>>();
+    let known_journal_event_ids = journal_entries
+        .iter()
+        .filter_map(|entry| match entry {
+            JournalEntry::Trade(event) => Some(event),
+            _ => None,
+        })
+        .map(|event| event.event_id())
         .collect::<HashSet<_>>();
-    let mut rpc_events = Vec::new();
-    for wallet_key in &target.wallet_keys {
-        let Some(wallet_public_key) = public_keys_by_wallet_key.get(wallet_key) else {
-            continue;
-        };
-        let (reset_baseline_unix_ms, reset_baseline_slot) = reset_baselines_by_wallet
-            .get(wallet_key)
-            .copied()
-            .unwrap_or((0, None));
-        rpc_events.extend(
-            fetch_rpc_resync_trade_events_for_wallet_mint(
-                wallet_key,
-                wallet_public_key,
-                &mint,
-                &mut known_event_ids,
-                reset_baseline_unix_ms,
-                reset_baseline_slot,
-            )
-            .await?,
-        );
-    }
-
-    // Slot is the monotonic per-chain ordering key, so events whose `block_time`
-    // was missing at capture (and fell back to wall-clock `now_unix_ms`) still
-    // sort into the correct chain order instead of clustering at the tail.
-    let mut merged_events = journal_events.clone();
-    merged_events.extend(rpc_events.iter().cloned());
-    merged_events.sort_by(|left, right| {
-        left.slot
-            .unwrap_or(0)
-            .cmp(&right.slot.unwrap_or(0))
-            .then_with(|| left.confirmed_at_unix_ms.cmp(&right.confirmed_at_unix_ms))
-            .then_with(|| left.signature.cmp(&right.signature))
+    let mut rpc_candidates = fetch_resync_candidates_for_wallets(
+        &target.wallet_keys,
+        &public_keys_by_wallet_key,
+        &mint,
+        &reset_baselines_by_wallet,
+        &known_wallets,
+        helius_config.as_ref(),
+    )
+    .await?;
+    let mut seen_candidates = HashSet::new();
+    rpc_candidates.retain(|candidate| {
+        seen_candidates.insert(format!(
+            "{}::{}::{}",
+            candidate.signature, candidate.wallet_key, mint
+        ))
     });
 
-    {
-        let mut ledger = state.trade_ledger.write().await;
-        for wallet_key in &target.wallet_keys {
-            let (reset_baseline_unix_ms, reset_baseline_slot) = reset_baselines_by_wallet
-                .get(wallet_key)
-                .copied()
-                .unwrap_or((0, None));
-            if reset_baseline_unix_ms > 0 {
-                reset_trade_ledger_position(
-                    &mut ledger,
-                    wallet_key,
-                    &mint,
-                    reset_baseline_unix_ms,
-                    reset_baseline_slot,
-                );
-            } else {
-                ledger.remove(&trade_ledger_lookup_key(wallet_key, &mint));
+    let mut resync_actions = build_rpc_resync_ledger_actions(
+        rpc_candidates,
+        &mint,
+        &selected_wallet_keys,
+        &local_events_by_id,
+    )
+    .await?;
+    merge_missing_local_resync_events(&mut resync_actions, &journal_events);
+    merge_scoped_local_resync_markers(
+        &mut resync_actions,
+        &journal_entries,
+        &selected_wallet_keys,
+        &mint,
+        &reset_baselines_by_wallet,
+    );
+    sort_resync_actions(&mut resync_actions);
+
+    let mut preview_ledger = current_ledger.clone();
+    reset_resync_scope_in_ledger(
+        &mut preview_ledger,
+        &target.wallet_keys,
+        &mint,
+        &reset_baselines_by_wallet,
+    );
+    let extra_actions = replay_resync_actions(&mut preview_ledger, &resync_actions, true);
+    let replayed_balances =
+        replayed_token_balances_from_actions(&target.wallet_keys, &mint, &resync_actions);
+    resync_actions.extend(extra_actions);
+    let reconciliation_slot = fetch_current_confirmed_slot()
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    let onchain_snapshot = fetch_current_resync_balances(
+        &target.wallet_keys,
+        &public_keys_by_wallet_key,
+        &mint,
+        Some(reconciliation_slot),
+    )
+    .await?;
+    let reconciliation_actions = build_balance_reconciliation_actions(
+        &target.wallet_keys,
+        &mint,
+        &replayed_balances,
+        &onchain_snapshot.balances,
+        &onchain_snapshot.slots_by_wallet,
+        now_unix_ms(),
+    );
+    resync_actions.extend(reconciliation_actions);
+    prune_incomplete_zero_clears_shadowed_by_nonzero_actions(&mut resync_actions);
+    sort_resync_actions(&mut resync_actions);
+
+    let rpc_events = resync_actions
+        .iter()
+        .filter_map(|action| match action {
+            RpcResyncLedgerAction::Trade(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let transfer_markers = resync_actions
+        .iter()
+        .filter_map(|action| match action {
+            RpcResyncLedgerAction::KnownTransfer { marker, .. } => Some(marker.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let force_close_markers = resync_actions
+        .iter()
+        .filter_map(|action| match action {
+            RpcResyncLedgerAction::ForceClose { marker, persist } if *persist => {
+                Some(marker.clone())
             }
-        }
-        for event in &merged_events {
-            let params = RecordConfirmedTradeParams {
-                wallet_key: &event.wallet_key,
-                wallet_public_key: &event.wallet_public_key,
-                mint: &event.mint,
-                side: event.side.clone(),
-                trade_value_lamports: event.trade_value_lamports,
-                token_delta_raw: event.token_delta_raw,
-                token_decimals: event.token_decimals,
-                confirmed_at_unix_ms: event.confirmed_at_unix_ms,
-                slot: event.slot,
-                entry_preference_asset: match event.side {
-                    TradeSide::Buy => event.settlement_asset,
-                    TradeSide::Sell => None,
-                },
-                settlement_asset: event.settlement_asset,
-                explicit_fees: event.explicit_fees.clone(),
-                platform_tag: event.platform_tag,
-                provenance: event.provenance,
-                signature: &event.signature,
-                client_request_id: event.client_request_id.as_deref(),
-                batch_id: event.batch_id.as_deref(),
-            };
-            record_confirmed_trade(&mut ledger, params);
-        }
-        persist_trade_ledger(&state.trade_ledger_paths, &ledger)?;
-    }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let incomplete_markers = resync_actions
+        .iter()
+        .filter_map(|action| match action {
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                wallet_key,
+                mint,
+                amount_raw,
+                signature,
+                applied_at_unix_ms,
+                slot,
+                persist,
+            } => Some(persist.then(|| {
+                IncompleteBalanceAdjustmentMarkerEvent::received_without_cost_basis(
+                    wallet_key,
+                    mint,
+                    *amount_raw,
+                    signature,
+                    *applied_at_unix_ms,
+                    *slot,
+                )
+            }))
+            .flatten(),
+            RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key,
+                mint,
+                amount_raw,
+                signature,
+                applied_at_unix_ms,
+                slot,
+                persist,
+            } => Some(persist.then(|| {
+                IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+                    wallet_key,
+                    mint,
+                    *amount_raw,
+                    signature,
+                    *applied_at_unix_ms,
+                    *slot,
+                )
+            }))
+            .flatten(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut appended_rpc_events = 0usize;
     if !rpc_events.is_empty() {
         let mut event_ids = state.trade_ledger_event_ids.write().await;
         for event in &rpc_events {
-            append_confirmed_trade_event(&state.trade_ledger_paths, event)?;
+            if !known_journal_event_ids.contains(&event.event_id()) {
+                append_confirmed_trade_event(&state.trade_ledger_paths, event)?;
+                appended_rpc_events = appended_rpc_events.saturating_add(1);
+            }
             event_ids.insert(event.event_id());
         }
+    }
+    for marker in &transfer_markers {
+        let _ =
+            crate::trade_ledger::append_token_transfer_marker(&state.trade_ledger_paths, marker)?;
+    }
+    for marker in &force_close_markers {
+        append_force_close_marker(&state.trade_ledger_paths, marker)?;
+    }
+    for marker in &incomplete_markers {
+        let _ = append_incomplete_balance_adjustment_marker(&state.trade_ledger_paths, marker)?;
+    }
+
+    {
+        let mut ledger = state.trade_ledger.write().await;
+        reset_resync_scope_in_ledger(
+            &mut ledger,
+            &target.wallet_keys,
+            &mint,
+            &reset_baselines_by_wallet,
+        );
+        let _ = replay_resync_actions(&mut ledger, &resync_actions, false);
+        persist_trade_ledger(&state.trade_ledger_paths, &ledger)?;
     }
     Ok(Json(json!({
         "ok": true,
         "mint": mint,
         "walletKeys": target.wallet_keys,
-        "replayedEvents": journal_events.len(),
-        "appendedRpcEvents": rpc_events.len(),
+        "replayedEvents": resync_actions.len(),
+        "appendedRpcEvents": appended_rpc_events,
         "resyncedAtUnixMs": now_unix_ms(),
     })))
 }
@@ -2943,7 +3486,7 @@ async fn create_wallet(
     invalidate_wallet_balance_cache(&[wallet.key.clone()]);
     state
         .balance_stream
-        .resync_wallets(list_solana_env_wallets());
+        .resync_wallets(runtime_wallets_from_engine(&engine));
     Ok(Json(wallet))
 }
 
@@ -2989,7 +3532,7 @@ async fn update_wallet(
     invalidate_wallet_balance_cache(&[wallet.key.clone()]);
     state
         .balance_stream
-        .resync_wallets(list_solana_env_wallets());
+        .resync_wallets(runtime_wallets_from_engine(&engine));
     Ok(Json(wallet))
 }
 
@@ -3010,7 +3553,7 @@ async fn delete_wallet(
     invalidate_wallet_balance_cache(&[wallet_key.clone()]);
     state
         .balance_stream
-        .resync_wallets(list_solana_env_wallets());
+        .resync_wallets(runtime_wallets_from_engine(&engine));
     Ok(Json(DeleteResourceResponse {
         deleted: true,
         resource_id: wallet_key,
@@ -3050,7 +3593,7 @@ async fn reorder_wallets(
     persist_engine_state(&state.state_path, &engine)?;
     state
         .balance_stream
-        .resync_wallets(list_solana_env_wallets());
+        .resync_wallets(runtime_wallets_from_engine(&engine));
     Ok(Json(build_effective_wallets(&engine)))
 }
 
@@ -3242,15 +3785,33 @@ fn runtime_sell_settlement_policy_label(policy: SellSettlementPolicy) -> &'stati
 }
 
 fn runtime_route_policy_label(side: &TradeSide, policy: &RuntimeExecutionPolicy) -> String {
+    let fee_bps = crate::rollout::wrapper_default_fee_bps();
     match side {
         TradeSide::Buy => format!(
-            "buy:{}",
-            runtime_buy_funding_policy_label(policy.buy_funding_policy)
+            "buy:{}:wrapper_fee_bps={}:conversion={}",
+            runtime_buy_funding_policy_label(policy.buy_funding_policy),
+            fee_bps,
+            runtime_route_policy_conversion_label(side, policy)
         ),
         TradeSide::Sell => format!(
-            "sell:{}",
-            runtime_sell_settlement_asset_label(policy.sell_settlement_asset)
+            "sell:{}:wrapper_fee_bps={}:conversion={}",
+            runtime_sell_settlement_asset_label(policy.sell_settlement_asset),
+            fee_bps,
+            runtime_route_policy_conversion_label(side, policy)
         ),
+    }
+}
+
+fn runtime_route_policy_conversion_label(
+    side: &TradeSide,
+    policy: &RuntimeExecutionPolicy,
+) -> &'static str {
+    match side {
+        TradeSide::Buy if policy.buy_funding_policy != BuyFundingPolicy::SolOnly => "to_sol_in",
+        TradeSide::Sell if policy.sell_settlement_asset != TradeSettlementAsset::Sol => {
+            "to_sol_out"
+        }
+        _ => "none",
     }
 }
 
@@ -3318,19 +3879,6 @@ async fn prewarm_mint(
         sell_settlement_policy,
         sell_settlement_asset: resolve_sell_settlement_asset(sell_settlement_policy, None),
     };
-    let prewarm_route_policy = runtime_route_policy_label(&TradeSide::Buy, &preset_defaults);
-    // Compute the flight fingerprint up front so the planner's
-    // TradeRuntimeRequest can round-trip the same `warm_key` that the
-    // eventual click will carry, keeping log lines / metrics labels
-    // consistent between the prewarm planner pass and the later trade.
-    let flight_fingerprint = build_fingerprint(
-        &preferred_input,
-        companion_pair.as_deref(),
-        &rpc_url,
-        &commitment,
-        &prewarm_route_policy,
-        allow_non_canonical,
-    );
     let runtime_request = TradeRuntimeRequest {
         side: TradeSide::Buy,
         mint: preferred_input.clone(),
@@ -3343,6 +3891,20 @@ async fn prewarm_mint(
         pinned_pool: companion_pair.clone(),
         warm_key: None,
     };
+    let (runtime_request, _) = normalize_runtime_request_for_wrapper_trade(&runtime_request);
+    let prewarm_route_policy = runtime_route_policy_label(&TradeSide::Buy, &runtime_request.policy);
+    // Compute the flight fingerprint up front so the planner's
+    // TradeRuntimeRequest can round-trip the same `warm_key` that the
+    // eventual click will carry, keeping log lines / metrics labels
+    // consistent between the prewarm planner pass and the later trade.
+    let flight_fingerprint = build_fingerprint(
+        &preferred_input,
+        companion_pair.as_deref(),
+        &rpc_url,
+        &commitment,
+        &prewarm_route_policy,
+        allow_non_canonical,
+    );
 
     // Single-flight dedupe. Three near-simultaneous prewarm calls for
     // the same mint (hover, panel-open, token-detail mount all firing
@@ -3488,6 +4050,29 @@ async fn prewarm_mint(
         // Label is threaded through for future metrics wiring.
         let _ = venue_family_label(&entry.venue);
         shared_mint_warm_cache().insert(fingerprint, entry).await;
+        if matches!(
+            plan.selector.family,
+            crate::trade_planner::TradeVenueFamily::MeteoraDbc
+                | crate::trade_planner::TradeVenueFamily::MeteoraDammV2
+        ) {
+            let mut snapshot_request = runtime_request.clone();
+            snapshot_request.mint = plan.resolved_mint.clone();
+            snapshot_request.pinned_pool = plan
+                .resolved_pinned_pool
+                .clone()
+                .or_else(|| resolved_pair.clone());
+            snapshot_request.planned_trade = Some(plan.selector.clone());
+            snapshot_request.warm_key = Some(buy_warm_key.clone());
+            if let Err(error) = crate::meteora_native::warm_meteora_compile_snapshot(
+                &plan.selector,
+                &snapshot_request,
+                &buy_warm_key,
+            )
+            .await
+            {
+                warnings.push(format!("meteora compile snapshot skipped: {error}"));
+            }
+        }
     }
 
     let sell_assets_to_warm = match sell_settlement_policy {
@@ -3508,7 +4093,6 @@ async fn prewarm_mint(
             );
             let mut sell_policy = preset_defaults.clone();
             sell_policy.sell_settlement_asset = sell_asset;
-            let sell_route_policy = runtime_route_policy_label(&TradeSide::Sell, &sell_policy);
             let sell_runtime_request = TradeRuntimeRequest {
                 side: TradeSide::Sell,
                 mint: preferred_input.clone(),
@@ -3521,6 +4105,10 @@ async fn prewarm_mint(
                 pinned_pool: companion_pair.clone(),
                 warm_key: None,
             };
+            let (sell_runtime_request, _) =
+                normalize_runtime_request_for_wrapper_trade(&sell_runtime_request);
+            let sell_route_policy =
+                runtime_route_policy_label(&TradeSide::Sell, &sell_runtime_request.policy);
             match plan_trade_request_to_dispatch(&sell_runtime_request).await {
                 Ok(plan) => {
                     sell_assets_warmed += 1;
@@ -3560,6 +4148,8 @@ async fn prewarm_mint(
     let family_enabled = serde_json::json!({
         "pump": crate::rollout::family_warm_enabled_by_label("pump"),
         "raydiumAmmV4": crate::rollout::family_warm_enabled_by_label("raydium-amm-v4"),
+        "raydiumCpmm": crate::rollout::family_warm_enabled_by_label("raydium-cpmm"),
+        "raydiumLaunchLab": crate::rollout::family_warm_enabled_by_label("raydium-launchlab"),
         "bonk": crate::rollout::family_warm_enabled_by_label("bonk"),
         "bags": crate::rollout::family_warm_enabled_by_label("bags"),
     });
@@ -3692,7 +4282,9 @@ async fn preview_batch(
         pinned_pool: preview_pinned_pool.clone(),
         warm_key: request.warm_key.clone(),
     };
-    let planned_dispatch = match resolve_trade_plan(&preview_request).await {
+    let (preview_wrapper_request, preview_route_conversion) =
+        normalize_preview_request_for_wrapper_trade(&preview_request);
+    let planned_dispatch = match resolve_trade_plan(&preview_wrapper_request).await {
         Ok(plan) => Some(plan),
         Err(error) => {
             warnings.push(error);
@@ -3703,9 +4295,7 @@ async fn preview_batch(
     let execution_adapter = planned_dispatch
         .as_ref()
         .map(|plan| plan.adapter.label().to_string());
-    let execution_backend = planned_dispatch
-        .as_ref()
-        .map(|_| runtime_execution_backend().label().to_string());
+    let mut execution_backend = planned_dispatch.as_ref().map(|_| "wrapper".to_string());
     // When the venue family is disabled by the rollout guard we surface
     // the warning **and** mark the preview as disallowed, so the panel
     // disables the trade button rather than rendering a preview that a
@@ -3730,7 +4320,7 @@ async fn preview_batch(
             .as_ref()
             .map(|plan| plan.resolved_mint.clone())
             .unwrap_or_else(|| preview_address.clone()),
-        platform_label: None,
+        platform_label: request.platform.clone(),
         buy_amount_sol: preview_buy_amount_sol.clone(),
         sell_intent: preview_sell_intent.clone(),
         policy: ExecutionPolicy {
@@ -3744,9 +4334,9 @@ async fn preview_batch(
             commitment: policy.commitment.clone(),
             skip_preflight: policy.skip_preflight,
             track_send_block_height: policy.track_send_block_height,
-            buy_funding_policy: policy.buy_funding_policy,
-            sell_settlement_policy: policy.sell_settlement_policy,
-            sell_settlement_asset: policy.sell_settlement_asset,
+            buy_funding_policy: preview_wrapper_request.policy.buy_funding_policy,
+            sell_settlement_policy: preview_wrapper_request.policy.sell_settlement_policy,
+            sell_settlement_asset: preview_wrapper_request.policy.sell_settlement_asset,
         },
         planned_route: planned_dispatch.clone(),
         planned_trade: planned_execution.clone(),
@@ -3797,6 +4387,26 @@ async fn preview_batch(
             ),
         )
     });
+    let planned_native_no_sol = planned_execution.as_ref().is_some_and(|selector| {
+        matches!(
+            selector.family,
+            crate::trade_planner::TradeVenueFamily::TrustedStableSwap
+        )
+    });
+    if matches!(
+        wrapper_route_classification,
+        Some(crate::wrapper_payload::WrapperRouteClassification::NoSol)
+    ) {
+        if planned_native_no_sol {
+            execution_backend = planned_dispatch.as_ref().map(|_| "native".to_string());
+        } else {
+            warnings.push(
+                "Selected route cannot be routed through the Trench wrapper; choose a SOL/WSOL-settled route."
+                    .to_string(),
+            );
+            preview_allowed = false;
+        }
+    }
     let wrapper_fee_bps = crate::rollout::wrapper_default_fee_bps();
     let execution_plan_with_fees = execution_plan
         .wallets
@@ -3806,30 +4416,34 @@ async fn preview_batch(
             if let Some(route) = wrapper_route_classification {
                 if route.touches_sol() {
                     summary.wrapper_fee_bps = wrapper_fee_bps;
-                    summary.wrapper_route = Some(route.label().to_string());
-                    if matches!(
-                        route,
-                        crate::wrapper_payload::WrapperRouteClassification::SolIn
-                    ) {
-                        let gross_sol_str = summary
-                            .buy_amount_sol
-                            .as_deref()
-                            .or(preview_buy_amount_sol.as_deref());
-                        if let Some(gross) = gross_sol_str {
-                            let gross_lamports = parse_sol_to_lamports(gross).unwrap_or(0);
-                            let fee_lamports = crate::wrapper_compile::estimate_sol_in_fee_lamports(
-                                gross_lamports,
-                                wrapper_fee_bps,
-                            );
-                            if fee_lamports > 0 {
-                                summary.wrapper_fee_sol =
-                                    Some(format_lamports_to_sol_string(fee_lamports));
-                            } else {
-                                // Still emit the "0 SOL" line so the UI
-                                // can show the tier explicitly even when
-                                // the user selected 0%.
-                                summary.wrapper_fee_sol = Some("0".to_string());
-                            }
+                    summary.wrapper_route = Some(if preview_route_conversion {
+                        format!("{}:conversion", route.label())
+                    } else {
+                        route.label().to_string()
+                    });
+                }
+                if matches!(
+                    route,
+                    crate::wrapper_payload::WrapperRouteClassification::SolIn
+                ) {
+                    let gross_sol_str = summary
+                        .buy_amount_sol
+                        .as_deref()
+                        .or(preview_buy_amount_sol.as_deref());
+                    if let Some(gross) = gross_sol_str {
+                        let gross_lamports = parse_sol_to_lamports(gross).unwrap_or(0);
+                        let fee_lamports = crate::wrapper_compile::estimate_sol_in_fee_lamports(
+                            gross_lamports,
+                            wrapper_fee_bps,
+                        );
+                        if fee_lamports > 0 {
+                            summary.wrapper_fee_sol =
+                                Some(format_lamports_to_sol_string(fee_lamports));
+                        } else {
+                            // Still emit the "0 SOL" line so the UI
+                            // can show the tier explicitly even when
+                            // the user selected 0%.
+                            summary.wrapper_fee_sol = Some("0".to_string());
                         }
                     }
                 }
@@ -3892,7 +4506,7 @@ async fn buy(
     let companion_pair =
         route_companion_pair(request.pair.as_deref(), request.pinned_pool.as_deref())?;
     let batch_planning_mint = trimmed_option(&request.mint).unwrap_or(&address_input);
-    let execution_backend = runtime_execution_backend().label().to_string();
+    let execution_backend = "runtime".to_string();
     let wallet_request = WalletTradeRequest {
         side: TradeSide::Buy,
         mint: address_input.clone(),
@@ -3921,11 +4535,12 @@ async fn buy(
         pinned_pool: companion_pair,
         warm_key: request.warm_key.clone(),
     };
+    let (route_wallet_request, _) = normalize_wallet_request_for_wrapper_trade(&wallet_request);
     let execution_plan = build_buy_batch_execution_plan(
         &engine,
         &target,
         batch_planning_mint,
-        &wallet_request,
+        &route_wallet_request,
         &trade_ledger,
         &build_buy_planning_seed(
             &request.preset_id,
@@ -4018,7 +4633,7 @@ async fn sell(
         request.sell_output_sol.as_deref(),
         policy.sell_percent.as_deref(),
     )?;
-    let execution_backend = runtime_execution_backend().label().to_string();
+    let execution_backend = "runtime".to_string();
     let wallet_request = WalletTradeRequest {
         side: TradeSide::Sell,
         mint: address_input.clone(),
@@ -4045,8 +4660,9 @@ async fn sell(
         pinned_pool: companion_pair,
         warm_key: request.warm_key.clone(),
     };
+    let (route_wallet_request, _) = normalize_wallet_request_for_wrapper_trade(&wallet_request);
     let execution_plan =
-        build_default_batch_execution_plan(&target, &wallet_request, &trade_ledger);
+        build_default_batch_execution_plan(&target, &route_wallet_request, &trade_ledger);
     let fingerprint = build_trade_fingerprint(
         &TradeSide::Sell,
         &wallet_request.mint,
@@ -4114,12 +4730,26 @@ async fn split_tokens(
         validate_distribution_wallet_keys(&request.wallet_keys, &available_wallet_keys)?;
     request.source_wallet_keys =
         validate_distribution_wallet_keys(&request.source_wallet_keys, &available_wallet_keys)?;
+    let preset_id = token_distribution_preset_id(&engine, &request.preset_id)?;
+    request.preset_id = preset_id.clone();
+    let preset = resolve_preset(&engine.presets, &preset_id)?;
+    let policy = resolve_buy_policy(
+        &engine.settings,
+        engine.config.as_ref().unwrap_or(&Value::Null),
+        preset,
+        None,
+        None,
+    );
     let config = TokenDistributionExecutionConfig {
-        commitment: engine.settings.execution_commitment.clone(),
-        skip_preflight: engine.settings.execution_skip_preflight,
-        track_send_block_height: config_track_send_block_height(
-            engine.config.as_ref().unwrap_or(&Value::Null),
-        ),
+        commitment: policy.commitment.clone(),
+        skip_preflight: policy.skip_preflight,
+        track_send_block_height: policy.track_send_block_height,
+        provider: policy.provider.clone(),
+        endpoint_profile: policy.endpoint_profile.clone(),
+        mev_mode: mev_mode_label(&policy.mev_mode).to_string(),
+        fee_sol: policy.fee_sol.clone(),
+        tip_sol: policy.tip_sol.clone(),
+        warnings: policy.auto_fee_warnings.clone(),
     };
     let fingerprint = build_token_distribution_fingerprint("split", &request)?;
     let (response, fresh) =
@@ -4157,12 +4787,26 @@ async fn consolidate_tokens(
             "Selected destination wallet is not available.".to_string(),
         ));
     }
+    let preset_id = token_distribution_preset_id(&engine, &request.preset_id)?;
+    request.preset_id = preset_id.clone();
+    let preset = resolve_preset(&engine.presets, &preset_id)?;
+    let policy = resolve_buy_policy(
+        &engine.settings,
+        engine.config.as_ref().unwrap_or(&Value::Null),
+        preset,
+        None,
+        None,
+    );
     let config = TokenDistributionExecutionConfig {
-        commitment: engine.settings.execution_commitment.clone(),
-        skip_preflight: engine.settings.execution_skip_preflight,
-        track_send_block_height: config_track_send_block_height(
-            engine.config.as_ref().unwrap_or(&Value::Null),
-        ),
+        commitment: policy.commitment.clone(),
+        skip_preflight: policy.skip_preflight,
+        track_send_block_height: policy.track_send_block_height,
+        provider: policy.provider.clone(),
+        endpoint_profile: policy.endpoint_profile.clone(),
+        mev_mode: mev_mode_label(&policy.mev_mode).to_string(),
+        fee_sol: policy.fee_sol.clone(),
+        tip_sol: policy.tip_sol.clone(),
+        warnings: policy.auto_fee_warnings.clone(),
     };
     let fingerprint = build_token_distribution_fingerprint("consolidate", &request)?;
     let (response, fresh) =
@@ -4174,6 +4818,32 @@ async fn consolidate_tokens(
         apply_token_distribution_ledger(&state, &response).await;
     }
     Ok(Json(response))
+}
+
+fn token_distribution_preset_id(
+    engine: &StoredEngineState,
+    requested_preset_id: &str,
+) -> Result<String, (StatusCode, String)> {
+    let requested = requested_preset_id.trim();
+    if !requested.is_empty() {
+        return Ok(requested.to_string());
+    }
+    engine
+        .presets
+        .first()
+        .map(|preset| preset.id.clone())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Token distribution requires an active preset.".to_string(),
+        ))
+}
+
+fn mev_mode_label(mode: &MevMode) -> &'static str {
+    match mode {
+        MevMode::Off => "off",
+        MevMode::Reduced => "reduced",
+        MevMode::Secure => "secure",
+    }
 }
 
 async fn rewards_summary(
@@ -4678,6 +5348,7 @@ async fn update_batch_execution_metadata(
     execution_adapter: Option<String>,
     execution_backend: Option<String>,
     planned_execution: Option<LifecycleAndCanonicalMarket>,
+    batch_policy: Option<BatchExecutionPolicySummary>,
 ) {
     let now = now_unix_ms();
     let mut guard = state.batches.write().await;
@@ -4693,6 +5364,9 @@ async fn update_batch_execution_metadata(
     }
     if planned_execution.is_some() {
         batch.planned_execution = planned_execution;
+    }
+    if batch_policy.is_some() {
+        batch.batch_policy = batch_policy;
     }
     if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
         eprintln!("[execution-engine][persist] batch history write failed: {error}");
@@ -4754,7 +5428,7 @@ async fn execute_batch_runtime(
     execution_backend: String,
     accepted_planned_execution: Option<LifecycleAndCanonicalMarket>,
     client_started_at_unix_ms: Option<u64>,
-    batch_policy: Option<BatchExecutionPolicySummary>,
+    mut batch_policy: Option<BatchExecutionPolicySummary>,
     execution_plan: Vec<PlannedWalletExecution>,
 ) {
     let worker_started_at = now_unix_ms();
@@ -4804,12 +5478,22 @@ async fn execute_batch_runtime(
         .planned_execution
         .clone()
         .or(accepted_planned_execution);
+    let resolved_execution_backend = planned_batch
+        .execution_backend
+        .clone()
+        .unwrap_or(execution_backend);
+    normalize_direct_stable_batch_policy_amounts(
+        resolved_planned_execution.as_ref(),
+        &planned_batch.execution_plan,
+        &mut batch_policy,
+    );
     update_batch_execution_metadata(
         &state,
         &batch_id,
         resolved_execution_adapter,
-        Some(execution_backend),
+        Some(resolved_execution_backend),
         resolved_planned_execution.clone(),
+        batch_policy.clone(),
     )
     .await;
     if let Some(selector) = resolved_planned_execution.as_ref() {
@@ -5114,13 +5798,70 @@ fn wallet_request_to_runtime_request(
     }
 }
 
+fn normalize_preview_request_for_wrapper_trade(
+    request: &TradeRuntimeRequest,
+) -> (TradeRuntimeRequest, bool) {
+    let mut normalized = request.clone();
+    let original_policy = normalized.policy.clone();
+    match normalized.side {
+        TradeSide::Buy => {
+            normalized.policy.buy_funding_policy = BuyFundingPolicy::SolOnly;
+        }
+        TradeSide::Sell => {
+            normalized.policy.sell_settlement_policy = SellSettlementPolicy::AlwaysToSol;
+            normalized.policy.sell_settlement_asset = TradeSettlementAsset::Sol;
+        }
+    }
+    let converted = normalized.policy.buy_funding_policy != original_policy.buy_funding_policy
+        || normalized.policy.sell_settlement_policy != original_policy.sell_settlement_policy
+        || normalized.policy.sell_settlement_asset != original_policy.sell_settlement_asset;
+    if converted {
+        normalized.planned_route = None;
+        normalized.planned_trade = None;
+        normalized.warm_key = None;
+    }
+    (normalized, converted)
+}
+
+fn normalize_runtime_request_for_wrapper_trade(
+    request: &TradeRuntimeRequest,
+) -> (TradeRuntimeRequest, bool) {
+    normalize_preview_request_for_wrapper_trade(request)
+}
+
+fn normalize_wallet_request_for_wrapper_trade(
+    request: &WalletTradeRequest,
+) -> (WalletTradeRequest, bool) {
+    let mut normalized = request.clone();
+    let original_policy = normalized.policy.clone();
+    match normalized.side {
+        TradeSide::Buy => {
+            normalized.policy.buy_funding_policy = BuyFundingPolicy::SolOnly;
+        }
+        TradeSide::Sell => {
+            normalized.policy.sell_settlement_policy = SellSettlementPolicy::AlwaysToSol;
+            normalized.policy.sell_settlement_asset = TradeSettlementAsset::Sol;
+        }
+    }
+    let converted = normalized.policy.buy_funding_policy != original_policy.buy_funding_policy
+        || normalized.policy.sell_settlement_policy != original_policy.sell_settlement_policy
+        || normalized.policy.sell_settlement_asset != original_policy.sell_settlement_asset;
+    if converted {
+        normalized.planned_route = None;
+        normalized.planned_trade = None;
+        normalized.warm_key = None;
+    }
+    (normalized, converted)
+}
+
 fn preview_compile_probe_required(
     side: &TradeSide,
     selector: &LifecycleAndCanonicalMarket,
 ) -> bool {
     matches!(
         selector.family,
-        crate::trade_planner::TradeVenueFamily::MeteoraDammV2
+        crate::trade_planner::TradeVenueFamily::MeteoraDbc
+            | crate::trade_planner::TradeVenueFamily::MeteoraDammV2
     ) || (matches!(side, TradeSide::Buy | TradeSide::Sell)
         && matches!(
             selector.family,
@@ -5195,6 +5936,7 @@ async fn run_preview_compile_probes(entries: &[PlannedWalletExecution]) -> Vec<S
 struct PlannedBatchRoutes {
     execution_plan: Vec<PlannedWalletExecution>,
     execution_adapter: Option<String>,
+    execution_backend: Option<String>,
     planned_execution: Option<LifecycleAndCanonicalMarket>,
     failed_wallets: Vec<(WalletTradeRequest, WalletExecutionState)>,
 }
@@ -5325,12 +6067,12 @@ async fn refresh_first_buy_only_batch_plan(
     updated
 }
 
-fn batch_route_plan_key(entry: &PlannedWalletExecution) -> String {
+fn batch_route_plan_key_for_request(request: &WalletTradeRequest) -> String {
     json!({
-        "side": entry.wallet_request.side,
-        "mint": entry.wallet_request.mint,
-        "pinnedPool": entry.wallet_request.pinned_pool,
-        "commitment": entry.wallet_request.policy.commitment,
+        "side": request.side,
+        "mint": request.mint,
+        "pinnedPool": request.pinned_pool,
+        "commitment": request.policy.commitment,
     })
     .to_string()
 }
@@ -5349,16 +6091,98 @@ fn route_planning_error_for_request(
     Ok(())
 }
 
+fn execution_backend_for_planned_route(selector: &LifecycleAndCanonicalMarket) -> &'static str {
+    if matches!(selector.family, TradeVenueFamily::TrustedStableSwap)
+        && !matches!(
+            selector.quote_asset,
+            PlannerQuoteAsset::Sol | PlannerQuoteAsset::Wsol
+        )
+    {
+        "native"
+    } else {
+        "wrapper"
+    }
+}
+
+fn direct_stable_buy_input_decimals(selector: &LifecycleAndCanonicalMarket) -> Option<u8> {
+    if matches!(selector.family, TradeVenueFamily::TrustedStableSwap)
+        && !matches!(
+            selector.quote_asset,
+            PlannerQuoteAsset::Sol | PlannerQuoteAsset::Wsol
+        )
+    {
+        Some(6)
+    } else {
+        None
+    }
+}
+
+fn normalize_direct_stable_buy_amount_precision(
+    selector: &LifecycleAndCanonicalMarket,
+    request: &mut WalletTradeRequest,
+    summary: &mut WalletExecutionPlanSummary,
+) {
+    if !matches!(request.side, TradeSide::Buy) {
+        return;
+    }
+    let Some(decimals) = direct_stable_buy_input_decimals(selector) else {
+        return;
+    };
+    let Some(amount) = request.buy_amount_sol.as_deref() else {
+        return;
+    };
+    let Some(raw_amount) = parse_decimal_units(amount, decimals) else {
+        return;
+    };
+    let normalized = format_decimal_units(raw_amount, decimals);
+    request.buy_amount_sol = Some(normalized.clone());
+    summary.buy_amount_sol = Some(normalized);
+}
+
+fn normalize_direct_stable_batch_policy_amounts(
+    selector: Option<&LifecycleAndCanonicalMarket>,
+    execution_plan: &[PlannedWalletExecution],
+    batch_policy: &mut Option<BatchExecutionPolicySummary>,
+) {
+    let (Some(selector), Some(policy)) = (selector, batch_policy.as_mut()) else {
+        return;
+    };
+    let Some(decimals) = direct_stable_buy_input_decimals(selector) else {
+        return;
+    };
+    let mut total_raw = 0u64;
+    let mut first_raw = None;
+    for entry in execution_plan {
+        if !matches!(entry.wallet_request.side, TradeSide::Buy) {
+            return;
+        }
+        let Some(amount) = entry.planned_summary.buy_amount_sol.as_deref() else {
+            return;
+        };
+        let Some(raw) = parse_decimal_units(amount, decimals) else {
+            return;
+        };
+        first_raw.get_or_insert(raw);
+        total_raw = total_raw.saturating_add(raw);
+    }
+    if let Some(raw) = first_raw {
+        policy.base_wallet_amount_sol = Some(format_decimal_units(raw, decimals));
+        policy.total_batch_spend_sol = Some(format_decimal_units(total_raw, decimals));
+    }
+}
+
 async fn plan_batch_wallet_trades(
     execution_plan: Vec<PlannedWalletExecution>,
 ) -> PlannedBatchRoutes {
     let mut grouped: HashMap<String, (WalletTradeRequest, Vec<usize>)> = HashMap::new();
     for (index, entry) in execution_plan.iter().enumerate() {
-        let key = batch_route_plan_key(entry);
+        let (normalized_request, _) =
+            normalize_wallet_request_for_wrapper_trade(&entry.wallet_request);
+        let key = batch_route_plan_key_for_request(&normalized_request);
         grouped
             .entry(key)
             .and_modify(|(_, indexes)| indexes.push(index))
-            .or_insert_with(|| (entry.wallet_request.clone(), vec![index]));
+            .or_insert_with(|| (normalized_request, vec![index]));
     }
 
     let mut resolved: HashMap<String, Result<crate::trade_dispatch::TradeDispatchPlan, String>> =
@@ -5366,7 +6190,7 @@ async fn plan_batch_wallet_trades(
     let mut join_set = JoinSet::new();
     for (key, (request, _)) in &grouped {
         let key = key.clone();
-        let request = request.clone();
+        let (request, _) = normalize_wallet_request_for_wrapper_trade(request);
         join_set.spawn(async move {
             let runtime_request = wallet_request_to_runtime_request(&request, None, None);
             let planned = plan_trade_request_to_dispatch(&runtime_request)
@@ -5391,6 +6215,7 @@ async fn plan_batch_wallet_trades(
 
     let mut updated = execution_plan;
     let mut execution_adapter = None;
+    let mut execution_backend = None;
     let mut planned_execution = None;
     let mut failed_wallets = Vec::new();
     for (key, (request, indexes)) in grouped {
@@ -5402,12 +6227,29 @@ async fn plan_batch_wallet_trades(
                 if planned_execution.is_none() {
                     planned_execution = Some(plan.selector.clone());
                 }
+                if execution_backend.is_none() {
+                    execution_backend =
+                        Some(execution_backend_for_planned_route(&plan.selector).to_string());
+                }
                 for index in indexes {
                     if let Some(entry) = updated.get_mut(index) {
-                        entry.wallet_request.mint = plan.resolved_mint.clone();
-                        entry.wallet_request.pinned_pool = plan.resolved_pinned_pool.clone();
-                        entry.wallet_request.planned_route = Some(plan.clone());
-                        entry.wallet_request.planned_trade = Some(plan.selector.clone());
+                        let (normalized_request, _) =
+                            normalize_wallet_request_for_wrapper_trade(&entry.wallet_request);
+                        let mut planned_summary = entry.planned_summary.clone();
+                        let mut routed_request = WalletTradeRequest {
+                            mint: plan.resolved_mint.clone(),
+                            pinned_pool: plan.resolved_pinned_pool.clone(),
+                            planned_route: Some(plan.clone()),
+                            planned_trade: Some(plan.selector.clone()),
+                            ..normalized_request
+                        };
+                        normalize_direct_stable_buy_amount_precision(
+                            &plan.selector,
+                            &mut routed_request,
+                            &mut planned_summary,
+                        );
+                        entry.wallet_request = routed_request;
+                        entry.planned_summary = planned_summary;
                     }
                 }
             }
@@ -5505,6 +6347,7 @@ async fn plan_batch_wallet_trades(
     PlannedBatchRoutes {
         execution_plan: successful_entries,
         execution_adapter,
+        execution_backend,
         planned_execution,
         failed_wallets,
     }
@@ -5659,7 +6502,13 @@ async fn record_confirmed_trade_ledger_entry(
         &wallet_request.mint,
     )
     .await
-    .map_err(ConfirmedTradeLedgerRecordError::Persist)?;
+    .map_err(ConfirmedTradeLedgerRecordError::Persist)?
+    .ok_or_else(|| {
+        ConfirmedTradeLedgerRecordError::Persist(format!(
+            "Confirmed transaction {tx_signature} did not include wallet {wallet_key} mint {} token-balance metadata.",
+            wallet_request.mint
+        ))
+    })?;
     validate_confirmed_trade_direction(
         &ledger_snapshot,
         &wallet_request.side,
@@ -5744,7 +6593,12 @@ async fn record_inferred_confirmed_trade_ledger_entry(
     let wallet_public_key = wallet_public_key_for_trade_ledger(wallet_key)?;
     let ledger_snapshot =
         fetch_wallet_trade_ledger_snapshot_for_signature(tx_signature, &wallet_public_key, mint)
-            .await?;
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "Confirmed transaction {tx_signature} did not include wallet {wallet_key} mint {mint} token-balance metadata."
+                )
+            })?;
     let side = if ledger_snapshot.token_delta_raw > 0 {
         TradeSide::Buy
     } else if ledger_snapshot.token_delta_raw < 0 {
@@ -5882,6 +6736,169 @@ struct ConfirmedTradeLedgerSnapshot {
     explicit_fees: ExplicitFeeBreakdown,
 }
 
+#[derive(Debug, Clone)]
+struct RpcResyncCandidate {
+    signature: String,
+    wallet_key: String,
+    wallet_public_key: String,
+    snapshot: ConfirmedTradeLedgerSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct HeliusResyncConfig {
+    base_url: String,
+    api_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct KnownWalletIdentity {
+    wallet_key: String,
+    public_key: String,
+}
+
+fn configured_helius_resync_config() -> Option<HeliusResyncConfig> {
+    if let Ok(value) = std::env::var("HELIUS_API_KEY") {
+        let api_key = value.trim();
+        if !api_key.is_empty() {
+            return Some(HeliusResyncConfig {
+                base_url: "https://api-mainnet.helius-rpc.com".to_string(),
+                api_key: api_key.to_string(),
+            });
+        }
+    }
+
+    let rpc_url = configured_rpc_url();
+    if !rpc_url.to_ascii_lowercase().contains("helius") {
+        return None;
+    }
+    let api_key = extract_query_param(&rpc_url, "api-key")
+        .or_else(|| extract_query_param(&rpc_url, "api_key"))?;
+    Some(HeliusResyncConfig {
+        base_url: "https://api-mainnet.helius-rpc.com".to_string(),
+        api_key,
+    })
+}
+
+fn extract_query_param(url: &str, name: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        if key == name && !value.trim().is_empty() {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+enum RpcResyncLedgerAction {
+    Trade(crate::trade_ledger::ConfirmedTradeEvent),
+    ForceClose {
+        marker: crate::trade_ledger::ForceCloseMarkerEvent,
+        persist: bool,
+    },
+    KnownTransfer {
+        marker: crate::trade_ledger::TokenTransferMarkerEvent,
+        slot: Option<u64>,
+    },
+    ReceivedWithoutCostBasis {
+        wallet_key: String,
+        mint: String,
+        amount_raw: u64,
+        signature: String,
+        applied_at_unix_ms: u64,
+        slot: Option<u64>,
+        persist: bool,
+    },
+    SentWithoutProceeds {
+        wallet_key: String,
+        mint: String,
+        amount_raw: u64,
+        signature: String,
+        applied_at_unix_ms: u64,
+        slot: Option<u64>,
+        persist: bool,
+    },
+}
+
+impl RpcResyncLedgerAction {
+    fn slot_sort_key(&self) -> u64 {
+        match self {
+            RpcResyncLedgerAction::Trade(event) => event.slot.unwrap_or(u64::MAX),
+            RpcResyncLedgerAction::ForceClose { .. } => u64::MAX,
+            RpcResyncLedgerAction::KnownTransfer { slot, .. }
+            | RpcResyncLedgerAction::ReceivedWithoutCostBasis { slot, .. }
+            | RpcResyncLedgerAction::SentWithoutProceeds { slot, .. } => slot.unwrap_or(u64::MAX),
+        }
+    }
+
+    fn applied_at_unix_ms(&self) -> u64 {
+        match self {
+            RpcResyncLedgerAction::Trade(event) => event.confirmed_at_unix_ms,
+            RpcResyncLedgerAction::ForceClose { marker, .. } => marker.applied_at_unix_ms,
+            RpcResyncLedgerAction::KnownTransfer { marker, .. } => marker.applied_at_unix_ms,
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                applied_at_unix_ms, ..
+            }
+            | RpcResyncLedgerAction::SentWithoutProceeds {
+                applied_at_unix_ms, ..
+            } => *applied_at_unix_ms,
+        }
+    }
+
+    fn signature(&self) -> &str {
+        match self {
+            RpcResyncLedgerAction::Trade(event) => &event.signature,
+            RpcResyncLedgerAction::ForceClose { marker, .. } => &marker.reason,
+            RpcResyncLedgerAction::KnownTransfer { marker, .. } => &marker.signature,
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis { signature, .. }
+            | RpcResyncLedgerAction::SentWithoutProceeds { signature, .. } => signature,
+        }
+    }
+
+    fn wallet_mint_key(&self) -> String {
+        match self {
+            RpcResyncLedgerAction::Trade(event) => {
+                trade_ledger_lookup_key(&event.wallet_key, &event.mint)
+            }
+            RpcResyncLedgerAction::ForceClose { marker, .. } => {
+                trade_ledger_lookup_key(&marker.wallet_key, &marker.mint)
+            }
+            RpcResyncLedgerAction::KnownTransfer { marker, .. } => {
+                trade_ledger_lookup_key(&marker.source_wallet_key, &marker.mint)
+            }
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                wallet_key, mint, ..
+            }
+            | RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key, mint, ..
+            } => trade_ledger_lookup_key(wallet_key, mint),
+        }
+    }
+
+    fn replay_rank(&self) -> u8 {
+        match self {
+            RpcResyncLedgerAction::Trade(_) => 0,
+            RpcResyncLedgerAction::KnownTransfer { .. } => 2,
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis { .. }
+            | RpcResyncLedgerAction::SentWithoutProceeds { .. } => 3,
+            RpcResyncLedgerAction::ForceClose { .. } => 4,
+        }
+    }
+}
+
+fn sort_resync_actions(actions: &mut [RpcResyncLedgerAction]) {
+    actions.sort_by(|left, right| {
+        left.applied_at_unix_ms()
+            .cmp(&right.applied_at_unix_ms())
+            .then_with(|| left.slot_sort_key().cmp(&right.slot_sort_key()))
+            .then_with(|| left.wallet_mint_key().cmp(&right.wallet_mint_key()))
+            .then_with(|| left.replay_rank().cmp(&right.replay_rank()))
+            .then_with(|| left.signature().cmp(right.signature()))
+            .then_with(|| resync_action_dedupe_key(left).cmp(&resync_action_dedupe_key(right)))
+    });
+}
+
 fn validate_confirmed_trade_direction(
     snapshot: &ConfirmedTradeLedgerSnapshot,
     side: &TradeSide,
@@ -5998,32 +7015,48 @@ fn total_token_balance_amount_from_meta(
     balances: &[Value],
     owner: &str,
     mint: &str,
-) -> Option<u64> {
+) -> Result<Option<u64>, String> {
     let mut total = 0u128;
     let mut found = false;
     for balance in balances {
         if token_balance_meta_matches_owner_and_mint(balance, owner, mint) {
             found = true;
-            total = total.saturating_add(u128::from(
-                token_balance_amount_from_meta(balance).unwrap_or(0),
-            ));
+            let amount = token_balance_amount_from_meta(balance).ok_or_else(|| {
+                format!(
+                    "Transaction token-balance metadata for wallet {owner} mint {mint} had an invalid amount."
+                )
+            })?;
+            total = total.saturating_add(u128::from(amount));
         }
     }
-    found.then_some(total.min(u128::from(u64::MAX)) as u64)
+    Ok(found.then_some(total.min(u128::from(u64::MAX)) as u64))
 }
 
+#[cfg(test)]
 fn trade_token_delta_from_meta(
     pre_token_balances: &[Value],
     post_token_balances: &[Value],
     owner: &str,
     mint: &str,
 ) -> Result<(i128, Option<u8>), String> {
-    let pre_raw = total_token_balance_amount_from_meta(pre_token_balances, owner, mint);
-    let post_raw = total_token_balance_amount_from_meta(post_token_balances, owner, mint);
+    maybe_trade_token_delta_from_meta(pre_token_balances, post_token_balances, owner, mint)?
+        .ok_or_else(|| {
+            format!(
+                "Transaction token-balance metadata did not include wallet {owner} mint {mint}."
+            )
+        })
+}
+
+fn maybe_trade_token_delta_from_meta(
+    pre_token_balances: &[Value],
+    post_token_balances: &[Value],
+    owner: &str,
+    mint: &str,
+) -> Result<Option<(i128, Option<u8>)>, String> {
+    let pre_raw = total_token_balance_amount_from_meta(pre_token_balances, owner, mint)?;
+    let post_raw = total_token_balance_amount_from_meta(post_token_balances, owner, mint)?;
     if pre_raw.is_none() && post_raw.is_none() {
-        return Err(format!(
-            "Transaction token-balance metadata did not include wallet {owner} mint {mint}."
-        ));
+        return Ok(None);
     }
     let token_decimals = post_token_balances
         .iter()
@@ -6032,10 +7065,327 @@ fn trade_token_delta_from_meta(
         .and_then(token_balance_decimals_from_meta);
     let effective_pre_raw = pre_raw.unwrap_or(0);
     let effective_post_raw = post_raw.or_else(|| pre_raw.map(|_| 0)).unwrap_or(0);
-    Ok((
+    Ok(Some((
         i128::from(effective_post_raw) - i128::from(effective_pre_raw),
         token_decimals,
-    ))
+    )))
+}
+
+fn helius_raw_token_amount(change: &Value, owner: &str, mint: &str) -> Result<i128, String> {
+    let raw = change
+        .get("rawTokenAmount")
+        .and_then(|value| value.get("tokenAmount"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("Helius token balance change for wallet {owner} mint {mint} had no raw amount.")
+        })?;
+    raw.trim().parse::<i128>().map_err(|error| {
+        format!("Helius token balance change for wallet {owner} mint {mint} had invalid raw amount: {error}")
+    })
+}
+
+fn helius_token_decimals(change: &Value) -> Option<u8> {
+    change
+        .get("rawTokenAmount")
+        .and_then(|value| value.get("decimals"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+}
+
+fn helius_token_delta_from_account_data(
+    account_data: &[Value],
+    owner: &str,
+    mint: &str,
+) -> Result<Option<(i128, Option<u8>)>, String> {
+    let mut total = 0i128;
+    let mut decimals = None;
+    let mut found = false;
+    for account in account_data {
+        let Some(changes) = account.get("tokenBalanceChanges").and_then(Value::as_array) else {
+            continue;
+        };
+        for change in changes {
+            let matches_owner = change
+                .get("userAccount")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == owner);
+            let matches_mint = change
+                .get("mint")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == mint);
+            if !matches_owner || !matches_mint {
+                continue;
+            }
+            found = true;
+            total = total.saturating_add(helius_raw_token_amount(change, owner, mint)?);
+            if decimals.is_none() {
+                decimals = helius_token_decimals(change);
+            }
+        }
+    }
+    Ok(found.then_some((total, decimals)))
+}
+
+fn helius_native_delta_from_account_data(account_data: &[Value], owner: &str) -> i64 {
+    account_data
+        .iter()
+        .find(|account| {
+            account
+                .get("account")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == owner)
+        })
+        .and_then(|account| account.get("nativeBalanceChange"))
+        .and_then(|value| match value {
+            Value::Number(number) => number
+                .as_i64()
+                .or_else(|| number.as_u64().and_then(|raw| i64::try_from(raw).ok())),
+            Value::String(raw) => raw.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn helius_explicit_fees(
+    transaction: &Value,
+    account_data: &[Value],
+    wallet_public_key: &str,
+    tracked_mint: &str,
+) -> ExplicitFeeBreakdown {
+    let fee_payer = transaction
+        .get("feePayer")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    ExplicitFeeBreakdown {
+        network_fee_lamports: if fee_payer == wallet_public_key {
+            transaction
+                .get("fee")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        } else {
+            0
+        },
+        tip_lamports: helius_tip_lamports(transaction, wallet_public_key),
+        rent_delta_lamports: helius_wallet_owned_token_account_rent_delta_lamports(
+            account_data,
+            wallet_public_key,
+            tracked_mint,
+        ),
+        ..ExplicitFeeBreakdown::default()
+    }
+}
+
+fn helius_tip_lamports(transaction: &Value, wallet_public_key: &str) -> u64 {
+    let Some(transfers) = transaction.get("nativeTransfers").and_then(Value::as_array) else {
+        return 0;
+    };
+    transfers.iter().fold(0u64, |sum, transfer| {
+        let from_wallet = transfer
+            .get("fromUserAccount")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == wallet_public_key);
+        let to_tip_account = transfer
+            .get("toUserAccount")
+            .and_then(Value::as_str)
+            .is_some_and(|value| recognized_tip_accounts().contains(value));
+        if from_wallet && to_tip_account {
+            sum.saturating_add(value_as_u64_loose(transfer.get("amount")).unwrap_or_default())
+        } else {
+            sum
+        }
+    })
+}
+
+fn helius_wallet_owned_token_account_rent_delta_lamports(
+    account_data: &[Value],
+    owner: &str,
+    mint: &str,
+) -> i64 {
+    let mut total = 0i128;
+    for account in account_data {
+        let Some(account_key) = account.get("account").and_then(Value::as_str) else {
+            continue;
+        };
+        if account_key == owner {
+            continue;
+        }
+        let Some(native_delta) = account
+            .get("nativeBalanceChange")
+            .and_then(|value| match value {
+                Value::Number(number) => number
+                    .as_i64()
+                    .or_else(|| number.as_u64().and_then(|raw| i64::try_from(raw).ok())),
+                Value::String(raw) => raw.trim().parse::<i64>().ok(),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let owns_relevant_mint = account
+            .get("tokenBalanceChanges")
+            .and_then(Value::as_array)
+            .is_some_and(|changes| {
+                changes.iter().any(|change| {
+                    change
+                        .get("userAccount")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == owner)
+                        && change
+                            .get("mint")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == mint || value == USD1_MINT)
+                        && change
+                            .get("tokenAccount")
+                            .and_then(Value::as_str)
+                            .map_or(true, |value| value == account_key)
+                })
+            });
+        if owns_relevant_mint {
+            total = total.saturating_add(i128::from(native_delta));
+        }
+    }
+    total.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn push_selected_token_only_movement_action(
+    actions: &mut Vec<RpcResyncLedgerAction>,
+    movement: TokenOnlyMovement,
+    selected_wallet_keys: &HashSet<String>,
+    is_incoming: bool,
+) {
+    if !selected_wallet_keys.contains(&movement.wallet_key) || movement.amount_raw == 0 {
+        return;
+    }
+    if is_incoming {
+        actions.push(RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+            wallet_key: movement.wallet_key,
+            mint: movement.mint,
+            amount_raw: movement.amount_raw,
+            signature: movement.signature,
+            applied_at_unix_ms: movement.applied_at_unix_ms,
+            slot: movement.slot,
+            persist: true,
+        });
+    } else {
+        actions.push(RpcResyncLedgerAction::SentWithoutProceeds {
+            wallet_key: movement.wallet_key,
+            mint: movement.mint,
+            amount_raw: movement.amount_raw,
+            signature: movement.signature,
+            applied_at_unix_ms: movement.applied_at_unix_ms,
+            slot: movement.slot,
+            persist: true,
+        });
+    }
+}
+
+fn push_clear_incomplete_movement_action(
+    actions: &mut Vec<RpcResyncLedgerAction>,
+    wallet_key: &str,
+    mint: &str,
+    signature: &str,
+    applied_at_unix_ms: u64,
+    slot: Option<u64>,
+    is_incoming: bool,
+) {
+    if is_incoming {
+        actions.push(RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+            wallet_key: wallet_key.to_string(),
+            mint: mint.to_string(),
+            amount_raw: 0,
+            signature: signature.to_string(),
+            applied_at_unix_ms,
+            slot,
+            persist: true,
+        });
+    } else {
+        actions.push(RpcResyncLedgerAction::SentWithoutProceeds {
+            wallet_key: wallet_key.to_string(),
+            mint: mint.to_string(),
+            amount_raw: 0,
+            signature: signature.to_string(),
+            applied_at_unix_ms,
+            slot,
+            persist: true,
+        });
+    }
+}
+
+fn transfer_incomplete_signature(
+    signature: &str,
+    wallet_key: &str,
+    counterparty_wallet_key: &str,
+    is_incoming: bool,
+) -> String {
+    format!(
+        "{}:incomplete:{}:{}:{}",
+        signature.trim(),
+        if is_incoming {
+            "received_from"
+        } else {
+            "sent_to"
+        },
+        wallet_key.trim(),
+        counterparty_wallet_key.trim()
+    )
+}
+
+fn helius_candidate_from_transaction(
+    transaction: &Value,
+    wallet_key: &str,
+    wallet_public_key: &str,
+    mint: &str,
+) -> Result<Option<RpcResyncCandidate>, String> {
+    if transaction
+        .get("transactionError")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Ok(None);
+    }
+    let signature = transaction
+        .get("signature")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Helius transaction did not include a signature.".to_string())?;
+    let account_data = transaction
+        .get("accountData")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let Some((token_delta_raw, token_decimals)) =
+        helius_token_delta_from_account_data(&account_data, wallet_public_key, mint)?
+    else {
+        return Ok(None);
+    };
+    if token_delta_raw == 0 {
+        return Ok(None);
+    }
+    let usd1_delta_raw =
+        helius_token_delta_from_account_data(&account_data, wallet_public_key, USD1_MINT)?
+            .map(|(delta, _)| delta)
+            .unwrap_or(0);
+    Ok(Some(RpcResyncCandidate {
+        signature: signature.to_string(),
+        wallet_key: wallet_key.to_string(),
+        wallet_public_key: wallet_public_key.to_string(),
+        snapshot: ConfirmedTradeLedgerSnapshot {
+            lamport_delta: helius_native_delta_from_account_data(&account_data, wallet_public_key),
+            usd1_delta_raw,
+            token_delta_raw,
+            token_decimals,
+            slot: transaction.get("slot").and_then(Value::as_u64),
+            block_time_unix_ms: transaction
+                .get("timestamp")
+                .and_then(Value::as_i64)
+                .and_then(|value| u64::try_from(value).ok())
+                .map(|value| value.saturating_mul(1_000)),
+            explicit_fees: helius_explicit_fees(
+                transaction,
+                &account_data,
+                wallet_public_key,
+                mint,
+            ),
+        },
+    }))
 }
 
 fn value_as_u64_loose(value: Option<&Value>) -> Option<u64> {
@@ -6282,7 +7632,7 @@ async fn fetch_wallet_trade_ledger_snapshot_for_signature(
     tx_signature: &str,
     wallet_public_key: &str,
     mint: &str,
-) -> Result<ConfirmedTradeLedgerSnapshot, String> {
+) -> Result<Option<ConfirmedTradeLedgerSnapshot>, String> {
     let client = extension_wallet_rpc_client()?;
     for _attempt in 0..3 {
         let result = crate::rpc_client::rpc_request_with_client(
@@ -6350,27 +7700,30 @@ async fn fetch_wallet_trade_ledger_snapshot_for_signature(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let (token_delta_raw, token_decimals) = trade_token_delta_from_meta(
+        let Some((token_delta_raw, token_decimals)) = maybe_trade_token_delta_from_meta(
             &pre_token_balances,
             &post_token_balances,
             wallet_public_key,
             mint,
-        )?;
-        return Ok(ConfirmedTradeLedgerSnapshot {
+        )?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(ConfirmedTradeLedgerSnapshot {
             lamport_delta: post_balance as i64 - pre_balance as i64,
             usd1_delta_raw: i128::from(
                 total_token_balance_amount_from_meta(
                     &post_token_balances,
                     wallet_public_key,
                     USD1_MINT,
-                )
+                )?
                 .unwrap_or(0),
             ) - i128::from(
                 total_token_balance_amount_from_meta(
                     &pre_token_balances,
                     wallet_public_key,
                     USD1_MINT,
-                )
+                )?
                 .unwrap_or(0),
             ),
             token_delta_raw,
@@ -6386,7 +7739,7 @@ async fn fetch_wallet_trade_ledger_snapshot_for_signature(
                 wallet_public_key,
                 mint,
             ),
-        });
+        }));
     }
     Err(format!(
         "Confirmed transaction {} was not yet available for ledger inspection.",
@@ -6420,6 +7773,1142 @@ fn settlement_asset_from_snapshot(
     }
 }
 
+fn rpc_resync_event_id(signature: &str, wallet_key: &str, mint: &str, side: &TradeSide) -> String {
+    format!(
+        "{}::{}::{}::{}",
+        signature.trim(),
+        wallet_key.trim(),
+        mint.trim(),
+        match side {
+            TradeSide::Buy => "buy",
+            TradeSide::Sell => "sell",
+        }
+    )
+}
+
+fn enrich_rpc_resync_event_from_local(
+    mut event: crate::trade_ledger::ConfirmedTradeEvent,
+    local_events_by_id: &HashMap<String, crate::trade_ledger::ConfirmedTradeEvent>,
+) -> crate::trade_ledger::ConfirmedTradeEvent {
+    if let Some(local) = local_events_by_id.get(&event.event_id()) {
+        event.platform_tag = local.platform_tag;
+        event.provenance = local.provenance;
+        event.client_request_id = local.client_request_id.clone();
+        event.batch_id = local.batch_id.clone();
+    }
+    event
+}
+
+fn merge_missing_local_resync_events(
+    actions: &mut Vec<RpcResyncLedgerAction>,
+    local_events: &[crate::trade_ledger::ConfirmedTradeEvent],
+) {
+    let mut known_event_ids = actions
+        .iter()
+        .filter_map(|action| match action {
+            RpcResyncLedgerAction::Trade(event) => Some(event.event_id()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    actions.extend(
+        local_events
+            .iter()
+            .filter(|event| known_event_ids.insert(event.event_id()))
+            .cloned()
+            .map(RpcResyncLedgerAction::Trade),
+    );
+}
+
+fn resync_action_dedupe_key(action: &RpcResyncLedgerAction) -> String {
+    match action {
+        RpcResyncLedgerAction::Trade(event) => format!("trade::{}", event.event_id()),
+        RpcResyncLedgerAction::ForceClose { marker, .. } => format!(
+            "force-close::{}::{}::{}::{}",
+            marker.wallet_key.trim(),
+            marker.mint.trim(),
+            marker.applied_at_unix_ms,
+            marker.reason.trim()
+        ),
+        RpcResyncLedgerAction::KnownTransfer { marker, .. } => {
+            format!("token-transfer::{}", marker.event_id())
+        }
+        RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+            wallet_key,
+            mint,
+            amount_raw,
+            signature,
+            slot,
+            ..
+        } => format!(
+            "incomplete::received_without_cost_basis::{wallet_key}::{mint}::{signature}::{amount_raw}::{}",
+            slot.unwrap_or(u64::MAX)
+        ),
+        RpcResyncLedgerAction::SentWithoutProceeds {
+            wallet_key,
+            mint,
+            amount_raw,
+            signature,
+            slot,
+            ..
+        } => format!(
+            "incomplete::sent_without_proceeds::{wallet_key}::{mint}::{signature}::{amount_raw}::{}",
+            slot.unwrap_or(u64::MAX)
+        ),
+    }
+}
+
+fn marker_is_after_resync_baseline(
+    wallet_key: &str,
+    applied_at_unix_ms: u64,
+    slot: Option<u64>,
+    reset_baselines_by_wallet: &HashMap<String, (u64, Option<u64>)>,
+) -> bool {
+    let (reset_baseline_unix_ms, reset_baseline_slot) = reset_baselines_by_wallet
+        .get(wallet_key)
+        .copied()
+        .unwrap_or((0, None));
+    crate::trade_ledger::trade_event_is_after_reset_baseline(
+        applied_at_unix_ms,
+        slot,
+        reset_baseline_unix_ms,
+        reset_baseline_slot,
+    )
+}
+
+fn incomplete_marker_resync_key(
+    marker: &crate::trade_ledger::IncompleteBalanceAdjustmentMarkerEvent,
+) -> String {
+    match marker.adjustment_kind {
+        crate::trade_ledger::IncompleteBalanceAdjustmentKind::ReceivedWithoutCostBasis => format!(
+            "received_without_cost_basis::{}::{}::{}",
+            marker.wallet_key, marker.mint, marker.signature
+        ),
+        crate::trade_ledger::IncompleteBalanceAdjustmentKind::SentWithoutProceeds => format!(
+            "sent_without_proceeds::{}::{}::{}",
+            marker.wallet_key, marker.mint, marker.signature
+        ),
+    }
+}
+
+fn incomplete_marker_order_key(
+    marker: &crate::trade_ledger::IncompleteBalanceAdjustmentMarkerEvent,
+) -> (u64, u64) {
+    (marker.slot.unwrap_or(0), marker.applied_at_unix_ms)
+}
+
+fn incomplete_marker_to_resync_action(
+    marker: crate::trade_ledger::IncompleteBalanceAdjustmentMarkerEvent,
+) -> RpcResyncLedgerAction {
+    match marker.adjustment_kind {
+        crate::trade_ledger::IncompleteBalanceAdjustmentKind::ReceivedWithoutCostBasis => {
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                wallet_key: marker.wallet_key,
+                mint: marker.mint,
+                amount_raw: marker.amount_raw,
+                signature: marker.signature,
+                applied_at_unix_ms: marker.applied_at_unix_ms,
+                slot: marker.slot,
+                persist: false,
+            }
+        }
+        crate::trade_ledger::IncompleteBalanceAdjustmentKind::SentWithoutProceeds => {
+            RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key: marker.wallet_key,
+                mint: marker.mint,
+                amount_raw: marker.amount_raw,
+                signature: marker.signature,
+                applied_at_unix_ms: marker.applied_at_unix_ms,
+                slot: marker.slot,
+                persist: false,
+            }
+        }
+    }
+}
+
+fn incomplete_marker_to_persisted_clear_action(
+    marker: crate::trade_ledger::IncompleteBalanceAdjustmentMarkerEvent,
+) -> RpcResyncLedgerAction {
+    match marker.adjustment_kind {
+        crate::trade_ledger::IncompleteBalanceAdjustmentKind::ReceivedWithoutCostBasis => {
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                wallet_key: marker.wallet_key,
+                mint: marker.mint,
+                amount_raw: 0,
+                signature: marker.signature,
+                applied_at_unix_ms: marker.applied_at_unix_ms,
+                slot: marker.slot,
+                persist: true,
+            }
+        }
+        crate::trade_ledger::IncompleteBalanceAdjustmentKind::SentWithoutProceeds => {
+            RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key: marker.wallet_key,
+                mint: marker.mint,
+                amount_raw: 0,
+                signature: marker.signature,
+                applied_at_unix_ms: marker.applied_at_unix_ms,
+                slot: marker.slot,
+                persist: true,
+            }
+        }
+    }
+}
+
+fn merge_scoped_local_resync_markers(
+    actions: &mut Vec<RpcResyncLedgerAction>,
+    journal_entries: &[JournalEntry],
+    selected_wallet_keys: &HashSet<String>,
+    mint: &str,
+    reset_baselines_by_wallet: &HashMap<String, (u64, Option<u64>)>,
+) {
+    let mut known_actions = actions
+        .iter()
+        .map(resync_action_dedupe_key)
+        .collect::<HashSet<_>>();
+    let mut transfer_shadowed_incomplete_keys = HashSet::new();
+    let mut marker_actions = Vec::new();
+    let mut latest_incomplete_markers = HashMap::new();
+
+    for entry in journal_entries {
+        match entry {
+            JournalEntry::ForceCloseMarker(marker)
+                if marker.mint == mint
+                    && selected_wallet_keys.contains(&marker.wallet_key)
+                    && marker_is_after_resync_baseline(
+                        &marker.wallet_key,
+                        marker.applied_at_unix_ms,
+                        None,
+                        reset_baselines_by_wallet,
+                    ) =>
+            {
+                marker_actions.push(RpcResyncLedgerAction::ForceClose {
+                    marker: marker.clone(),
+                    persist: false,
+                });
+            }
+            JournalEntry::TokenTransferMarker(marker) if marker.mint == mint => {
+                let source_selected = selected_wallet_keys.contains(&marker.source_wallet_key);
+                let destination_selected =
+                    selected_wallet_keys.contains(&marker.destination_wallet_key);
+                if !source_selected && !destination_selected {
+                    continue;
+                }
+                if source_selected
+                    && !marker_is_after_resync_baseline(
+                        &marker.source_wallet_key,
+                        marker.applied_at_unix_ms,
+                        marker.slot,
+                        reset_baselines_by_wallet,
+                    )
+                {
+                    continue;
+                }
+                if destination_selected
+                    && !marker_is_after_resync_baseline(
+                        &marker.destination_wallet_key,
+                        marker.applied_at_unix_ms,
+                        marker.slot,
+                        reset_baselines_by_wallet,
+                    )
+                {
+                    continue;
+                }
+
+                let sent_signature = transfer_incomplete_signature(
+                    &marker.signature,
+                    &marker.source_wallet_key,
+                    &marker.destination_wallet_key,
+                    false,
+                );
+                transfer_shadowed_incomplete_keys.insert(format!(
+                    "sent_without_proceeds::{}::{}::{}",
+                    marker.source_wallet_key, marker.mint, sent_signature
+                ));
+                let received_signature = transfer_incomplete_signature(
+                    &marker.signature,
+                    &marker.destination_wallet_key,
+                    &marker.source_wallet_key,
+                    true,
+                );
+                transfer_shadowed_incomplete_keys.insert(format!(
+                    "received_without_cost_basis::{}::{}::{}",
+                    marker.destination_wallet_key, marker.mint, received_signature
+                ));
+
+                match (source_selected, destination_selected) {
+                    (true, true) => marker_actions.push(RpcResyncLedgerAction::KnownTransfer {
+                        marker: marker.clone(),
+                        slot: marker.slot,
+                    }),
+                    (true, false) => {
+                        marker_actions.push(RpcResyncLedgerAction::SentWithoutProceeds {
+                            wallet_key: marker.source_wallet_key.clone(),
+                            mint: marker.mint.clone(),
+                            amount_raw: marker.amount_raw,
+                            signature: sent_signature,
+                            applied_at_unix_ms: marker.applied_at_unix_ms,
+                            slot: marker.slot,
+                            persist: false,
+                        });
+                    }
+                    (false, true) => {
+                        marker_actions.push(RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                            wallet_key: marker.destination_wallet_key.clone(),
+                            mint: marker.mint.clone(),
+                            amount_raw: marker.amount_raw,
+                            signature: received_signature,
+                            applied_at_unix_ms: marker.applied_at_unix_ms,
+                            slot: marker.slot,
+                            persist: false,
+                        });
+                    }
+                    (false, false) => {}
+                }
+            }
+            JournalEntry::IncompleteBalanceAdjustmentMarker(marker)
+                if marker.mint == mint
+                    && selected_wallet_keys.contains(&marker.wallet_key)
+                    && !marker
+                        .signature
+                        .trim()
+                        .starts_with("resync-balance-reconcile:")
+                    && marker_is_after_resync_baseline(
+                        &marker.wallet_key,
+                        marker.applied_at_unix_ms,
+                        marker.slot,
+                        reset_baselines_by_wallet,
+                    ) =>
+            {
+                let clear_scope = incomplete_marker_resync_key(marker);
+                if marker.amount_raw == 0 {
+                    latest_incomplete_markers.retain(|_, existing| {
+                        incomplete_marker_resync_key(existing) != clear_scope
+                    });
+                    latest_incomplete_markers.insert(marker.event_id(), marker.clone());
+                    continue;
+                }
+                let event_id = marker.event_id();
+                let should_replace =
+                    latest_incomplete_markers
+                        .get(&event_id)
+                        .map_or(true, |existing| {
+                            incomplete_marker_order_key(marker)
+                                >= incomplete_marker_order_key(existing)
+                        });
+                if should_replace {
+                    latest_incomplete_markers.insert(event_id, marker.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for marker in latest_incomplete_markers.into_values() {
+        if transfer_shadowed_incomplete_keys.contains(&incomplete_marker_resync_key(&marker)) {
+            marker_actions.push(incomplete_marker_to_persisted_clear_action(marker));
+        } else {
+            marker_actions.push(incomplete_marker_to_resync_action(marker));
+        }
+    }
+
+    actions.extend(
+        marker_actions
+            .into_iter()
+            .filter(|action| known_actions.insert(resync_action_dedupe_key(action))),
+    );
+}
+
+#[derive(Debug, Clone)]
+struct TokenOnlyMovement {
+    wallet_key: String,
+    mint: String,
+    amount_raw: u64,
+    signature: String,
+    applied_at_unix_ms: u64,
+    slot: Option<u64>,
+}
+
+async fn build_rpc_resync_ledger_actions(
+    candidates: Vec<RpcResyncCandidate>,
+    mint: &str,
+    selected_wallet_keys: &HashSet<String>,
+    local_events_by_id: &HashMap<String, crate::trade_ledger::ConfirmedTradeEvent>,
+) -> Result<Vec<RpcResyncLedgerAction>, (StatusCode, String)> {
+    let mut actions = Vec::new();
+    let mut token_only_by_signature: BTreeMap<String, Vec<RpcResyncCandidate>> = BTreeMap::new();
+
+    for candidate in candidates {
+        let snapshot = &candidate.snapshot;
+        let side = if snapshot.token_delta_raw > 0 {
+            TradeSide::Buy
+        } else if snapshot.token_delta_raw < 0 {
+            TradeSide::Sell
+        } else {
+            continue;
+        };
+        let notional_source = match side {
+            TradeSide::Buy => confirmed_buy_notional_source(snapshot),
+            TradeSide::Sell => confirmed_sell_notional_source(snapshot),
+        };
+        let Some(notional_source) = notional_source else {
+            token_only_by_signature
+                .entry(candidate.signature.clone())
+                .or_default()
+                .push(candidate);
+            continue;
+        };
+        if !selected_wallet_keys.contains(&candidate.wallet_key) {
+            continue;
+        }
+        let trade_value_lamports = resolve_confirmed_trade_notional_lamports(Some(notional_source))
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+        let mut event = crate::trade_ledger::ConfirmedTradeEvent {
+            schema_version: crate::trade_ledger::trade_ledger_schema_version(),
+            signature: candidate.signature.clone(),
+            slot: snapshot.slot,
+            confirmed_at_unix_ms: snapshot.block_time_unix_ms.unwrap_or_else(now_unix_ms),
+            wallet_key: candidate.wallet_key.clone(),
+            wallet_public_key: candidate.wallet_public_key.clone(),
+            mint: mint.to_string(),
+            side: side.clone(),
+            platform_tag: PlatformTag::Unknown,
+            provenance: EventProvenance::RpcResync,
+            settlement_asset: settlement_asset_from_snapshot(snapshot, &side),
+            token_delta_raw: snapshot.token_delta_raw,
+            token_decimals: snapshot.token_decimals,
+            trade_value_lamports,
+            explicit_fees: snapshot.explicit_fees.clone(),
+            client_request_id: None,
+            batch_id: None,
+        };
+        if let Some(local) = local_events_by_id.get(&rpc_resync_event_id(
+            &event.signature,
+            &event.wallet_key,
+            &event.mint,
+            &event.side,
+        )) {
+            event.platform_tag = local.platform_tag;
+            event.provenance = local.provenance;
+            event.client_request_id = local.client_request_id.clone();
+            event.batch_id = local.batch_id.clone();
+        }
+        actions.push(RpcResyncLedgerAction::Trade(
+            enrich_rpc_resync_event_from_local(event, local_events_by_id),
+        ));
+    }
+
+    for (signature, movements) in token_only_by_signature {
+        let mut outgoing = Vec::new();
+        let mut incoming = Vec::new();
+        for candidate in movements {
+            let applied_at_unix_ms = candidate
+                .snapshot
+                .block_time_unix_ms
+                .unwrap_or_else(now_unix_ms);
+            if candidate.snapshot.token_delta_raw > 0 {
+                incoming.push(TokenOnlyMovement {
+                    wallet_key: candidate.wallet_key,
+                    mint: mint.to_string(),
+                    amount_raw: u64::try_from(candidate.snapshot.token_delta_raw)
+                        .unwrap_or(u64::MAX),
+                    signature: signature.clone(),
+                    applied_at_unix_ms,
+                    slot: candidate.snapshot.slot,
+                });
+            } else if candidate.snapshot.token_delta_raw < 0 {
+                outgoing.push(TokenOnlyMovement {
+                    wallet_key: candidate.wallet_key,
+                    mint: mint.to_string(),
+                    amount_raw: u64::try_from(-candidate.snapshot.token_delta_raw)
+                        .unwrap_or(u64::MAX),
+                    signature: signature.clone(),
+                    applied_at_unix_ms,
+                    slot: candidate.snapshot.slot,
+                });
+            }
+        }
+
+        if outgoing.len() > 1 && incoming.len() > 1 {
+            for movement in incoming {
+                push_selected_token_only_movement_action(
+                    &mut actions,
+                    movement,
+                    selected_wallet_keys,
+                    true,
+                );
+            }
+            for movement in outgoing {
+                push_selected_token_only_movement_action(
+                    &mut actions,
+                    movement,
+                    selected_wallet_keys,
+                    false,
+                );
+            }
+            continue;
+        }
+
+        for source in &mut outgoing {
+            for destination in &mut incoming {
+                if source.amount_raw == 0 || destination.amount_raw == 0 {
+                    continue;
+                }
+                let moved_amount = source.amount_raw.min(destination.amount_raw);
+                source.amount_raw = source.amount_raw.saturating_sub(moved_amount);
+                destination.amount_raw = destination.amount_raw.saturating_sub(moved_amount);
+                let source_selected = selected_wallet_keys.contains(&source.wallet_key);
+                let destination_selected = selected_wallet_keys.contains(&destination.wallet_key);
+                let applied_at_unix_ms = source
+                    .applied_at_unix_ms
+                    .max(destination.applied_at_unix_ms);
+                let slot = source.slot.or(destination.slot);
+                match (source_selected, destination_selected) {
+                    (true, true) => {
+                        actions.push(RpcResyncLedgerAction::KnownTransfer {
+                            marker: crate::trade_ledger::TokenTransferMarkerEvent::new(
+                                &source.wallet_key,
+                                &destination.wallet_key,
+                                &source.mint,
+                                moved_amount,
+                                &signature,
+                                applied_at_unix_ms,
+                            )
+                            .with_slot(slot),
+                            slot,
+                        });
+                        push_clear_incomplete_movement_action(
+                            &mut actions,
+                            &source.wallet_key,
+                            &source.mint,
+                            &transfer_incomplete_signature(
+                                &signature,
+                                &source.wallet_key,
+                                &destination.wallet_key,
+                                false,
+                            ),
+                            applied_at_unix_ms,
+                            slot,
+                            false,
+                        );
+                        push_clear_incomplete_movement_action(
+                            &mut actions,
+                            &destination.wallet_key,
+                            &destination.mint,
+                            &transfer_incomplete_signature(
+                                &signature,
+                                &destination.wallet_key,
+                                &source.wallet_key,
+                                true,
+                            ),
+                            applied_at_unix_ms,
+                            slot,
+                            true,
+                        );
+                    }
+                    (true, false) => {
+                        let incomplete_signature = transfer_incomplete_signature(
+                            &signature,
+                            &source.wallet_key,
+                            &destination.wallet_key,
+                            false,
+                        );
+                        actions.push(RpcResyncLedgerAction::SentWithoutProceeds {
+                            wallet_key: source.wallet_key.clone(),
+                            mint: source.mint.clone(),
+                            amount_raw: moved_amount,
+                            signature: incomplete_signature,
+                            applied_at_unix_ms,
+                            slot,
+                            persist: true,
+                        });
+                    }
+                    (false, true) => {
+                        let incomplete_signature = transfer_incomplete_signature(
+                            &signature,
+                            &destination.wallet_key,
+                            &source.wallet_key,
+                            true,
+                        );
+                        actions.push(RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                            wallet_key: destination.wallet_key.clone(),
+                            mint: destination.mint.clone(),
+                            amount_raw: moved_amount,
+                            signature: incomplete_signature,
+                            applied_at_unix_ms,
+                            slot,
+                            persist: true,
+                        });
+                    }
+                    (false, false) => {}
+                }
+            }
+        }
+
+        for movement in incoming {
+            push_selected_token_only_movement_action(
+                &mut actions,
+                movement,
+                selected_wallet_keys,
+                true,
+            );
+        }
+        for movement in outgoing {
+            push_selected_token_only_movement_action(
+                &mut actions,
+                movement,
+                selected_wallet_keys,
+                false,
+            );
+        }
+    }
+
+    Ok(actions)
+}
+
+fn apply_resync_action_to_ledger(
+    ledger: &mut HashMap<String, crate::trade_ledger::TradeLedgerEntry>,
+    action: &RpcResyncLedgerAction,
+    emit_known_transfer_extras: bool,
+) -> Vec<RpcResyncLedgerAction> {
+    match action {
+        RpcResyncLedgerAction::Trade(event) => {
+            let params = RecordConfirmedTradeParams {
+                wallet_key: &event.wallet_key,
+                wallet_public_key: &event.wallet_public_key,
+                mint: &event.mint,
+                side: event.side.clone(),
+                trade_value_lamports: event.trade_value_lamports,
+                token_delta_raw: event.token_delta_raw,
+                token_decimals: event.token_decimals,
+                confirmed_at_unix_ms: event.confirmed_at_unix_ms,
+                slot: event.slot,
+                entry_preference_asset: match event.side {
+                    TradeSide::Buy => event.settlement_asset,
+                    TradeSide::Sell => None,
+                },
+                settlement_asset: event.settlement_asset,
+                explicit_fees: event.explicit_fees.clone(),
+                platform_tag: event.platform_tag,
+                provenance: event.provenance,
+                signature: &event.signature,
+                client_request_id: event.client_request_id.as_deref(),
+                batch_id: event.batch_id.as_deref(),
+            };
+            record_confirmed_trade(ledger, params);
+            Vec::new()
+        }
+        RpcResyncLedgerAction::ForceClose { marker, .. } => {
+            crate::trade_ledger::force_close_trade_ledger_position(
+                ledger,
+                &marker.wallet_key,
+                &marker.mint,
+                marker.applied_at_unix_ms,
+            );
+            Vec::new()
+        }
+        RpcResyncLedgerAction::KnownTransfer { marker, slot } => {
+            let moved_amount = crate::trade_ledger::transfer_trade_ledger_position(
+                ledger,
+                &marker.source_wallet_key,
+                &marker.destination_wallet_key,
+                &marker.mint,
+                marker.amount_raw,
+                &marker.signature,
+                marker.applied_at_unix_ms,
+            );
+            let unmoved_amount = marker.amount_raw.saturating_sub(moved_amount);
+            if !emit_known_transfer_extras || unmoved_amount == 0 {
+                return Vec::new();
+            }
+            crate::trade_ledger::mark_trade_ledger_sent_without_proceeds(
+                ledger,
+                &marker.source_wallet_key,
+                &marker.mint,
+                unmoved_amount,
+                &marker.signature,
+                marker.applied_at_unix_ms,
+            );
+            crate::trade_ledger::mark_trade_ledger_received_without_cost_basis(
+                ledger,
+                &marker.destination_wallet_key,
+                &marker.mint,
+                unmoved_amount,
+                &marker.signature,
+                marker.applied_at_unix_ms,
+            );
+            vec![
+                RpcResyncLedgerAction::SentWithoutProceeds {
+                    wallet_key: marker.source_wallet_key.clone(),
+                    mint: marker.mint.clone(),
+                    amount_raw: unmoved_amount,
+                    signature: transfer_incomplete_signature(
+                        &marker.signature,
+                        &marker.source_wallet_key,
+                        &marker.destination_wallet_key,
+                        false,
+                    ),
+                    applied_at_unix_ms: marker.applied_at_unix_ms,
+                    slot: *slot,
+                    persist: true,
+                },
+                RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                    wallet_key: marker.destination_wallet_key.clone(),
+                    mint: marker.mint.clone(),
+                    amount_raw: unmoved_amount,
+                    signature: transfer_incomplete_signature(
+                        &marker.signature,
+                        &marker.destination_wallet_key,
+                        &marker.source_wallet_key,
+                        true,
+                    ),
+                    applied_at_unix_ms: marker.applied_at_unix_ms,
+                    slot: *slot,
+                    persist: true,
+                },
+            ]
+        }
+        RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+            wallet_key,
+            mint,
+            amount_raw,
+            signature,
+            applied_at_unix_ms,
+            ..
+        } => {
+            if *amount_raw == 0 {
+                return Vec::new();
+            }
+            crate::trade_ledger::mark_trade_ledger_received_without_cost_basis(
+                ledger,
+                wallet_key,
+                mint,
+                *amount_raw,
+                signature,
+                *applied_at_unix_ms,
+            );
+            Vec::new()
+        }
+        RpcResyncLedgerAction::SentWithoutProceeds {
+            wallet_key,
+            mint,
+            amount_raw,
+            signature,
+            applied_at_unix_ms,
+            ..
+        } => {
+            if *amount_raw == 0 {
+                return Vec::new();
+            }
+            crate::trade_ledger::mark_trade_ledger_sent_without_proceeds(
+                ledger,
+                wallet_key,
+                mint,
+                *amount_raw,
+                signature,
+                *applied_at_unix_ms,
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn reset_resync_scope_in_ledger(
+    ledger: &mut HashMap<String, crate::trade_ledger::TradeLedgerEntry>,
+    wallet_keys: &[String],
+    mint: &str,
+    reset_baselines_by_wallet: &HashMap<String, (u64, Option<u64>)>,
+) {
+    for wallet_key in wallet_keys {
+        let (reset_baseline_unix_ms, reset_baseline_slot) = reset_baselines_by_wallet
+            .get(wallet_key)
+            .copied()
+            .unwrap_or((0, None));
+        if reset_baseline_unix_ms > 0 {
+            reset_trade_ledger_position(
+                ledger,
+                wallet_key,
+                mint,
+                reset_baseline_unix_ms,
+                reset_baseline_slot,
+            );
+        } else {
+            ledger.remove(&trade_ledger_lookup_key(wallet_key, mint));
+        }
+    }
+}
+
+fn replay_resync_actions(
+    ledger: &mut HashMap<String, crate::trade_ledger::TradeLedgerEntry>,
+    actions: &[RpcResyncLedgerAction],
+    emit_known_transfer_extras: bool,
+) -> Vec<RpcResyncLedgerAction> {
+    let mut extra_actions = Vec::new();
+    for action in actions {
+        extra_actions.extend(apply_resync_action_to_ledger(
+            ledger,
+            action,
+            emit_known_transfer_extras,
+        ));
+    }
+    extra_actions
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResyncBalanceSnapshot {
+    balances: HashMap<String, u64>,
+    slots_by_wallet: HashMap<String, u64>,
+}
+
+async fn fetch_current_resync_balance_with_context(
+    client: Client,
+    rpc_url: String,
+    owner: String,
+    mint: String,
+    min_context_slot: Option<u64>,
+) -> Result<(u64, u64), String> {
+    let mut config = serde_json::Map::new();
+    config.insert("encoding".to_string(), json!("jsonParsed"));
+    config.insert("commitment".to_string(), json!("confirmed"));
+    if let Some(slot) = min_context_slot {
+        config.insert("minContextSlot".to_string(), json!(slot));
+    }
+    let result = crate::rpc_client::rpc_request_with_client(
+        &client,
+        &rpc_url,
+        "getTokenAccountsByOwner",
+        json!([owner, { "mint": mint }, Value::Object(config)]),
+    )
+    .await?;
+    let context_slot = result
+        .get("context")
+        .and_then(|value| value.get("slot"))
+        .and_then(Value::as_u64)
+        .or(min_context_slot)
+        .unwrap_or(0);
+    let accounts = result
+        .get("value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "RPC getTokenAccountsByOwner returned invalid account data.".to_string())?;
+
+    let mut total_raw = 0u128;
+    for entry in accounts {
+        let token_amount = entry
+            .get("account")
+            .and_then(|value| value.get("data"))
+            .and_then(|value| value.get("parsed"))
+            .and_then(|value| value.get("info"))
+            .and_then(|value| value.get("tokenAmount"))
+            .ok_or_else(|| {
+                "RPC getTokenAccountsByOwner returned invalid token amount data.".to_string()
+            })?;
+        let amount_raw = token_amount
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "RPC token balance response did not include raw amount.".to_string())?
+            .parse::<u128>()
+            .map_err(|error| format!("RPC token balance amount parse failed: {error}"))?;
+        total_raw = total_raw.saturating_add(amount_raw);
+    }
+    let total_raw = u64::try_from(total_raw)
+        .map_err(|_| format!("Token balance for {owner} exceeded u64 limits."))?;
+    Ok((total_raw, context_slot))
+}
+
+async fn fetch_current_resync_balances(
+    wallet_keys: &[String],
+    public_keys_by_wallet_key: &HashMap<String, String>,
+    mint: &str,
+    min_context_slot: Option<u64>,
+) -> Result<ResyncBalanceSnapshot, (StatusCode, String)> {
+    let client = extension_wallet_rpc_client().map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    let rpc_url = configured_rpc_url();
+    let mut snapshot = ResyncBalanceSnapshot::default();
+    for wallet_key in wallet_keys {
+        if !public_keys_by_wallet_key.contains_key(wallet_key) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Selected wallet {wallet_key} is missing a configured public key."),
+            ));
+        }
+    }
+    let mut pending = wallet_keys
+        .iter()
+        .map(|wallet_key| {
+            (
+                wallet_key.clone(),
+                public_keys_by_wallet_key
+                    .get(wallet_key)
+                    .expect("wallet public key was prevalidated")
+                    .clone(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut tasks = JoinSet::new();
+
+    loop {
+        while tasks.len() < RESYNC_WALLET_CONCURRENCY {
+            let Some((wallet_key, public_key)) = pending.next() else {
+                break;
+            };
+            let mint = mint.to_string();
+            let client = client.clone();
+            let rpc_url = rpc_url.clone();
+            tasks.spawn(async move {
+                let (amount_raw, context_slot) = fetch_current_resync_balance_with_context(
+                    client,
+                    rpc_url,
+                    public_key,
+                    mint,
+                    min_context_slot,
+                )
+                .await
+                .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+                Ok::<_, (StatusCode, String)>((wallet_key, amount_raw, context_slot))
+            });
+        }
+
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        let (wallet_key, amount_raw, context_slot) = joined.map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Current balance resync task failed: {error}"),
+            )
+        })??;
+        snapshot.balances.insert(wallet_key.clone(), amount_raw);
+        snapshot.slots_by_wallet.insert(wallet_key, context_slot);
+    }
+    for wallet_key in wallet_keys {
+        if !snapshot.balances.contains_key(wallet_key) {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("Current balance resync did not return data for wallet {wallet_key}."),
+            ));
+        }
+    }
+    Ok(snapshot)
+}
+
+fn replayed_token_balances_from_actions(
+    wallet_keys: &[String],
+    mint: &str,
+    actions: &[RpcResyncLedgerAction],
+) -> HashMap<String, u64> {
+    let selected = wallet_keys.iter().cloned().collect::<HashSet<_>>();
+    let mut balances = wallet_keys
+        .iter()
+        .map(|wallet_key| (wallet_key.clone(), 0i128))
+        .collect::<HashMap<_, _>>();
+    for action in actions {
+        match action {
+            RpcResyncLedgerAction::Trade(event)
+                if event.mint == mint && selected.contains(&event.wallet_key) =>
+            {
+                let entry = balances.entry(event.wallet_key.clone()).or_default();
+                *entry = entry.saturating_add(event.token_delta_raw);
+            }
+            RpcResyncLedgerAction::KnownTransfer { marker, .. } if marker.mint == mint => {
+                if selected.contains(&marker.source_wallet_key) {
+                    let entry = balances
+                        .entry(marker.source_wallet_key.clone())
+                        .or_default();
+                    *entry = entry.saturating_sub(i128::from(marker.amount_raw));
+                }
+                if selected.contains(&marker.destination_wallet_key) {
+                    let entry = balances
+                        .entry(marker.destination_wallet_key.clone())
+                        .or_default();
+                    *entry = entry.saturating_add(i128::from(marker.amount_raw));
+                }
+            }
+            RpcResyncLedgerAction::ForceClose { marker, .. }
+                if marker.mint == mint && selected.contains(&marker.wallet_key) =>
+            {
+                balances.insert(marker.wallet_key.clone(), 0);
+            }
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                wallet_key,
+                mint: action_mint,
+                amount_raw,
+                ..
+            } if action_mint == mint && selected.contains(wallet_key) => {
+                let entry = balances.entry(wallet_key.clone()).or_default();
+                *entry = entry.saturating_add(i128::from(*amount_raw));
+            }
+            RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key,
+                mint: action_mint,
+                amount_raw,
+                ..
+            } if action_mint == mint && selected.contains(wallet_key) => {
+                let entry = balances.entry(wallet_key.clone()).or_default();
+                *entry = entry.saturating_sub(i128::from(*amount_raw));
+            }
+            _ => {}
+        }
+    }
+    balances
+        .into_iter()
+        .map(|(wallet_key, amount)| {
+            let clamped = amount.clamp(0, i128::from(u64::MAX)) as u64;
+            (wallet_key, clamped)
+        })
+        .collect()
+}
+
+fn incomplete_resync_action_key(action: &RpcResyncLedgerAction) -> Option<String> {
+    match action {
+        RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+            wallet_key,
+            mint,
+            signature,
+            ..
+        } => Some(format!(
+            "received_without_cost_basis::{wallet_key}::{mint}::{signature}"
+        )),
+        RpcResyncLedgerAction::SentWithoutProceeds {
+            wallet_key,
+            mint,
+            signature,
+            ..
+        } => Some(format!(
+            "sent_without_proceeds::{wallet_key}::{mint}::{signature}"
+        )),
+        _ => None,
+    }
+}
+
+fn incomplete_resync_action_amount(action: &RpcResyncLedgerAction) -> Option<u64> {
+    match action {
+        RpcResyncLedgerAction::ReceivedWithoutCostBasis { amount_raw, .. }
+        | RpcResyncLedgerAction::SentWithoutProceeds { amount_raw, .. } => Some(*amount_raw),
+        _ => None,
+    }
+}
+
+fn prune_incomplete_zero_clears_shadowed_by_nonzero_actions(
+    actions: &mut Vec<RpcResyncLedgerAction>,
+) {
+    let nonzero_keys = actions
+        .iter()
+        .filter(|action| incomplete_resync_action_amount(action).is_some_and(|amount| amount > 0))
+        .filter_map(incomplete_resync_action_key)
+        .collect::<HashSet<_>>();
+    actions.retain(|action| {
+        let is_zero_clear = incomplete_resync_action_amount(action) == Some(0);
+        !is_zero_clear
+            || incomplete_resync_action_key(action).map_or(true, |key| !nonzero_keys.contains(&key))
+    });
+}
+
+fn build_balance_reconciliation_actions(
+    wallet_keys: &[String],
+    mint: &str,
+    replayed_balances: &HashMap<String, u64>,
+    onchain_balances: &HashMap<String, u64>,
+    balance_slots_by_wallet: &HashMap<String, u64>,
+    applied_at_unix_ms: u64,
+) -> Vec<RpcResyncLedgerAction> {
+    let mut actions = Vec::new();
+    for wallet_key in wallet_keys {
+        let Some(onchain) = onchain_balances.get(wallet_key).copied() else {
+            continue;
+        };
+        let local = replayed_balances.get(wallet_key).copied().unwrap_or(0);
+        let Some(slot) = balance_slots_by_wallet.get(wallet_key).copied() else {
+            continue;
+        };
+        let slot = Some(slot);
+        let received_signature =
+            format!("resync-balance-reconcile:received_without_cost_basis:{wallet_key}:{mint}");
+        let sent_signature =
+            format!("resync-balance-reconcile:sent_without_proceeds:{wallet_key}:{mint}");
+        if onchain > local {
+            actions.push(RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                wallet_key: wallet_key.clone(),
+                mint: mint.to_string(),
+                amount_raw: onchain.saturating_sub(local),
+                signature: received_signature.clone(),
+                applied_at_unix_ms,
+                slot,
+                persist: true,
+            });
+            push_clear_incomplete_movement_action(
+                &mut actions,
+                wallet_key,
+                mint,
+                &sent_signature,
+                applied_at_unix_ms,
+                slot,
+                false,
+            );
+        } else if local > onchain {
+            push_clear_incomplete_movement_action(
+                &mut actions,
+                wallet_key,
+                mint,
+                &received_signature,
+                applied_at_unix_ms,
+                slot,
+                true,
+            );
+            if onchain == 0 {
+                push_clear_incomplete_movement_action(
+                    &mut actions,
+                    wallet_key,
+                    mint,
+                    &sent_signature,
+                    applied_at_unix_ms,
+                    slot,
+                    false,
+                );
+                actions.push(RpcResyncLedgerAction::ForceClose {
+                    marker: ForceCloseMarkerEvent::new(
+                        wallet_key,
+                        mint,
+                        applied_at_unix_ms,
+                        "on-chain-zero-after-resync",
+                    ),
+                    persist: true,
+                });
+            } else {
+                actions.push(RpcResyncLedgerAction::SentWithoutProceeds {
+                    wallet_key: wallet_key.clone(),
+                    mint: mint.to_string(),
+                    amount_raw: local.saturating_sub(onchain),
+                    signature: sent_signature,
+                    applied_at_unix_ms,
+                    slot,
+                    persist: true,
+                });
+            }
+        } else {
+            push_clear_incomplete_movement_action(
+                &mut actions,
+                wallet_key,
+                mint,
+                &received_signature,
+                applied_at_unix_ms,
+                slot,
+                true,
+            );
+            push_clear_incomplete_movement_action(
+                &mut actions,
+                wallet_key,
+                mint,
+                &sent_signature,
+                applied_at_unix_ms,
+                slot,
+                false,
+            );
+        }
+    }
+    actions
+}
+
 async fn fetch_current_confirmed_slot() -> Result<u64, String> {
     let client = extension_wallet_rpc_client()?;
     let response = crate::rpc_client::rpc_request_with_client(
@@ -6434,66 +8923,213 @@ async fn fetch_current_confirmed_slot() -> Result<u64, String> {
         .ok_or_else(|| "RPC getSlot returned an invalid payload.".to_string())
 }
 
-async fn fetch_rpc_resync_trade_events_for_wallet_mint(
+async fn fetch_resync_candidates_for_wallet_mint(
     wallet_key: &str,
     wallet_public_key: &str,
     mint: &str,
-    known_event_ids: &mut HashSet<String>,
     reset_baseline_unix_ms: u64,
     reset_baseline_slot: Option<u64>,
-) -> Result<Vec<crate::trade_ledger::ConfirmedTradeEvent>, (StatusCode, String)> {
+    known_wallets: &[KnownWalletIdentity],
+    helius_config: Option<&HeliusResyncConfig>,
+) -> Result<Vec<RpcResyncCandidate>, (StatusCode, String)> {
+    if let Some(config) = helius_config {
+        match fetch_helius_resync_candidates_for_wallet_mint(
+            config,
+            wallet_public_key,
+            mint,
+            reset_baseline_unix_ms,
+            reset_baseline_slot,
+            known_wallets,
+        )
+        .await
+        {
+            Ok(candidates) => return Ok(candidates),
+            Err((status, error)) => {
+                eprintln!(
+                    "[execution-engine][pnl-resync] Helius history failed for wallet={} mint={} status={} err={}; falling back to token-account RPC.",
+                    wallet_public_key, mint, status, error
+                );
+            }
+        }
+    }
+    fetch_rpc_resync_candidates_for_wallet_mint(
+        wallet_key,
+        wallet_public_key,
+        mint,
+        reset_baseline_unix_ms,
+        reset_baseline_slot,
+        known_wallets,
+    )
+    .await
+}
+
+async fn fetch_resync_candidates_for_wallets(
+    wallet_keys: &[String],
+    public_keys_by_wallet_key: &HashMap<String, String>,
+    mint: &str,
+    reset_baselines_by_wallet: &HashMap<String, (u64, Option<u64>)>,
+    known_wallets: &[KnownWalletIdentity],
+    helius_config: Option<&HeliusResyncConfig>,
+) -> Result<Vec<RpcResyncCandidate>, (StatusCode, String)> {
+    let mut pending = wallet_keys
+        .iter()
+        .filter_map(|wallet_key| {
+            public_keys_by_wallet_key.get(wallet_key).map(|public_key| {
+                let (reset_baseline_unix_ms, reset_baseline_slot) = reset_baselines_by_wallet
+                    .get(wallet_key)
+                    .copied()
+                    .unwrap_or((0, None));
+                (
+                    wallet_key.clone(),
+                    public_key.clone(),
+                    reset_baseline_unix_ms,
+                    reset_baseline_slot,
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut tasks = JoinSet::new();
+    let mut candidates = Vec::new();
+
+    loop {
+        while tasks.len() < RESYNC_WALLET_CONCURRENCY {
+            let Some((wallet_key, wallet_public_key, reset_baseline_unix_ms, reset_baseline_slot)) =
+                pending.next()
+            else {
+                break;
+            };
+            let mint = mint.to_string();
+            let known_wallets = known_wallets.to_vec();
+            let helius_config = helius_config.cloned();
+            tasks.spawn(async move {
+                fetch_resync_candidates_for_wallet_mint(
+                    &wallet_key,
+                    &wallet_public_key,
+                    &mint,
+                    reset_baseline_unix_ms,
+                    reset_baseline_slot,
+                    &known_wallets,
+                    helius_config.as_ref(),
+                )
+                .await
+            });
+        }
+
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        candidates.extend(joined.map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Wallet resync task failed: {error}"),
+            )
+        })??);
+    }
+
+    Ok(candidates)
+}
+
+async fn fetch_helius_resync_candidates_for_wallet_mint(
+    config: &HeliusResyncConfig,
+    wallet_public_key: &str,
+    mint: &str,
+    reset_baseline_unix_ms: u64,
+    reset_baseline_slot: Option<u64>,
+    known_wallets: &[KnownWalletIdentity],
+) -> Result<Vec<RpcResyncCandidate>, (StatusCode, String)> {
     let client = extension_wallet_rpc_client().map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    let endpoint = format!(
+        "{}/v0/addresses/{}/transactions",
+        config.base_url.trim_end_matches('/'),
+        wallet_public_key
+    );
     let deadline = Instant::now() + RPC_RESYNC_OVERALL_TIMEOUT;
     let mut before: Option<String> = None;
-    let mut events = Vec::new();
+    let mut candidates = Vec::new();
     let mut pages_processed = 0usize;
-    let mut signatures_examined = 0usize;
+    let mut transactions_examined = 0usize;
 
-    'pages: loop {
-        if Instant::now() >= deadline
-            || pages_processed >= RPC_RESYNC_MAX_PAGES
-            || signatures_examined >= RPC_RESYNC_MAX_SIGNATURES
+    loop {
+        if Instant::now() >= deadline {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Helius enhanced transaction history timed out before reaching the resync boundary."
+                    .to_string(),
+            ));
+        }
+        if pages_processed >= RPC_RESYNC_MAX_PAGES
+            || transactions_examined >= RPC_RESYNC_MAX_SIGNATURES
         {
-            break;
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Helius enhanced transaction history hit the resync scan limit before reaching the resync boundary."
+                    .to_string(),
+            ));
         }
         pages_processed += 1;
 
-        let mut options = serde_json::Map::new();
-        options.insert("limit".to_string(), json!(RPC_RESYNC_PAGE_SIZE));
-        options.insert("commitment".to_string(), json!("confirmed"));
-        if let Some(before_signature) = before.clone() {
-            options.insert("before".to_string(), json!(before_signature));
+        let mut query = vec![
+            ("api-key".to_string(), config.api_key.clone()),
+            ("commitment".to_string(), "confirmed".to_string()),
+            ("token-accounts".to_string(), "balanceChanged".to_string()),
+            ("limit".to_string(), HELIUS_RESYNC_PAGE_SIZE.to_string()),
+        ];
+        if let Some(slot) = reset_baseline_slot {
+            query.push(("gte-slot".to_string(), slot.to_string()));
+        } else if reset_baseline_unix_ms > 0 {
+            query.push((
+                "gte-time".to_string(),
+                reset_baseline_unix_ms.saturating_div(1_000).to_string(),
+            ));
         }
-        let response = crate::rpc_client::rpc_request_with_client(
-            &client,
-            &configured_rpc_url(),
-            "getSignaturesForAddress",
-            json!([wallet_public_key, Value::Object(options)]),
-        )
-        .await
-        .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
-        let signatures = response.as_array().ok_or_else(|| {
+        if let Some(before_signature) = before.clone() {
+            query.push(("before-signature".to_string(), before_signature));
+        }
+
+        let response = client
+            .get(&endpoint)
+            .query(&query)
+            .send()
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Helius enhanced transaction request failed: {error}"),
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Helius enhanced transaction request returned status {}.",
+                    response.status()
+                ),
+            ));
+        }
+        let transactions = response.json::<Vec<Value>>().await.map_err(|error| {
             (
                 StatusCode::BAD_GATEWAY,
-                "RPC getSignaturesForAddress returned an invalid payload.".to_string(),
+                format!("Helius enhanced transaction response was invalid: {error}"),
             )
         })?;
-        if signatures.is_empty() {
+        if transactions.is_empty() {
             break;
         }
 
         let mut page_has_candidate = false;
-        for item in signatures {
-            if Instant::now() >= deadline || signatures_examined >= RPC_RESYNC_MAX_SIGNATURES {
-                break 'pages;
+        for transaction in &transactions {
+            if Instant::now() >= deadline || transactions_examined >= RPC_RESYNC_MAX_SIGNATURES {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Helius enhanced transaction history stopped mid-page before reaching the resync boundary."
+                        .to_string(),
+                ));
             }
-            signatures_examined += 1;
-            let Some(signature) = item.get("signature").and_then(Value::as_str) else {
-                continue;
-            };
-            let list_slot = item.get("slot").and_then(Value::as_u64);
-            let list_block_time_unix_ms = item
-                .get("blockTime")
+            transactions_examined += 1;
+            let list_slot = transaction.get("slot").and_then(Value::as_u64);
+            let list_block_time_unix_ms = transaction
+                .get("timestamp")
                 .and_then(Value::as_i64)
                 .filter(|value| *value > 0)
                 .map(|value| (value as u64).saturating_mul(1_000));
@@ -6506,91 +9142,406 @@ async fn fetch_rpc_resync_trade_events_for_wallet_mint(
                 continue;
             }
             page_has_candidate = true;
-            let snapshot = fetch_wallet_trade_ledger_snapshot_for_signature(
-                signature,
-                wallet_public_key,
-                mint,
-            )
-            .await
-            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
-            if snapshot.token_delta_raw == 0 {
-                continue;
-            }
-            if !crate::trade_ledger::trade_event_is_after_reset_baseline(
-                snapshot.block_time_unix_ms.unwrap_or(0),
-                snapshot.slot,
-                reset_baseline_unix_ms,
-                reset_baseline_slot,
-            ) {
-                continue;
-            }
-            let side = if snapshot.token_delta_raw > 0 {
-                TradeSide::Buy
-            } else {
-                TradeSide::Sell
-            };
-            let trade_value_lamports = match side {
-                TradeSide::Buy => resolve_confirmed_trade_notional_lamports(
-                    confirmed_buy_notional_source(&snapshot),
+            for identity in known_wallets {
+                let Some(candidate) = helius_candidate_from_transaction(
+                    transaction,
+                    &identity.wallet_key,
+                    &identity.public_key,
+                    mint,
                 )
-                .await
-                .map_err(|error| (StatusCode::BAD_GATEWAY, error))?,
-                TradeSide::Sell => resolve_confirmed_trade_notional_lamports(
-                    confirmed_sell_notional_source(&snapshot),
-                )
-                .await
-                .map_err(|error| (StatusCode::BAD_GATEWAY, error))?,
-            };
-            let event = crate::trade_ledger::ConfirmedTradeEvent {
-                schema_version: crate::trade_ledger::trade_ledger_schema_version(),
-                signature: signature.to_string(),
-                slot: snapshot.slot,
-                confirmed_at_unix_ms: snapshot.block_time_unix_ms.unwrap_or_else(now_unix_ms),
-                wallet_key: wallet_key.to_string(),
-                wallet_public_key: wallet_public_key.to_string(),
-                mint: mint.to_string(),
-                side: side.clone(),
-                platform_tag: PlatformTag::Unknown,
-                provenance: EventProvenance::RpcResync,
-                settlement_asset: settlement_asset_from_snapshot(&snapshot, &side),
-                token_delta_raw: snapshot.token_delta_raw,
-                token_decimals: snapshot.token_decimals,
-                trade_value_lamports,
-                explicit_fees: snapshot.explicit_fees.clone(),
-                client_request_id: None,
-                batch_id: None,
-            };
-            let event_id = event.event_id();
-            if !known_event_ids.insert(event_id) {
-                continue;
+                .map_err(|error| (StatusCode::BAD_GATEWAY, error))?
+                else {
+                    continue;
+                };
+                candidates.push(candidate);
             }
-            events.push(event);
         }
 
-        // Early exit: pagination is newest-first, so once an entire page is at
-        // or before the reset baseline, every older page will be too.
         if reset_baseline_unix_ms > 0 && !page_has_candidate {
             break;
         }
-        if signatures.len() < RPC_RESYNC_PAGE_SIZE {
+        if transactions.len() < HELIUS_RESYNC_PAGE_SIZE {
             break;
         }
-        before = signatures
+        before = transactions
             .last()
             .and_then(|item| item.get("signature"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        if before.is_none() {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Helius enhanced transaction history page did not include a pagination signature."
+                    .to_string(),
+            ));
+        }
     }
 
-    Ok(events)
+    Ok(candidates)
+}
+
+async fn fetch_rpc_token_accounts_for_owner_mint(
+    client: &Client,
+    rpc_url: &str,
+    owner: &str,
+    mint: &str,
+) -> Result<Vec<String>, String> {
+    let response = crate::rpc_client::rpc_request_with_client(
+        client,
+        rpc_url,
+        "getTokenAccountsByOwner",
+        json!([
+            owner,
+            { "mint": mint },
+            { "encoding": "jsonParsed", "commitment": "confirmed" }
+        ]),
+    )
+    .await?;
+    let accounts = response
+        .get("value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "RPC getTokenAccountsByOwner returned invalid account data.".to_string())?;
+    Ok(accounts
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("pubkey")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect())
+}
+
+async fn fetch_rpc_resync_candidates_for_signature(
+    client: &Client,
+    tx_signature: &str,
+    mint: &str,
+    known_wallets: &[KnownWalletIdentity],
+) -> Result<Vec<RpcResyncCandidate>, String> {
+    let result = crate::rpc_client::rpc_request_with_client(
+        client,
+        &configured_rpc_url(),
+        "getTransaction",
+        json!([
+            tx_signature,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0,
+            }
+        ]),
+    )
+    .await?;
+    if result.is_null() {
+        return Ok(Vec::new());
+    }
+    let account_keys = result
+        .get("transaction")
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.get("accountKeys"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pre_balances = result
+        .get("meta")
+        .and_then(|value| value.get("preBalances"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let post_balances = result
+        .get("meta")
+        .and_then(|value| value.get("postBalances"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pre_token_balances = result
+        .get("meta")
+        .and_then(|value| value.get("preTokenBalances"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let post_token_balances = result
+        .get("meta")
+        .and_then(|value| value.get("postTokenBalances"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut candidates = Vec::new();
+    for identity in known_wallets {
+        let Some((token_delta_raw, token_decimals)) = maybe_trade_token_delta_from_meta(
+            &pre_token_balances,
+            &post_token_balances,
+            &identity.public_key,
+            mint,
+        )?
+        else {
+            continue;
+        };
+        if token_delta_raw == 0 {
+            continue;
+        }
+        let account_index = account_keys.iter().position(|entry| {
+            entry.as_str() == Some(identity.public_key.as_str())
+                || entry
+                    .get("pubkey")
+                    .and_then(Value::as_str)
+                    .is_some_and(|pubkey| pubkey == identity.public_key)
+        });
+        let lamport_delta = account_index
+            .and_then(|index| {
+                let pre = pre_balances.get(index).and_then(Value::as_u64)?;
+                let post = post_balances.get(index).and_then(Value::as_u64)?;
+                Some(post as i64 - pre as i64)
+            })
+            .unwrap_or(0);
+        let usd1_delta_raw = i128::from(
+            total_token_balance_amount_from_meta(
+                &post_token_balances,
+                &identity.public_key,
+                USD1_MINT,
+            )?
+            .unwrap_or(0),
+        ) - i128::from(
+            total_token_balance_amount_from_meta(
+                &pre_token_balances,
+                &identity.public_key,
+                USD1_MINT,
+            )?
+            .unwrap_or(0),
+        );
+        candidates.push(RpcResyncCandidate {
+            signature: tx_signature.to_string(),
+            wallet_key: identity.wallet_key.clone(),
+            wallet_public_key: identity.public_key.clone(),
+            snapshot: ConfirmedTradeLedgerSnapshot {
+                lamport_delta,
+                usd1_delta_raw,
+                token_delta_raw,
+                token_decimals,
+                slot: result.get("slot").and_then(Value::as_u64),
+                block_time_unix_ms: result
+                    .get("blockTime")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| u64::try_from(value).ok())
+                    .map(|value| value.saturating_mul(1_000)),
+                explicit_fees: explicit_fee_breakdown_from_transaction(
+                    &result,
+                    &identity.public_key,
+                    mint,
+                ),
+            },
+        });
+    }
+    Ok(candidates)
+}
+
+async fn fetch_rpc_resync_candidates_for_wallet_mint(
+    _wallet_key: &str,
+    wallet_public_key: &str,
+    mint: &str,
+    reset_baseline_unix_ms: u64,
+    reset_baseline_slot: Option<u64>,
+    known_wallets: &[KnownWalletIdentity],
+) -> Result<Vec<RpcResyncCandidate>, (StatusCode, String)> {
+    let client = extension_wallet_rpc_client().map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    let rpc_url = configured_rpc_url();
+    let (_decimals, token_program) =
+        fetch_mint_metadata_with_client(&client, &rpc_url, mint, "confirmed")
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    let owner_pubkey = Pubkey::from_str(wallet_public_key).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid wallet public key {wallet_public_key}: {error}"),
+        )
+    })?;
+    let mint_pubkey = Pubkey::from_str(mint).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid mint {mint}: {error}"),
+        )
+    })?;
+    let ata =
+        get_associated_token_address_with_program_id(&owner_pubkey, &mint_pubkey, &token_program)
+            .to_string();
+    let mut token_accounts =
+        fetch_rpc_token_accounts_for_owner_mint(&client, &rpc_url, wallet_public_key, mint)
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    token_accounts.push(ata);
+    token_accounts.sort();
+    token_accounts.dedup();
+
+    let deadline = Instant::now() + RPC_RESYNC_OVERALL_TIMEOUT;
+    let mut candidates = Vec::new();
+    let mut seen_signatures = HashSet::new();
+    let mut pages_processed = 0usize;
+    let mut signatures_examined = 0usize;
+
+    for token_account in token_accounts {
+        let mut before: Option<String> = None;
+        loop {
+            if Instant::now() >= deadline {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "RPC token-account transaction history timed out before reaching the resync boundary."
+                        .to_string(),
+                ));
+            }
+            if pages_processed >= RPC_RESYNC_MAX_PAGES
+                || signatures_examined >= RPC_RESYNC_MAX_SIGNATURES
+            {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "RPC token-account transaction history hit the resync scan limit before reaching the resync boundary."
+                        .to_string(),
+                ));
+            }
+            pages_processed += 1;
+
+            let mut options = serde_json::Map::new();
+            options.insert("limit".to_string(), json!(RPC_RESYNC_PAGE_SIZE));
+            options.insert("commitment".to_string(), json!("confirmed"));
+            if let Some(before_signature) = before.clone() {
+                options.insert("before".to_string(), json!(before_signature));
+            }
+            let response = crate::rpc_client::rpc_request_with_client(
+                &client,
+                &rpc_url,
+                "getSignaturesForAddress",
+                json!([token_account, Value::Object(options)]),
+            )
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+            let signatures = response.as_array().ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "RPC getSignaturesForAddress returned an invalid payload.".to_string(),
+                )
+            })?;
+            if signatures.is_empty() {
+                break;
+            }
+
+            let mut page_has_candidate = false;
+            for item in signatures {
+                if Instant::now() >= deadline || signatures_examined >= RPC_RESYNC_MAX_SIGNATURES {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        "RPC token-account transaction history stopped mid-page before reaching the resync boundary."
+                            .to_string(),
+                    ));
+                }
+                signatures_examined += 1;
+                let Some(signature) = item.get("signature").and_then(Value::as_str) else {
+                    continue;
+                };
+                let list_slot = item.get("slot").and_then(Value::as_u64);
+                let list_block_time_unix_ms = item
+                    .get("blockTime")
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value > 0)
+                    .map(|value| (value as u64).saturating_mul(1_000));
+                if !crate::trade_ledger::trade_event_is_after_reset_baseline(
+                    list_block_time_unix_ms.unwrap_or(0),
+                    list_slot,
+                    reset_baseline_unix_ms,
+                    reset_baseline_slot,
+                ) {
+                    continue;
+                }
+                page_has_candidate = true;
+                if !seen_signatures.insert(signature.to_string()) {
+                    continue;
+                }
+                let signature_candidates = fetch_rpc_resync_candidates_for_signature(
+                    &client,
+                    signature,
+                    mint,
+                    known_wallets,
+                )
+                .await
+                .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+                for candidate in signature_candidates {
+                    if !crate::trade_ledger::trade_event_is_after_reset_baseline(
+                        candidate.snapshot.block_time_unix_ms.unwrap_or(0),
+                        candidate.snapshot.slot,
+                        reset_baseline_unix_ms,
+                        reset_baseline_slot,
+                    ) {
+                        continue;
+                    }
+                    candidates.push(candidate);
+                }
+            }
+
+            if reset_baseline_unix_ms > 0 && !page_has_candidate {
+                break;
+            }
+            if signatures.len() < RPC_RESYNC_PAGE_SIZE {
+                break;
+            }
+            before = signatures
+                .last()
+                .and_then(|item| item.get("signature"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if before.is_none() {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "RPC token-account transaction history page did not include a pagination signature."
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(candidates)
 }
 
 fn parse_sol_to_lamports(value: &str) -> Option<u64> {
-    let parsed = value.trim().parse::<f64>().ok()?;
-    if !parsed.is_finite() || parsed <= 0.0 {
+    parse_decimal_units(value, 9)
+}
+
+fn parse_decimal_units(value: &str, decimals: u8) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
         return None;
     }
-    Some((parsed * 1_000_000_000.0).round() as u64)
+    let mut parts = trimmed.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || !fraction.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let scale = 10u128.checked_pow(u32::from(decimals))?;
+    let whole_value = if whole.is_empty() {
+        0u128
+    } else {
+        whole.parse::<u128>().ok()?
+    };
+    let mut fraction_string = fraction.to_string();
+    if fraction_string.len() > usize::from(decimals) {
+        fraction_string.truncate(usize::from(decimals));
+    }
+    while fraction_string.len() < usize::from(decimals) {
+        fraction_string.push('0');
+    }
+    let fraction_value = if fraction_string.is_empty() {
+        0u128
+    } else {
+        fraction_string.parse::<u128>().ok()?
+    };
+    let value = whole_value
+        .checked_mul(scale)?
+        .checked_add(fraction_value)?;
+    if value == 0 {
+        return None;
+    }
+    u64::try_from(value).ok()
 }
 
 fn build_buy_planning_seed(
@@ -6609,12 +9560,17 @@ fn build_buy_planning_seed(
 }
 
 fn format_lamports_to_sol_string(lamports: u64) -> String {
-    let whole = lamports / 1_000_000_000;
-    let fractional = lamports % 1_000_000_000;
+    format_decimal_units(lamports, 9)
+}
+
+fn format_decimal_units(amount: u64, decimals: u8) -> String {
+    let scale = 10u64.pow(u32::from(decimals));
+    let whole = amount / scale;
+    let fractional = amount % scale;
     if fractional == 0 {
         return whole.to_string();
     }
-    let mut fractional_text = format!("{fractional:09}");
+    let mut fractional_text = format!("{fractional:0width$}", width = usize::from(decimals));
     while fractional_text.ends_with('0') {
         fractional_text.pop();
     }
@@ -7223,9 +10179,24 @@ fn build_trade_fingerprint(
         "trackSendBlockHeight": policy.track_send_block_height,
         "buyFundingPolicy": policy.buy_funding_policy,
         "sellSettlementPolicy": policy.sell_settlement_policy,
-        "sellSettlementAsset": policy.sell_settlement_asset
+        "sellSettlementAsset": policy.sell_settlement_asset,
+        "wrapperFeeBps": crate::rollout::wrapper_default_fee_bps(),
+        "wrapperRouteConversion": trade_fingerprint_route_conversion(side, policy)
     })
     .to_string()
+}
+
+fn trade_fingerprint_route_conversion(
+    side: &TradeSide,
+    policy: &ResolvedTradePolicy,
+) -> &'static str {
+    match side {
+        TradeSide::Buy if policy.buy_funding_policy != BuyFundingPolicy::SolOnly => "to_sol_in",
+        TradeSide::Sell if policy.sell_settlement_asset != TradeSettlementAsset::Sol => {
+            "to_sol_out"
+        }
+        _ => "none",
+    }
 }
 
 fn resolve_batch_target(
@@ -7542,6 +10513,19 @@ fn resolve_capped_auto_fee_fields(
     });
     match output {
         Ok(output) => {
+            eprintln!(
+                "[execution-engine][auto-fee] provider={} action={} priority_source={} tip_source={} priority_lamports={:?} tip_lamports={:?} priority_estimate_lamports={:?} tip_estimate_lamports={:?} cap_lamports={:?} degradations={}",
+                provider,
+                action,
+                output.priority_source,
+                output.tip_source,
+                output.priority_lamports,
+                output.tip_lamports,
+                output.priority_estimate_lamports,
+                output.tip_estimate_lamports,
+                output.cap_lamports,
+                output.degradations.len()
+            );
             let fee_sol = output
                 .priority_lamports
                 .map(format_lamports_to_sol_decimal)
@@ -7570,6 +10554,10 @@ fn resolve_capped_auto_fee_fields(
             } else {
                 String::new()
             };
+            eprintln!(
+                "[execution-engine][auto-fee] provider={} action={} source=error-fallback error={} fee_sol={} tip_sol={}",
+                provider, action, error, fee_sol, tip_sol
+            );
             (
                 fee_sol.clone(),
                 tip_sol.clone(),
@@ -7902,6 +10890,7 @@ fn build_settings_response(base: &EngineSettings) -> EngineSettings {
     settings.rpc_url = shared_rpc.rpc_url;
     settings.ws_url = shared_rpc.ws_url;
     settings.warm_rpc_url = shared_rpc.warm_rpc_url;
+    settings.warm_ws_url = shared_rpc.warm_ws_url;
     settings.shared_region = shared_rpc.shared_region;
     settings.helius_rpc_url = shared_rpc.helius_rpc_url;
     settings.helius_ws_url = shared_rpc.helius_ws_url;
@@ -7932,6 +10921,7 @@ fn shared_rpc_config_from_settings(settings: &EngineSettings) -> SharedRpcConfig
         rpc_url: settings.rpc_url.clone(),
         ws_url: settings.ws_url.clone(),
         warm_rpc_url: settings.warm_rpc_url.clone(),
+        warm_ws_url: settings.warm_ws_url.clone(),
         shared_region: settings.shared_region.clone(),
         helius_rpc_url: settings.helius_rpc_url.clone(),
         helius_ws_url: settings.helius_ws_url.clone(),
@@ -8402,6 +11392,180 @@ fn active_quote_request_cache_key(
     )
 }
 
+fn active_mark_surface_id(request: &ExtensionActiveMarkRequest) -> String {
+    request
+        .surface_id
+        .as_deref()
+        .and_then(trimmed_option)
+        .unwrap_or("default")
+        .to_string()
+}
+
+fn live_mark_accounts_from_targets<'a>(
+    targets: impl Iterator<Item = &'a LiveMarkTarget>,
+) -> Vec<String> {
+    let mut accounts = Vec::new();
+    let mut seen = HashSet::new();
+    for target in targets {
+        for account in &target.watch_accounts {
+            if seen.insert(account.clone()) {
+                accounts.push(account.clone());
+            }
+        }
+    }
+    accounts
+}
+
+fn live_mark_target_matches(left: &LiveMarkTarget, right: &LiveMarkTarget) -> bool {
+    left.surface_id == right.surface_id
+        && left.mark_revision == right.mark_revision
+        && left.mint == right.mint
+        && left.wallet_keys == right.wallet_keys
+        && left.wallet_group_id == right.wallet_group_id
+        && left.selector.lifecycle == right.selector.lifecycle
+        && left.selector.family == right.selector.family
+        && left.selector.canonical_market_key == right.selector.canonical_market_key
+        && left.selector.quote_asset == right.selector.quote_asset
+        && left.selector.verification_source == right.selector.verification_source
+        && left.selector.wrapper_action == right.selector.wrapper_action
+        && left.selector.wrapper_accounts == right.selector.wrapper_accounts
+        && left.selector.market_subtype == right.selector.market_subtype
+        && left.selector.direct_protocol_target == right.selector.direct_protocol_target
+        && left.selector.input_amount_hint == right.selector.input_amount_hint
+        && left.selector.minimum_output_hint == right.selector.minimum_output_hint
+        && left.selector.runtime_bundle == right.selector.runtime_bundle
+        && left.watch_accounts == right.watch_accounts
+        && left.token_decimals == right.token_decimals
+        && left.token_balance_raw == right.token_balance_raw
+}
+
+async fn is_current_live_mark_target(state: &AppState, target: &LiveMarkTarget) -> bool {
+    let targets = state.live_mark_targets.read().await;
+    targets
+        .get(&target.surface_id)
+        .is_some_and(|current| live_mark_target_matches(current, target))
+}
+
+fn active_mark_wallet_status_request(
+    request: &ExtensionActiveMarkRequest,
+    mint: &str,
+) -> ExtensionWalletStatusRequest {
+    ExtensionWalletStatusRequest {
+        wallet_key: request.wallet_key.clone(),
+        wallet_keys: request.wallet_keys.clone(),
+        wallet_group_id: request.wallet_group_id.clone(),
+        mint: Some(mint.to_string()),
+        preset_id: request.preset_id.clone(),
+        buy_funding_policy: request.buy_funding_policy,
+        sell_settlement_policy: request.sell_settlement_policy,
+        quoted_price: None,
+        route_address: request.route_address.clone(),
+        pair: request.pair.clone(),
+        warm_key: request.warm_key.clone(),
+        family: request.family.clone(),
+        lifecycle: request.lifecycle.clone(),
+        quote_asset: request.quote_asset.clone(),
+        canonical_market_key: request.canonical_market_key.clone(),
+        surface: request.surface.clone(),
+        page_url: request.page_url.clone(),
+        source: request.source.clone(),
+        include_disabled: false,
+        read_only: true,
+        force: false,
+        skip_sol_balance: true,
+        include_sol_balance: Some(false),
+        include_usd1_balance: Some(false),
+    }
+}
+
+fn live_mark_ui_amount_to_raw(amount: f64, decimals: Option<u8>) -> Option<u64> {
+    let decimals = decimals?;
+    if !amount.is_finite() || amount < 0.0 {
+        return None;
+    }
+    let scale = 10u128.checked_pow(u32::from(decimals))?;
+    let raw = (amount * scale as f64).round();
+    if !raw.is_finite() || raw < 0.0 || raw > u64::MAX as f64 {
+        return None;
+    }
+    Some(raw as u64)
+}
+
+fn aggregate_live_mark_raw(balances: &HashMap<String, f64>, decimals: Option<u8>) -> Option<u64> {
+    let decimals = decimals?;
+    let scale = 10u128.checked_pow(u32::from(decimals))?;
+    let mut total = 0u64;
+    let mut any = false;
+    for amount in balances.values() {
+        if !amount.is_finite() || *amount < 0.0 {
+            continue;
+        }
+        let raw = (*amount * scale as f64).round();
+        if !raw.is_finite() || raw < 0.0 || raw > u64::MAX as f64 {
+            return None;
+        }
+        total = total.saturating_add(raw as u64);
+        any = true;
+    }
+    any.then_some(total)
+}
+
+fn push_live_mark_account(accounts: &mut Vec<String>, account: impl AsRef<str>) {
+    let account = account.as_ref().trim();
+    if account.is_empty() || Pubkey::from_str(account).is_err() {
+        return;
+    }
+    if !accounts.iter().any(|existing| existing == account) {
+        accounts.push(account.to_string());
+    }
+}
+
+fn live_mark_watch_accounts(selector: &LifecycleAndCanonicalMarket) -> Vec<String> {
+    let mut accounts = Vec::new();
+    match selector.runtime_bundle.as_ref() {
+        Some(PlannerRuntimeBundle::PumpBondingCurve(bundle)) => {
+            push_live_mark_account(&mut accounts, &bundle.bonding_curve);
+            push_live_mark_account(&mut accounts, &bundle.associated_bonding_curve);
+        }
+        Some(PlannerRuntimeBundle::PumpAmm(bundle)) => {
+            push_live_mark_account(&mut accounts, &bundle.pool);
+            push_live_mark_account(&mut accounts, &bundle.pool_base_token_account);
+            push_live_mark_account(&mut accounts, &bundle.pool_quote_token_account);
+        }
+        Some(PlannerRuntimeBundle::RaydiumAmmV4(bundle)) => {
+            push_live_mark_account(&mut accounts, &bundle.pool);
+            push_live_mark_account(&mut accounts, &bundle.base_vault);
+            push_live_mark_account(&mut accounts, &bundle.quote_vault);
+            push_live_mark_account(&mut accounts, &bundle.open_orders);
+        }
+        Some(PlannerRuntimeBundle::RaydiumCpmm(bundle)) => {
+            push_live_mark_account(&mut accounts, &bundle.pool);
+            push_live_mark_account(&mut accounts, &bundle.vault_a);
+            push_live_mark_account(&mut accounts, &bundle.vault_b);
+            push_live_mark_account(&mut accounts, &bundle.observation_id);
+        }
+        Some(PlannerRuntimeBundle::Bags(bundle)) => {
+            push_live_mark_account(
+                &mut accounts,
+                &bundle.bags_launch.preMigrationDbcPoolAddress,
+            );
+            push_live_mark_account(
+                &mut accounts,
+                &bundle.bags_launch.postMigrationDammPoolAddress,
+            );
+        }
+        Some(PlannerRuntimeBundle::TrustedStable(_)) | None => {}
+    }
+    if accounts.is_empty() {
+        push_live_mark_account(
+            &mut accounts,
+            &selector.direct_protocol_target.clone().unwrap_or_default(),
+        );
+        push_live_mark_account(&mut accounts, &selector.canonical_market_key);
+    }
+    accounts
+}
+
 fn normalized_route_hint(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('_', "-")
 }
@@ -8601,11 +11765,28 @@ async fn quote_usd1_to_sol_cached(
     commitment: &str,
     usd1_raw: u64,
 ) -> Result<u64, String> {
+    quote_usd1_to_sol_with_cache(rpc_url, commitment, usd1_raw, true).await
+}
+
+async fn quote_usd1_to_sol_fresh(
+    rpc_url: &str,
+    commitment: &str,
+    usd1_raw: u64,
+) -> Result<u64, String> {
+    quote_usd1_to_sol_with_cache(rpc_url, commitment, usd1_raw, false).await
+}
+
+async fn quote_usd1_to_sol_with_cache(
+    rpc_url: &str,
+    commitment: &str,
+    usd1_raw: u64,
+    use_cache: bool,
+) -> Result<u64, String> {
     if usd1_raw == 0 {
         return Ok(0);
     }
     let key = format!("rpc={rpc_url}|cmt={commitment}|usd1={usd1_raw}");
-    {
+    if use_cache {
         let cache = stable_quote_cache().lock().await;
         if let Some(entry) = cache.get(&key)
             && entry.fetched_at.elapsed() <= Duration::from_millis(3_000)
@@ -8613,14 +11794,19 @@ async fn quote_usd1_to_sol_cached(
             return Ok(entry.lamports);
         }
     }
+    let max_setup_age = if use_cache {
+        Duration::from_millis(3_000)
+    } else {
+        Duration::ZERO
+    };
     let lamports =
         crate::bonk_execution_support::quote_sol_lamports_for_exact_usd1_input_with_max_setup_age(
             rpc_url,
             usd1_raw,
-            Duration::from_millis(3_000),
+            max_setup_age,
         )
         .await?;
-    {
+    if use_cache {
         let mut cache = stable_quote_cache().lock().await;
         cache.insert(
             key,
@@ -8634,6 +11820,183 @@ async fn quote_usd1_to_sol_cached(
         }
     }
     Ok(lamports)
+}
+
+async fn quote_active_token_value_lamports_for_rpc(
+    rpc_url: &str,
+    commitment: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    mint: &str,
+    token_amount_raw: u64,
+    use_cache: bool,
+) -> Result<u64, String> {
+    match selector.family {
+        TradeVenueFamily::PumpBondingCurve | TradeVenueFamily::PumpAmm => {
+            if use_cache {
+                crate::pump_native::quote_pump_holding_value_sol(
+                    rpc_url,
+                    selector,
+                    mint,
+                    token_amount_raw,
+                    commitment,
+                )
+                .await
+            } else {
+                crate::pump_native::quote_pump_holding_value_sol_fresh(
+                    rpc_url,
+                    selector,
+                    mint,
+                    token_amount_raw,
+                    commitment,
+                )
+                .await
+            }
+        }
+        TradeVenueFamily::RaydiumAmmV4 => {
+            if use_cache {
+                crate::raydium_amm_v4_native::quote_raydium_amm_v4_holding_value_sol(
+                    rpc_url,
+                    selector,
+                    mint,
+                    token_amount_raw,
+                    commitment,
+                )
+                .await
+            } else {
+                crate::raydium_amm_v4_native::quote_raydium_amm_v4_holding_value_sol_fresh(
+                    rpc_url,
+                    selector,
+                    mint,
+                    token_amount_raw,
+                    commitment,
+                )
+                .await
+            }
+        }
+        TradeVenueFamily::RaydiumCpmm => {
+            crate::raydium_cpmm_native::quote_raydium_cpmm_holding_value_sol(
+                rpc_url,
+                selector,
+                mint,
+                token_amount_raw,
+                commitment,
+            )
+            .await
+        }
+        TradeVenueFamily::RaydiumLaunchLab => {
+            crate::raydium_launchlab_native::quote_raydium_launchlab_token_value_lamports(
+                rpc_url,
+                commitment,
+                selector,
+                mint,
+                token_amount_raw,
+            )
+            .await
+        }
+        TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium => {
+            let quote_asset = match selector.quote_asset {
+                PlannerQuoteAsset::Sol | PlannerQuoteAsset::Wsol => "sol",
+                PlannerQuoteAsset::Usd1 => "usd1",
+                PlannerQuoteAsset::Usdc | PlannerQuoteAsset::Usdt => {
+                    return Err(format!(
+                        "Unsupported Bonk holding quote asset {}.",
+                        selector.quote_asset.label()
+                    ));
+                }
+            };
+            let (quote_raw, quote_asset) = if use_cache {
+                crate::bonk_execution_support::quote_bonk_holding_value_quote_raw(
+                    rpc_url,
+                    mint,
+                    Some(&selector.canonical_market_key),
+                    quote_asset,
+                    token_amount_raw,
+                    commitment,
+                )
+                .await?
+            } else {
+                crate::bonk_execution_support::quote_bonk_holding_value_quote_raw_fresh(
+                    rpc_url,
+                    mint,
+                    Some(&selector.canonical_market_key),
+                    quote_asset,
+                    token_amount_raw,
+                    commitment,
+                )
+                .await?
+            };
+            if quote_asset.eq_ignore_ascii_case("usd1") {
+                if use_cache {
+                    quote_usd1_to_sol_cached(rpc_url, commitment, quote_raw).await
+                } else {
+                    quote_usd1_to_sol_fresh(rpc_url, commitment, quote_raw).await
+                }
+            } else {
+                Ok(quote_raw)
+            }
+        }
+        TradeVenueFamily::MeteoraDbc | TradeVenueFamily::MeteoraDammV2 => {
+            let bags_launch = crate::meteora_native::selector_to_bags_launch(selector);
+            if use_cache {
+                crate::bags_execution_support::quote_bags_holding_value_sol(
+                    rpc_url,
+                    mint,
+                    token_amount_raw,
+                    commitment,
+                    Some(&bags_launch),
+                )
+                .await
+            } else {
+                crate::bags_execution_support::quote_bags_holding_value_sol_fresh(
+                    rpc_url,
+                    mint,
+                    token_amount_raw,
+                    commitment,
+                    Some(&bags_launch),
+                )
+                .await
+            }
+        }
+        TradeVenueFamily::TrustedStableSwap => {
+            Err("Trusted stable routes are not token holding quote markets.".to_string())
+        }
+    }
+}
+
+async fn quote_active_token_value_lamports_for_rpc_cached(
+    rpc_url: &str,
+    commitment: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    mint: &str,
+    token_amount_raw: u64,
+) -> Result<u64, String> {
+    quote_active_token_value_lamports_for_rpc(
+        rpc_url,
+        commitment,
+        selector,
+        mint,
+        token_amount_raw,
+        true,
+    )
+    .await
+}
+
+async fn quote_active_token_value_lamports_for_rpc_fresh(
+    rpc_url: &str,
+    commitment: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    mint: &str,
+    token_amount_raw: u64,
+) -> Result<u64, String> {
+    quote_active_token_value_lamports_for_rpc(
+        rpc_url,
+        commitment,
+        selector,
+        mint,
+        token_amount_raw,
+        false,
+    )
+    .await
 }
 
 async fn quote_active_token_value_sol(
@@ -8650,7 +12013,7 @@ async fn quote_active_token_value_sol(
             quote_age_ms: 0,
         });
     }
-    let rpc_url = configured_warm_rpc_url();
+    let rpc_url = configured_rpc_url();
     let commitment = engine.settings.execution_commitment.as_str();
     let request_cache_key = active_quote_request_cache_key(&rpc_url, commitment, request, mint);
     let request_flight = {
@@ -8733,69 +12096,14 @@ async fn quote_active_token_value_sol(
             return Ok(quote);
         }
     }
-    let value_lamports = match selector.family {
-        TradeVenueFamily::PumpBondingCurve | TradeVenueFamily::PumpAmm => {
-            crate::pump_native::quote_pump_holding_value_sol(
-                &rpc_url,
-                &selector,
-                mint,
-                token_amount_raw,
-                commitment,
-            )
-            .await?
-        }
-        TradeVenueFamily::RaydiumAmmV4 => {
-            crate::raydium_amm_v4_native::quote_raydium_amm_v4_holding_value_sol(
-                &rpc_url,
-                &selector,
-                mint,
-                token_amount_raw,
-                commitment,
-            )
-            .await?
-        }
-        TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium => {
-            let quote_asset = match selector.quote_asset {
-                PlannerQuoteAsset::Sol | PlannerQuoteAsset::Wsol => "sol",
-                PlannerQuoteAsset::Usd1 => "usd1",
-                PlannerQuoteAsset::Usdc | PlannerQuoteAsset::Usdt => {
-                    return Err(format!(
-                        "Unsupported Bonk holding quote asset {}.",
-                        selector.quote_asset.label()
-                    ));
-                }
-            };
-            let (quote_raw, quote_asset) =
-                crate::bonk_execution_support::quote_bonk_holding_value_quote_raw(
-                    &rpc_url,
-                    mint,
-                    Some(&selector.canonical_market_key),
-                    quote_asset,
-                    token_amount_raw,
-                    commitment,
-                )
-                .await?;
-            if quote_asset.eq_ignore_ascii_case("usd1") {
-                quote_usd1_to_sol_cached(&rpc_url, commitment, quote_raw).await?
-            } else {
-                quote_raw
-            }
-        }
-        TradeVenueFamily::MeteoraDbc | TradeVenueFamily::MeteoraDammV2 => {
-            let bags_launch = crate::meteora_native::selector_to_bags_launch(&selector);
-            crate::bags_execution_support::quote_bags_holding_value_sol(
-                &rpc_url,
-                mint,
-                token_amount_raw,
-                commitment,
-                Some(&bags_launch),
-            )
-            .await?
-        }
-        TradeVenueFamily::TrustedStableSwap => {
-            return Err("Trusted stable routes are not token holding quote markets.".to_string());
-        }
-    };
+    let value_lamports = quote_active_token_value_lamports_for_rpc_cached(
+        &rpc_url,
+        commitment,
+        &selector,
+        mint,
+        token_amount_raw,
+    )
+    .await?;
     let quote = ActiveTokenSolQuote {
         value_lamports,
         source: selector.family.label().to_string(),
@@ -8816,6 +12124,303 @@ async fn quote_active_token_value_sol(
         }
     }
     Ok(quote)
+}
+
+fn live_mark_pnl_payload(
+    trade_ledger: &HashMap<String, crate::trade_ledger::TradeLedgerEntry>,
+    target: &LiveMarkTarget,
+    holding_value_lamports: u64,
+    slot: Option<u64>,
+) -> MarkEventPayload {
+    let trade_summary = aggregate_trade_ledger(trade_ledger, &target.wallet_keys, &target.mint);
+    let holding_value_sol = holding_value_lamports as f64 / 1_000_000_000.0;
+    let tracked_bought_sol = trade_summary.tracked_bought_lamports as f64 / 1_000_000_000.0;
+    let remaining_cost_basis_sol =
+        trade_summary.remaining_cost_basis_lamports as f64 / 1_000_000_000.0;
+    let realized_pnl_gross_sol = trade_summary.realized_pnl_gross_lamports as f64 / 1_000_000_000.0;
+    let explicit_fee_total_sol = trade_summary.explicit_fee_total_lamports as f64 / 1_000_000_000.0;
+    let unrealized_pnl_gross_sol = holding_value_sol - remaining_cost_basis_sol;
+    let pnl_gross = realized_pnl_gross_sol + unrealized_pnl_gross_sol;
+    let pnl_net = pnl_gross - explicit_fee_total_sol;
+    let pnl_percent_gross = if tracked_bought_sol > 0.0 {
+        Some((pnl_gross / tracked_bought_sol) * 100.0)
+    } else {
+        None
+    };
+    let pnl_percent_net = if tracked_bought_sol > 0.0 {
+        Some((pnl_net / tracked_bought_sol) * 100.0)
+    } else {
+        None
+    };
+    let token_balance = target.token_balance_raw.and_then(|raw| {
+        target
+            .token_decimals
+            .map(|decimals| raw as f64 / 10_f64.powi(i32::from(decimals)))
+    });
+    MarkEventPayload {
+        surface_id: Some(target.surface_id.clone()),
+        mark_revision: target.mark_revision,
+        mint: target.mint.clone(),
+        wallet_keys: target.wallet_keys.clone(),
+        wallet_group_id: target.wallet_group_id.clone(),
+        token_balance,
+        token_balance_raw: target.token_balance_raw,
+        holding_value_sol: Some(holding_value_sol),
+        holding: Some(holding_value_sol),
+        pnl_gross: Some(pnl_gross),
+        pnl_net: Some(pnl_net),
+        pnl_percent_gross,
+        pnl_percent_net,
+        quote_source: Some(format!("live-mark:{}", target.selector.family.label())),
+        commitment: Some("processed".to_string()),
+        slot,
+        at_ms: u128::from(now_unix_ms()),
+    }
+}
+
+async fn publish_live_mark(state: &AppState, target: LiveMarkTarget, slot: Option<u64>) {
+    let Some(token_amount_raw) = target.token_balance_raw else {
+        return;
+    };
+    if !is_current_live_mark_target(state, &target).await {
+        return;
+    }
+    let trade_ledger = state.trade_ledger.read().await.clone();
+    let value_lamports = match quote_active_token_value_lamports_for_rpc_fresh(
+        &configured_rpc_url(),
+        "processed",
+        &target.selector,
+        &target.mint,
+        token_amount_raw,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "[execution-engine][live-mark] quote failed mint={} raw={} err={}",
+                target.mint, token_amount_raw, error
+            );
+            return;
+        }
+    };
+    if !is_current_live_mark_target(state, &target).await {
+        return;
+    }
+    let payload = live_mark_pnl_payload(&trade_ledger, &target, value_lamports, slot);
+    state.balance_stream().publish_mark_event(payload);
+}
+
+async fn update_live_mark_token_balance(
+    state: &AppState,
+    env_key: &str,
+    mint: &str,
+    amount: f64,
+    slot: Option<u64>,
+) {
+    let targets = {
+        let mut guard = state.live_mark_targets.write().await;
+        let mut targets = Vec::new();
+        for target in guard.values_mut() {
+            if target.mint != mint || !target.wallet_keys.iter().any(|key| key == env_key) {
+                continue;
+            }
+            target.mark_revision = target.mark_revision.saturating_add(1);
+            target
+                .token_balance_ui_by_wallet
+                .insert(env_key.to_string(), amount);
+            if let Some(raw) =
+                aggregate_live_mark_raw(&target.token_balance_ui_by_wallet, target.token_decimals)
+            {
+                target.token_balance_raw = Some(raw);
+            }
+            targets.push(target.clone());
+        }
+        targets
+    };
+    for target in targets {
+        publish_live_mark(state, target, slot).await;
+    }
+}
+
+async fn update_live_mark_market_account(state: &AppState, account: &str, slot: Option<u64>) {
+    let targets = {
+        let mut guard = state.live_mark_targets.write().await;
+        let mut targets = Vec::new();
+        for target in guard.values_mut() {
+            if !target.watch_accounts.iter().any(|watch| watch == account) {
+                continue;
+            }
+            target.mark_revision = target.mark_revision.saturating_add(1);
+            targets.push(target.clone());
+        }
+        targets
+    };
+    for target in targets {
+        publish_live_mark(state, target, slot).await;
+    }
+}
+
+async fn update_live_mark_trade_ledger(state: &AppState, slot: Option<u64>) {
+    let targets = {
+        let mut guard = state.live_mark_targets.write().await;
+        let mut targets = Vec::new();
+        for target in guard.values_mut() {
+            target.mark_revision = target.mark_revision.saturating_add(1);
+            targets.push(target.clone());
+        }
+        targets
+    };
+    for target in targets {
+        publish_live_mark(state, target, slot).await;
+    }
+}
+
+fn spawn_live_mark_task(state: AppState) {
+    let mut events = state.balance_stream().subscribe_events();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(StreamEvent::Balance(payload)) => {
+                    if let (Some(mint), Some(balance)) =
+                        (payload.token_mint.as_deref(), payload.token_balance)
+                    {
+                        update_live_mark_token_balance(
+                            &state,
+                            &payload.env_key,
+                            mint,
+                            balance,
+                            payload.slot,
+                        )
+                        .await;
+                    }
+                }
+                Ok(StreamEvent::MarketAccount(payload)) => {
+                    update_live_mark_market_account(&state, &payload.account, payload.slot).await;
+                }
+                Ok(StreamEvent::Trade(payload)) => {
+                    if payload.ledger_applied == Some(true) {
+                        update_live_mark_trade_ledger(&state, payload.slot).await;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    eprintln!(
+                        "[execution-engine][live-mark] broadcast lagged by {missed} events; skipping to latest."
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+fn active_quote_error_should_try_primary(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    let deterministic_quote_error = [
+        "unsupported bonk holding quote asset",
+        "trusted stable routes are not token holding quote markets",
+        "was not found",
+        "not found",
+        "missing",
+        "invalid",
+        "unsupported",
+        "unexpected",
+        "too short",
+        "shorter than expected",
+        "reserves are empty",
+        "pool reserves are empty",
+        "liquidity",
+        "division by zero",
+        "fee configuration is invalid",
+        "mints do not match",
+        "does not match",
+        "slippagepercent is out of range",
+        "sell percent",
+        "zero tokens",
+        "you have 0 tokens",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    if deterministic_quote_error {
+        return false;
+    }
+    [
+        "failed to fetch",
+        "rpc",
+        "http",
+        "request",
+        "response",
+        "status",
+        "timeout",
+        "timed out",
+        "connect",
+        "connection",
+        "network",
+        "transport",
+        "rate limit",
+        "too many requests",
+        "unauthorized",
+        "forbidden",
+        "429",
+        "401",
+        "403",
+        "500",
+        "502",
+        "503",
+        "504",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+#[cfg(test)]
+fn wallet_status_has_balance_error(status: &WalletStatusSummary) -> bool {
+    status.error.is_none()
+        && status
+            .balanceError
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+fn wallet_status_has_usable_balance(status: &WalletStatusSummary) -> bool {
+    status.balanceError.is_none()
+        && (status.balanceLamports.is_some()
+            || status.balanceSol.is_some()
+            || status.usd1Balance.is_some())
+}
+
+#[cfg(test)]
+fn merge_wallet_status_primary_fallback(
+    warm_statuses: Vec<WalletStatusSummary>,
+    primary_statuses: Vec<WalletStatusSummary>,
+) -> (Vec<WalletStatusSummary>, bool) {
+    let primary_by_key = primary_statuses
+        .into_iter()
+        .map(|status| (status.envKey.clone(), status))
+        .collect::<HashMap<_, _>>();
+    let mut recovered_any = false;
+    let merged = warm_statuses
+        .into_iter()
+        .map(|warm| {
+            if !wallet_status_has_balance_error(&warm) {
+                return warm;
+            }
+            let Some(primary) = primary_by_key.get(&warm.envKey) else {
+                return warm;
+            };
+            if wallet_status_has_usable_balance(primary) {
+                recovered_any = true;
+                return primary.clone();
+            }
+            warm
+        })
+        .collect();
+    (merged, recovered_any)
 }
 
 async fn build_extension_wallet_status_payload(
@@ -8842,7 +12447,6 @@ async fn build_extension_wallet_status_payload(
         .map(|(index, wallet)| (wallet.key.clone(), index))
         .collect::<HashMap<_, _>>();
     let primary_rpc_url = configured_rpc_url();
-    let warm_rpc_url = configured_warm_rpc_url();
     let include_sol_balance = request
         .include_sol_balance
         .unwrap_or(!request.skip_sol_balance)
@@ -8850,8 +12454,10 @@ async fn build_extension_wallet_status_payload(
     let include_usd1_balance = request
         .include_usd1_balance
         .unwrap_or(!request.skip_sol_balance);
+    let runtime_wallets = runtime_wallets_from_wallet_summaries(&effective_wallets);
     let mut raw_wallet_statuses = if !include_sol_balance && !include_usd1_balance {
-        list_solana_env_wallets()
+        runtime_wallets
+            .clone()
             .into_iter()
             .map(|wallet| WalletStatusSummary {
                 envKey: wallet.envKey,
@@ -8866,9 +12472,9 @@ async fn build_extension_wallet_status_payload(
             .collect::<Vec<_>>()
     } else {
         enrich_wallet_statuses_with_balance_options(
-            &warm_rpc_url,
+            &primary_rpc_url,
             USD1_MINT,
-            &list_solana_env_wallets(),
+            &runtime_wallets,
             request.force,
             include_sol_balance,
             include_usd1_balance,
@@ -8918,40 +12524,9 @@ async fn build_extension_wallet_status_payload(
         .and_then(trimmed_option)
         .map(str::to_string);
     if let Some(mint) = requested_mint.as_deref() {
-        let mint_balances = match fetch_wallet_mint_balances(&warm_rpc_url, &wallets, mint).await {
+        let mint_balances = match fetch_wallet_mint_balances(&primary_rpc_url, &wallets, mint).await
+        {
             Ok(balances) => balances,
-            Err(error) if warm_rpc_url != primary_rpc_url => {
-                eprintln!(
-                    "[execution-engine][wallet-status] warm RPC mint balance refresh failed; falling back primary mint={} wallets={} err={}",
-                    mint,
-                    wallets.len(),
-                    error
-                );
-                fetch_wallet_mint_balances(&primary_rpc_url, &wallets, mint)
-                    .await
-                    .unwrap_or_else(|fallback_error| {
-                        eprintln!(
-                            "[execution-engine][wallet-status] primary RPC mint balance fallback failed mint={} wallets={} err={}",
-                            mint,
-                            wallets.len(),
-                            fallback_error
-                        );
-                        wallets
-                            .iter()
-                            .map(|wallet| {
-                                (
-                                    wallet.key.clone(),
-                                    MintBalanceSnapshot {
-                                        raw: None,
-                                        ui_amount: None,
-                                        decimals: None,
-                                        error: Some(fallback_error.clone()),
-                                    },
-                                )
-                            })
-                            .collect()
-                    })
-            }
             Err(error) => {
                 eprintln!(
                     "[execution-engine][wallet-status] mint balance refresh failed mint={} wallets={} err={}",
@@ -9448,6 +13023,29 @@ fn build_effective_wallets(engine: &StoredEngineState) -> Vec<WalletSummary> {
     ordered
 }
 
+fn runtime_wallets_from_wallet_summaries(wallets: &[WalletSummary]) -> Vec<RuntimeWalletSummary> {
+    wallets
+        .iter()
+        .map(|wallet| {
+            let label = wallet.label.trim();
+            RuntimeWalletSummary {
+                envKey: wallet.key.clone(),
+                customName: if label.is_empty() || label == wallet.key {
+                    None
+                } else {
+                    Some(label.to_string())
+                },
+                publicKey: Some(wallet.public_key.clone()),
+                error: None,
+            }
+        })
+        .collect()
+}
+
+fn runtime_wallets_from_engine(engine: &StoredEngineState) -> Vec<RuntimeWalletSummary> {
+    runtime_wallets_from_wallet_summaries(&build_effective_wallets(engine))
+}
+
 fn build_effective_wallet_groups(engine: &StoredEngineState) -> Vec<WalletGroupSummary> {
     let known_wallets: HashSet<String> = build_effective_wallets(engine)
         .into_iter()
@@ -9546,6 +13144,7 @@ fn sample_engine_state() -> StoredEngineState {
         rpc_url: String::new(),
         ws_url: String::new(),
         warm_rpc_url: String::new(),
+        warm_ws_url: String::new(),
         shared_region: String::new(),
         helius_rpc_url: String::new(),
         helius_ws_url: String::new(),
@@ -9903,6 +13502,7 @@ fn normalize_settings(mut settings: EngineSettings) -> EngineSettings {
     settings.rpc_url = settings.rpc_url.trim().to_string();
     settings.ws_url = settings.ws_url.trim().to_string();
     settings.warm_rpc_url = settings.warm_rpc_url.trim().to_string();
+    settings.warm_ws_url = settings.warm_ws_url.trim().to_string();
     settings.shared_region = settings.shared_region.trim().to_string();
     settings.helius_rpc_url = settings.helius_rpc_url.trim().to_string();
     settings.helius_ws_url = settings.helius_ws_url.trim().to_string();
@@ -10188,6 +13788,161 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod warm_fallback_tests {
+    use super::*;
+
+    fn wallet_status(
+        key: &str,
+        balance_lamports: Option<u64>,
+        balance_error: Option<&str>,
+    ) -> WalletStatusSummary {
+        WalletStatusSummary {
+            envKey: key.to_string(),
+            customName: None,
+            publicKey: Some(format!("{key}Pubkey")),
+            error: None,
+            balanceLamports: balance_lamports,
+            balanceSol: balance_lamports.map(|value| value as f64 / 1_000_000_000.0),
+            usd1Balance: None,
+            balanceError: balance_error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn merges_primary_balance_success_over_warm_balance_error() {
+        let warm = vec![
+            wallet_status("SOLANA_PRIVATE_KEY", None, Some("warm invalid json")),
+            wallet_status("SOLANA_PRIVATE_KEY2", Some(42), None),
+        ];
+        let primary = vec![
+            wallet_status("SOLANA_PRIVATE_KEY", Some(100), None),
+            wallet_status("SOLANA_PRIVATE_KEY2", Some(99), None),
+        ];
+
+        let (merged, recovered) = merge_wallet_status_primary_fallback(warm, primary);
+
+        assert!(recovered);
+        assert_eq!(merged[0].balanceLamports, Some(100));
+        assert_eq!(merged[0].balanceError, None);
+        assert_eq!(merged[1].balanceLamports, Some(42));
+    }
+
+    #[test]
+    fn diagnostic_fingerprint_uses_host_without_query_string() {
+        let host = sanitized_endpoint_host("https://rpc.example.test/path?api-key=secret");
+        assert_eq!(host.as_deref(), Some("rpc.example.test"));
+        let fingerprint = diagnostic_fingerprint(
+            "execution-engine",
+            Some("warm-rpc"),
+            Some("WARM_RPC_URL"),
+            host.as_deref(),
+            "warm_rpc_failed_primary_used",
+        );
+        assert!(fingerprint.contains("rpc.example.test"));
+        assert!(!fingerprint.contains("secret"));
+    }
+
+    #[test]
+    fn runtime_diagnostics_record_update_and_clear_by_sanitized_host() {
+        clear_runtime_diagnostic(
+            "execution-engine",
+            Some("warm-rpc"),
+            Some("WARM_RPC_URL"),
+            Some("https://rpc.example.test/path?api-key=secret"),
+            "warm_rpc_failed_primary_used",
+        );
+
+        record_runtime_diagnostic(RuntimeDiagnosticInput {
+            severity: "warning",
+            source: "execution-engine",
+            code: "warm_rpc_failed_primary_used",
+            message: "warm RPC failed".to_string(),
+            detail: Some("first failure".to_string()),
+            env_var: Some("WARM_RPC_URL"),
+            endpoint_kind: Some("warm-rpc"),
+            endpoint_url: Some("https://rpc.example.test/path?api-key=secret".to_string()),
+            restart_required: false,
+        });
+        record_runtime_diagnostic(RuntimeDiagnosticInput {
+            severity: "error",
+            source: "execution-engine",
+            code: "warm_rpc_failed_primary_used",
+            message: "warm RPC still failing".to_string(),
+            detail: Some("second failure".to_string()),
+            env_var: Some("WARM_RPC_URL"),
+            endpoint_kind: Some("warm-rpc"),
+            endpoint_url: Some("https://rpc.example.test/other?api-key=secret".to_string()),
+            restart_required: true,
+        });
+
+        let diagnostics = runtime_diagnostics_snapshot();
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "warm_rpc_failed_primary_used")
+            .expect("recorded runtime diagnostic");
+        assert_eq!(diagnostic.severity, "error");
+        assert_eq!(diagnostic.message, "warm RPC still failing");
+        assert_eq!(diagnostic.detail.as_deref(), Some("second failure"));
+        assert_eq!(diagnostic.host.as_deref(), Some("rpc.example.test"));
+        assert!(diagnostic.restart_required);
+        assert!(diagnostic.last_seen_at_ms >= diagnostic.first_seen_at_ms);
+        assert!(!diagnostic.fingerprint.contains("secret"));
+
+        clear_runtime_diagnostic(
+            "execution-engine",
+            Some("warm-rpc"),
+            Some("WARM_RPC_URL"),
+            Some("https://rpc.example.test/path?api-key=secret"),
+            "warm_rpc_failed_primary_used",
+        );
+
+        assert!(
+            !runtime_diagnostics_snapshot()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "warm_rpc_failed_primary_used")
+        );
+    }
+
+    #[test]
+    fn active_quote_primary_fallback_only_for_likely_endpoint_errors() {
+        assert!(active_quote_error_should_try_primary(
+            "Failed to fetch Bonk multiple accounts: request timed out"
+        ));
+        assert!(active_quote_error_should_try_primary(
+            "RPC status 429 Too Many Requests"
+        ));
+        assert!(!active_quote_error_should_try_primary(
+            "Raydium AMM v4 pool reserves are empty."
+        ));
+        assert!(!active_quote_error_should_try_primary(
+            "Raydium AMM v4 pool ExamplePool was not found."
+        ));
+        assert!(!active_quote_error_should_try_primary(
+            "Unsupported Bonk holding quote asset."
+        ));
+    }
+
+    #[test]
+    fn runtime_wallet_summaries_preserve_shared_config_wallet_labels() {
+        let wallets = vec![WalletSummary {
+            key: "SOLANA_PRIVATE_KEY6".to_string(),
+            label: "New wallet".to_string(),
+            public_key: "ExamplePublicKey".to_string(),
+            enabled: true,
+            emoji: String::new(),
+        }];
+
+        let runtime = runtime_wallets_from_wallet_summaries(&wallets);
+
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].envKey, "SOLANA_PRIVATE_KEY6");
+        assert_eq!(runtime[0].customName.as_deref(), Some("New wallet"));
+        assert_eq!(runtime[0].publicKey.as_deref(), Some("ExamplePublicKey"));
+        assert_eq!(runtime[0].error, None);
+    }
 }
 
 #[cfg(test)]
@@ -11050,6 +14805,57 @@ mod tests {
     }
 
     #[test]
+    fn live_mark_pnl_uses_ledger_baseline_and_mark_value() {
+        let target = LiveMarkTarget {
+            surface_id: "content:test".to_string(),
+            mark_revision: 1,
+            mint: "Mint111".to_string(),
+            wallet_keys: vec!["wallet-alpha".to_string()],
+            wallet_group_id: None,
+            selector: LifecycleAndCanonicalMarket {
+                lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
+                family: TradeVenueFamily::PumpAmm,
+                canonical_market_key: "Market111".to_string(),
+                quote_asset: PlannerQuoteAsset::Sol,
+                verification_source:
+                    crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+                wrapper_action: crate::trade_planner::WrapperAction::PumpAmmWsolSell,
+                wrapper_accounts: Vec::new(),
+                market_subtype: None,
+                direct_protocol_target: None,
+                input_amount_hint: None,
+                minimum_output_hint: None,
+                runtime_bundle: None,
+            },
+            watch_accounts: vec!["Market111".to_string()],
+            token_decimals: Some(6),
+            token_balance_raw: Some(1_000_000),
+            token_balance_ui_by_wallet: HashMap::new(),
+        };
+        let mut ledger = HashMap::new();
+        ledger.insert(
+            "wallet-alpha::Mint111".to_string(),
+            crate::trade_ledger::TradeLedgerEntry {
+                wallet_key: "wallet-alpha".to_string(),
+                mint: "Mint111".to_string(),
+                tracked_bought_lamports: 2_000_000_000,
+                remaining_cost_basis_lamports: 1_500_000_000,
+                realized_pnl_gross_lamports: 250_000_000,
+                explicit_fee_total_lamports: 50_000_000,
+                ..crate::trade_ledger::TradeLedgerEntry::default()
+            },
+        );
+
+        let payload = live_mark_pnl_payload(&ledger, &target, 1_800_000_000, Some(77));
+
+        assert_eq!(payload.holding_value_sol, Some(1.8));
+        assert_eq!(payload.pnl_gross, Some(0.55));
+        assert_eq!(payload.pnl_net, Some(0.5));
+        assert_eq!(payload.pnl_percent_gross, Some(27.500000000000004));
+        assert_eq!(payload.slot, Some(77));
+    }
+
+    #[test]
     fn confirmed_trade_notional_prefers_usd1_balance_deltas() {
         let buy_snapshot = ConfirmedTradeLedgerSnapshot {
             lamport_delta: -5_000,
@@ -11253,7 +15059,8 @@ mod tests {
         ];
 
         assert_eq!(
-            total_token_balance_amount_from_meta(&balances, "wallet-alpha", "Mint111"),
+            total_token_balance_amount_from_meta(&balances, "wallet-alpha", "Mint111")
+                .expect("valid token metadata"),
             Some(18)
         );
     }
@@ -11265,6 +15072,21 @@ mod tests {
 
         assert!(error.contains("wallet-alpha"));
         assert!(error.contains("Mint111"));
+    }
+
+    #[test]
+    fn rpc_resync_token_delta_treats_absent_wallet_mint_metadata_as_irrelevant() {
+        let unrelated = vec![json!({
+            "owner": "wallet-alpha",
+            "mint": "OtherMint",
+            "uiTokenAmount": { "amount": "99", "decimals": 6 }
+        })];
+
+        assert!(
+            maybe_trade_token_delta_from_meta(&[], &unrelated, "wallet-alpha", "Mint111")
+                .expect("metadata parse")
+                .is_none()
+        );
     }
 
     #[test]
@@ -11296,6 +15118,852 @@ mod tests {
                 .expect("closed account delta");
         assert_eq!(closed_delta, -42);
         assert_eq!(closed_decimals, Some(6));
+    }
+
+    fn rpc_resync_candidate(
+        signature: &str,
+        wallet_key: &str,
+        token_delta_raw: i128,
+        lamport_delta: i64,
+        usd1_delta_raw: i128,
+        at_ms: u64,
+    ) -> RpcResyncCandidate {
+        RpcResyncCandidate {
+            signature: signature.to_string(),
+            wallet_key: wallet_key.to_string(),
+            wallet_public_key: format!("{wallet_key}-public"),
+            snapshot: ConfirmedTradeLedgerSnapshot {
+                lamport_delta,
+                usd1_delta_raw,
+                token_delta_raw,
+                token_decimals: Some(6),
+                slot: Some(at_ms / 100),
+                block_time_unix_ms: Some(at_ms),
+                explicit_fees: ExplicitFeeBreakdown::default(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_resync_actions_replay_external_and_local_buys_once() {
+        let local = crate::trade_ledger::ConfirmedTradeEvent {
+            schema_version: crate::trade_ledger::trade_ledger_schema_version(),
+            signature: "sig-trench".to_string(),
+            slot: Some(20),
+            confirmed_at_unix_ms: 2_000,
+            wallet_key: "wallet-alpha".to_string(),
+            wallet_public_key: "wallet-alpha-public".to_string(),
+            mint: "Mint111".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 50,
+            token_decimals: Some(6),
+            trade_value_lamports: 500,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: Some("client-1".to_string()),
+            batch_id: Some("batch-1".to_string()),
+        };
+        let local_events_by_id = HashMap::from([(local.event_id(), local)]);
+        let actions = build_rpc_resync_ledger_actions(
+            vec![
+                rpc_resync_candidate("sig-external", "wallet-alpha", 25, -250, 0, 1_000),
+                rpc_resync_candidate("sig-trench", "wallet-alpha", 50, -500, 0, 2_000),
+            ],
+            "Mint111",
+            &HashSet::from(["wallet-alpha".to_string()]),
+            &local_events_by_id,
+        )
+        .await
+        .expect("resync actions");
+        let trades = actions
+            .iter()
+            .filter_map(|action| match action {
+                RpcResyncLedgerAction::Trade(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0].signature, "sig-external");
+        assert_eq!(trades[0].trade_value_lamports, 250);
+        assert_eq!(trades[1].signature, "sig-trench");
+        assert_eq!(trades[1].platform_tag, PlatformTag::Axiom);
+        assert_eq!(trades[1].provenance, EventProvenance::LocalExecution);
+        assert_eq!(trades[1].client_request_id.as_deref(), Some("client-1"));
+    }
+
+    #[test]
+    fn missing_local_resync_events_are_preserved_when_rpc_misses_them() {
+        let local = crate::trade_ledger::ConfirmedTradeEvent {
+            schema_version: crate::trade_ledger::trade_ledger_schema_version(),
+            signature: "sig-local-only".to_string(),
+            slot: Some(20),
+            confirmed_at_unix_ms: 2_000,
+            wallet_key: "wallet-alpha".to_string(),
+            wallet_public_key: "wallet-alpha-public".to_string(),
+            mint: "Mint111".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 50,
+            token_decimals: Some(6),
+            trade_value_lamports: 500,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: Some("client-1".to_string()),
+            batch_id: Some("batch-1".to_string()),
+        };
+        let mut actions = Vec::new();
+
+        merge_missing_local_resync_events(&mut actions, &[local.clone()]);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RpcResyncLedgerAction::Trade(event)]
+                if event.event_id() == local.event_id()
+        ));
+    }
+
+    #[test]
+    fn missing_local_resync_events_are_deduped_before_live_replay() {
+        let local = crate::trade_ledger::ConfirmedTradeEvent {
+            schema_version: crate::trade_ledger::trade_ledger_schema_version(),
+            signature: "sig-local-only".to_string(),
+            slot: Some(20),
+            confirmed_at_unix_ms: 2_000,
+            wallet_key: "wallet-alpha".to_string(),
+            wallet_public_key: "wallet-alpha-public".to_string(),
+            mint: "Mint111".to_string(),
+            side: TradeSide::Buy,
+            platform_tag: PlatformTag::Axiom,
+            provenance: EventProvenance::LocalExecution,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw: 50,
+            token_decimals: Some(6),
+            trade_value_lamports: 500,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: Some("client-1".to_string()),
+            batch_id: Some("batch-1".to_string()),
+        };
+        let mut actions = Vec::new();
+
+        merge_missing_local_resync_events(&mut actions, &[local.clone(), local]);
+
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, RpcResyncLedgerAction::Trade(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_resync_actions_do_not_turn_token_only_incoming_into_zero_cost_buy() {
+        let actions = build_rpc_resync_ledger_actions(
+            vec![rpc_resync_candidate(
+                "sig-received",
+                "wallet-alpha",
+                25,
+                0,
+                0,
+                1_000,
+            )],
+            "Mint111",
+            &HashSet::from(["wallet-alpha".to_string()]),
+            &HashMap::new(),
+        )
+        .await
+        .expect("resync actions");
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RpcResyncLedgerAction::ReceivedWithoutCostBasis {
+                wallet_key,
+                amount_raw: 25,
+                ..
+            }] if wallet_key == "wallet-alpha"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rpc_resync_actions_do_not_turn_token_only_outgoing_into_sell() {
+        let actions = build_rpc_resync_ledger_actions(
+            vec![rpc_resync_candidate(
+                "sig-sent",
+                "wallet-alpha",
+                -25,
+                0,
+                0,
+                1_000,
+            )],
+            "Mint111",
+            &HashSet::from(["wallet-alpha".to_string()]),
+            &HashMap::new(),
+        )
+        .await
+        .expect("resync actions");
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key,
+                amount_raw: 25,
+                ..
+            }] if wallet_key == "wallet-alpha"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rpc_resync_actions_pair_known_wallet_token_only_movements_as_transfer() {
+        let actions = build_rpc_resync_ledger_actions(
+            vec![
+                rpc_resync_candidate("sig-transfer", "wallet-alpha", -40, 0, 0, 1_000),
+                rpc_resync_candidate("sig-transfer", "wallet-bravo", 40, 0, 0, 1_000),
+            ],
+            "Mint111",
+            &HashSet::from(["wallet-alpha".to_string(), "wallet-bravo".to_string()]),
+            &HashMap::new(),
+        )
+        .await
+        .expect("resync actions");
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::KnownTransfer { marker, .. }
+                if marker.source_wallet_key == "wallet-alpha"
+                    && marker.destination_wallet_key == "wallet-bravo"
+                    && marker.amount_raw == 40
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::SentWithoutProceeds { wallet_key, amount_raw: 0, .. }
+                if wallet_key == "wallet-alpha"
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis { wallet_key, amount_raw: 0, .. }
+                if wallet_key == "wallet-bravo"
+        )));
+    }
+
+    #[tokio::test]
+    async fn rpc_resync_actions_do_not_mutate_unselected_known_transfer_counterparty() {
+        let actions = build_rpc_resync_ledger_actions(
+            vec![
+                rpc_resync_candidate("sig-transfer", "wallet-alpha", -40, 0, 0, 1_000),
+                rpc_resync_candidate("sig-transfer", "wallet-bravo", 40, 0, 0, 1_000),
+            ],
+            "Mint111",
+            &HashSet::from(["wallet-alpha".to_string()]),
+            &HashMap::new(),
+        )
+        .await
+        .expect("resync actions");
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key,
+                amount_raw: 40,
+                persist: true,
+                ..
+            }] if wallet_key == "wallet-alpha"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rpc_resync_actions_do_not_guess_ambiguous_multi_wallet_transfers() {
+        let actions = build_rpc_resync_ledger_actions(
+            vec![
+                rpc_resync_candidate("sig-ambiguous", "wallet-alpha", -40, 0, 0, 1_000),
+                rpc_resync_candidate("sig-ambiguous", "wallet-bravo", -30, 0, 0, 1_000),
+                rpc_resync_candidate("sig-ambiguous", "wallet-charlie", 40, 0, 0, 1_000),
+                rpc_resync_candidate("sig-ambiguous", "wallet-delta", 30, 0, 0, 1_000),
+            ],
+            "Mint111",
+            &HashSet::from([
+                "wallet-alpha".to_string(),
+                "wallet-bravo".to_string(),
+                "wallet-charlie".to_string(),
+                "wallet-delta".to_string(),
+            ]),
+            &HashMap::new(),
+        )
+        .await
+        .expect("resync actions");
+
+        assert!(
+            actions
+                .iter()
+                .all(|action| !matches!(action, RpcResyncLedgerAction::KnownTransfer { .. }))
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    RpcResyncLedgerAction::SentWithoutProceeds { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    RpcResyncLedgerAction::ReceivedWithoutCostBasis { .. }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn scoped_local_markers_preserve_transfer_without_stale_partial_duplicate() {
+        let transfer = crate::trade_ledger::TokenTransferMarkerEvent::new(
+            "wallet-alpha",
+            "wallet-bravo",
+            "Mint111",
+            40,
+            "sig-transfer",
+            2_000,
+        )
+        .with_slot(Some(20));
+        let stale_partial =
+            crate::trade_ledger::IncompleteBalanceAdjustmentMarkerEvent::sent_without_proceeds(
+                "wallet-alpha",
+                "Mint111",
+                40,
+                "sig-transfer:incomplete:sent_to:wallet-alpha:wallet-bravo",
+                1_000,
+                Some(10),
+            );
+        let mut actions = Vec::new();
+
+        merge_scoped_local_resync_markers(
+            &mut actions,
+            &[
+                JournalEntry::IncompleteBalanceAdjustmentMarker(stale_partial),
+                JournalEntry::TokenTransferMarker(transfer),
+            ],
+            &HashSet::from(["wallet-alpha".to_string(), "wallet-bravo".to_string()]),
+            "Mint111",
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, RpcResyncLedgerAction::KnownTransfer { .. }))
+                .count(),
+            1
+        );
+        assert!(actions.iter().all(|action| !matches!(
+            action,
+            RpcResyncLedgerAction::SentWithoutProceeds { amount_raw: 40, .. }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::SentWithoutProceeds {
+                amount_raw: 0,
+                persist: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn scoped_local_markers_do_not_mutate_unselected_transfer_counterparty() {
+        let transfer = crate::trade_ledger::TokenTransferMarkerEvent::new(
+            "wallet-alpha",
+            "wallet-bravo",
+            "Mint111",
+            40,
+            "sig-transfer",
+            2_000,
+        )
+        .with_slot(Some(20));
+        let mut actions = Vec::new();
+
+        merge_scoped_local_resync_markers(
+            &mut actions,
+            &[JournalEntry::TokenTransferMarker(transfer)],
+            &HashSet::from(["wallet-alpha".to_string()]),
+            "Mint111",
+            &HashMap::new(),
+        );
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key,
+                amount_raw: 40,
+                persist: false,
+                ..
+            }] if wallet_key == "wallet-alpha"
+        ));
+    }
+
+    #[test]
+    fn scoped_local_markers_preserve_force_close_after_reset_baseline() {
+        let mut actions = Vec::new();
+        let marker = ForceCloseMarkerEvent::new(
+            "wallet-alpha",
+            "Mint111",
+            2_000,
+            "on-chain-zero-after-resync",
+        );
+
+        merge_scoped_local_resync_markers(
+            &mut actions,
+            &[JournalEntry::ForceCloseMarker(marker)],
+            &HashSet::from(["wallet-alpha".to_string()]),
+            "Mint111",
+            &HashMap::from([("wallet-alpha".to_string(), (1_000, None))]),
+        );
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RpcResyncLedgerAction::ForceClose { marker, persist: false }]
+                if marker.wallet_key == "wallet-alpha"
+        ));
+    }
+
+    #[test]
+    fn malformed_matching_token_metadata_is_a_payload_error() {
+        let malformed = vec![json!({
+            "owner": "wallet-alpha",
+            "mint": "Mint111",
+            "uiTokenAmount": { "decimals": 6 }
+        })];
+
+        let error = maybe_trade_token_delta_from_meta(&[], &malformed, "wallet-alpha", "Mint111")
+            .expect_err("matching metadata without amount should fail");
+        assert!(error.contains("invalid amount"));
+    }
+
+    #[test]
+    fn rpc_resync_action_sorting_matches_journal_timestamp_order() {
+        let mut actions = vec![
+            RpcResyncLedgerAction::Trade(crate::trade_ledger::ConfirmedTradeEvent {
+                schema_version: crate::trade_ledger::trade_ledger_schema_version(),
+                signature: "sig-sell".to_string(),
+                slot: Some(20),
+                confirmed_at_unix_ms: 1_000,
+                wallet_key: "wallet-alpha".to_string(),
+                wallet_public_key: "wallet-alpha-public".to_string(),
+                mint: "Mint111".to_string(),
+                side: TradeSide::Sell,
+                platform_tag: PlatformTag::Unknown,
+                provenance: EventProvenance::RpcResync,
+                settlement_asset: Some(TradeSettlementAsset::Sol),
+                token_delta_raw: -10,
+                token_decimals: Some(6),
+                trade_value_lamports: 100,
+                explicit_fees: ExplicitFeeBreakdown::default(),
+                client_request_id: None,
+                batch_id: None,
+            }),
+            RpcResyncLedgerAction::Trade(crate::trade_ledger::ConfirmedTradeEvent {
+                schema_version: crate::trade_ledger::trade_ledger_schema_version(),
+                signature: "sig-buy".to_string(),
+                slot: Some(10),
+                confirmed_at_unix_ms: 2_000,
+                wallet_key: "wallet-alpha".to_string(),
+                wallet_public_key: "wallet-alpha-public".to_string(),
+                mint: "Mint111".to_string(),
+                side: TradeSide::Buy,
+                platform_tag: PlatformTag::Unknown,
+                provenance: EventProvenance::RpcResync,
+                settlement_asset: Some(TradeSettlementAsset::Sol),
+                token_delta_raw: 10,
+                token_decimals: Some(6),
+                trade_value_lamports: 100,
+                explicit_fees: ExplicitFeeBreakdown::default(),
+                client_request_id: None,
+                batch_id: None,
+            }),
+        ];
+
+        sort_resync_actions(&mut actions);
+
+        assert_eq!(actions[0].signature(), "sig-sell");
+    }
+
+    #[test]
+    fn helius_parser_uses_user_account_token_deltas_and_wallet_native_delta() {
+        let transaction = json!({
+            "signature": "sig-helius",
+            "slot": 77,
+            "timestamp": 123,
+            "fee": 5000,
+            "feePayer": "other-wallet",
+            "transactionError": null,
+            "nativeTransfers": [
+                {
+                    "fromUserAccount": "wallet-public",
+                    "toUserAccount": "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+                    "amount": 7
+                },
+                {
+                    "fromUserAccount": "other-wallet",
+                    "toUserAccount": "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+                    "amount": 999
+                }
+            ],
+            "accountData": [
+                {
+                    "account": "wallet-public",
+                    "nativeBalanceChange": -2000,
+                    "tokenBalanceChanges": [
+                        {
+                            "userAccount": "wallet-public",
+                            "tokenAccount": "token-account",
+                            "mint": "Mint111",
+                            "rawTokenAmount": { "tokenAmount": "100", "decimals": 6 }
+                        },
+                        {
+                            "userAccount": "wallet-public",
+                            "tokenAccount": "usd1-account",
+                            "mint": USD1_MINT,
+                            "rawTokenAmount": { "tokenAmount": "-50", "decimals": 6 }
+                        },
+                        {
+                            "userAccount": "other-wallet",
+                            "tokenAccount": "other-token-account",
+                            "mint": "Mint111",
+                            "rawTokenAmount": { "tokenAmount": "999", "decimals": 6 }
+                        }
+                    ]
+                },
+                {
+                    "account": "other-wallet",
+                    "nativeBalanceChange": -999999,
+                    "tokenBalanceChanges": []
+                }
+            ]
+        });
+
+        let candidate =
+            helius_candidate_from_transaction(&transaction, "wallet-6", "wallet-public", "Mint111")
+                .expect("parse helius transaction")
+                .expect("candidate");
+
+        assert_eq!(candidate.signature, "sig-helius");
+        assert_eq!(candidate.snapshot.token_delta_raw, 100);
+        assert_eq!(candidate.snapshot.token_decimals, Some(6));
+        assert_eq!(candidate.snapshot.usd1_delta_raw, -50);
+        assert_eq!(candidate.snapshot.lamport_delta, -2000);
+        assert_eq!(candidate.snapshot.slot, Some(77));
+        assert_eq!(candidate.snapshot.block_time_unix_ms, Some(123_000));
+        assert_eq!(candidate.snapshot.explicit_fees.network_fee_lamports, 0);
+        assert_eq!(candidate.snapshot.explicit_fees.tip_lamports, 7);
+    }
+
+    #[test]
+    fn helius_parser_rejects_malformed_matching_raw_token_amount() {
+        let transaction = json!({
+            "signature": "sig-helius-bad",
+            "slot": 77,
+            "timestamp": 123,
+            "transactionError": null,
+            "accountData": [
+                {
+                    "account": "wallet-public",
+                    "nativeBalanceChange": 0,
+                    "tokenBalanceChanges": [
+                        {
+                            "userAccount": "wallet-public",
+                            "tokenAccount": "token-account",
+                            "mint": "Mint111",
+                            "rawTokenAmount": { "tokenAmount": "not-a-number", "decimals": 6 }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let error =
+            helius_candidate_from_transaction(&transaction, "wallet-6", "wallet-public", "Mint111")
+                .expect_err("matching malformed raw amount should fail");
+
+        assert!(error.contains("invalid raw amount"));
+    }
+
+    #[test]
+    fn helius_rent_delta_tracks_wallet_owned_token_account_lamports() {
+        let account_data = vec![
+            json!({
+                "account": "wallet-public",
+                "nativeBalanceChange": -999,
+                "tokenBalanceChanges": []
+            }),
+            json!({
+                "account": "token-account",
+                "nativeBalanceChange": -2_039_280,
+                "tokenBalanceChanges": [{
+                    "userAccount": "wallet-public",
+                    "tokenAccount": "token-account",
+                    "mint": "Mint111",
+                    "rawTokenAmount": { "tokenAmount": "100", "decimals": 6 }
+                }]
+            }),
+            json!({
+                "account": "other-token-account",
+                "nativeBalanceChange": -2_039_280,
+                "tokenBalanceChanges": [{
+                    "userAccount": "other-wallet",
+                    "tokenAccount": "other-token-account",
+                    "mint": "Mint111",
+                    "rawTokenAmount": { "tokenAmount": "100", "decimals": 6 }
+                }]
+            }),
+        ];
+
+        assert_eq!(
+            helius_wallet_owned_token_account_rent_delta_lamports(
+                &account_data,
+                "wallet-public",
+                "Mint111"
+            ),
+            -2_039_280
+        );
+    }
+
+    #[test]
+    fn helius_rent_delta_includes_wallet_owned_usd1_token_account_lamports() {
+        let account_data = vec![json!({
+            "account": "usd1-token-account",
+            "nativeBalanceChange": -2_039_280,
+            "tokenBalanceChanges": [{
+                "userAccount": "wallet-public",
+                "tokenAccount": "usd1-token-account",
+                "mint": USD1_MINT,
+                "rawTokenAmount": { "tokenAmount": "-100", "decimals": 6 }
+            }]
+        })];
+
+        assert_eq!(
+            helius_wallet_owned_token_account_rent_delta_lamports(
+                &account_data,
+                "wallet-public",
+                "Mint111"
+            ),
+            -2_039_280
+        );
+    }
+
+    #[test]
+    fn balance_reconciliation_marks_higher_and_lower_onchain_differences() {
+        let mut ledger = HashMap::new();
+        record_confirmed_trade(
+            &mut ledger,
+            RecordConfirmedTradeParams {
+                wallet_key: "wallet-high",
+                wallet_public_key: "wallet-high-public",
+                mint: "Mint111",
+                side: TradeSide::Buy,
+                trade_value_lamports: 100,
+                token_delta_raw: 40,
+                token_decimals: Some(6),
+                confirmed_at_unix_ms: 100,
+                slot: Some(10),
+                entry_preference_asset: Some(TradeSettlementAsset::Sol),
+                settlement_asset: Some(TradeSettlementAsset::Sol),
+                explicit_fees: ExplicitFeeBreakdown::default(),
+                platform_tag: PlatformTag::Unknown,
+                provenance: EventProvenance::RpcResync,
+                signature: "sig-high-buy",
+                client_request_id: None,
+                batch_id: None,
+            },
+        );
+        record_confirmed_trade(
+            &mut ledger,
+            RecordConfirmedTradeParams {
+                wallet_key: "wallet-low",
+                wallet_public_key: "wallet-low-public",
+                mint: "Mint111",
+                side: TradeSide::Buy,
+                trade_value_lamports: 100,
+                token_delta_raw: 40,
+                token_decimals: Some(6),
+                confirmed_at_unix_ms: 100,
+                slot: Some(10),
+                entry_preference_asset: Some(TradeSettlementAsset::Sol),
+                settlement_asset: Some(TradeSettlementAsset::Sol),
+                explicit_fees: ExplicitFeeBreakdown::default(),
+                platform_tag: PlatformTag::Unknown,
+                provenance: EventProvenance::RpcResync,
+                signature: "sig-low-buy",
+                client_request_id: None,
+                batch_id: None,
+            },
+        );
+        let wallet_keys = vec![
+            "wallet-high".to_string(),
+            "wallet-low".to_string(),
+            "wallet-empty".to_string(),
+        ];
+        let onchain = HashMap::from([
+            ("wallet-high".to_string(), 55),
+            ("wallet-low".to_string(), 10),
+            ("wallet-empty".to_string(), 7),
+        ]);
+
+        let replayed = HashMap::from([
+            ("wallet-high".to_string(), 40),
+            ("wallet-low".to_string(), 40),
+            ("wallet-empty".to_string(), 0),
+        ]);
+        let slots = HashMap::from([
+            ("wallet-high".to_string(), 20),
+            ("wallet-low".to_string(), 21),
+            ("wallet-empty".to_string(), 22),
+        ]);
+        let actions = build_balance_reconciliation_actions(
+            &wallet_keys,
+            "Mint111",
+            &replayed,
+            &onchain,
+            &slots,
+            2_000,
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis { wallet_key, amount_raw, .. }
+                if wallet_key == "wallet-high" && *amount_raw == 15
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::SentWithoutProceeds { wallet_key, amount_raw, .. }
+                if wallet_key == "wallet-low" && *amount_raw == 30
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis { wallet_key, amount_raw, .. }
+                if wallet_key == "wallet-empty" && *amount_raw == 7
+        )));
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                RpcResyncLedgerAction::ReceivedWithoutCostBasis { wallet_key, slot, .. }
+                    if wallet_key == "wallet-high" && *slot == Some(20)
+            )
+        }));
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                RpcResyncLedgerAction::SentWithoutProceeds { wallet_key, slot, .. }
+                    if wallet_key == "wallet-low" && *slot == Some(21)
+            )
+        }));
+    }
+
+    #[test]
+    fn balance_reconciliation_clears_stale_markers_when_balances_match() {
+        let wallet_keys = vec!["wallet-alpha".to_string()];
+        let balances = HashMap::from([("wallet-alpha".to_string(), 40)]);
+        let slots = HashMap::from([("wallet-alpha".to_string(), 20)]);
+        let actions = build_balance_reconciliation_actions(
+            &wallet_keys,
+            "Mint111",
+            &balances,
+            &balances,
+            &slots,
+            2_000,
+        );
+
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::ReceivedWithoutCostBasis { amount_raw: 0, .. }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::SentWithoutProceeds { amount_raw: 0, .. }
+        )));
+    }
+
+    #[test]
+    fn balance_reconciliation_ignores_wallet_without_observed_balance_slot() {
+        let wallet_keys = vec!["wallet-alpha".to_string()];
+        let replayed = HashMap::from([("wallet-alpha".to_string(), 40)]);
+        let actions = build_balance_reconciliation_actions(
+            &wallet_keys,
+            "Mint111",
+            &replayed,
+            &HashMap::new(),
+            &HashMap::new(),
+            2_000,
+        );
+
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn balance_reconciliation_force_closes_when_onchain_balance_is_zero() {
+        let wallet_keys = vec!["wallet-alpha".to_string()];
+        let replayed = HashMap::from([("wallet-alpha".to_string(), 40)]);
+        let onchain = HashMap::from([("wallet-alpha".to_string(), 0)]);
+        let slots = HashMap::from([("wallet-alpha".to_string(), 20)]);
+        let actions = build_balance_reconciliation_actions(
+            &wallet_keys,
+            "Mint111",
+            &replayed,
+            &onchain,
+            &slots,
+            2_000,
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RpcResyncLedgerAction::ForceClose {
+                marker,
+                persist: true
+            } if marker.wallet_key == "wallet-alpha"
+                && marker.reason == "on-chain-zero-after-resync"
+        )));
+        assert!(actions.iter().all(|action| !matches!(
+            action,
+            RpcResyncLedgerAction::SentWithoutProceeds { amount_raw: 40, .. }
+        )));
+    }
+
+    #[test]
+    fn zero_clear_does_not_shadow_same_signature_nonzero_adjustment() {
+        let mut actions = vec![
+            RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key: "wallet-alpha".to_string(),
+                mint: "Mint111".to_string(),
+                amount_raw: 0,
+                signature: "sig-transfer".to_string(),
+                applied_at_unix_ms: 1_000,
+                slot: Some(10),
+                persist: true,
+            },
+            RpcResyncLedgerAction::SentWithoutProceeds {
+                wallet_key: "wallet-alpha".to_string(),
+                mint: "Mint111".to_string(),
+                amount_raw: 40,
+                signature: "sig-transfer".to_string(),
+                applied_at_unix_ms: 1_000,
+                slot: Some(10),
+                persist: true,
+            },
+        ];
+
+        prune_incomplete_zero_clears_shadowed_by_nonzero_actions(&mut actions);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RpcResyncLedgerAction::SentWithoutProceeds { amount_raw: 40, .. }]
+        ));
     }
 
     #[test]
@@ -11629,8 +16297,8 @@ mod tests {
     }
 
     #[test]
-    fn preview_compile_probe_targets_meteora_damm_routes() {
-        let selector = LifecycleAndCanonicalMarket {
+    fn preview_compile_probe_targets_meteora_routes() {
+        let mut selector = LifecycleAndCanonicalMarket {
             lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
             family: crate::trade_planner::TradeVenueFamily::MeteoraDammV2,
             canonical_market_key: "pool-1".to_string(),
@@ -11644,6 +16312,9 @@ mod tests {
             minimum_output_hint: None,
             runtime_bundle: None,
         };
+        assert!(preview_compile_probe_required(&TradeSide::Buy, &selector));
+        selector.family = crate::trade_planner::TradeVenueFamily::MeteoraDbc;
+        selector.wrapper_action = crate::trade_planner::WrapperAction::MeteoraDbcBuy;
         assert!(preview_compile_probe_required(&TradeSide::Buy, &selector));
     }
 }

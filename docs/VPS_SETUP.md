@@ -68,7 +68,7 @@ Start simple:
 
 - `SOLANA_RPC_URL`: Helius Gatekeeper HTTP
 - `SOLANA_WS_URL`: Helius standard websocket
-- `WARM_RPC_URL`: Shyft or another low-priority warm/cache RPC
+- `WARM_RPC_URL`: Shyft or another low-priority RPC for compatible warm/cache traffic
 - provider: `Helius Sender` or `Hello Moon`
 
 Helius Developer tier, about $50/month, is strongly recommended if you care about watcher quality, multiple snipes, or follow automation.
@@ -281,7 +281,7 @@ Fill the starter values:
 - `USER_REGION`
 - `TRENCH_TOOLS_MODE` if you want something other than the normal full stack
 - `TRENCH_TOOL_FEE` only if you want to turn the voluntary fee off or increase it
-- `WARM_RPC_URL` if using a separate warm/cache RPC
+- `WARM_RPC_URL` moves compatible warm/cache traffic off the primary RPC
 - `HELLOMOON_API_KEY` only if using Hello Moon
 - `BAGS_API_KEY` only if using Bags launchpad flows
 - `PINATA_JWT` only if using Pinata metadata uploads

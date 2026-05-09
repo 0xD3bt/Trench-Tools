@@ -27,6 +27,7 @@ const DEFAULT_CONFIRM_POLL_INTERVAL_MS: u64 = 500;
 const TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
 const TOKEN_ACCOUNT_AMOUNT_LEN: usize = 8;
 const ATA_BALANCE_RETRY_DELAYS_MS: [u64; 4] = [80, 160, 320, 480];
+const MAX_MULTIPLE_ACCOUNTS_BATCH_SIZE: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct TokenBalance {
@@ -169,6 +170,24 @@ fn truncate_for_log(raw: &str, max_chars: usize) -> String {
     out
 }
 
+fn sanitized_rpc_endpoint_for_log(rpc_url: &str) -> String {
+    let trimmed = rpc_url.trim();
+    if trimmed.is_empty() {
+        return "<empty-rpc-url>".to_string();
+    }
+    let Ok(parsed) = reqwest::Url::parse(trimmed) else {
+        return "<invalid-rpc-url>".to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "<invalid-rpc-url>".to_string();
+    };
+    let port = parsed
+        .port()
+        .map(|value| format!(":{value}"))
+        .unwrap_or_default();
+    format!("{}://{}{}", parsed.scheme(), host, port)
+}
+
 /// Extract a human-readable error message out of a JSON-RPC error body.
 /// Handles the common Helius / Solana shapes:
 ///   { "error": { "code": -32002, "message": "..." } }
@@ -215,6 +234,7 @@ pub async fn rpc_request_with_client(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
+    crate::route_metrics::record_rpc_method(method);
     let response = client
         .post(rpc_url)
         .json(&json!({
@@ -253,8 +273,9 @@ pub async fn rpc_request_with_client(
                     format!("body: {}", truncate_for_log(&body_text, 800))
                 }
             });
+        let endpoint = sanitized_rpc_endpoint_for_log(rpc_url);
         eprintln!(
-            "[execution-engine][rpc] {method} -> {rpc_url} HTTP {} :: {detail}",
+            "[execution-engine][rpc] {method} -> {endpoint} HTTP {} :: {detail}",
             status.as_u16()
         );
         return Err(format!("RPC {method} HTTP {} :: {detail}", status.as_u16()));
@@ -268,7 +289,8 @@ pub async fn rpc_request_with_client(
     })?;
 
     if let Some(detail) = format_json_rpc_error(&payload) {
-        eprintln!("[execution-engine][rpc] {method} -> {rpc_url} JSON-RPC error :: {detail}");
+        let endpoint = sanitized_rpc_endpoint_for_log(rpc_url);
+        eprintln!("[execution-engine][rpc] {method} -> {endpoint} JSON-RPC error :: {detail}");
         return Err(format!("RPC {method} failed: {detail}"));
     }
 
@@ -287,6 +309,12 @@ pub async fn fetch_account_data(
     address: &str,
     commitment: &str,
 ) -> Result<Vec<u8>, String> {
+    let commitment = normalized_commitment(commitment);
+    if let Some(cached) = crate::route_metrics::cached_account_owner_data(address, &commitment) {
+        return cached
+            .map(|(_, data)| data)
+            .ok_or_else(|| format!("Account {address} was not found."));
+    }
     let result = rpc_request(
         rpc_url,
         "getAccountInfo",
@@ -294,7 +322,7 @@ pub async fn fetch_account_data(
             address,
             {
                 "encoding": "base64",
-                "commitment": normalized_commitment(commitment)
+                "commitment": commitment
             }
         ]),
     )
@@ -324,6 +352,10 @@ pub async fn fetch_account_exists(
     address: &str,
     commitment: &str,
 ) -> Result<bool, String> {
+    let commitment = normalized_commitment(commitment);
+    if let Some(cached) = crate::route_metrics::cached_account_owner_data(address, &commitment) {
+        return Ok(cached.is_some());
+    }
     let result = rpc_request(
         rpc_url,
         "getAccountInfo",
@@ -331,7 +363,7 @@ pub async fn fetch_account_exists(
             address,
             {
                 "encoding": "base64",
-                "commitment": normalized_commitment(commitment)
+                "commitment": commitment
             }
         ]),
     )
@@ -350,6 +382,10 @@ pub async fn fetch_account_owner_and_data(
     address: &str,
     commitment: &str,
 ) -> Result<Option<(Pubkey, Vec<u8>)>, String> {
+    let commitment = normalized_commitment(commitment);
+    if let Some(cached) = crate::route_metrics::cached_account_owner_data(address, &commitment) {
+        return Ok(cached);
+    }
     let result = rpc_request(
         rpc_url,
         "getAccountInfo",
@@ -357,7 +393,7 @@ pub async fn fetch_account_owner_and_data(
             address,
             {
                 "encoding": "base64",
-                "commitment": normalized_commitment(commitment)
+                "commitment": commitment
             }
         ]),
     )
@@ -367,6 +403,7 @@ pub async fn fetch_account_owner_and_data(
         .get("value")
         .ok_or_else(|| format!("RPC getAccountInfo did not return account data for {address}."))?;
     if value.is_null() {
+        crate::route_metrics::cache_account_owner_data(address, &commitment, None);
         return Ok(None);
     }
     let owner_str = value
@@ -375,6 +412,100 @@ pub async fn fetch_account_owner_and_data(
         .ok_or_else(|| format!("RPC getAccountInfo did not return an owner for {address}."))?;
     let owner = Pubkey::from_str(owner_str).map_err(|error| {
         format!("RPC getAccountInfo returned an invalid owner for {address}: {error}")
+    })?;
+    let data_str = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let data = if data_str.is_empty() {
+        Vec::new()
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(data_str)
+            .map_err(|error| format!("Failed to decode account data for {address}: {error}"))?
+    };
+    let decoded = Some((owner, data));
+    crate::route_metrics::cache_account_owner_data(address, &commitment, decoded.clone());
+    Ok(decoded)
+}
+
+pub async fn fetch_multiple_account_owner_and_data(
+    rpc_url: &str,
+    addresses: &[String],
+    commitment: &str,
+) -> Result<Vec<Option<(Pubkey, Vec<u8>)>>, String> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let commitment = normalized_commitment(commitment);
+    let mut output = vec![None; addresses.len()];
+    let mut missing_indexes = Vec::new();
+    let mut missing_addresses = Vec::new();
+    for (index, address) in addresses.iter().enumerate() {
+        if let Some(cached) = crate::route_metrics::cached_account_owner_data(address, &commitment)
+        {
+            output[index] = cached;
+        } else {
+            missing_indexes.push(index);
+            missing_addresses.push(address.clone());
+        }
+    }
+    for (index_chunk, address_chunk) in missing_indexes
+        .chunks(MAX_MULTIPLE_ACCOUNTS_BATCH_SIZE)
+        .zip(missing_addresses.chunks(MAX_MULTIPLE_ACCOUNTS_BATCH_SIZE))
+    {
+        let result = rpc_request(
+            rpc_url,
+            "getMultipleAccounts",
+            json!([
+                address_chunk,
+                {
+                    "encoding": "base64",
+                    "commitment": commitment
+                }
+            ]),
+        )
+        .await?;
+        let values = result
+            .get("value")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "RPC getMultipleAccounts did not return a value array.".to_string())?;
+        if values.len() != address_chunk.len() {
+            return Err(format!(
+                "RPC getMultipleAccounts returned {} entries for {} requested accounts.",
+                values.len(),
+                address_chunk.len()
+            ));
+        }
+        for ((output_index, address), value) in index_chunk
+            .iter()
+            .copied()
+            .zip(address_chunk.iter())
+            .zip(values.iter())
+        {
+            let decoded = decode_rpc_account_owner_and_data(value, address)?;
+            crate::route_metrics::cache_account_owner_data(address, &commitment, decoded.clone());
+            output[output_index] = decoded;
+        }
+    }
+    Ok(output)
+}
+
+fn decode_rpc_account_owner_and_data(
+    value: &Value,
+    address: &str,
+) -> Result<Option<(Pubkey, Vec<u8>)>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let owner_str = value
+        .get("owner")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("RPC account response did not return an owner for {address}."))?;
+    let owner = Pubkey::from_str(owner_str).map_err(|error| {
+        format!("RPC account response returned an invalid owner for {address}: {error}")
     })?;
     let data_str = value
         .get("data")

@@ -33,6 +33,7 @@ use tokio::time::{Duration, Instant, sleep};
 use uuid::Uuid;
 
 use crate::{
+    app_logs::record_warn,
     config::{
         NormalizedConfig, NormalizedExecution, NormalizedRecipient,
         configured_bags_rust_blockhash_override, configured_bags_setup_gate_commitment,
@@ -359,6 +360,17 @@ fn bags_api_response_message(value: &Value) -> Option<String> {
     }
 }
 
+fn compact_bags_api_preview(value: &str, max_chars: usize) -> String {
+    let compact = value.trim();
+    let mut chars = compact.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        compact.to_string()
+    }
+}
+
 fn summarize_bags_api_failure(
     action: &str,
     status: reqwest::StatusCode,
@@ -368,27 +380,57 @@ fn summarize_bags_api_failure(
 ) -> String {
     let normalized_error = error.trim();
     if !normalized_error.is_empty() {
+        if status.is_server_error()
+            || normalized_error.eq_ignore_ascii_case("internal server error")
+        {
+            return format!("{action}: status {status} | error {normalized_error}");
+        }
         return normalized_error.to_string();
     }
     if let Some(message) = response.and_then(bags_api_response_message) {
+        if status.is_server_error() || message.eq_ignore_ascii_case("internal server error") {
+            return format!("{action}: status {status} | response {message}");
+        }
         return message;
     }
     let compact_body = raw_body.trim();
     if compact_body.is_empty() {
         return format!("{action}: status {status}");
     }
-    let preview = if compact_body.len() > 280 {
-        format!("{}...", &compact_body[..277])
-    } else {
-        compact_body.to_string()
-    };
+    let preview = compact_bags_api_preview(compact_body, 277);
     format!("{action}: status {status} | body {preview}")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+fn record_bags_api_failure(
+    action: &str,
+    status: reqwest::StatusCode,
+    error: &str,
+    response: Option<&Value>,
+    raw_body: &str,
+    request_context: Value,
+) {
+    let compact_body = raw_body.trim();
+    let body_preview = compact_bags_api_preview(compact_body, 277);
+    record_warn(
+        "bags-api",
+        format!("{action} failed with status {status}"),
+        Some(json!({
+            "action": action,
+            "status": status.as_u16(),
+            "error": error,
+            "response": response,
+            "bodyPreview": body_preview,
+            "request": request_context,
+        })),
+    );
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BagsLookupWalletResponse {
     #[serde(default)]
     provider: String,
+    #[serde(default)]
+    platformData: Value,
     #[serde(default)]
     wallet: String,
 }
@@ -1666,21 +1708,13 @@ async fn ensure_tx_config_on_bags_versioned_transaction(
     commitment: &str,
     blockhash_override: Option<(String, u64)>,
 ) -> Result<VersionedTransaction, String> {
-    if versioned_transaction_has_additional_required_signers(&transaction, &owner.pubkey()) {
+    let has_additional_required_signers =
+        versioned_transaction_has_additional_required_signers(&transaction, &owner.pubkey());
+    if has_additional_required_signers {
         let mut transaction = transaction;
         sign_existing_versioned_transaction_with_owner(&mut transaction, owner)?;
         return Ok(transaction);
     }
-    let fresh_blockhash = if let Some((blockhash, _)) = blockhash_override {
-        Hash::from_str(blockhash.trim())
-            .map_err(|error| format!("Invalid Bags blockhash override: {error}"))?
-    } else {
-        let (blockhash, _) = fetch_latest_blockhash_cached(rpc_url, commitment).await?;
-        Hash::from_str(blockhash.trim())
-            .map_err(|error| format!("Invalid Bags latest blockhash: {error}"))?
-    };
-    let shared_lookup_table_accounts =
-        load_shared_lookup_table_for_bags_transaction(rpc_url, commitment).await?;
     let source_lookup_table_accounts =
         resolve_lookup_table_accounts_for_bags_transaction(rpc_url, &transaction, commitment)
             .await?;
@@ -1694,11 +1728,25 @@ async fn ensure_tx_config_on_bags_versioned_transaction(
         existing_compute_unit_limit,
         existing_compute_unit_price_micro_lamports,
     ) = split_compute_budget_instructions(instructions);
-    if tx_config.jitodontfront {
-        let dontfront = bags_jitodontfront_pubkey()?;
-        for instruction in &mut filtered_instructions {
-            apply_jitodontfront_to_instruction(instruction, &dontfront);
-        }
+    let fresh_blockhash = if let Some((blockhash, _)) = blockhash_override {
+        Hash::from_str(blockhash.trim())
+            .map_err(|error| format!("Invalid Bags blockhash override: {error}"))?
+    } else {
+        let (blockhash, _) = fetch_latest_blockhash_cached(rpc_url, commitment).await?;
+        Hash::from_str(blockhash.trim())
+            .map_err(|error| format!("Invalid Bags latest blockhash: {error}"))?
+    };
+    let shared_lookup_table_accounts =
+        load_shared_lookup_table_for_bags_transaction(rpc_url, commitment).await?;
+    if tx_config.jitodontfront
+        && !filtered_instructions.iter().any(|instruction| {
+            instruction
+                .accounts
+                .iter()
+                .any(|meta| meta.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+        })
+    {
+        filtered_instructions.insert(0, build_jitodontfront_noop_instruction(&owner.pubkey())?);
     }
     let tip_instruction = build_inline_tip_instruction(
         &owner.pubkey(),
@@ -1779,6 +1827,25 @@ fn compiled_transaction_from_bags_versioned_transaction(
         inlineTipLamports: inline_tip_lamports,
         inlineTipAccount: inline_tip_account,
     })
+}
+
+async fn last_valid_block_height_for_bags_transactions(
+    rpc_url: &str,
+    commitment: &str,
+    transactions: &[VersionedTransaction],
+    blockhash_override: Option<(String, u64)>,
+) -> Result<u64, String> {
+    if let Some((blockhash, last_valid_block_height)) = blockhash_override {
+        let all_transactions_use_override = transactions
+            .iter()
+            .all(|transaction| transaction.message.recent_blockhash().to_string() == blockhash);
+        if all_transactions_use_override {
+            return Ok(last_valid_block_height);
+        }
+    }
+    fetch_latest_blockhash_cached(rpc_url, commitment)
+        .await
+        .map(|(_, last_valid_block_height)| last_valid_block_height)
 }
 
 fn normalize_bags_versioned_transactions(
@@ -1912,21 +1979,17 @@ fn build_follow_sell_tx_config(
     })
 }
 
-fn apply_jitodontfront_to_instruction(instruction: &mut Instruction, dontfront: &Pubkey) {
-    if instruction
-        .accounts
-        .iter()
-        .any(|meta| meta.pubkey == *dontfront)
-    {
-        return;
-    }
-    instruction
-        .accounts
-        .push(AccountMeta::new_readonly(*dontfront, false));
+fn build_jitodontfront_noop_instruction(payer: &Pubkey) -> Result<Instruction, String> {
+    let mut instruction = transfer(payer, payer, 0);
+    instruction.accounts.push(AccountMeta::new_readonly(
+        bags_jitodontfront_pubkey()?,
+        false,
+    ));
+    Ok(instruction)
 }
 
 fn build_native_follow_instructions(
-    mut core_instructions: Vec<Instruction>,
+    core_instructions: Vec<Instruction>,
     tx_config: &NativeFollowTxConfig,
     payer: &Pubkey,
 ) -> Result<Vec<Instruction>, String> {
@@ -1941,11 +2004,15 @@ fn build_native_follow_instructions(
             tx_config.compute_unit_price_micro_lamports,
         )?);
     }
-    if tx_config.jitodontfront {
-        let dontfront = bags_jitodontfront_pubkey()?;
-        for instruction in &mut core_instructions {
-            apply_jitodontfront_to_instruction(instruction, &dontfront);
-        }
+    if tx_config.jitodontfront
+        && !core_instructions.iter().any(|instruction| {
+            instruction
+                .accounts
+                .iter()
+                .any(|meta| meta.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+        })
+    {
+        instructions.push(build_jitodontfront_noop_instruction(payer)?);
     }
     instructions.extend(core_instructions);
     if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty() {
@@ -4002,6 +4069,22 @@ async fn upload_bags_token_info_and_metadata(
     let payload: BagsApiEnvelope<Value> = serde_json::from_str(&response_text)
         .map_err(|error| format!("Failed to parse Bags token metadata upload response: {error}"))?;
     if !status.is_success() || !payload.success {
+        record_bags_api_failure(
+            "Failed to upload Bags token metadata",
+            status,
+            &payload.error,
+            payload.response.as_ref(),
+            &response_text,
+            json!({
+                "name": config.token.name,
+                "symbol": config.token.symbol,
+                "hasDescription": !config.token.description.trim().is_empty(),
+                "hasTelegram": !config.token.telegram.trim().is_empty(),
+                "hasWebsite": !config.token.website.trim().is_empty(),
+                "hasTwitter": !config.token.twitter.trim().is_empty(),
+                "imageLocalPath": config.imageLocalPath,
+            }),
+        );
         return Err(summarize_bags_api_failure(
             "Failed to upload Bags token metadata",
             status,
@@ -4478,13 +4561,31 @@ async fn create_bags_fee_share_config(
     let envelope: BagsApiEnvelope<Value> = serde_json::from_str(&response_text)
         .map_err(|error| format!("Failed to parse Bags fee-share config response: {error}"))?;
     if !status.is_success() || !envelope.success {
-        return Err(summarize_bags_api_failure(
+        record_bags_api_failure(
             "Failed to create Bags fee-share config",
             status,
             &envelope.error,
             envelope.response.as_ref(),
             &response_text,
-        ));
+            payload.clone(),
+        );
+        let mut message = summarize_bags_api_failure(
+            "Failed to create Bags fee-share config",
+            status,
+            &envelope.error,
+            envelope.response.as_ref(),
+            &response_text,
+        );
+        if status.is_server_error()
+            && message
+                .to_ascii_lowercase()
+                .contains("internal server error")
+        {
+            message = format!(
+                "{message}. Bags returned this while creating fee-share config for payer {owner}; verify the deployer wallet, fee-sharing recipients, and Bags API key permissions."
+            );
+        }
+        return Err(message);
     }
     let payload = envelope
         .response
@@ -4535,6 +4636,14 @@ async fn create_bags_launch_transaction_bytes(
     let envelope: BagsApiEnvelope<Value> = serde_json::from_str(&response_text)
         .map_err(|error| format!("Failed to parse Bags launch transaction response: {error}"))?;
     if !status.is_success() || !envelope.success {
+        record_bags_api_failure(
+            "Failed to create Bags launch transaction",
+            status,
+            &envelope.error,
+            envelope.response.as_ref(),
+            &response_text,
+            payload.clone(),
+        );
         return Err(summarize_bags_api_failure(
             "Failed to create Bags launch transaction",
             status,
@@ -4573,6 +4682,37 @@ fn build_bags_launch_transaction_payload(
         }
     }
     payload
+}
+
+fn resolve_bags_initial_buy_lamports(config: &NormalizedConfig) -> Result<u64, String> {
+    let Some(dev_buy) = config.devBuy.as_ref() else {
+        return Ok(0);
+    };
+    if dev_buy.amount.trim().is_empty() {
+        return Ok(0);
+    }
+    match dev_buy.mode.trim().to_ascii_lowercase().as_str() {
+        "sol" => u64::try_from(parse_decimal_to_u128(&dev_buy.amount, 9, "dev buy amount")?)
+            .map_err(|_| "dev buy amount is too large.".to_string()),
+        "tokens" => {
+            let desired_tokens = parse_decimal_to_u128(&dev_buy.amount, 9, "dev buy tokens")?;
+            if desired_tokens == 0 {
+                return Ok(0);
+            }
+            let excluded_input =
+                bags_get_quote_to_base_input_for_output(&biguint_from_u128(desired_tokens))?;
+            let required_input = bags_get_fee_amount_included(
+                &excluded_input,
+                bags_cliff_fee_numerator_for_mode(&config.mode),
+            );
+            required_input
+                .to_u64()
+                .ok_or_else(|| "Bags token-mode dev buy amount is too large.".to_string())
+        }
+        other => Err(format!(
+            "Unsupported Bags dev buy mode: {other}. Expected sol or tokens."
+        )),
+    }
 }
 
 fn decode_bags_versioned_transaction(encoded: &str) -> Result<VersionedTransaction, String> {
@@ -4686,6 +4826,9 @@ fn build_native_bags_artifacts_from_prepared(
     if !prepared.pre_migration_dbc_pool_address.trim().is_empty() {
         report["preMigrationDbcPoolAddress"] =
             Value::String(prepared.pre_migration_dbc_pool_address.clone());
+        report["pairAddress"] = Value::String(prepared.pre_migration_dbc_pool_address.clone());
+        report["routeAddress"] = Value::String(prepared.pre_migration_dbc_pool_address.clone());
+        report["poolAddress"] = Value::String(prepared.pre_migration_dbc_pool_address.clone());
     }
     report["bagsSetupFeeEstimate"] =
         serde_json::to_value(&fee_estimate).map_err(|error| error.to_string())?;
@@ -4840,14 +4983,6 @@ async fn native_prepare_bags_launch(
         &config.execution.commitment,
     )
     .await?;
-    let shared_last_valid_block_height =
-        if let Some((_, last_valid_block_height)) = blockhash_override.clone() {
-            last_valid_block_height
-        } else {
-            fetch_latest_blockhash_cached(rpc_url, &config.execution.commitment)
-                .await?
-                .1
-        };
     let direct_tx_config = NativeBagsVersionedTxConfig {
         compute_unit_limit: config
             .tx
@@ -4886,10 +5021,17 @@ async fn native_prepare_bags_launch(
         .await?;
         signed_setup_transactions.push(ensured);
     }
+    let setup_last_valid_block_height = last_valid_block_height_for_bags_transactions(
+        rpc_url,
+        &config.execution.commitment,
+        &signed_setup_transactions,
+        blockhash_override.clone(),
+    )
+    .await?;
     let setup_transactions = normalize_bags_versioned_transactions(
         &signed_setup_transactions,
         "bags-config-direct",
-        shared_last_valid_block_height,
+        setup_last_valid_block_height,
         Some(direct_tx_config.compute_unit_limit),
         Some(direct_tx_config.compute_unit_price_micro_lamports),
         if direct_tx_config.tip_lamports > 0 {
@@ -4919,10 +5061,17 @@ async fn native_prepare_bags_launch(
             .await?;
             signed_bundle_transactions.push(ensured);
         }
+        let bundle_last_valid_block_height = last_valid_block_height_for_bags_transactions(
+            rpc_url,
+            &config.execution.commitment,
+            &signed_bundle_transactions,
+            blockhash_override.clone(),
+        )
+        .await?;
         let compiled_bundle_transactions = normalize_bags_versioned_transactions(
             &signed_bundle_transactions,
             &format!("bags-config-bundle-{}", index + 1),
-            shared_last_valid_block_height,
+            bundle_last_valid_block_height,
             Some(direct_tx_config.compute_unit_limit),
             Some(direct_tx_config.compute_unit_price_micro_lamports),
             if bundled_tx_config.tip_lamports > 0 {
@@ -5097,16 +5246,7 @@ pub async fn compile_launch_transaction(
         Pubkey::from_str(mint).map_err(|error| format!("Invalid Bags mint address: {error}"))?;
     let config_key = Pubkey::from_str(config_key)
         .map_err(|error| format!("Invalid Bags config key: {error}"))?;
-    let initial_buy_lamports = if let Some(dev_buy) = config.devBuy.as_ref() {
-        if dev_buy.amount.trim().is_empty() {
-            0
-        } else {
-            u64::try_from(parse_decimal_to_u128(&dev_buy.amount, 9, "dev buy amount")?)
-                .map_err(|_| "dev buy amount is too large.".to_string())?
-        }
-    } else {
-        0
-    };
+    let initial_buy_lamports = resolve_bags_initial_buy_lamports(config)?;
     let tip_account = parse_optional_pubkey(&config.tx.jitoTipAccount);
     let tx_config = NativeBagsVersionedTxConfig {
         compute_unit_limit: config
@@ -5167,13 +5307,13 @@ pub async fn compile_launch_transaction(
         blockhash_override.clone(),
     )
     .await?;
-    let last_valid_block_height = if let Some((_, last_valid_block_height)) = blockhash_override {
-        last_valid_block_height
-    } else {
-        fetch_latest_blockhash_cached(rpc_url, &setup_gate_commitment)
-            .await?
-            .1
-    };
+    let last_valid_block_height = last_valid_block_height_for_bags_transactions(
+        rpc_url,
+        &setup_gate_commitment,
+        std::slice::from_ref(&ensured),
+        blockhash_override,
+    )
+    .await?;
     let mut normalized = normalize_bags_versioned_transactions(
         &[ensured],
         "launch",
@@ -5992,6 +6132,7 @@ pub async fn compile_atomic_follow_buy_transaction(
     mint: &str,
     launch_creator: &str,
     buy_amount_sol: &str,
+    bags_launch: Option<&BagsLaunchMetadata>,
 ) -> Result<CompiledTransaction, String> {
     compile_follow_buy_transaction(
         rpc_url,
@@ -6002,7 +6143,7 @@ pub async fn compile_atomic_follow_buy_transaction(
         mint,
         launch_creator,
         buy_amount_sol,
-        None,
+        bags_launch,
         None,
     )
     .await
@@ -6412,6 +6553,36 @@ mod tests {
     }
 
     #[test]
+    fn summarize_bags_api_failure_keeps_stage_for_generic_server_error() {
+        let message = summarize_bags_api_failure(
+            "Failed to create Bags launch transaction",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error",
+            None,
+            r#"{"success":false,"error":"Internal server error"}"#,
+        );
+        assert_eq!(
+            message,
+            "Failed to create Bags launch transaction: status 500 Internal Server Error | error Internal server error"
+        );
+    }
+
+    #[test]
+    fn summarize_bags_api_failure_keeps_stage_for_generic_response_server_error() {
+        let message = summarize_bags_api_failure(
+            "Failed to create Bags fee-share config",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "",
+            Some(&json!("Internal server error")),
+            r#"{"success":false,"response":"Internal server error"}"#,
+        );
+        assert_eq!(
+            message,
+            "Failed to create Bags fee-share config: status 500 Internal Server Error | response Internal server error"
+        );
+    }
+
+    #[test]
     fn summarize_bags_api_failure_falls_back_to_body_preview() {
         let message = summarize_bags_api_failure(
             "Failed to create Bags launch transaction",
@@ -6422,6 +6593,21 @@ mod tests {
         );
         assert!(message.contains("status 400 Bad Request"));
         assert!(message.contains(r#"{"success":false,"unexpected":"shape"}"#));
+    }
+
+    #[test]
+    fn summarize_bags_api_failure_safely_truncates_unicode_body() {
+        let body = format!("{}{}", "é".repeat(300), "tail");
+        let message = summarize_bags_api_failure(
+            "Failed to create Bags launch transaction",
+            reqwest::StatusCode::BAD_REQUEST,
+            "",
+            None,
+            &body,
+        );
+
+        assert!(message.ends_with("..."));
+        assert!(message.contains("status 400 Bad Request"));
     }
 
     #[test]
@@ -6540,6 +6726,26 @@ mod tests {
         }))
         .expect("parse token account balance");
         assert_eq!(parsed.result.value.amount, "33792190511826");
+    }
+
+    #[test]
+    fn token_mode_dev_buy_resolves_initial_buy_lamports() {
+        let mut config = sample_bags_config();
+        config.devBuy = Some(crate::config::NormalizedDevBuy {
+            mode: "tokens".to_string(),
+            amount: "250000".to_string(),
+            source: "test".to_string(),
+        });
+        let lamports = resolve_bags_initial_buy_lamports(&config).expect("token-mode lamports");
+
+        assert!(lamports > 0);
+        assert_eq!(
+            native_quote_launch(&config.mode, "tokens", "250000")
+                .expect("native quote")
+                .as_ref()
+                .map(|quote| quote.estimatedSol.clone()),
+            Some(format_decimal_u128(u128::from(lamports), 9, 6))
+        );
     }
 
     #[tokio::test]
@@ -6714,8 +6920,8 @@ mod tests {
         )
         .expect("sign provider transaction");
         let config = NativeBagsVersionedTxConfig {
-            compute_unit_limit: 340_000,
-            compute_unit_price_micro_lamports: 1,
+            compute_unit_limit: 0,
+            compute_unit_price_micro_lamports: 0,
             tip_lamports: 0,
             tip_account: String::new(),
             jitodontfront: false,
@@ -6728,6 +6934,94 @@ mod tests {
             &config,
             "confirmed",
             None,
+        )
+        .await
+        .expect("preserve multi-signer transaction");
+
+        assert_eq!(ensured.message, VersionedMessage::V0(message));
+    }
+
+    #[tokio::test]
+    async fn bags_api_preserved_transactions_ignore_blockhash_override() {
+        let owner = Keypair::new();
+        let provider_signer = Keypair::new();
+        let instruction = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new_readonly(provider_signer.pubkey(), true),
+            ],
+            data: vec![],
+        };
+        let original_blockhash = Hash::new_unique();
+        let override_blockhash = Hash::new_unique();
+        let message =
+            v0::Message::try_compile(&owner.pubkey(), &[instruction], &[], original_blockhash)
+                .expect("compile provider message");
+        let transaction = VersionedTransaction::try_new(
+            VersionedMessage::V0(message.clone()),
+            &[&owner, &provider_signer],
+        )
+        .expect("sign provider transaction");
+        let config = NativeBagsVersionedTxConfig {
+            compute_unit_limit: 0,
+            compute_unit_price_micro_lamports: 0,
+            tip_lamports: 0,
+            tip_account: String::new(),
+            jitodontfront: false,
+        };
+
+        let ensured = ensure_tx_config_on_bags_versioned_transaction(
+            "",
+            &owner,
+            transaction,
+            &config,
+            "confirmed",
+            Some((override_blockhash.to_string(), 123)),
+        )
+        .await
+        .expect("preserve multi-signer transaction");
+
+        assert_eq!(ensured.message, VersionedMessage::V0(message));
+        assert_eq!(ensured.message.recent_blockhash(), &original_blockhash);
+    }
+
+    #[tokio::test]
+    async fn bags_api_multi_signer_transactions_preserve_requested_mutations() {
+        let owner = Keypair::new();
+        let provider_signer = Keypair::new();
+        let instruction = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new_readonly(provider_signer.pubkey(), true),
+            ],
+            data: vec![],
+        };
+        let message =
+            v0::Message::try_compile(&owner.pubkey(), &[instruction], &[], Hash::new_unique())
+                .expect("compile provider message");
+        let transaction = VersionedTransaction::try_new(
+            VersionedMessage::V0(message.clone()),
+            &[&owner, &provider_signer],
+        )
+        .expect("sign provider transaction");
+        let config = NativeBagsVersionedTxConfig {
+            compute_unit_limit: 340_000,
+            compute_unit_price_micro_lamports: 5_000,
+            tip_lamports: 1_000,
+            tip_account: Pubkey::new_unique().to_string(),
+            jitodontfront: true,
+        };
+        let override_blockhash = Hash::new_unique();
+
+        let ensured = ensure_tx_config_on_bags_versioned_transaction(
+            "",
+            &owner,
+            transaction,
+            &config,
+            "confirmed",
+            Some((override_blockhash.to_string(), 123)),
         )
         .await
         .expect("preserve multi-signer transaction");

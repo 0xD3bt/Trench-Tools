@@ -10,11 +10,17 @@ import { fetchWalletStatus } from "./execution-client.js";
 const WALLET_STATUS_REVISION_KEY = "trenchTools.walletStatusRevision";
 const WALLET_STATUS_META_KEY = "trenchTools.walletStatusMeta";
 const WALLET_STATUS_DIFF_KEY = "trenchTools.walletStatusDiff";
+const WALLET_STATUS_MARK_REVISION_KEY = "trenchTools.walletStatusMarkRevision";
+const WALLET_STATUS_MARK_DIFF_KEY = "trenchTools.walletStatusMarkDiff";
 const LAST_TRADE_EVENT_KEY = "trenchTools.lastTradeEvent";
 
 const STORE = {
   balances: new Map(),
   tokenBalances: new Map(),
+  balanceSlots: new Map(),
+  tokenSlots: new Map(),
+  markRevisions: new Map(),
+  storageRevision: Date.now(),
   lastFetchAt: 0,
   lastEventAt: 0,
   lastError: null,
@@ -31,6 +37,19 @@ function numberOrNull(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function slotOrNull(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function revisionOrNull(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function nextStorageRevision() {
+  STORE.storageRevision = Math.max(Date.now(), STORE.storageRevision + 1);
+  return STORE.storageRevision;
+}
+
 function normalizeEntry(row) {
   return {
     balanceSol: numberOrNull(row?.balanceSol),
@@ -41,6 +60,9 @@ function normalizeEntry(row) {
         ? row.balanceError
         : null,
     publicKey: typeof row?.publicKey === "string" ? row.publicKey : null,
+    commitment: typeof row?.commitment === "string" ? row.commitment : null,
+    source: typeof row?.source === "string" ? row.source : null,
+    slot: slotOrNull(row?.slot),
     fetchedAt: Date.now(),
   };
 }
@@ -52,6 +74,9 @@ function mergeEntry(prev, next) {
   if (next.balanceLamports != null) merged.balanceLamports = next.balanceLamports;
   if (next.usd1Balance != null) merged.usd1Balance = next.usd1Balance;
   if (next.publicKey != null) merged.publicKey = next.publicKey;
+  if (next.commitment != null) merged.commitment = next.commitment;
+  if (next.source != null) merged.source = next.source;
+  if (next.slot != null) merged.slot = next.slot;
   if (next.balanceError !== undefined) merged.balanceError = next.balanceError;
   merged.fetchedAt = next.fetchedAt || Date.now();
   return merged;
@@ -59,6 +84,20 @@ function mergeEntry(prev, next) {
 
 function tokenBalanceKey(envKey, mint) {
   return `${String(envKey || "").trim()}::${String(mint || "").trim()}`;
+}
+
+function balanceSlotKey(envKey, field) {
+  return `${String(envKey || "").trim()}::${field}`;
+}
+
+function shouldApplySlot(slotMap, key, slot) {
+  if (slot == null) return true;
+  const previous = slotMap.get(key);
+  if (previous != null && slot < previous) {
+    return false;
+  }
+  slotMap.set(key, slot);
+  return true;
 }
 
 function tokenBalanceFromRow(row) {
@@ -75,7 +114,30 @@ function walletBalanceDiffEntry(envKey, entry) {
   if (entry?.balanceLamports != null) diff.balanceLamports = entry.balanceLamports;
   if (entry?.usd1Balance != null) diff.usd1Balance = entry.usd1Balance;
   diff.balanceError = entry?.balanceError ?? null;
+  if (entry?.commitment) diff.commitment = entry.commitment;
+  if (entry?.source) diff.source = entry.source;
+  if (entry?.slot != null) diff.slot = entry.slot;
   return diff;
+}
+
+function markSlotKey(event) {
+  const surface = String(event?.surfaceId || "").trim();
+  const mint = String(event?.mint || "").trim();
+  const walletKeys = Array.isArray(event?.walletKeys)
+    ? event.walletKeys.map((key) => String(key || "").trim()).filter(Boolean).sort().join(",")
+    : "";
+  const group = String(event?.walletGroupId || "").trim();
+  return `${surface}::${mint}::${group}::${walletKeys}`;
+}
+
+function shouldApplyMarkRevision(revisionMap, key, revision) {
+  if (revision == null) return true;
+  const previous = revisionMap.get(key);
+  if (previous != null && revision <= previous) {
+    return false;
+  }
+  revisionMap.set(key, revision);
+  return true;
 }
 
 function snapshotFromStore() {
@@ -121,6 +183,9 @@ export function applyServerSnapshot(snapshot) {
   }
   STORE.balances = nextMap;
   STORE.tokenBalances.clear();
+  STORE.balanceSlots.clear();
+  STORE.tokenSlots.clear();
+  STORE.markRevisions.clear();
   STORE.lastEventAt = Date.now();
   STORE.lastError = null;
   const changedKeys = Array.from(nextMap.keys());
@@ -142,31 +207,58 @@ export function applyServerBalanceEvent(event) {
   if (!envKey) return;
   const tokenMint = typeof event.tokenMint === "string" ? event.tokenMint.trim() : "";
   const tokenBalance = numberOrNull(event.tokenBalance);
+  const eventSlot = slotOrNull(event.slot);
+  const eventCommitment = typeof event.commitment === "string" ? event.commitment : null;
+  const eventSource = typeof event.source === "string" ? event.source : null;
   const prev = STORE.balances.get(envKey);
+  const balanceSol = numberOrNull(event.balanceSol);
+  const balanceLamports = numberOrNull(event.balanceLamports);
+  const usd1Balance = numberOrNull(event.usd1Balance);
+  const hasSolUpdate = balanceSol != null || balanceLamports != null;
+  const solSlotOk =
+    !hasSolUpdate ||
+    shouldApplySlot(STORE.balanceSlots, balanceSlotKey(envKey, "sol"), eventSlot);
+  const usd1SlotOk =
+    usd1Balance == null ||
+    shouldApplySlot(STORE.balanceSlots, balanceSlotKey(envKey, "usd1"), eventSlot);
+  const tokenSlotOk =
+    !tokenMint ||
+    tokenBalance == null ||
+    shouldApplySlot(STORE.tokenSlots, tokenBalanceKey(envKey, tokenMint), eventSlot);
   const previousTokenBalance =
-    tokenMint && tokenBalance != null
+    tokenMint && tokenBalance != null && tokenSlotOk
       ? STORE.tokenBalances.get(tokenBalanceKey(envKey, tokenMint))
       : undefined;
-  const tokenChanged = tokenMint && tokenBalance != null && previousTokenBalance !== tokenBalance;
+  const tokenChanged =
+    tokenMint && tokenBalance != null && tokenSlotOk && previousTokenBalance !== tokenBalance;
+  const hasAppliedBalanceField =
+    (solSlotOk && hasSolUpdate) || (usd1SlotOk && usd1Balance != null);
   const partial = {
-    balanceSol: numberOrNull(event.balanceSol),
-    balanceLamports: numberOrNull(event.balanceLamports),
-    usd1Balance: numberOrNull(event.usd1Balance),
+    balanceSol: solSlotOk ? balanceSol : null,
+    balanceLamports: solSlotOk ? balanceLamports : null,
+    usd1Balance: usd1SlotOk ? usd1Balance : null,
     publicKey: prev?.publicKey ?? null,
-    balanceError: null,
+    commitment: hasAppliedBalanceField ? eventCommitment : null,
+    source: hasAppliedBalanceField ? eventSource : null,
+    slot: hasAppliedBalanceField ? eventSlot : null,
+    balanceError: hasAppliedBalanceField ? null : undefined,
     fetchedAt: Date.now(),
   };
   const next = mergeEntry(prev, partial);
-  const balanceChanged = !prev || !sameTrackedFields(prev, next) || prev.publicKey !== next.publicKey;
+  const balanceChanged =
+    hasAppliedBalanceField &&
+    (!prev || !sameTrackedFields(prev, next) || prev.publicKey !== next.publicKey);
   STORE.lastEventAt = Date.now();
   // Skip the broadcast when the incoming notification didn't actually change
   // any tracked field. Solana resends state on reconnect / subscription ack
   // and the UI shouldn't tear down rows for a no-op.
   if (!balanceChanged && !tokenChanged) {
-    STORE.balances.set(envKey, next);
+    if (hasAppliedBalanceField || prev) {
+      STORE.balances.set(envKey, next);
+    }
     return;
   }
-  if (tokenMint && tokenBalance != null) {
+  if (tokenMint && tokenBalance != null && tokenSlotOk) {
     STORE.tokenBalances.set(tokenBalanceKey(envKey, tokenMint), tokenBalance);
   }
   STORE.balances.set(envKey, next);
@@ -174,10 +266,55 @@ export function applyServerBalanceEvent(event) {
     changedKeys: [envKey],
     changedMints: tokenChanged ? [tokenMint] : [],
     tokenBalanceEntries: tokenChanged
-      ? [{ envKey, mint: tokenMint, tokenBalance }]
+      ? [
+          {
+            envKey,
+            mint: tokenMint,
+            tokenBalance,
+            commitment: eventCommitment,
+            source: eventSource,
+            slot: eventSlot,
+          },
+        ]
       : [],
     walletBalanceEntries: balanceChanged ? [walletBalanceDiffEntry(envKey, next)] : [],
   });
+}
+
+export function applyServerMarkEvent(event) {
+  if (!event || typeof event !== "object") return;
+  const mint = String(event.mint || "").trim();
+  if (!mint) return;
+  const eventSlot = slotOrNull(event.slot);
+  const markRevision = revisionOrNull(event.markRevision);
+  if (!shouldApplyMarkRevision(STORE.markRevisions, markSlotKey(event), markRevision)) {
+    return;
+  }
+  STORE.lastEventAt = Date.now();
+  try {
+    chrome.storage.local.set({
+      [WALLET_STATUS_MARK_REVISION_KEY]: nextStorageRevision(),
+      [WALLET_STATUS_MARK_DIFF_KEY]: {
+        surfaceId: typeof event.surfaceId === "string" ? event.surfaceId : null,
+        markRevision,
+        mint,
+        walletKeys: Array.isArray(event.walletKeys) ? event.walletKeys : [],
+        walletGroupId: typeof event.walletGroupId === "string" ? event.walletGroupId : null,
+        tokenBalance: numberOrNull(event.tokenBalance),
+        tokenBalanceRaw: numberOrNull(event.tokenBalanceRaw),
+        holdingValueSol: numberOrNull(event.holdingValueSol),
+        holding: numberOrNull(event.holding),
+        pnlGross: numberOrNull(event.pnlGross),
+        pnlNet: numberOrNull(event.pnlNet),
+        pnlPercentGross: numberOrNull(event.pnlPercentGross),
+        pnlPercentNet: numberOrNull(event.pnlPercentNet),
+        quoteSource: typeof event.quoteSource === "string" ? event.quoteSource : null,
+        commitment: typeof event.commitment === "string" ? event.commitment : null,
+        slot: eventSlot,
+        at: Date.now(),
+      },
+    });
+  } catch (_error) {}
 }
 
 function sameTrackedFields(a, b) {
@@ -348,7 +485,7 @@ function broadcastUpdated({
 } = {}) {
   try {
     const payload = {
-      [WALLET_STATUS_REVISION_KEY]: Date.now(),
+      [WALLET_STATUS_REVISION_KEY]: nextStorageRevision(),
     };
     if (changedKeys.length > 0) {
       payload[WALLET_STATUS_DIFF_KEY] = {

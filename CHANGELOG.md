@@ -7,6 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Documentation for current extension popup, Axiom surfaces, token split/consolidate, live PnL controls, and route prewarm behavior.
+- Documentation for current execution route coverage, including Raydium CPMM, Raydium LaunchLab, Meteora DBC/DAMM v2, wrapper v3 notes, and route metrics.
+
+### Changed
+
+- Refreshed LaunchDeck, environment, and configuration docs for native metadata defaults, Pump/Bonk vanity queues, Bonk USD1 behavior, Bags prepare flow, follow daemon capacity/offset behavior, and newer route-family safety switches.
+
 ## [1.0.0] - 2026-04-27
 
 ### Added

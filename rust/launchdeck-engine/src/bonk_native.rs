@@ -45,7 +45,18 @@ use crate::{
         fetch_latest_blockhash_cached, fetch_multiple_account_data,
     },
     transport::TransportPlan,
+    vanity_pool::{
+        VanityLaunchpad, VanityReservation, append_vanity_report_note, reserve_vanity_mint,
+    },
     wallet::read_keypair_bytes,
+    wrapper_compile::{
+        ABI_VERSION as WRAPPER_ABI_VERSION, EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT,
+        EXECUTE_SWAP_ROUTE_TOKEN_FEE_ACCOUNT_COUNT, EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT,
+        ExecuteSwapRouteRequest, SWAP_ROUTE_NO_PATCH_OFFSET, SwapLegInputSource,
+        SwapRouteDirection, SwapRouteFeeMode, SwapRouteLeg, SwapRouteMode, SwapRouteSettlement,
+        build_execute_swap_route_instruction, estimate_sol_in_fee_lamports, route_wsol_pda,
+        wrapper_fee_vault, wrapper_token_program_id, wrapper_wsol_mint,
+    },
 };
 
 use crate::pump_native::{LaunchQuote, NativeCompileTimings};
@@ -82,13 +93,14 @@ const BONK_DEFAULT_USD1_ROUTE_SETUP_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
 const BONK_DEFAULT_LOOKUP_TABLE_CACHE_TTL_MS: u64 = 30 * 60 * 1000;
 const BONK_STARTUP_WARM_DEFAULT_STAGGER_MS: u64 = 400;
 const BONK_TOKEN_DECIMALS: u32 = 6;
-const DEFAULT_BONK_SELL_COMPUTE_UNIT_LIMIT: u64 = 240_000;
+const DEFAULT_BONK_SELL_COMPUTE_UNIT_LIMIT: u64 = 280_000;
+const DEFAULT_WRAPPER_FEE_BPS: u16 = 10;
 const BONK_FEE_RATE_DENOMINATOR: u64 = 1_000_000;
 const BONK_SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const BONK_CLMM_TICK_ARRAY_SIZE: i32 = 60;
 const BONK_CLMM_DEFAULT_BITMAP_OFFSET: i32 = 512;
 const BONK_USD1_QUOTE_MAX_INPUT_LAMPORTS: u64 = 100_000 * 1_000_000_000;
-const BONK_USD1_ROUTE_SLIPPAGE_BPS: u64 = 1_000;
+const BONK_USD1_ROUTE_SLIPPAGE_BPS: u64 = 500;
 const BONK_CLMM_MIN_SQRT_PRICE_X64_PLUS_ONE: u128 = 4_295_048_017;
 const BONK_CLMM_MAX_SQRT_PRICE_X64_MINUS_ONE: u128 = 79_226_673_521_066_979_257_578_248_091;
 const BONK_CLMM_SWAP_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
@@ -118,6 +130,7 @@ pub struct NativeBonkArtifacts {
     pub compile_timings: NativeCompileTimings,
     pub mint: String,
     pub launch_creator: String,
+    pub vanity_reservation: Option<VanityReservation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,8 +203,6 @@ struct HelperUsd1QuoteMetrics {
     expansionQuoteCalls: u64,
     #[serde(default)]
     binarySearchQuoteCalls: u64,
-    #[serde(default)]
-    bufferQuoteCalls: u64,
     #[serde(default)]
     searchIterations: u64,
 }
@@ -429,6 +440,7 @@ struct NativeBonkUsd1LaunchDetails {
 struct NativeBonkLaunchResult {
     mint: String,
     launch_creator: String,
+    vanity_reservation: Option<VanityReservation>,
     compiled_transactions: Vec<CompiledTransaction>,
     predicted_dev_buy_token_amount_raw: Option<String>,
     atomic_combined: bool,
@@ -461,6 +473,14 @@ pub struct BonkFollowBuyCompileResult {
     pub primary_tx_index: usize,
     pub requires_ordered_execution: bool,
     pub entry_preference_asset: Option<String>,
+    pub wrapper_tx_index: Option<usize>,
+    pub wrapper_gross_sol_in_lamports: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BonkAtomicFollowBuyCompileResult {
+    pub transaction: CompiledTransaction,
+    pub wrapper_gross_sol_in_lamports: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -694,7 +714,7 @@ fn render_usd1_quote_metrics_note(metrics: &HelperUsd1QuoteMetrics) -> Option<St
         return None;
     }
     Some(format!(
-        "USD1 quote metrics: calls={} total={}ms avg={:.1}ms quote-cache-hits={} route-setup(local/ttl/miss)={}/{}/{} route-setup-fetch={}ms super-alt(local/rpc-refresh)={}/{} search(expansion/binary/buffer iters)={}/{}/{}/{}",
+        "USD1 quote metrics: calls={} total={}ms avg={:.1}ms quote-cache-hits={} route-setup(local/ttl/miss)={}/{}/{} route-setup-fetch={}ms super-alt(local/rpc-refresh)={}/{} search(expansion/binary iters)={}/{}/{}",
         metrics.quoteCalls,
         metrics.quoteTotalMs,
         metrics.averageQuoteMs,
@@ -707,7 +727,6 @@ fn render_usd1_quote_metrics_note(metrics: &HelperUsd1QuoteMetrics) -> Option<St
         metrics.superAltRpcRefreshes,
         metrics.expansionQuoteCalls,
         metrics.binarySearchQuoteCalls,
-        metrics.bufferQuoteCalls,
         metrics.searchIterations,
     ))
 }
@@ -954,8 +973,15 @@ fn normalize_bonk_launch_mode(mode: &str) -> &'static str {
 }
 
 fn normalize_bonk_buy_funding_policy(policy: &str) -> &'static str {
-    match policy.trim().to_ascii_lowercase().as_str() {
+    match policy
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_")
+        .as_str()
+    {
         "usd1_only" => "usd1_only",
+        "usd1_via_sol" => "usd1_via_sol",
         "prefer_usd1_else_topup" => "prefer_usd1_else_topup",
         _ => "sol_only",
     }
@@ -1773,20 +1799,6 @@ fn bonk_usd1_search_tolerance_lamports(high: &BigUint) -> BigUint {
     bonk_biguint_from_u64(search_min_lamports).max(bps_lamports)
 }
 
-fn bonk_add_usd1_search_buffer_lamports(high: &BigUint, max_input_lamports: &BigUint) -> BigUint {
-    let search_buffer_bps = std::env::var("BONK_USD1_SEARCH_BUFFER_BPS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(25);
-    let search_buffer_min_lamports = std::env::var("BONK_USD1_SEARCH_BUFFER_MIN_LAMPORTS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(25_000);
-    let bps_buffer = (high * BigUint::from(search_buffer_bps)) / BigUint::from(10_000u64);
-    let buffer = bonk_biguint_from_u64(search_buffer_min_lamports).max(bps_buffer);
-    std::cmp::min(high + buffer, max_input_lamports.clone())
-}
-
 fn bonk_usd1_min_remaining_lamports() -> Result<u64, String> {
     parse_decimal_u64(
         &std::env::var("BONK_USD1_MIN_REMAINING_SOL").unwrap_or_else(|_| "0.02".to_string()),
@@ -1903,6 +1915,52 @@ async fn native_prepare_bonk_usd1_topup(
         min_quote_out: Some(quote.min_out),
         traversed_tick_array_starts: quote.traversed_tick_array_starts,
     })
+}
+
+fn gross_lamports_for_net_after_wrapper_fee(
+    net_lamports: u64,
+    fee_bps: u16,
+) -> Result<u64, String> {
+    if net_lamports == 0 || fee_bps == 0 {
+        return Ok(net_lamports);
+    }
+    let denominator = 10_000u64
+        .checked_sub(u64::from(fee_bps))
+        .ok_or_else(|| "Bonk wrapper fee bps exceeded denominator.".to_string())?;
+    if denominator == 0 {
+        return Err("Bonk wrapper fee bps leaves zero venue input.".to_string());
+    }
+    let mut gross = ((u128::from(net_lamports) * 10_000u128) + u128::from(denominator - 1))
+        / u128::from(denominator);
+    loop {
+        let gross_u64 = u64::try_from(gross)
+            .map_err(|_| "Bonk wrapper gross SOL input overflowed u64.".to_string())?;
+        let fee = estimate_sol_in_fee_lamports(gross_u64, fee_bps);
+        let candidate_net = gross_u64
+            .checked_sub(fee)
+            .ok_or_else(|| "Bonk wrapper fee exceeds gross SOL input.".to_string())?;
+        if candidate_net < net_lamports {
+            gross = gross
+                .checked_add(1)
+                .ok_or_else(|| "Bonk wrapper gross SOL input overflowed.".to_string())?;
+            continue;
+        }
+        return Ok(gross_u64);
+    }
+}
+
+fn prepared_topup_with_wrapper_gross_input(
+    prepared: &NativeBonkPreparedUsd1Topup,
+    fee_bps: u16,
+) -> Result<NativeBonkPreparedUsd1Topup, String> {
+    let Some(input_lamports) = prepared.input_lamports.as_ref() else {
+        return Ok(prepared.clone());
+    };
+    let net_lamports = biguint_to_u64(input_lamports, "Bonk USD1 top-up net input lamports")?;
+    let gross_lamports = gross_lamports_for_net_after_wrapper_fee(net_lamports, fee_bps)?;
+    let mut adjusted = prepared.clone();
+    adjusted.input_lamports = Some(bonk_biguint_from_u64(gross_lamports));
+    Ok(adjusted)
 }
 
 fn bonk_build_usd1_search_guess_lamports(
@@ -2645,18 +2703,9 @@ async fn native_quote_sol_input_for_usd1_output_with_max_and_metrics(
             low = mid + BigUint::from(1u8);
         }
     }
-    let buffered_input = bonk_add_usd1_search_buffer_lamports(&high, &max_input_lamports);
-    if buffered_input > high {
-        high = buffered_input;
-        quote = bonk_quote_usd1_from_exact_sol_input(&setup, &high, slippage_bps)?;
-        if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.quoteCalls = metrics.quoteCalls.saturating_add(1);
-            metrics.bufferQuoteCalls = metrics.bufferQuoteCalls.saturating_add(1);
-        }
-    }
     if quote.min_out < *required_quote_amount {
         return Err(format!(
-            "Pinned USD1 route pool could not satisfy required USD1 output after search buffering: {BONK_PINNED_USD1_ROUTE_POOL_ID}."
+            "Pinned USD1 route pool could not satisfy required USD1 output: {BONK_PINNED_USD1_ROUTE_POOL_ID}."
         ));
     }
     if let Some(metrics) = metrics.as_deref_mut() {
@@ -3987,6 +4036,12 @@ fn configured_default_bonk_launchpad_buy_compute_unit_limit() -> u64 {
         .max(configured_default_follow_up_compute_unit_limit())
 }
 
+fn configured_default_bonk_usd1_dynamic_buy_compute_unit_limit() -> u64 {
+    configured_default_launch_compute_unit_limit()
+        .max(configured_default_sniper_buy_compute_unit_limit())
+        .max(configured_default_follow_up_compute_unit_limit())
+}
+
 fn configured_default_bonk_usd1_sell_to_sol_compute_unit_limit() -> u64 {
     std::env::var("LAUNCHDECK_BONK_USD1_SELL_TO_SOL_COMPUTE_UNIT_LIMIT")
         .ok()
@@ -4079,24 +4134,26 @@ fn build_compute_unit_price_instruction(micro_lamports: u64) -> Result<Instructi
 fn apply_jitodontfront(
     mut instructions: Vec<Instruction>,
     enabled: bool,
+    payer: &Pubkey,
 ) -> Result<Vec<Instruction>, String> {
     if !enabled {
         return Ok(instructions);
     }
     let dontfront = Pubkey::from_str(JITODONTFRONT_ACCOUNT)
         .map_err(|error| format!("Invalid jitodontfront account: {error}"))?;
-    for instruction in &mut instructions {
-        if instruction
+    if instructions.iter().any(|instruction| {
+        instruction
             .accounts
             .iter()
             .any(|meta| meta.pubkey == dontfront)
-        {
-            continue;
-        }
-        instruction
-            .accounts
-            .push(AccountMeta::new_readonly(dontfront, false));
+    }) {
+        return Ok(instructions);
     }
+    let mut instruction = solana_system_interface::instruction::transfer(payer, payer, 0);
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(dontfront, false));
+    instructions.insert(0, instruction);
     Ok(instructions)
 }
 
@@ -4117,6 +4174,7 @@ fn with_bonk_tx_settings(
     instructions.extend(apply_jitodontfront(
         core_instructions,
         jitodontfront_enabled,
+        payer,
     )?);
     if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty() {
         let tip_account = Pubkey::from_str(tx_config.tip_account.trim())
@@ -5005,6 +5063,7 @@ fn build_bonk_atomic_tx_instructions(
     instructions.extend(apply_jitodontfront(
         core_instructions,
         jitodontfront_enabled,
+        payer,
     )?);
     if tx_config.tip_lamports > 0 && !tx_config.tip_account.trim().is_empty() {
         let tip_account = Pubkey::from_str(tx_config.tip_account.trim())
@@ -5517,6 +5576,373 @@ fn build_bonk_wrapped_sol_close_instruction(
 ) -> Result<Instruction, String> {
     spl_token::instruction::close_account(&spl_token::id(), wrapped_account, owner, owner, &[])
         .map_err(|error| format!("Failed to build wrapped SOL close instruction: {error}"))
+}
+
+fn route_account_index(
+    route_accounts: &[AccountMeta],
+    pubkey: &Pubkey,
+    context: &str,
+) -> Result<u16, String> {
+    route_accounts
+        .iter()
+        .position(|meta| meta.pubkey == *pubkey)
+        .ok_or_else(|| format!("{context} account {pubkey} is missing from route accounts"))?
+        .try_into()
+        .map_err(|_| format!("{context} route account index does not fit in u16"))
+}
+
+fn route_len_u16(len: usize, context: &str) -> Result<u16, String> {
+    len.try_into()
+        .map_err(|_| format!("{context} route account count does not fit in u16"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_bonk_dynamic_usd1_buy_from_sol_route(
+    rpc_url: &str,
+    commitment: &str,
+    owner: &Keypair,
+    allow_ata_creation: bool,
+    tx_config: &NativeBonkTxConfig,
+    jitodontfront_enabled: bool,
+    mint_pubkey: &Pubkey,
+    gross_sol_in_lamports: u64,
+    net_sol_in_lamports: u64,
+    min_usd1_out: u64,
+    route_setup: &BonkUsd1RouteSetup,
+    buy_ix: Instruction,
+    token_account: &Pubkey,
+    token_program: &Pubkey,
+    min_token_out: u64,
+    fee_bps: u16,
+) -> Result<CompiledTransaction, String> {
+    let owner_pubkey = owner.pubkey();
+    let quote_token_program = spl_token::id();
+    let usd1_mint = bonk_quote_mint("usd1")?;
+    let usd1_account = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &owner_pubkey,
+        &usd1_mint,
+        &quote_token_program,
+    );
+    let route_wsol_account = route_wsol_pda(&owner_pubkey, 0);
+    let route_quote = bonk_quote_usd1_from_exact_sol_input(
+        route_setup,
+        &bonk_biguint_from_u64(net_sol_in_lamports),
+        BONK_USD1_ROUTE_SLIPPAGE_BPS,
+    )?;
+    let first_leg_ix = build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        &owner_pubkey,
+        route_setup,
+        &route_wsol_account,
+        &usd1_account,
+        net_sol_in_lamports,
+        min_usd1_out,
+        &route_quote.traversed_tick_array_starts,
+        &route_setup.mint_a,
+        &route_setup.mint_b,
+    )?;
+
+    let mut route_accounts = vec![
+        AccountMeta::new_readonly(first_leg_ix.program_id, false),
+        AccountMeta::new_readonly(buy_ix.program_id, false),
+    ];
+    let first_program_index = 0u16;
+    let buy_program_index = 1u16;
+    let first_accounts_start =
+        route_len_u16(route_accounts.len(), "Bonk USD1 buy route first leg")?;
+    route_accounts.extend(first_leg_ix.accounts.iter().cloned());
+    let first_accounts_len =
+        route_len_u16(first_leg_ix.accounts.len(), "Bonk USD1 buy route first leg")?;
+    let first_output_index = route_account_index(
+        &route_accounts,
+        &usd1_account,
+        "Bonk USD1 buy route USD1 output",
+    )?;
+    let buy_accounts_start = route_len_u16(route_accounts.len(), "Bonk USD1 buy route venue leg")?;
+    route_accounts.extend(buy_ix.accounts.iter().cloned());
+    let buy_accounts_len = route_len_u16(buy_ix.accounts.len(), "Bonk USD1 buy route venue leg")?;
+    let buy_output_index = route_account_index(
+        &route_accounts,
+        token_account,
+        "Bonk USD1 buy route token output",
+    )?;
+
+    let zeroed_wsol = Pubkey::new_from_array([0; 32]);
+    let request = ExecuteSwapRouteRequest {
+        version: WRAPPER_ABI_VERSION,
+        route_mode: SwapRouteMode::Mixed,
+        direction: SwapRouteDirection::Buy,
+        settlement: SwapRouteSettlement::Token,
+        fee_mode: SwapRouteFeeMode::SolPre,
+        wsol_lane: 0,
+        fee_bps,
+        gross_sol_in_lamports,
+        gross_token_in_amount: 0,
+        min_net_output: min_token_out,
+        route_accounts_offset: EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT
+            + EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT,
+        intermediate_account_index: first_output_index,
+        token_fee_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+        legs: vec![
+            SwapRouteLeg {
+                program_account_index: first_program_index,
+                accounts_start: first_accounts_start,
+                accounts_len: first_accounts_len,
+                input_source: SwapLegInputSource::GrossSolNetOfFee,
+                input_amount: net_sol_in_lamports,
+                input_patch_offset: 8,
+                output_account_index: first_output_index,
+                ix_data: first_leg_ix.data,
+            },
+            SwapRouteLeg {
+                program_account_index: buy_program_index,
+                accounts_start: buy_accounts_start,
+                accounts_len: buy_accounts_len,
+                input_source: SwapLegInputSource::PreviousTokenDelta,
+                input_amount: min_usd1_out,
+                input_patch_offset: 8,
+                output_account_index: buy_output_index,
+                ix_data: buy_ix.data,
+            },
+        ],
+    };
+    let wrapper_ix = build_execute_swap_route_instruction(
+        &owner_pubkey,
+        &zeroed_wsol,
+        &route_wsol_account,
+        &first_leg_ix.program_id,
+        &request,
+        &route_accounts,
+        None,
+    )?;
+
+    let mut instructions = Vec::new();
+    if allow_ata_creation {
+        instructions.push(build_bonk_create_ata_instruction(
+            &owner_pubkey,
+            &usd1_mint,
+            &quote_token_program,
+        ));
+        instructions.push(build_bonk_create_ata_instruction(
+            &owner_pubkey,
+            mint_pubkey,
+            token_program,
+        ));
+    }
+    instructions.push(wrapper_ix);
+    let tx_instructions = build_bonk_atomic_tx_instructions(
+        instructions,
+        tx_config,
+        &owner_pubkey,
+        jitodontfront_enabled,
+    )?;
+    let (blockhash, last_valid_block_height) =
+        fetch_latest_blockhash_cached(rpc_url, commitment).await?;
+    let preferred_lookup_tables =
+        load_bonk_preferred_usd1_lookup_tables(rpc_url, commitment).await?;
+    build_bonk_compiled_transaction_with_lookup_preference(
+        "follow-buy-atomic",
+        NativeBonkTxFormat::V0,
+        &blockhash,
+        last_valid_block_height,
+        owner,
+        &[],
+        tx_instructions,
+        tx_config,
+        &[],
+        &preferred_lookup_tables,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_bonk_dynamic_usd1_sell_to_sol_route(
+    owner: &Pubkey,
+    usd1_account: &Pubkey,
+    first_leg_ix: Instruction,
+    first_leg_input_amount: u64,
+    min_usd1_out: u64,
+    expected_usd1_out: u64,
+    route_setup: &BonkUsd1RouteSetup,
+    fee_bps: u16,
+) -> Result<Vec<Instruction>, String> {
+    if expected_usd1_out < min_usd1_out {
+        return Err("Bonk USD1 dynamic sell expected output was below its minimum.".to_string());
+    }
+    let route_wsol_account = route_wsol_pda(owner, 0);
+    let unwind_quote = bonk_quote_sol_from_exact_usd1_input(
+        route_setup,
+        &bonk_biguint_from_u64(expected_usd1_out),
+        BONK_USD1_ROUTE_SLIPPAGE_BPS,
+    )?;
+    let unwind_min_out =
+        biguint_to_u64(&unwind_quote.min_out, "Bonk USD1 dynamic unwind min output")?;
+    let unwind_ix = build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        owner,
+        route_setup,
+        usd1_account,
+        &route_wsol_account,
+        expected_usd1_out,
+        unwind_min_out,
+        &unwind_quote.traversed_tick_array_starts,
+        &route_setup.mint_b,
+        &route_setup.mint_a,
+    )?;
+
+    let mut route_accounts = vec![
+        AccountMeta::new_readonly(first_leg_ix.program_id, false),
+        AccountMeta::new_readonly(unwind_ix.program_id, false),
+    ];
+    let first_program_index = 0u16;
+    let unwind_program_index = 1u16;
+    let first_accounts_start = route_len_u16(route_accounts.len(), "Bonk USD1 first leg")?;
+    route_accounts.extend(first_leg_ix.accounts.iter().cloned());
+    let first_accounts_len = route_len_u16(first_leg_ix.accounts.len(), "Bonk USD1 first leg")?;
+    let first_output_index =
+        route_account_index(&route_accounts, usd1_account, "Bonk USD1 first leg output")?;
+    let unwind_accounts_start = route_len_u16(route_accounts.len(), "Bonk USD1 unwind leg")?;
+    route_accounts.extend(unwind_ix.accounts.iter().cloned());
+    let unwind_accounts_len = route_len_u16(unwind_ix.accounts.len(), "Bonk USD1 unwind leg")?;
+    let unwind_output_index = route_account_index(
+        &route_accounts,
+        &route_wsol_account,
+        "Bonk USD1 unwind output",
+    )?;
+
+    let min_net_sol_out = unwind_min_out
+        .checked_sub(estimate_sol_in_fee_lamports(unwind_min_out, fee_bps))
+        .ok_or_else(|| "Bonk USD1 dynamic unwind min output fee underflowed".to_string())?;
+    let fee_vault_wsol_ata =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &wrapper_fee_vault(),
+            &wrapper_wsol_mint(),
+            &wrapper_token_program_id(),
+        );
+    let request = ExecuteSwapRouteRequest {
+        version: WRAPPER_ABI_VERSION,
+        route_mode: SwapRouteMode::Mixed,
+        direction: SwapRouteDirection::Sell,
+        settlement: SwapRouteSettlement::Wsol,
+        fee_mode: SwapRouteFeeMode::WsolPost,
+        wsol_lane: 0,
+        fee_bps,
+        gross_sol_in_lamports: 0,
+        gross_token_in_amount: 0,
+        min_net_output: min_net_sol_out,
+        route_accounts_offset: EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT
+            + EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT,
+        intermediate_account_index: first_output_index,
+        token_fee_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+        legs: vec![
+            SwapRouteLeg {
+                program_account_index: first_program_index,
+                accounts_start: first_accounts_start,
+                accounts_len: first_accounts_len,
+                input_source: SwapLegInputSource::Fixed,
+                input_amount: first_leg_input_amount,
+                input_patch_offset: SWAP_ROUTE_NO_PATCH_OFFSET,
+                output_account_index: first_output_index,
+                ix_data: first_leg_ix.data,
+            },
+            SwapRouteLeg {
+                program_account_index: unwind_program_index,
+                accounts_start: unwind_accounts_start,
+                accounts_len: unwind_accounts_len,
+                input_source: SwapLegInputSource::PreviousTokenDelta,
+                input_amount: expected_usd1_out,
+                input_patch_offset: 8,
+                output_account_index: unwind_output_index,
+                ix_data: unwind_ix.data,
+            },
+        ],
+    };
+    let wrapper_ix = build_execute_swap_route_instruction(
+        owner,
+        &fee_vault_wsol_ata,
+        &route_wsol_account,
+        &first_leg_ix.program_id,
+        &request,
+        &route_accounts,
+        None,
+    )?;
+
+    let mut instructions = Vec::new();
+    instructions.push(wrapper_ix);
+    Ok(instructions)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_bonk_token_fee_route_instruction(
+    owner: &Pubkey,
+    fee_bps: u16,
+    fee_mint: &Pubkey,
+    fee_token_program: &Pubkey,
+    gross_token_in_amount: u64,
+    min_net_output: u64,
+    direction: SwapRouteDirection,
+    fee_mode: SwapRouteFeeMode,
+    venue_ix: Instruction,
+    token_fee_account: &Pubkey,
+    output_account: &Pubkey,
+) -> Result<Instruction, String> {
+    let fee_vault = wrapper_fee_vault();
+    let token_fee_vault_ata =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &fee_vault,
+            fee_mint,
+            fee_token_program,
+        );
+    let zeroed_wsol = Pubkey::new_from_array([0; 32]);
+    let mut route_accounts = vec![AccountMeta::new_readonly(venue_ix.program_id, false)];
+    route_accounts.extend(venue_ix.accounts.iter().cloned());
+    let token_fee_account_index = route_account_index(
+        &route_accounts,
+        token_fee_account,
+        "Bonk token-fee route fee account",
+    )?;
+    let output_account_index = route_account_index(
+        &route_accounts,
+        output_account,
+        "Bonk token-fee route output account",
+    )?;
+    let accounts_len = route_len_u16(venue_ix.accounts.len(), "Bonk token-fee route leg")?;
+    let request = ExecuteSwapRouteRequest {
+        version: WRAPPER_ABI_VERSION,
+        route_mode: SwapRouteMode::TokenOnly,
+        direction,
+        settlement: SwapRouteSettlement::Token,
+        fee_mode,
+        wsol_lane: 0,
+        fee_bps,
+        gross_sol_in_lamports: 0,
+        gross_token_in_amount,
+        min_net_output,
+        route_accounts_offset: EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT
+            + EXECUTE_SWAP_ROUTE_TOKEN_FEE_ACCOUNT_COUNT,
+        intermediate_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+        token_fee_account_index,
+        legs: vec![SwapRouteLeg {
+            program_account_index: 0,
+            accounts_start: 1,
+            accounts_len,
+            input_source: if matches!(fee_mode, SwapRouteFeeMode::TokenPre) {
+                SwapLegInputSource::GrossTokenNetOfFee
+            } else {
+                SwapLegInputSource::Fixed
+            },
+            input_amount: gross_token_in_amount,
+            input_patch_offset: SWAP_ROUTE_NO_PATCH_OFFSET,
+            output_account_index,
+            ix_data: venue_ix.data,
+        }],
+    };
+    build_execute_swap_route_instruction(
+        owner,
+        &zeroed_wsol,
+        &zeroed_wsol,
+        &venue_ix.program_id,
+        &request,
+        &route_accounts,
+        Some(&token_fee_vault_ata),
+    )
 }
 
 fn build_bonk_create_ata_instruction(
@@ -6190,11 +6616,24 @@ async fn native_compile_bonk_buy_transaction_with_pool_context(
     requested_amount_b: u64,
     allow_ata_creation: bool,
     tx_format: NativeBonkTxFormat,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let owner_pubkey = owner.pubkey();
     let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
+    let token_fee_bps = wrapper_fee_bps;
+    let token_fee_route = pool_context.quote.asset == "usd1" && token_fee_bps > 0;
+    let venue_requested_amount_b = if token_fee_route {
+        requested_amount_b
+            .checked_sub(estimate_sol_in_fee_lamports(
+                requested_amount_b,
+                token_fee_bps,
+            ))
+            .ok_or_else(|| "Bonk USD1 token-fee buy amount underflowed".to_string())?
+    } else {
+        requested_amount_b
+    };
     let (instruction_amount_b, min_amount_a) =
-        bonk_follow_buy_amounts(pool_context, requested_amount_b, slippage_bps)?;
+        bonk_follow_buy_amounts(pool_context, venue_requested_amount_b, slippage_bps)?;
     let tip_lamports =
         resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
     let tx_config = bonk_follow_tx_config(
@@ -6254,14 +6693,31 @@ async fn native_compile_bonk_buy_transaction_with_pool_context(
         }
         quote_ata
     };
-    instructions.push(build_bonk_buy_exact_in_instruction(
+    let buy_ix = build_bonk_buy_exact_in_instruction(
         &owner_pubkey,
         pool_context,
         &user_token_account_a,
         &user_token_account_b,
         instruction_amount_b,
         min_amount_a,
-    )?);
+    )?;
+    if token_fee_route {
+        instructions.push(build_bonk_token_fee_route_instruction(
+            &owner_pubkey,
+            token_fee_bps,
+            &bonk_quote_mint(pool_context.quote.asset)?,
+            &quote_token_program,
+            requested_amount_b,
+            min_amount_a,
+            SwapRouteDirection::Buy,
+            SwapRouteFeeMode::TokenPre,
+            buy_ix,
+            &user_token_account_b,
+            &user_token_account_a,
+        )?);
+    } else {
+        instructions.push(buy_ix);
+    }
     if pool_context.quote.asset == "sol" {
         instructions.push(build_bonk_wrapped_sol_close_instruction(
             &owner_pubkey,
@@ -6306,6 +6762,7 @@ async fn native_compile_bonk_buy_transaction_with_cpmm_context(
     requested_amount_b: u64,
     allow_ata_creation: bool,
     tx_format: NativeBonkTxFormat,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let owner_pubkey = owner.pubkey();
     let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
@@ -6318,6 +6775,18 @@ async fn native_compile_bonk_buy_transaction_with_cpmm_context(
         jito_tip_account,
     )?;
     let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+    let token_fee_bps = wrapper_fee_bps;
+    let token_fee_route = pool_context.quote.asset == "usd1" && token_fee_bps > 0;
+    let venue_requested_amount_b = if token_fee_route {
+        requested_amount_b
+            .checked_sub(estimate_sol_in_fee_lamports(
+                requested_amount_b,
+                token_fee_bps,
+            ))
+            .ok_or_else(|| "Bonk CPMM USD1 token-fee buy amount underflowed".to_string())?
+    } else {
+        requested_amount_b
+    };
     let (token_mint, token_program, quote_program) = if pool_context.pool.token_0_mint == quote_mint
     {
         (
@@ -6382,18 +6851,39 @@ async fn native_compile_bonk_buy_transaction_with_cpmm_context(
         }
         quote_ata
     };
-    let (_, min_amount_a) =
-        bonk_cpmm_quote_exact_input(pool_context, &quote_mint, requested_amount_b, slippage_bps)?;
-    instructions.push(build_bonk_cpmm_swap_exact_in_instruction(
+    let (_, min_amount_a) = bonk_cpmm_quote_exact_input(
+        pool_context,
+        &quote_mint,
+        venue_requested_amount_b,
+        slippage_bps,
+    )?;
+    let buy_ix = build_bonk_cpmm_swap_exact_in_instruction(
         &owner_pubkey,
         pool_context,
         &user_quote_account,
         &user_token_account_a,
-        requested_amount_b,
+        venue_requested_amount_b,
         min_amount_a,
         &quote_mint,
         mint_pubkey,
-    )?);
+    )?;
+    if token_fee_route {
+        instructions.push(build_bonk_token_fee_route_instruction(
+            &owner_pubkey,
+            token_fee_bps,
+            &quote_mint,
+            &quote_program,
+            requested_amount_b,
+            min_amount_a,
+            SwapRouteDirection::Buy,
+            SwapRouteFeeMode::TokenPre,
+            buy_ix,
+            &user_quote_account,
+            &user_token_account_a,
+        )?);
+    } else {
+        instructions.push(buy_ix);
+    }
     if pool_context.quote.asset == "sol" {
         instructions.push(build_bonk_wrapped_sol_close_instruction(
             &owner_pubkey,
@@ -6438,6 +6928,7 @@ async fn native_compile_bonk_buy_transaction_with_clmm_context(
     requested_amount_b: u64,
     allow_ata_creation: bool,
     tx_format: NativeBonkTxFormat,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let owner_pubkey = owner.pubkey();
     let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
@@ -6450,6 +6941,18 @@ async fn native_compile_bonk_buy_transaction_with_clmm_context(
         jito_tip_account,
     )?;
     let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+    let token_fee_bps = wrapper_fee_bps;
+    let token_fee_route = pool_context.quote.asset == "usd1" && token_fee_bps > 0;
+    let venue_requested_amount_b = if token_fee_route {
+        requested_amount_b
+            .checked_sub(estimate_sol_in_fee_lamports(
+                requested_amount_b,
+                token_fee_bps,
+            ))
+            .ok_or_else(|| "Bonk CLMM USD1 token-fee buy amount underflowed".to_string())?
+    } else {
+        requested_amount_b
+    };
     let (token_program, quote_program) = if pool_context.setup.mint_a == quote_mint {
         (pool_context.mint_program_b, pool_context.mint_program_a)
     } else if pool_context.setup.mint_b == quote_mint {
@@ -6513,20 +7016,38 @@ async fn native_compile_bonk_buy_transaction_with_clmm_context(
     let quote = bonk_quote_clmm_exact_input(
         &pool_context.setup,
         &quote_mint,
-        &bonk_biguint_from_u64(requested_amount_b),
+        &bonk_biguint_from_u64(venue_requested_amount_b),
         slippage_bps,
     )?;
-    instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+    let min_amount_a = biguint_to_u64(&quote.min_out, "Bonk CLMM buy min output")?;
+    let buy_ix = build_bonk_clmm_swap_exact_in_instruction_for_setup(
         &owner_pubkey,
         &pool_context.setup,
         &user_quote_account,
         &user_token_account_a,
-        requested_amount_b,
-        biguint_to_u64(&quote.min_out, "Bonk CLMM buy min output")?,
+        venue_requested_amount_b,
+        min_amount_a,
         &quote.traversed_tick_array_starts,
         &quote_mint,
         mint_pubkey,
-    )?);
+    )?;
+    if token_fee_route {
+        instructions.push(build_bonk_token_fee_route_instruction(
+            &owner_pubkey,
+            token_fee_bps,
+            &quote_mint,
+            &quote_program,
+            requested_amount_b,
+            min_amount_a,
+            SwapRouteDirection::Buy,
+            SwapRouteFeeMode::TokenPre,
+            buy_ix,
+            &user_quote_account,
+            &user_token_account_a,
+        )?);
+    } else {
+        instructions.push(buy_ix);
+    }
     if pool_context.quote.asset == "sol" {
         instructions.push(build_bonk_wrapped_sol_close_instruction(
             &owner_pubkey,
@@ -6571,6 +7092,7 @@ async fn native_compile_bonk_buy_transaction_with_venue_context(
     requested_amount_b: u64,
     allow_ata_creation: bool,
     tx_format: NativeBonkTxFormat,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     match venue_context {
         NativeBonkTradeVenueContext::Launchpad(context) => {
@@ -6584,6 +7106,7 @@ async fn native_compile_bonk_buy_transaction_with_venue_context(
                 requested_amount_b,
                 allow_ata_creation,
                 tx_format,
+                wrapper_fee_bps,
             )
             .await
         }
@@ -6598,6 +7121,7 @@ async fn native_compile_bonk_buy_transaction_with_venue_context(
                 requested_amount_b,
                 allow_ata_creation,
                 tx_format,
+                wrapper_fee_bps,
             )
             .await
         }
@@ -6612,6 +7136,7 @@ async fn native_compile_bonk_buy_transaction_with_venue_context(
                 requested_amount_b,
                 allow_ata_creation,
                 tx_format,
+                wrapper_fee_bps,
             )
             .await
         }
@@ -6627,6 +7152,7 @@ async fn native_compile_bonk_sell_transaction_with_cpmm_context(
     pool_context: &NativeBonkCpmmPoolContext,
     sell_amount: u64,
     sell_settlement_asset: &str,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let owner_pubkey = owner.pubkey();
     let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
@@ -6688,9 +7214,9 @@ async fn native_compile_bonk_sell_transaction_with_cpmm_context(
         ));
         quote_ata
     };
-    let (_, min_amount_b) =
+    let (expected_amount_b, min_amount_b) =
         bonk_cpmm_quote_exact_input(pool_context, mint_pubkey, sell_amount, slippage_bps)?;
-    instructions.push(build_bonk_cpmm_swap_exact_in_instruction(
+    let sell_ix = build_bonk_cpmm_swap_exact_in_instruction(
         &owner_pubkey,
         pool_context,
         &user_token_account_a,
@@ -6699,51 +7225,46 @@ async fn native_compile_bonk_sell_transaction_with_cpmm_context(
         min_amount_b,
         mint_pubkey,
         &quote_mint,
-    )?);
+    )?;
     let settlement_asset = normalize_bonk_sell_settlement_asset(sell_settlement_asset);
     if pool_context.quote.asset == "usd1" && settlement_asset == "sol" {
-        let wrapped_signer = Keypair::new();
-        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
-            rpc_url,
-            &execution.commitment,
-            BONK_SPL_TOKEN_ACCOUNT_LEN,
-        )
-        .await?;
-        instructions.extend(build_bonk_wrapped_sol_open_instructions(
-            &owner_pubkey,
-            &wrapped_signer.pubkey(),
-            rent_exempt_lamports,
-        )?);
         let route_setup = load_bonk_usd1_route_setup(rpc_url).await?;
-        // The preceding sell can output anywhere down to min_amount_b. In the
-        // same transaction, only the minimum is guaranteed to be available for
-        // the USD1 -> SOL unwind.
-        let unwind_quote = bonk_quote_sol_from_exact_usd1_input(
-            &route_setup,
-            &bonk_biguint_from_u64(min_amount_b),
-            BONK_USD1_ROUTE_SLIPPAGE_BPS,
-        )?;
-        instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        let route_instructions = build_bonk_dynamic_usd1_sell_to_sol_route(
             &owner_pubkey,
-            &route_setup,
             &user_quote_account,
-            &wrapped_signer.pubkey(),
+            sell_ix,
+            sell_amount,
             min_amount_b,
-            biguint_to_u64(&unwind_quote.min_out, "Bonk CPMM unwind min output")?,
-            &unwind_quote.traversed_tick_array_starts,
-            &route_setup.mint_b,
-            &route_setup.mint_a,
-        )?);
-        instructions.push(build_bonk_wrapped_sol_close_instruction(
-            &owner_pubkey,
-            &wrapped_signer.pubkey(),
-        )?);
-        extra_signers.push(wrapped_signer);
+            expected_amount_b,
+            &route_setup,
+            wrapper_fee_bps,
+        )?;
+        instructions.extend(route_instructions);
     } else if pool_context.quote.asset == "sol" {
+        instructions.push(sell_ix);
         instructions.push(build_bonk_wrapped_sol_close_instruction(
             &owner_pubkey,
             &user_quote_account,
         )?);
+    } else if pool_context.quote.asset == "usd1" {
+        let min_net_amount_b = min_amount_b
+            .checked_sub(estimate_sol_in_fee_lamports(min_amount_b, wrapper_fee_bps))
+            .ok_or_else(|| "Bonk CPMM USD1 token-fee sell min output underflowed".to_string())?;
+        instructions.push(build_bonk_token_fee_route_instruction(
+            &owner_pubkey,
+            wrapper_fee_bps,
+            &quote_mint,
+            &quote_program,
+            0,
+            min_net_amount_b,
+            SwapRouteDirection::Sell,
+            SwapRouteFeeMode::TokenPost,
+            sell_ix,
+            &user_quote_account,
+            &user_quote_account,
+        )?);
+    } else {
+        instructions.push(sell_ix);
     }
     let tx_instructions = with_bonk_tx_settings(
         instructions,
@@ -6779,6 +7300,7 @@ async fn native_compile_bonk_sell_transaction_with_clmm_context(
     pool_context: &NativeBonkClmmPoolContext,
     sell_amount: u64,
     sell_settlement_asset: &str,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let owner_pubkey = owner.pubkey();
     let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
@@ -6840,7 +7362,7 @@ async fn native_compile_bonk_sell_transaction_with_clmm_context(
         &bonk_biguint_from_u64(sell_amount),
         slippage_bps,
     )?;
-    instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+    let sell_ix = build_bonk_clmm_swap_exact_in_instruction_for_setup(
         &owner_pubkey,
         &pool_context.setup,
         &user_token_account_a,
@@ -6850,52 +7372,50 @@ async fn native_compile_bonk_sell_transaction_with_clmm_context(
         &quote.traversed_tick_array_starts,
         mint_pubkey,
         &quote_mint,
-    )?);
+    )?;
     let settlement_asset = normalize_bonk_sell_settlement_asset(sell_settlement_asset);
     if pool_context.quote.asset == "usd1" && settlement_asset == "sol" {
-        let wrapped_signer = Keypair::new();
-        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
-            rpc_url,
-            &execution.commitment,
-            BONK_SPL_TOKEN_ACCOUNT_LEN,
-        )
-        .await?;
-        instructions.extend(build_bonk_wrapped_sol_open_instructions(
-            &owner_pubkey,
-            &wrapped_signer.pubkey(),
-            rent_exempt_lamports,
-        )?);
         let route_setup = load_bonk_usd1_route_setup(rpc_url).await?;
-        // The preceding sell can output anywhere down to quote.min_out. In the
-        // same transaction, only the minimum is guaranteed to be available for
-        // the USD1 -> SOL unwind.
-        let unwind_quote = bonk_quote_sol_from_exact_usd1_input(
-            &route_setup,
-            &quote.min_out,
-            BONK_USD1_ROUTE_SLIPPAGE_BPS,
-        )?;
         let unwind_input = biguint_to_u64(&quote.min_out, "Bonk CLMM sell minimum output")?;
-        instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        let expected_unwind_input =
+            biguint_to_u64(&quote.expected_out, "Bonk CLMM sell expected output")?;
+        let route_instructions = build_bonk_dynamic_usd1_sell_to_sol_route(
             &owner_pubkey,
-            &route_setup,
             &user_quote_account,
-            &wrapped_signer.pubkey(),
+            sell_ix,
+            sell_amount,
             unwind_input,
-            biguint_to_u64(&unwind_quote.min_out, "Bonk CLMM unwind min output")?,
-            &unwind_quote.traversed_tick_array_starts,
-            &route_setup.mint_b,
-            &route_setup.mint_a,
-        )?);
-        instructions.push(build_bonk_wrapped_sol_close_instruction(
-            &owner_pubkey,
-            &wrapped_signer.pubkey(),
-        )?);
-        extra_signers.push(wrapped_signer);
+            expected_unwind_input,
+            &route_setup,
+            wrapper_fee_bps,
+        )?;
+        instructions.extend(route_instructions);
     } else if pool_context.quote.asset == "sol" {
+        instructions.push(sell_ix);
         instructions.push(build_bonk_wrapped_sol_close_instruction(
             &owner_pubkey,
             &user_quote_account,
         )?);
+    } else if pool_context.quote.asset == "usd1" {
+        let min_amount_b = biguint_to_u64(&quote.min_out, "Bonk CLMM sell min output")?;
+        let min_net_amount_b = min_amount_b
+            .checked_sub(estimate_sol_in_fee_lamports(min_amount_b, wrapper_fee_bps))
+            .ok_or_else(|| "Bonk CLMM USD1 token-fee sell min output underflowed".to_string())?;
+        instructions.push(build_bonk_token_fee_route_instruction(
+            &owner_pubkey,
+            wrapper_fee_bps,
+            &quote_mint,
+            &quote_program,
+            0,
+            min_net_amount_b,
+            SwapRouteDirection::Sell,
+            SwapRouteFeeMode::TokenPost,
+            sell_ix,
+            &user_quote_account,
+            &user_quote_account,
+        )?);
+    } else {
+        instructions.push(sell_ix);
     }
     let tx_instructions = with_bonk_tx_settings(
         instructions,
@@ -6931,10 +7451,11 @@ async fn native_compile_follow_sell_launchpad_transaction(
     pool_context: &NativeBonkPoolContext,
     sell_amount: u64,
     sell_settlement_asset: &str,
+    wrapper_fee_bps: u16,
 ) -> Result<CompiledTransaction, String> {
     let owner_pubkey = owner.pubkey();
     let slippage_bps = slippage_bps_from_percent(&execution.sellSlippagePercent)?;
-    let (_, min_amount_b) =
+    let (expected_amount_b, min_amount_b) =
         bonk_follow_sell_quote_amounts(pool_context, sell_amount, slippage_bps)?;
     let tip_lamports =
         resolve_follow_tip_lamports(&execution.sellProvider, &execution.sellTipSol, "sell tip")?;
@@ -6985,57 +7506,54 @@ async fn native_compile_follow_sell_launchpad_transaction(
         ));
         quote_ata
     };
-    instructions.push(build_bonk_sell_exact_in_instruction(
+    let sell_ix = build_bonk_sell_exact_in_instruction(
         &owner_pubkey,
         pool_context,
         &user_token_account_a,
         &user_token_account_b,
         sell_amount,
         min_amount_b,
-    )?);
+    )?;
     if pool_context.quote.asset == "usd1" && settlement_asset == "sol" {
-        let wrapped_signer = Keypair::new();
-        let rent_exempt_lamports = rpc_get_minimum_balance_for_rent_exemption(
-            rpc_url,
-            &execution.commitment,
-            BONK_SPL_TOKEN_ACCOUNT_LEN,
-        )
-        .await?;
-        instructions.extend(build_bonk_wrapped_sol_open_instructions(
-            &owner_pubkey,
-            &wrapped_signer.pubkey(),
-            rent_exempt_lamports,
-        )?);
         let route_setup = load_bonk_usd1_route_setup(rpc_url).await?;
-        // The preceding launchpad sell can output anywhere down to min_amount_b.
-        // In the same transaction, only the minimum is guaranteed to be
-        // available for the USD1 -> SOL unwind.
-        let unwind_quote = bonk_quote_sol_from_exact_usd1_input(
-            &route_setup,
-            &bonk_biguint_from_u64(min_amount_b),
-            BONK_USD1_ROUTE_SLIPPAGE_BPS,
-        )?;
-        instructions.push(build_bonk_clmm_swap_exact_in_instruction_for_setup(
+        let route_instructions = build_bonk_dynamic_usd1_sell_to_sol_route(
             &owner_pubkey,
-            &route_setup,
             &user_token_account_b,
-            &wrapped_signer.pubkey(),
+            sell_ix,
+            sell_amount,
             min_amount_b,
-            biguint_to_u64(&unwind_quote.min_out, "follow sell unwind min output")?,
-            &unwind_quote.traversed_tick_array_starts,
-            &route_setup.mint_b,
-            &route_setup.mint_a,
-        )?);
-        instructions.push(build_bonk_wrapped_sol_close_instruction(
-            &owner_pubkey,
-            &wrapped_signer.pubkey(),
-        )?);
-        extra_signers.push(wrapped_signer);
+            expected_amount_b,
+            &route_setup,
+            wrapper_fee_bps,
+        )?;
+        instructions.extend(route_instructions);
     } else if pool_context.quote.asset == "sol" {
+        instructions.push(sell_ix);
         instructions.push(build_bonk_wrapped_sol_close_instruction(
             &owner_pubkey,
             &user_token_account_b,
         )?);
+    } else if pool_context.quote.asset == "usd1" {
+        let min_net_amount_b = min_amount_b
+            .checked_sub(estimate_sol_in_fee_lamports(min_amount_b, wrapper_fee_bps))
+            .ok_or_else(|| {
+                "Bonk launchpad USD1 token-fee sell min output underflowed".to_string()
+            })?;
+        instructions.push(build_bonk_token_fee_route_instruction(
+            &owner_pubkey,
+            wrapper_fee_bps,
+            &bonk_quote_mint(pool_context.quote.asset)?,
+            &quote_token_program,
+            0,
+            min_net_amount_b,
+            SwapRouteDirection::Sell,
+            SwapRouteFeeMode::TokenPost,
+            sell_ix,
+            &user_token_account_b,
+            &user_token_account_b,
+        )?);
+    } else {
+        instructions.push(sell_ix);
     }
     let tx_instructions = with_bonk_tx_settings(
         instructions,
@@ -7121,6 +7639,7 @@ async fn native_compile_follow_buy_transaction(
     pool_context_override: Option<&NativeBonkPoolContext>,
     pool_id_override: Option<&str>,
     usd1_route_setup_override: Option<&BonkUsd1RouteSetup>,
+    wrapper_fee_bps: u16,
 ) -> Result<BonkFollowBuyCompileResult, String> {
     let owner = parse_owner_keypair(wallet_secret)?;
     let mint_pubkey =
@@ -7147,7 +7666,7 @@ async fn native_compile_follow_buy_transaction(
     let quote = bonk_quote_asset_config(quote_asset);
     if quote.asset == "usd1" {
         let funding_policy = normalize_bonk_buy_funding_policy(&execution.buyFundingPolicy);
-        let sol_input_quote = if funding_policy == "usd1_only" {
+        let sol_input_quote = if matches!(funding_policy, "usd1_only" | "usd1_via_sol") {
             None
         } else {
             Some(
@@ -7160,7 +7679,7 @@ async fn native_compile_follow_buy_transaction(
             )
         };
         let current_balance = match funding_policy {
-            "sol_only" => 0,
+            "sol_only" | "usd1_via_sol" => 0,
             _ => fetch_bonk_owner_token_balance(
                 rpc_url,
                 &execution.commitment,
@@ -7170,7 +7689,7 @@ async fn native_compile_follow_buy_transaction(
             .await?
             .unwrap_or_default(),
         };
-        let requested_amount_b = if funding_policy == "usd1_only" {
+        let requested_amount_b = if matches!(funding_policy, "usd1_only" | "usd1_via_sol") {
             parse_decimal_u64(
                 buy_amount,
                 quote.decimals,
@@ -7192,25 +7711,241 @@ async fn native_compile_follow_buy_transaction(
                 format_biguint_decimal(&bonk_biguint_from_u64(current_balance), 6, 6),
             ));
         }
-        if funding_policy == "sol_only" || current_balance < requested_amount_b {
+        if matches!(funding_policy, "sol_only" | "usd1_via_sol")
+            || current_balance < requested_amount_b
+        {
             let tip_lamports = resolve_follow_tip_lamports(
                 &execution.buyProvider,
                 &execution.buyTipSol,
                 "buy tip",
             )?;
             let buy_tx_config = bonk_follow_tx_config(
-                configured_default_sniper_buy_compute_unit_limit(),
+                configured_default_bonk_usd1_dynamic_buy_compute_unit_limit(),
                 priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
                 tip_lamports,
                 jito_tip_account,
             )?;
+            if funding_policy == "sol_only" {
+                let owner_pubkey = owner.pubkey();
+                let slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
+                let route_setup = if let Some(setup) = usd1_route_setup_override {
+                    setup.clone()
+                } else {
+                    load_bonk_usd1_route_setup(rpc_url).await?
+                };
+                let gross_sol_in_lamports =
+                    parse_decimal_u64(buy_amount, 9, "Bonk USD1 dynamic buy SOL input")?;
+                let net_sol_in_lamports = gross_sol_in_lamports
+                    .checked_sub(estimate_sol_in_fee_lamports(
+                        gross_sol_in_lamports,
+                        wrapper_fee_bps,
+                    ))
+                    .ok_or_else(|| "Bonk USD1 dynamic buy fee exceeded input SOL".to_string())?;
+                let dynamic_usd1_quote = native_quote_usd1_output_from_sol_input_with_metrics(
+                    rpc_url,
+                    &bonk_biguint_from_u64(net_sol_in_lamports),
+                    BONK_USD1_ROUTE_SLIPPAGE_BPS,
+                    None,
+                    Some(&route_setup),
+                )
+                .await?;
+                let dynamic_min_amount_b = biguint_to_u64(
+                    &dynamic_usd1_quote.min_out,
+                    "Bonk USD1 dynamic buy guaranteed USD1 output",
+                )?;
+                let dynamic_expected_amount_b = biguint_to_u64(
+                    &dynamic_usd1_quote.expected_out,
+                    "Bonk USD1 dynamic buy expected USD1 output",
+                )?;
+                let (buy_ix, token_account, token_program, min_amount_a) = match &venue_context {
+                    NativeBonkTradeVenueContext::Launchpad(pool_context) => {
+                        let token_account =
+                            spl_associated_token_account::get_associated_token_address_with_program_id(
+                                &owner_pubkey,
+                                &mint_pubkey,
+                                &pool_context.token_program,
+                            );
+                        let usd1_account =
+                            spl_associated_token_account::get_associated_token_address_with_program_id(
+                                &owner_pubkey,
+                                &bonk_quote_mint("usd1")?,
+                                &spl_token::id(),
+                            );
+                        let (instruction_amount_b, min_amount_a) = bonk_follow_buy_amounts(
+                            pool_context,
+                            dynamic_expected_amount_b,
+                            slippage_bps,
+                        )?;
+                        (
+                            build_bonk_buy_exact_in_instruction(
+                                &owner_pubkey,
+                                pool_context,
+                                &token_account,
+                                &usd1_account,
+                                instruction_amount_b,
+                                min_amount_a,
+                            )?,
+                            token_account,
+                            pool_context.token_program,
+                            min_amount_a,
+                        )
+                    }
+                    NativeBonkTradeVenueContext::RaydiumCpmm(pool_context) => {
+                        let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+                        let (token_mint, token_program, quote_program) =
+                            if pool_context.pool.token_0_mint == quote_mint {
+                                (
+                                    pool_context.pool.token_1_mint,
+                                    pool_context.pool.token_1_program,
+                                    pool_context.pool.token_0_program,
+                                )
+                            } else if pool_context.pool.token_1_mint == quote_mint {
+                                (
+                                    pool_context.pool.token_0_mint,
+                                    pool_context.pool.token_0_program,
+                                    pool_context.pool.token_1_program,
+                                )
+                            } else {
+                                return Err(
+                                    "Bonk CPMM quote mint did not match the selected pool."
+                                        .to_string(),
+                                );
+                            };
+                        if mint_pubkey != token_mint {
+                            return Err(
+                                "Bonk CPMM token mint did not match the selected pool.".to_string()
+                            );
+                        }
+                        let token_account =
+                            spl_associated_token_account::get_associated_token_address_with_program_id(
+                                &owner_pubkey,
+                                &mint_pubkey,
+                                &token_program,
+                            );
+                        let usd1_account =
+                            spl_associated_token_account::get_associated_token_address_with_program_id(
+                                &owner_pubkey,
+                                &quote_mint,
+                                &quote_program,
+                            );
+                        let (_, min_amount_a) = bonk_cpmm_quote_exact_input(
+                            pool_context,
+                            &quote_mint,
+                            dynamic_expected_amount_b,
+                            slippage_bps,
+                        )?;
+                        (
+                            build_bonk_cpmm_swap_exact_in_instruction(
+                                &owner_pubkey,
+                                pool_context,
+                                &usd1_account,
+                                &token_account,
+                                dynamic_expected_amount_b,
+                                min_amount_a,
+                                &quote_mint,
+                                &mint_pubkey,
+                            )?,
+                            token_account,
+                            token_program,
+                            min_amount_a,
+                        )
+                    }
+                    NativeBonkTradeVenueContext::RaydiumClmm(pool_context) => {
+                        let quote_mint = bonk_quote_mint(pool_context.quote.asset)?;
+                        let (token_program, quote_program) = if pool_context.setup.mint_a
+                            == quote_mint
+                        {
+                            (pool_context.mint_program_b, pool_context.mint_program_a)
+                        } else if pool_context.setup.mint_b == quote_mint {
+                            (pool_context.mint_program_a, pool_context.mint_program_b)
+                        } else {
+                            return Err(
+                                "Bonk CLMM quote mint did not match the selected pool.".to_string()
+                            );
+                        };
+                        let token_mint = if pool_context.setup.mint_a == quote_mint {
+                            pool_context.setup.mint_b
+                        } else {
+                            pool_context.setup.mint_a
+                        };
+                        if mint_pubkey != token_mint {
+                            return Err(
+                                "Bonk CLMM token mint did not match the selected pool.".to_string()
+                            );
+                        }
+                        let token_account =
+                            spl_associated_token_account::get_associated_token_address_with_program_id(
+                                &owner_pubkey,
+                                &mint_pubkey,
+                                &token_program,
+                            );
+                        let usd1_account =
+                            spl_associated_token_account::get_associated_token_address_with_program_id(
+                                &owner_pubkey,
+                                &quote_mint,
+                                &quote_program,
+                            );
+                        let quote = bonk_quote_clmm_exact_input(
+                            &pool_context.setup,
+                            &quote_mint,
+                            &bonk_biguint_from_u64(dynamic_expected_amount_b),
+                            slippage_bps,
+                        )?;
+                        let min_amount_a =
+                            biguint_to_u64(&quote.min_out, "Bonk CLMM buy min output")?;
+                        (
+                            build_bonk_clmm_swap_exact_in_instruction_for_setup(
+                                &owner_pubkey,
+                                &pool_context.setup,
+                                &usd1_account,
+                                &token_account,
+                                dynamic_expected_amount_b,
+                                min_amount_a,
+                                &quote.traversed_tick_array_starts,
+                                &quote_mint,
+                                &mint_pubkey,
+                            )?,
+                            token_account,
+                            token_program,
+                            min_amount_a,
+                        )
+                    }
+                };
+                let transaction = build_bonk_dynamic_usd1_buy_from_sol_route(
+                    rpc_url,
+                    &execution.commitment,
+                    &owner,
+                    allow_ata_creation,
+                    &buy_tx_config,
+                    execution.buyJitodontfront,
+                    &mint_pubkey,
+                    gross_sol_in_lamports,
+                    net_sol_in_lamports,
+                    dynamic_min_amount_b,
+                    &route_setup,
+                    buy_ix,
+                    &token_account,
+                    &token_program,
+                    min_amount_a,
+                    wrapper_fee_bps,
+                )
+                .await?;
+                return Ok(BonkFollowBuyCompileResult {
+                    transactions: vec![transaction],
+                    primary_tx_index: 0,
+                    requires_ordered_execution: false,
+                    entry_preference_asset: Some("sol".to_string()),
+                    wrapper_tx_index: Some(0),
+                    wrapper_gross_sol_in_lamports: Some(gross_sol_in_lamports),
+                });
+            }
             let prepared_topup = native_prepare_bonk_usd1_topup(
                 rpc_url,
                 &execution.commitment,
                 &owner.pubkey(),
                 &bonk_biguint_from_u64(requested_amount_b),
                 BONK_USD1_ROUTE_SLIPPAGE_BPS,
-                if funding_policy == "sol_only" {
+                if matches!(funding_policy, "sol_only" | "usd1_via_sol") {
                     BonkUsd1TopupMode::ForceFullAmount
                 } else {
                     BonkUsd1TopupMode::RespectExistingBalance
@@ -7219,6 +7954,8 @@ async fn native_compile_follow_buy_transaction(
                 usd1_route_setup_override,
             )
             .await?;
+            let prepared_topup =
+                prepared_topup_with_wrapper_gross_input(&prepared_topup, wrapper_fee_bps)?;
             let topup_transaction = native_compile_bonk_usd1_topup_from_prepared(
                 rpc_url,
                 &execution.commitment,
@@ -7235,6 +7972,14 @@ async fn native_compile_follow_buy_transaction(
                 "Native Bonk live USD1 follow buy could not prepare a required top-up transaction."
                     .to_string()
             })?;
+            let wrapper_gross_sol_in_lamports = prepared_topup
+                .input_lamports
+                .as_ref()
+                .ok_or_else(|| {
+                    "Native Bonk live USD1 follow buy top-up was missing SOL input lamports."
+                        .to_string()
+                })
+                .and_then(|value| biguint_to_u64(value, "Bonk USD1 top-up input lamports"))?;
             let action_transaction = native_compile_bonk_buy_transaction_with_venue_context(
                 rpc_url,
                 execution,
@@ -7245,6 +7990,11 @@ async fn native_compile_follow_buy_transaction(
                 requested_amount_b,
                 allow_ata_creation,
                 NativeBonkTxFormat::V0,
+                if funding_policy == "usd1_via_sol" {
+                    0
+                } else {
+                    wrapper_fee_bps
+                },
             )
             .await?;
             return match combine_atomic_bonk_usd1_follow_buy_transactions(
@@ -7262,6 +8012,8 @@ async fn native_compile_follow_buy_transaction(
                     primary_tx_index: 0,
                     requires_ordered_execution: false,
                     entry_preference_asset: Some("sol".to_string()),
+                    wrapper_tx_index: Some(0),
+                    wrapper_gross_sol_in_lamports: Some(wrapper_gross_sol_in_lamports),
                 }),
                 Err(error) => {
                     let transport_plan = crate::transport::build_transport_plan(execution, 2);
@@ -7278,6 +8030,8 @@ async fn native_compile_follow_buy_transaction(
                         primary_tx_index: 1,
                         requires_ordered_execution: true,
                         entry_preference_asset: Some("sol".to_string()),
+                        wrapper_tx_index: Some(0),
+                        wrapper_gross_sol_in_lamports: Some(wrapper_gross_sol_in_lamports),
                     })
                 }
             };
@@ -7294,12 +8048,15 @@ async fn native_compile_follow_buy_transaction(
                     requested_amount_b,
                     allow_ata_creation,
                     NativeBonkTxFormat::V0,
+                    wrapper_fee_bps,
                 )
                 .await?,
             ],
             primary_tx_index: 0,
             requires_ordered_execution: false,
             entry_preference_asset: Some("usd1".to_string()),
+            wrapper_tx_index: None,
+            wrapper_gross_sol_in_lamports: None,
         });
     }
     let requested_amount_b = parse_decimal_u64(
@@ -7319,12 +8076,15 @@ async fn native_compile_follow_buy_transaction(
                 requested_amount_b,
                 allow_ata_creation,
                 select_bonk_native_tx_format(&execution.txFormat),
+                wrapper_fee_bps,
             )
             .await?,
         ],
         primary_tx_index: 0,
         requires_ordered_execution: false,
         entry_preference_asset: Some("sol".to_string()),
+        wrapper_tx_index: None,
+        wrapper_gross_sol_in_lamports: None,
     })
 }
 
@@ -7341,6 +8101,7 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
     launch_mode_override: Option<&str>,
     launch_creator_override: Option<&str>,
     sell_settlement_asset: &str,
+    wrapper_fee_bps: u16,
 ) -> Result<Option<CompiledTransaction>, String> {
     let owner = parse_owner_keypair(wallet_secret)?;
     let owner_pubkey = owner.pubkey();
@@ -7386,6 +8147,7 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
                 &pool_context,
                 sell_amount,
                 sell_settlement_asset,
+                wrapper_fee_bps,
             )
             .await?,
         ));
@@ -7463,6 +8225,7 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
                 pool_context,
                 sell_amount,
                 sell_settlement_asset,
+                wrapper_fee_bps,
             )
             .await?
         }
@@ -7476,6 +8239,7 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
                 pool_context,
                 sell_amount,
                 sell_settlement_asset,
+                wrapper_fee_bps,
             )
             .await?
         }
@@ -7489,6 +8253,7 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
                 pool_context,
                 sell_amount,
                 sell_settlement_asset,
+                wrapper_fee_bps,
             )
             .await?
         }
@@ -7507,7 +8272,8 @@ async fn native_compile_atomic_follow_buy_transaction(
     buy_amount: &str,
     allow_ata_creation: bool,
     predicted_prior_buy_quote_amount_b: Option<u64>,
-) -> Result<CompiledTransaction, String> {
+    wrapper_fee_bps: u16,
+) -> Result<BonkAtomicFollowBuyCompileResult, String> {
     let owner = parse_owner_keypair(wallet_secret)?;
     let mint_pubkey =
         Pubkey::from_str(mint).map_err(|error| format!("Invalid Bonk mint address: {error}"))?;
@@ -7528,25 +8294,41 @@ async fn native_compile_atomic_follow_buy_transaction(
             buy_slippage_bps,
         )?;
     }
+    let funding_policy = normalize_bonk_buy_funding_policy(&execution.buyFundingPolicy);
     let (requested_amount_b, current_usd1_balance) = if defaults.quote.asset == "usd1" {
-        let sol_input_quote =
-            native_quote_usd1_buy_amounts_from_sol_input(rpc_url, buy_amount, None).await?;
-        let current_balance = fetch_bonk_owner_token_balance(
-            rpc_url,
-            &execution.commitment,
-            &owner.pubkey(),
-            &bonk_quote_mint("usd1")?,
-        )
-        .await?
-        .unwrap_or_default();
-        (
-            select_bonk_usd1_buy_amount_from_sol_quote(
-                "prefer_usd1_else_topup",
+        if funding_policy == "usd1_via_sol" {
+            (
+                parse_decimal_u64(
+                    buy_amount,
+                    defaults.quote.decimals,
+                    &format!("follow buy amount {}", defaults.quote.label),
+                )?,
+                0,
+            )
+        } else {
+            let sol_input_quote =
+                native_quote_usd1_buy_amounts_from_sol_input(rpc_url, buy_amount, None).await?;
+            let current_balance = if funding_policy == "sol_only" {
+                0
+            } else {
+                fetch_bonk_owner_token_balance(
+                    rpc_url,
+                    &execution.commitment,
+                    &owner.pubkey(),
+                    &bonk_quote_mint("usd1")?,
+                )
+                .await?
+                .unwrap_or_default()
+            };
+            (
+                select_bonk_usd1_buy_amount_from_sol_quote(
+                    funding_policy,
+                    current_balance,
+                    &sol_input_quote,
+                ),
                 current_balance,
-                &sol_input_quote,
-            ),
-            current_balance,
-        )
+            )
+        }
     } else {
         (
             parse_decimal_u64(
@@ -7560,16 +8342,136 @@ async fn native_compile_atomic_follow_buy_transaction(
     if defaults.quote.asset == "usd1" {
         let current_balance = current_usd1_balance;
         if current_balance < requested_amount_b {
-            let required_quote_amount =
-                format_biguint_decimal(&bonk_biguint_from_u64(requested_amount_b), 6, 6);
-            let topup_transaction = compile_sol_to_usd1_topup_transaction_with_format(
+            if funding_policy == "sol_only" {
+                let tip_lamports = resolve_follow_tip_lamports(
+                    &execution.buyProvider,
+                    &execution.buyTipSol,
+                    "buy tip",
+                )?;
+                let buy_tx_config = bonk_follow_tx_config(
+                    configured_default_bonk_usd1_dynamic_buy_compute_unit_limit(),
+                    priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
+                    tip_lamports,
+                    jito_tip_account,
+                )?;
+                let owner_pubkey = owner.pubkey();
+                let token_account =
+                    spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &owner_pubkey,
+                        &mint_pubkey,
+                        &pool_context.token_program,
+                    );
+                let usd1_account =
+                    spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &owner_pubkey,
+                        &bonk_quote_mint("usd1")?,
+                        &spl_token::id(),
+                    );
+                let route_setup = load_bonk_usd1_route_setup(rpc_url).await?;
+                let gross_sol_in_lamports =
+                    parse_decimal_u64(buy_amount, 9, "Bonk USD1 dynamic buy SOL input")?;
+                let net_sol_in_lamports = gross_sol_in_lamports
+                    .checked_sub(estimate_sol_in_fee_lamports(
+                        gross_sol_in_lamports,
+                        wrapper_fee_bps,
+                    ))
+                    .ok_or_else(|| "Bonk USD1 dynamic buy fee exceeded input SOL".to_string())?;
+                let dynamic_usd1_quote = native_quote_usd1_output_from_sol_input_with_metrics(
+                    rpc_url,
+                    &bonk_biguint_from_u64(net_sol_in_lamports),
+                    BONK_USD1_ROUTE_SLIPPAGE_BPS,
+                    None,
+                    Some(&route_setup),
+                )
+                .await?;
+                let dynamic_min_amount_b = biguint_to_u64(
+                    &dynamic_usd1_quote.min_out,
+                    "Bonk USD1 dynamic buy guaranteed USD1 output",
+                )?;
+                let dynamic_expected_amount_b = biguint_to_u64(
+                    &dynamic_usd1_quote.expected_out,
+                    "Bonk USD1 dynamic buy expected USD1 output",
+                )?;
+                let (instruction_amount_b, min_amount_a) = bonk_follow_buy_amounts(
+                    &pool_context,
+                    dynamic_expected_amount_b,
+                    buy_slippage_bps,
+                )?;
+                let buy_ix = build_bonk_buy_exact_in_instruction(
+                    &owner_pubkey,
+                    &pool_context,
+                    &token_account,
+                    &usd1_account,
+                    instruction_amount_b,
+                    min_amount_a,
+                )?;
+                let transaction = build_bonk_dynamic_usd1_buy_from_sol_route(
+                    rpc_url,
+                    &execution.commitment,
+                    &owner,
+                    allow_ata_creation,
+                    &buy_tx_config,
+                    execution.buyJitodontfront,
+                    &mint_pubkey,
+                    gross_sol_in_lamports,
+                    net_sol_in_lamports,
+                    dynamic_min_amount_b,
+                    &route_setup,
+                    buy_ix,
+                    &token_account,
+                    &pool_context.token_program,
+                    min_amount_a,
+                    wrapper_fee_bps,
+                )
+                .await?;
+                return Ok(BonkAtomicFollowBuyCompileResult {
+                    transaction,
+                    wrapper_gross_sol_in_lamports: Some(gross_sol_in_lamports),
+                });
+            }
+            let required_quote_amount_b = bonk_biguint_from_u64(requested_amount_b);
+            let prepared_topup = native_prepare_bonk_usd1_topup(
                 rpc_url,
-                execution,
+                &execution.commitment,
+                &owner.pubkey(),
+                &required_quote_amount_b,
+                BONK_USD1_ROUTE_SLIPPAGE_BPS,
+                BonkUsd1TopupMode::ForceFullAmount,
+                None,
+                None,
+            )
+            .await?;
+            let prepared_topup =
+                prepared_topup_with_wrapper_gross_input(&prepared_topup, wrapper_fee_bps)?;
+            let wrapper_gross_sol_in_lamports = prepared_topup
+                .input_lamports
+                .as_ref()
+                .ok_or_else(|| {
+                    "Native Bonk atomic USD1 follow buy top-up was missing SOL input lamports."
+                        .to_string()
+                })
+                .and_then(|value| biguint_to_u64(value, "Bonk USD1 top-up input lamports"))?;
+            let tip_lamports = resolve_follow_tip_lamports(
+                &execution.buyProvider,
+                &execution.buyTipSol,
+                "buy tip",
+            )?;
+            let buy_tx_config = bonk_follow_tx_config(
+                configured_default_sniper_buy_compute_unit_limit(),
+                priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
+                tip_lamports,
                 jito_tip_account,
-                wallet_secret,
-                &required_quote_amount,
+            )?;
+            let topup_transaction = native_compile_bonk_usd1_topup_from_prepared(
+                rpc_url,
+                &execution.commitment,
+                &owner,
+                allow_ata_creation,
                 "usd1-topup",
-                Some("v0"),
+                NativeBonkTxFormat::V0,
+                &buy_tx_config,
+                execution.buyJitodontfront,
+                &prepared_topup,
             )
             .await?
             .ok_or_else(|| {
@@ -7586,9 +8488,14 @@ async fn native_compile_atomic_follow_buy_transaction(
                 requested_amount_b,
                 allow_ata_creation,
                 NativeBonkTxFormat::V0,
+                if funding_policy == "usd1_via_sol" {
+                    0
+                } else {
+                    wrapper_fee_bps
+                },
             )
             .await?;
-            return combine_atomic_bonk_usd1_follow_buy_transactions(
+            let transaction = combine_atomic_bonk_usd1_follow_buy_transactions(
                 rpc_url,
                 execution,
                 jito_tip_account,
@@ -7596,7 +8503,11 @@ async fn native_compile_atomic_follow_buy_transaction(
                 &topup_transaction,
                 &action_transaction,
             )
-            .await;
+            .await?;
+            return Ok(BonkAtomicFollowBuyCompileResult {
+                transaction,
+                wrapper_gross_sol_in_lamports: Some(wrapper_gross_sol_in_lamports),
+            });
         }
     }
     let tx_format = if defaults.quote.asset == "usd1" {
@@ -7604,7 +8515,7 @@ async fn native_compile_atomic_follow_buy_transaction(
     } else {
         select_bonk_native_tx_format(&execution.txFormat)
     };
-    native_compile_bonk_buy_transaction_with_pool_context(
+    let transaction = native_compile_bonk_buy_transaction_with_pool_context(
         rpc_url,
         execution,
         jito_tip_account,
@@ -7614,8 +8525,13 @@ async fn native_compile_atomic_follow_buy_transaction(
         requested_amount_b,
         allow_ata_creation,
         tx_format,
+        wrapper_fee_bps,
     )
-    .await
+    .await?;
+    Ok(BonkAtomicFollowBuyCompileResult {
+        transaction,
+        wrapper_gross_sol_in_lamports: None,
+    })
 }
 
 fn build_transaction_summaries(
@@ -7961,7 +8877,14 @@ fn build_native_bonk_artifacts_from_launch_result(
     }
     report.transactions = build_transaction_summaries(&compiled_transactions, config.tx.dumpBase64);
     let text = render_report(&report);
-    let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
+    let mut report = serde_json::to_value(report).map_err(|error| error.to_string())?;
+    let mint_pubkey = Pubkey::from_str(&result.mint)
+        .map_err(|error| format!("Invalid Bonk mint in launch report: {error}"))?;
+    let pool_id = bonk_canonical_pool_id_for_mint(&config.quoteAsset, &mint_pubkey)?;
+    report["pairAddress"] = serde_json::Value::String(pool_id.clone());
+    report["routeAddress"] = serde_json::Value::String(pool_id.clone());
+    report["poolAddress"] = serde_json::Value::String(pool_id);
+    append_vanity_report_note(&mut report, result.vanity_reservation.as_ref());
     Ok(NativeBonkArtifacts {
         creation_transactions: compiled_transactions.clone(),
         deferred_setup_transactions: vec![],
@@ -7971,27 +8894,79 @@ fn build_native_bonk_artifacts_from_launch_result(
         compile_timings: NativeCompileTimings::default(),
         mint: result.mint,
         launch_creator: result.launch_creator,
+        vanity_reservation: result.vanity_reservation,
     })
+}
+
+#[derive(Debug)]
+struct ResolvedBonkLaunchMint {
+    keypair: Keypair,
+    vanity_reservation: Option<VanityReservation>,
+    requires_unused_check: bool,
 }
 
 async fn resolve_bonk_launch_mint_keypair(
     rpc_url: &str,
     vanity_private_key: &str,
-) -> Result<Keypair, String> {
+) -> Result<ResolvedBonkLaunchMint, String> {
     let trimmed = vanity_private_key.trim();
     if trimmed.is_empty() {
-        return Ok(Keypair::new());
+        return Ok(ResolvedBonkLaunchMint {
+            keypair: Keypair::new(),
+            vanity_reservation: None,
+            requires_unused_check: false,
+        });
     }
     let bytes = read_keypair_bytes(trimmed)
         .map_err(|error| format!("Invalid vanity private key: {error}"))?;
     let keypair = Keypair::try_from(bytes.as_slice())
         .map_err(|error| format!("Invalid vanity private key: {error}"))?;
+    let _ = rpc_url;
+    Ok(ResolvedBonkLaunchMint {
+        keypair,
+        vanity_reservation: None,
+        requires_unused_check: true,
+    })
+}
+
+async fn resolve_bonk_launch_mint_keypair_for_launch(
+    rpc_url: &str,
+    vanity_private_key: &str,
+    allow_queued_vanity: bool,
+) -> Result<ResolvedBonkLaunchMint, String> {
+    if !vanity_private_key.trim().is_empty() {
+        return resolve_bonk_launch_mint_keypair(rpc_url, vanity_private_key).await;
+    }
+    if allow_queued_vanity
+        && let Some(reserved) = reserve_vanity_mint(VanityLaunchpad::Bonk, rpc_url).await?
+    {
+        return Ok(ResolvedBonkLaunchMint {
+            keypair: reserved.keypair,
+            vanity_reservation: Some(reserved.reservation),
+            requires_unused_check: false,
+        });
+    }
+    Ok(ResolvedBonkLaunchMint {
+        keypair: Keypair::new(),
+        vanity_reservation: None,
+        requires_unused_check: false,
+    })
+}
+
+async fn ensure_bonk_launch_mint_unused(
+    rpc_url: &str,
+    keypair: &Keypair,
+    requires_unused_check: bool,
+) -> Result<(), String> {
+    if !requires_unused_check {
+        return Ok(());
+    }
     match fetch_account_data(rpc_url, &keypair.pubkey().to_string(), "confirmed").await {
         Ok(_) => Err(format!(
             "This vanity address has already been used on-chain. Generate a fresh one. ({})",
             keypair.pubkey()
         )),
-        Err(error) if error.contains("was not found.") => Ok(keypair),
+        Err(error) if error.contains("was not found.") => Ok(()),
         Err(error) => Err(format!(
             "Failed to verify vanity private key availability: {error}"
         )),
@@ -8258,7 +9233,16 @@ async fn native_build_launch_result(
     let owner_pubkey = owner.pubkey();
     let defaults = load_bonk_launch_defaults(rpc_url, &config.mode, &config.quoteAsset).await?;
     let slippage_bps = slippage_bps_from_percent(&config.execution.buySlippagePercent)?;
-    let mint_keypair = resolve_bonk_launch_mint_keypair(rpc_url, &config.vanityPrivateKey).await?;
+    let resolved_mint = resolve_bonk_launch_mint_keypair_for_launch(
+        rpc_url,
+        &config.vanityPrivateKey,
+        allow_ata_creation,
+    )
+    .await?;
+    let mint_keypair = resolved_mint.keypair;
+    ensure_bonk_launch_mint_unused(rpc_url, &mint_keypair, resolved_mint.requires_unused_check)
+        .await?;
+    let vanity_reservation = resolved_mint.vanity_reservation;
     let mint_pubkey = mint_keypair.pubkey();
     let predicted_dev_buy_token_amount_raw = native_predict_dev_buy_token_amount(rpc_url, config)
         .await?
@@ -8477,6 +9461,7 @@ async fn native_build_launch_result(
     Ok(NativeBonkLaunchResult {
         mint: mint_pubkey.to_string(),
         launch_creator: owner_pubkey.to_string(),
+        vanity_reservation,
         compiled_transactions: compiled_launch_transactions,
         predicted_dev_buy_token_amount_raw,
         atomic_combined,
@@ -8547,6 +9532,7 @@ pub async fn compile_follow_buy_transaction(
         pool_context_override,
         pool_id_override,
         usd1_route_setup_override,
+        DEFAULT_WRAPPER_FEE_BPS,
     )
     .await?;
     if result.transactions.len() != 1 {
@@ -8574,6 +9560,7 @@ pub async fn compile_follow_buy_transaction_with_metadata(
     pool_context_override: Option<&NativeBonkPoolContext>,
     pool_id_override: Option<&str>,
     usd1_route_setup_override: Option<&BonkUsd1RouteSetup>,
+    wrapper_fee_bps: u16,
 ) -> Result<BonkFollowBuyCompileResult, String> {
     native_compile_follow_buy_transaction(
         rpc_url,
@@ -8587,6 +9574,7 @@ pub async fn compile_follow_buy_transaction_with_metadata(
         pool_context_override,
         pool_id_override,
         usd1_route_setup_override,
+        wrapper_fee_bps,
     )
     .await
 }
@@ -8605,6 +9593,40 @@ pub async fn compile_atomic_follow_buy_transaction(
     allow_ata_creation: bool,
     predicted_prior_buy_quote_amount_b: Option<u64>,
 ) -> Result<CompiledTransaction, String> {
+    compile_atomic_follow_buy_transaction_with_metadata(
+        rpc_url,
+        launch_mode,
+        quote_asset,
+        execution,
+        _token_mayhem_mode,
+        jito_tip_account,
+        wallet_secret,
+        mint,
+        launch_creator,
+        buy_amount_sol,
+        allow_ata_creation,
+        predicted_prior_buy_quote_amount_b,
+        DEFAULT_WRAPPER_FEE_BPS,
+    )
+    .await
+    .map(|result| result.transaction)
+}
+
+pub async fn compile_atomic_follow_buy_transaction_with_metadata(
+    rpc_url: &str,
+    launch_mode: &str,
+    quote_asset: &str,
+    execution: &NormalizedExecution,
+    _token_mayhem_mode: bool,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    launch_creator: &str,
+    buy_amount_sol: &str,
+    allow_ata_creation: bool,
+    predicted_prior_buy_quote_amount_b: Option<u64>,
+    wrapper_fee_bps: u16,
+) -> Result<BonkAtomicFollowBuyCompileResult, String> {
     native_compile_atomic_follow_buy_transaction(
         rpc_url,
         launch_mode,
@@ -8617,6 +9639,7 @@ pub async fn compile_atomic_follow_buy_transaction(
         buy_amount_sol,
         allow_ata_creation,
         predicted_prior_buy_quote_amount_b,
+        wrapper_fee_bps,
     )
     .await
 }
@@ -8646,6 +9669,7 @@ pub async fn compile_follow_sell_transaction(
         None,
         None,
         quote_asset,
+        DEFAULT_WRAPPER_FEE_BPS,
     )
     .await
 }
@@ -8676,6 +9700,7 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
         launch_mode_override,
         launch_creator_override,
         quote_asset,
+        DEFAULT_WRAPPER_FEE_BPS,
     )
     .await
 }
@@ -8693,6 +9718,7 @@ pub async fn compile_follow_sell_transaction_with_token_amount_and_settlement(
     launch_mode_override: Option<&str>,
     launch_creator_override: Option<&str>,
     sell_settlement_asset: &str,
+    wrapper_fee_bps: u16,
 ) -> Result<Option<CompiledTransaction>, String> {
     native_compile_follow_sell_transaction_with_token_amount(
         rpc_url,
@@ -8707,6 +9733,7 @@ pub async fn compile_follow_sell_transaction_with_token_amount_and_settlement(
         launch_mode_override,
         launch_creator_override,
         sell_settlement_asset,
+        wrapper_fee_bps,
     )
     .await
 }
@@ -8964,6 +9991,35 @@ pub async fn warm_bonk_state(rpc_url: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use borsh::BorshDeserialize;
+
+    #[tokio::test]
+    async fn resolve_bonk_launch_mint_keypair_uses_vanity_private_key_when_present() {
+        let vanity_keypair = Keypair::new();
+        let encoded = bs58::encode(vanity_keypair.to_bytes()).into_string();
+
+        let resolved =
+            resolve_bonk_launch_mint_keypair_for_launch("http://127.0.0.1:1", &encoded, true)
+                .await
+                .expect("vanity mint keypair");
+
+        assert_eq!(resolved.keypair.pubkey(), vanity_keypair.pubkey());
+        assert!(resolved.vanity_reservation.is_none());
+        assert!(resolved.requires_unused_check);
+    }
+
+    #[tokio::test]
+    async fn resolve_bonk_launch_mint_keypair_rejects_invalid_vanity_private_key() {
+        let error = resolve_bonk_launch_mint_keypair_for_launch(
+            "http://127.0.0.1:1",
+            "not-a-keypair",
+            true,
+        )
+        .await
+        .expect_err("invalid vanity key should fail");
+
+        assert!(error.contains("Invalid vanity private key"));
+    }
 
     #[test]
     fn usd1_sol_input_buy_amount_uses_expected_only_when_already_available() {
@@ -8988,6 +10044,17 @@ mod tests {
             select_bonk_usd1_buy_amount_from_sol_quote("prefer_usd1_else_topup", 500_000, &quote),
             900_000
         );
+    }
+
+    #[test]
+    fn usd1_topup_gross_input_covers_wrapper_fee() {
+        let net_lamports = 1_000_000_000;
+        let gross_lamports =
+            gross_lamports_for_net_after_wrapper_fee(net_lamports, 10).expect("gross input");
+        let fee_lamports = estimate_sol_in_fee_lamports(gross_lamports, 10);
+
+        assert!(gross_lamports > net_lamports);
+        assert!(gross_lamports - fee_lamports >= net_lamports);
     }
 
     fn push_test_pubkey(bytes: &mut Vec<u8>, value: &Pubkey) {
@@ -9410,6 +10477,53 @@ mod tests {
         }
     }
 
+    fn test_usd1_route_setup() -> BonkUsd1RouteSetup {
+        let tick_spacing = 60;
+        let start_tick_index = 0;
+        let mut ticks = Vec::new();
+        for index in 0..BONK_CLMM_TICK_ARRAY_SIZE {
+            let tick = start_tick_index + index * tick_spacing;
+            ticks.push(BonkClmmTick {
+                tick,
+                liquidity_net: 0,
+                liquidity_gross: if matches!(index, 0 | 3) {
+                    BigUint::from(1u8)
+                } else {
+                    BigUint::ZERO
+                },
+            });
+        }
+        let sqrt_price_x64 = bonk_sqrt_price_from_tick(120).expect("current sqrt price");
+        BonkUsd1RouteSetup {
+            pool_id: Pubkey::new_unique(),
+            program_id: Pubkey::new_unique(),
+            amm_config: Pubkey::new_unique(),
+            mint_a: bonk_quote_mint("sol").expect("sol mint"),
+            mint_b: bonk_quote_mint("usd1").expect("usd1 mint"),
+            vault_a: Pubkey::new_unique(),
+            vault_b: Pubkey::new_unique(),
+            observation_id: Pubkey::new_unique(),
+            tick_spacing,
+            trade_fee_rate: 2_500,
+            sqrt_price_x64: sqrt_price_x64.clone(),
+            liquidity: BigUint::from(1_000_000_000_000u64),
+            tick_current: 120,
+            mint_a_decimals: 9,
+            mint_b_decimals: 6,
+            current_price: bonk_sqrt_price_x64_to_price(&sqrt_price_x64, 9, 6)
+                .expect("current price"),
+            tick_arrays_desc: vec![start_tick_index],
+            tick_arrays_asc: vec![start_tick_index],
+            tick_arrays: HashMap::from([(
+                start_tick_index,
+                BonkClmmTickArray {
+                    start_tick_index,
+                    ticks,
+                },
+            )]),
+        }
+    }
+
     #[test]
     fn native_bonk_sol_quote_matches_fixed_price_defaults() {
         let quote = build_native_bonk_quote_from_defaults(&test_launch_defaults(), "sol", "0.25")
@@ -9445,6 +10559,118 @@ mod tests {
         .expect("context");
         let min_amount_b = bonk_follow_sell_amounts(&context, 125_000_000, 0).expect("sell quote");
         assert_eq!(min_amount_b, 250_000_000);
+    }
+
+    #[test]
+    fn atomic_usd1_buy_final_min_uses_expected_intermediate_output() {
+        let setup = test_usd1_route_setup();
+        let route_quote = bonk_quote_usd1_from_exact_sol_input(
+            &setup,
+            &BigUint::from(1_000_000u64),
+            BONK_USD1_ROUTE_SLIPPAGE_BPS,
+        )
+        .expect("USD1 route quote");
+        let expected_usd1 =
+            biguint_to_u64(&route_quote.expected_out, "expected USD1").expect("expected USD1");
+        let min_usd1 = biguint_to_u64(&route_quote.min_out, "minimum USD1").expect("minimum USD1");
+        assert!(expected_usd1 > min_usd1);
+
+        let mut defaults = test_launch_defaults();
+        defaults.quote = bonk_quote_asset_config("usd1");
+        let context = build_prelaunch_bonk_pool_context(
+            &defaults,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            "regular",
+        )
+        .expect("context");
+        let (_, expected_based_min) =
+            bonk_follow_buy_amounts(&context, expected_usd1, 100).expect("expected-based buy");
+        let (_, min_based_min) =
+            bonk_follow_buy_amounts(&context, min_usd1, 100).expect("min-based buy");
+
+        assert!(expected_based_min > min_based_min);
+    }
+
+    #[test]
+    fn atomic_usd1_sell_unwind_min_uses_expected_intermediate_output() {
+        let owner = Pubkey::new_unique();
+        let usd1_account = Pubkey::new_unique();
+        let setup = test_usd1_route_setup();
+        let min_usd1_out = 950_000;
+        let expected_usd1_out = 1_000_000;
+        let fee_bps = 10;
+        let first_leg_ix = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![AccountMeta::new(usd1_account, false)],
+            data: vec![0; 24],
+        };
+
+        let route_instructions = build_bonk_dynamic_usd1_sell_to_sol_route(
+            &owner,
+            &usd1_account,
+            first_leg_ix,
+            123_456,
+            min_usd1_out,
+            expected_usd1_out,
+            &setup,
+            fee_bps,
+        )
+        .expect("route instructions");
+        let request = ExecuteSwapRouteRequest::try_from_slice(&route_instructions[0].data[1..])
+            .expect("decode wrapper request");
+        let expected_unwind_quote = bonk_quote_sol_from_exact_usd1_input(
+            &setup,
+            &BigUint::from(expected_usd1_out),
+            BONK_USD1_ROUTE_SLIPPAGE_BPS,
+        )
+        .expect("expected unwind quote");
+        let min_based_unwind_quote = bonk_quote_sol_from_exact_usd1_input(
+            &setup,
+            &BigUint::from(min_usd1_out),
+            BONK_USD1_ROUTE_SLIPPAGE_BPS,
+        )
+        .expect("minimum unwind quote");
+        let expected_min_out = biguint_to_u64(
+            &expected_unwind_quote.min_out,
+            "expected unwind minimum output",
+        )
+        .expect("expected unwind minimum output");
+        let min_based_out = biguint_to_u64(
+            &min_based_unwind_quote.min_out,
+            "min-based unwind minimum output",
+        )
+        .expect("min-based unwind minimum output");
+        let expected_min_net = expected_min_out
+            .checked_sub(estimate_sol_in_fee_lamports(expected_min_out, fee_bps))
+            .expect("expected fee");
+        let min_based_net = min_based_out
+            .checked_sub(estimate_sol_in_fee_lamports(min_based_out, fee_bps))
+            .expect("min-based fee");
+
+        assert_eq!(request.min_net_output, expected_min_net);
+        assert!(request.min_net_output > min_based_net);
+        assert_eq!(
+            request.legs[1].input_source,
+            SwapLegInputSource::PreviousTokenDelta
+        );
+        assert_eq!(request.legs[1].input_amount, expected_usd1_out);
+        assert_eq!(
+            u64::from_le_bytes(
+                request.legs[1].ix_data[8..16]
+                    .try_into()
+                    .expect("amount bytes")
+            ),
+            expected_usd1_out
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                request.legs[1].ix_data[16..24]
+                    .try_into()
+                    .expect("min bytes")
+            ),
+            expected_min_out
+        );
     }
 
     #[test]
@@ -9528,7 +10754,7 @@ mod tests {
     fn atomic_bonk_usd1_follow_buy_uses_merged_child_compute_budget() {
         assert_eq!(
             configured_atomic_bonk_usd1_follow_buy_compute_unit_limit(Some(120_000), Some(120_000)),
-            240_000
+            280_000
         );
         assert!(
             configured_atomic_bonk_usd1_follow_buy_compute_unit_limit(None, None)
@@ -9541,13 +10767,22 @@ mod tests {
     }
 
     #[test]
+    fn bonk_usd1_dynamic_buys_use_launch_grade_compute_budget() {
+        assert_eq!(
+            configured_default_bonk_usd1_dynamic_buy_compute_unit_limit(),
+            configured_default_launch_compute_unit_limit()
+        );
+        assert!(configured_default_bonk_usd1_dynamic_buy_compute_unit_limit() >= 340_000);
+    }
+
+    #[test]
     fn bonk_sells_use_larger_compute_budget() {
-        assert_eq!(configured_default_bonk_sell_compute_unit_limit(), 240_000);
+        assert_eq!(configured_default_bonk_sell_compute_unit_limit(), 280_000);
         assert_eq!(
             configured_bonk_sell_compute_unit_limit("sol", "sol"),
-            240_000
+            280_000
         );
-        assert!(configured_bonk_sell_compute_unit_limit("usd1", "sol") >= 240_000);
+        assert!(configured_bonk_sell_compute_unit_limit("usd1", "sol") >= 280_000);
         assert!(
             configured_bonk_sell_compute_unit_limit("usd1", "sol")
                 >= configured_default_bonk_sell_compute_unit_limit()

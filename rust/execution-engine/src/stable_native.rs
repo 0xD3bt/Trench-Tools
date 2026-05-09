@@ -2,9 +2,9 @@ use std::str::FromStr;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use num_traits::ToPrimitive;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use shared_transaction_submit::compiled_transaction_signers;
-use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_sdk::{
     hash::Hash,
     instruction::{AccountMeta, Instruction},
@@ -13,7 +13,7 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
-use solana_system_interface::instruction::create_account;
+use solana_system_interface::instruction::{create_account, transfer};
 use spl_associated_token_account::{
     get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
@@ -24,8 +24,12 @@ use spl_token::instruction::{
 
 use crate::{
     bonk_execution_support::build_trusted_raydium_clmm_swap_exact_in,
-    extension_api::{TradeSettlementAsset, TradeSide},
-    rpc_client::{CompiledTransaction, configured_rpc_url, fetch_account_owner_and_data},
+    extension_api::{MevMode, TradeSettlementAsset, TradeSide},
+    provider_tip::pick_tip_account_for_provider,
+    rpc_client::{
+        CompiledTransaction, configured_rpc_url, fetch_account_owner_and_data,
+        fetch_token_balance_via_ata, rpc_request_with_client, shared_rpc_http_client,
+    },
     trade_dispatch::{CompiledAdapterTrade, TransactionDependencyMode},
     trade_planner::{
         LifecycleAndCanonicalMarket, PlannerQuoteAsset, PlannerRuntimeBundle,
@@ -44,11 +48,14 @@ const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgr
 const ORCA_WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY8hd7YTPLW1m";
+const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 const SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const TEMP_WSOL_RENT_LAMPORTS: u64 = 2_039_280;
 const STABLE_SWAP_COMPUTE_UNITS: u32 = 360_000;
+const HELIUS_SENDER_MIN_TIP_LAMPORTS: u64 = 200_000;
+const HELLO_MOON_MIN_TIP_LAMPORTS: u64 = 1_000_000;
+const JITODONTFRONT_ACCOUNT: &str = "jitodontfront111111111111111111111111111111";
 const TRUSTED_STABLE_DEFAULT_SLIPPAGE_CAP_BPS: u64 = 100;
 const TRUSTED_STABLE_MAX_SLIPPAGE_CAP_BPS: u64 = 500;
 const ORCA_WHIRLPOOL_TICK_ARRAY_SIZE: i32 = 88;
@@ -311,12 +318,6 @@ pub async fn compile_trusted_stable_trade(
     let token_program = token_program_id()?;
     let (input_mint, output_mint, input_decimals, output_decimals, amount_in) = match request.side {
         TradeSide::Buy => {
-            if route.buy_input_mint != WSOL_MINT {
-                return Err(format!(
-                    "Trusted stable route {} is direct-only and cannot use a SOL buy amount.",
-                    route.label
-                ));
-            }
             let amount = request
                 .buy_amount_sol
                 .as_deref()
@@ -324,6 +325,23 @@ pub async fn compile_trusted_stable_trade(
                 .and_then(|value| {
                     parse_decimal_u64(value, route.buy_input_decimals, "stable buy amount")
                 })?;
+            if route.buy_input_mint != WSOL_MINT {
+                let balance = fetch_token_balance_via_ata(
+                    &owner.to_string(),
+                    route.buy_input_mint,
+                    route.buy_input_decimals,
+                    &request.policy.commitment,
+                )
+                .await?;
+                if amount > balance.amount_raw {
+                    return Err(format!(
+                        "Insufficient {} balance for trusted stable buy: need {} raw units, have {} raw units.",
+                        stable_symbol_for_mint(route.buy_input_mint),
+                        amount,
+                        balance.amount_raw
+                    ));
+                }
+            }
             (
                 parse_pubkey(route.buy_input_mint, "stable buy input mint")?,
                 parse_pubkey(route.buy_output_mint, "stable buy output mint")?,
@@ -366,6 +384,8 @@ pub async fn compile_trusted_stable_trade(
     if amount_in == 0 {
         return Err("Trusted stable input amount resolved to zero.".to_string());
     }
+    let resolved_tip =
+        resolve_inline_tip(&owner, &request.policy.provider, &request.policy.tip_sol)?;
 
     let mut extra_signers: Vec<Keypair> = Vec::new();
     let user_input_account = if input_mint.to_string() == WSOL_MINT {
@@ -404,6 +424,21 @@ pub async fn compile_trusted_stable_trade(
         ));
         ata
     };
+    let inline_tip_lamports_for_balance = resolved_tip
+        .as_ref()
+        .map(|(_, lamports, _)| *lamports)
+        .unwrap_or(0);
+    ensure_stable_payer_sol_balance(
+        &rpc_url,
+        &request.policy.commitment,
+        &owner,
+        &user_output_account,
+        &input_mint,
+        &output_mint,
+        amount_in,
+        inline_tip_lamports_for_balance,
+    )
+    .await?;
 
     let swap_instruction = match route.venue {
         TrustedStableVenue::RaydiumClmm => {
@@ -438,6 +473,7 @@ pub async fn compile_trusted_stable_trade(
                 slippage_bps,
             )
             .await?
+            .instruction
         }
     };
     instructions.push(swap_instruction);
@@ -447,12 +483,22 @@ pub async fn compile_trusted_stable_trade(
     if input_mint.to_string() == WSOL_MINT {
         instructions.push(close_temp_wsol_instruction(&owner, &user_input_account)?);
     }
+    let (inline_tip_lamports, inline_tip_account) =
+        if let Some((tip_instruction, tip_lamports, tip_account)) = resolved_tip {
+            instructions.push(tip_instruction);
+            (Some(tip_lamports), Some(tip_account))
+        } else {
+            (None, None)
+        };
+    if matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure) {
+        apply_jitodontfront(&mut instructions, &owner)?;
+    }
 
     let blockhash = shared_warming_service()
         .latest_blockhash(&rpc_url, &request.policy.commitment)
         .await?
         .blockhash;
-    let lookup_tables = load_shared_lookup_tables(&rpc_url, &request.policy.commitment).await?;
+    let lookup_tables = crate::pump_native::load_shared_super_lookup_tables(&rpc_url).await?;
     let compiled = compile_stable_transaction(
         route.label,
         blockhash,
@@ -462,6 +508,8 @@ pub async fn compile_trusted_stable_trade(
         &lookup_tables,
         STABLE_SWAP_COMPUTE_UNITS,
         compute_price,
+        inline_tip_lamports,
+        inline_tip_account,
     )?;
     let entry_preference_asset = match request.side {
         TradeSide::Buy => stable_asset_for_mint(route.buy_output_mint),
@@ -486,11 +534,83 @@ pub fn trusted_stable_effective_slippage_bps(user_slippage_percent: &str) -> Res
     Ok(user_bps.min(cap))
 }
 
+async fn fetch_sol_balance_lamports(
+    rpc_url: &str,
+    owner: &Pubkey,
+    commitment: &str,
+) -> Result<u64, String> {
+    let result = rpc_request_with_client(
+        shared_rpc_http_client(),
+        rpc_url,
+        "getBalance",
+        json!([
+            owner.to_string(),
+            {
+                "commitment": commitment,
+            }
+        ]),
+    )
+    .await?;
+    result
+        .get("value")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| "RPC getBalance did not return a lamport balance.".to_string())
+}
+
+async fn ensure_stable_payer_sol_balance(
+    rpc_url: &str,
+    commitment: &str,
+    owner: &Pubkey,
+    user_output_account: &Pubkey,
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount_in: u64,
+    inline_tip_lamports: u64,
+) -> Result<(), String> {
+    let mut required_lamports = inline_tip_lamports;
+    if input_mint.to_string() == WSOL_MINT {
+        required_lamports =
+            required_lamports.saturating_add(amount_in.saturating_add(TEMP_WSOL_RENT_LAMPORTS));
+    }
+    if output_mint.to_string() == WSOL_MINT {
+        required_lamports = required_lamports.saturating_add(TEMP_WSOL_RENT_LAMPORTS);
+    } else {
+        let output_account_exists =
+            fetch_account_owner_and_data(rpc_url, &user_output_account.to_string(), commitment)
+                .await?
+                .is_some();
+        if !output_account_exists {
+            required_lamports = required_lamports.saturating_add(TEMP_WSOL_RENT_LAMPORTS);
+        }
+    }
+    if required_lamports == 0 {
+        return Ok(());
+    }
+    let balance = fetch_sol_balance_lamports(rpc_url, owner, commitment).await?;
+    if balance < required_lamports {
+        return Err(format!(
+            "Insufficient SOL balance for trusted stable swap: need at least {} lamports for input, rent, and provider tip; have {} lamports.",
+            required_lamports, balance
+        ));
+    }
+    Ok(())
+}
+
 fn stable_asset_for_mint(mint: &str) -> Option<TradeSettlementAsset> {
     match mint {
         WSOL_MINT => Some(TradeSettlementAsset::Sol),
         USD1_MINT => Some(TradeSettlementAsset::Usd1),
         _ => None,
+    }
+}
+
+fn stable_symbol_for_mint(mint: &str) -> &'static str {
+    match mint {
+        WSOL_MINT => "WSOL",
+        USDC_MINT => "USDC",
+        USDT_MINT => "USDT",
+        USD1_MINT => "USD1",
+        _ => "token",
     }
 }
 
@@ -506,7 +626,13 @@ struct DecodedWhirlpool {
     vault_b: Pubkey,
 }
 
-async fn build_orca_whirlpool_swap_exact_in(
+#[derive(Debug, Clone)]
+pub struct OrcaWhirlpoolSwapQuote {
+    pub instruction: Instruction,
+    pub min_out: u64,
+}
+
+pub async fn build_orca_whirlpool_swap_exact_in(
     rpc_url: &str,
     route: &TrustedStableRoute,
     commitment: &str,
@@ -519,7 +645,7 @@ async fn build_orca_whirlpool_swap_exact_in(
     output_decimals: u8,
     amount_in: u64,
     slippage_bps: u64,
-) -> Result<Instruction, String> {
+) -> Result<OrcaWhirlpoolSwapQuote, String> {
     let pool_id = parse_pubkey(route.pool, "trusted Orca pool")?;
     let (owner_pubkey, pool_data) = fetch_account_owner_and_data(rpc_url, route.pool, commitment)
         .await?
@@ -573,22 +699,25 @@ async fn build_orca_whirlpool_swap_exact_in(
     } else {
         (*user_output_account, *user_input_account)
     };
-    Ok(Instruction {
-        program_id: orca_whirlpool_program_id()?,
-        accounts: vec![
-            AccountMeta::new_readonly(token_program_id()?, false),
-            AccountMeta::new_readonly(*owner, true),
-            AccountMeta::new(pool_id, false),
-            AccountMeta::new(owner_account_a, false),
-            AccountMeta::new(pool.vault_a, false),
-            AccountMeta::new(owner_account_b, false),
-            AccountMeta::new(pool.vault_b, false),
-            AccountMeta::new(tick_arrays[0], false),
-            AccountMeta::new(tick_arrays[1], false),
-            AccountMeta::new(tick_arrays[2], false),
-            AccountMeta::new_readonly(oracle, false),
-        ],
-        data,
+    Ok(OrcaWhirlpoolSwapQuote {
+        instruction: Instruction {
+            program_id: orca_whirlpool_program_id()?,
+            accounts: vec![
+                AccountMeta::new_readonly(token_program_id()?, false),
+                AccountMeta::new_readonly(*owner, true),
+                AccountMeta::new(pool_id, false),
+                AccountMeta::new(owner_account_a, false),
+                AccountMeta::new(pool.vault_a, false),
+                AccountMeta::new(owner_account_b, false),
+                AccountMeta::new(pool.vault_b, false),
+                AccountMeta::new(tick_arrays[0], false),
+                AccountMeta::new(tick_arrays[1], false),
+                AccountMeta::new(tick_arrays[2], false),
+                AccountMeta::new_readonly(oracle, false),
+            ],
+            data,
+        },
+        min_out,
     })
 }
 
@@ -707,6 +836,8 @@ fn compile_stable_transaction(
     lookup_tables: &[AddressLookupTableAccount],
     compute_unit_limit: u32,
     compute_unit_price_micro_lamports: u64,
+    inline_tip_lamports: Option<u64>,
+    inline_tip_account: Option<String>,
 ) -> Result<CompiledTransaction, String> {
     let message = v0::Message::try_compile(&payer.pubkey(), instructions, lookup_tables, blockhash)
         .map_err(|error| format!("Failed to compile trusted stable v0 message: {error}"))?;
@@ -753,25 +884,9 @@ fn compile_stable_transaction(
         } else {
             None
         },
-        inline_tip_lamports: None,
-        inline_tip_account: None,
+        inline_tip_lamports,
+        inline_tip_account,
     })
-}
-
-async fn load_shared_lookup_tables(
-    rpc_url: &str,
-    commitment: &str,
-) -> Result<Vec<AddressLookupTableAccount>, String> {
-    let (_owner, data) =
-        fetch_account_owner_and_data(rpc_url, SHARED_SUPER_LOOKUP_TABLE, commitment)
-            .await?
-            .ok_or_else(|| format!("Shared ALT {SHARED_SUPER_LOOKUP_TABLE} was not found."))?;
-    let table = AddressLookupTable::deserialize(&data)
-        .map_err(|error| format!("Failed to decode shared ALT: {error}"))?;
-    Ok(vec![AddressLookupTableAccount {
-        key: parse_pubkey(SHARED_SUPER_LOOKUP_TABLE, "shared ALT")?,
-        addresses: table.addresses.to_vec(),
-    }])
 }
 
 fn open_temp_wsol_instructions(
@@ -827,6 +942,77 @@ fn compute_unit_price_instruction(micro_lamports: u64) -> Result<Instruction, St
         accounts: vec![],
         data,
     })
+}
+
+fn resolve_inline_tip(
+    payer: &Pubkey,
+    provider: &str,
+    tip_sol: &str,
+) -> Result<Option<(Instruction, u64, String)>, String> {
+    let provider_tip_account_raw = pick_tip_account_for_provider(provider);
+    let (tip_account_str, resolved_from_provider) = if provider_tip_account_raw.is_empty() {
+        match configured_tip_account()? {
+            Some(account) => (account.to_string(), false),
+            None => return Ok(None),
+        }
+    } else {
+        (provider_tip_account_raw, true)
+    };
+    let min_lamports = provider_min_tip_lamports(provider);
+    let requested_lamports = parse_decimal_u64(tip_sol, 9, "tipSol").unwrap_or(0);
+    let lamports = if resolved_from_provider {
+        requested_lamports.max(min_lamports)
+    } else {
+        requested_lamports
+    };
+    if lamports == 0 {
+        return Ok(None);
+    }
+    let tip_pubkey = parse_pubkey(&tip_account_str, "tip account")?;
+    Ok(Some((
+        transfer(payer, &tip_pubkey, lamports),
+        lamports,
+        tip_account_str,
+    )))
+}
+
+fn provider_min_tip_lamports(provider: &str) -> u64 {
+    match provider.trim() {
+        "helius-sender" => HELIUS_SENDER_MIN_TIP_LAMPORTS,
+        "hellomoon" => HELLO_MOON_MIN_TIP_LAMPORTS,
+        _ => 0,
+    }
+}
+
+fn configured_tip_account() -> Result<Option<Pubkey>, String> {
+    let raw = std::env::var("EXECUTION_ENGINE_JITO_TIP_ACCOUNT")
+        .ok()
+        .or_else(|| std::env::var("JITO_TIP_ACCOUNT").ok())
+        .unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        parse_pubkey(trimmed, "tip account").map(Some)
+    }
+}
+
+fn apply_jitodontfront(instructions: &mut Vec<Instruction>, payer: &Pubkey) -> Result<(), String> {
+    if instructions.iter().any(|instruction| {
+        instruction
+            .accounts
+            .iter()
+            .any(|account| account.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+    }) {
+        return Ok(());
+    }
+    let dontfront = parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront")?;
+    let mut instruction = transfer(payer, payer, 0);
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(dontfront, false));
+    instructions.insert(0, instruction);
+    Ok(())
 }
 
 fn percent_of_amount(amount: u64, percent: &str) -> Result<u64, String> {
@@ -963,7 +1149,33 @@ mod tests {
         assert!(
             trusted_stable_route_for_pool("3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv").is_some()
         );
+        assert!(
+            trusted_stable_route_for_pool("3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF").is_some()
+        );
+        assert!(
+            trusted_stable_route_for_pool("AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS").is_some()
+        );
+        assert!(
+            trusted_stable_route_for_pool("BCDdHonby65iduz3Ev3c9v5XjNkzyu5e56KRFHpBM4T9").is_some()
+        );
+        assert!(
+            trusted_stable_route_for_pool("BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU").is_some()
+        );
+        assert!(
+            trusted_stable_route_for_pool("B4k3cQ56rcx5ZuxZh2wNpaDjW9Wbo2oUiReSgKatvJpS").is_none()
+        );
         assert!(trusted_stable_route_for_pool(USDC_MINT).is_none());
+    }
+
+    #[test]
+    fn usdc_usdt_route_is_direct_stable_only() {
+        let route = trusted_stable_route_for_pool("BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU")
+            .expect("USDC/USDT route");
+        assert_eq!(route.buy_input_mint, USDT_MINT);
+        assert_eq!(route.buy_output_mint, USDC_MINT);
+        assert_eq!(route.sell_input_mint, USDC_MINT);
+        assert_eq!(route.sell_output_mint, USDT_MINT);
+        assert_ne!(route.buy_input_mint, WSOL_MINT);
     }
 
     #[test]
@@ -1016,6 +1228,48 @@ mod tests {
             Some(ORCA_WHIRLPOOL_PROGRAM_ID)
         );
         assert_eq!(selector.wrapper_action, WrapperAction::TrustedStableSwapBuy);
+    }
+
+    #[test]
+    fn hellomoon_inline_tip_uses_provider_minimum() {
+        let payer = Pubkey::new_unique();
+        let (instruction, lamports, account) = resolve_inline_tip(&payer, "hellomoon", "0")
+            .expect("tip")
+            .expect("tip");
+
+        assert_eq!(lamports, HELLO_MOON_MIN_TIP_LAMPORTS);
+        assert!(account.starts_with("moon"));
+        assert_eq!(instruction.program_id, solana_system_interface::program::ID);
+        assert_eq!(instruction.accounts[0].pubkey, payer);
+        assert_eq!(instruction.accounts[1].pubkey.to_string(), account);
+    }
+
+    #[test]
+    fn stable_jitodontfront_adds_noop_without_mutating_swap() {
+        let payer = Pubkey::new_unique();
+        let swap = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![AccountMeta::new(Pubkey::new_unique(), false)],
+            data: vec![1, 2, 3],
+        };
+        let original_swap = swap.clone();
+        let mut instructions = vec![swap];
+
+        apply_jitodontfront(&mut instructions, &payer).expect("jitodontfront");
+        apply_jitodontfront(&mut instructions, &payer).expect("idempotent jitodontfront");
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[1], original_swap);
+        assert_eq!(
+            instructions[0].program_id,
+            solana_system_interface::program::ID
+        );
+        assert!(
+            instructions[0]
+                .accounts
+                .iter()
+                .any(|account| account.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+        );
     }
 
     #[test]

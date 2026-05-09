@@ -33,6 +33,7 @@ const ROUTE_TIMEOUT_MS = {
   tradeReadiness: 1500,
   previewBatch: 3500,
   walletStatus: 3500,
+  setActiveMark: 1500,
   balancePresence: 1500,
   resyncPnlHistory: 15000,
   resetPnlHistory: 5000,
@@ -340,6 +341,13 @@ export function postActiveMints(entries) {
   return requestJson("setActiveMints", "/api/extension/events/active-mint", {
     method: "POST",
     body: { entries: Array.isArray(entries) ? entries : [] }
+  });
+}
+
+export function postActiveMark(payload = {}) {
+  return requestJson("setActiveMark", "/api/extension/events/active-mark", {
+    method: "POST",
+    body: payload && typeof payload === "object" ? payload : {}
   });
 }
 

@@ -91,6 +91,18 @@ Every fire-and-forget path needs:
 - error/rejection reason surfaced
 - enough detail for the operator to understand whether a request was accepted, sent, or landed
 
+## Wrapper And Route Families
+
+Wrapper v3 route-mode execution is the current wrapper path. When changing or adding a venue family:
+
+- keep planner family, lifecycle, quote asset, and wrapper action in sync
+- validate all inner programs through the wrapper allowlist
+- keep ALT usage observable through diagnostics when relevant
+- update native compile, wrapper compile, and route metrics together
+- add focused buy/sell tests for the new route family
+
+Do not add a route that can build natively but cannot pass wrapper validation on supported fee paths.
+
 ## Hard Don'ts
 
 - Do not hide transport requirements behind UI defaults.

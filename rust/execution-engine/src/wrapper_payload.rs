@@ -6,8 +6,8 @@ use crate::{
     trade_planner::{LifecycleAndCanonicalMarket, PlannerQuoteAsset, TradeVenueFamily},
     trade_runtime::{RuntimeSellIntent, TradeRuntimeRequest},
     wrapper_abi::{
-        ABI_VERSION, EXECUTE_FIXED_ACCOUNT_COUNT, ExecuteRequest, MAX_FEE_BPS, WrapperRouteKind,
-        encode_execute_data,
+        ABI_VERSION, MAX_FEE_BPS, SwapRouteDirection, SwapRouteFeeMode, SwapRouteMode,
+        SwapRouteSettlement, WrapperRouteKind,
     },
 };
 
@@ -105,14 +105,27 @@ pub fn classify_trade_route(
 #[derive(Debug, Clone)]
 pub struct WrapperInstructionPayload {
     pub route_classification: WrapperRouteClassification,
-    pub request: ExecuteRequest,
-    pub serialized_data: Vec<u8>,
+    pub route_metadata: WrapperRouteMetadata,
     pub fee_lamports_estimate: u64,
     pub gross_sol_in_lamports: u64,
 }
 
+/// Local route/fee metadata for the v3 wrapper compiler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapperRouteMetadata {
+    pub version: u8,
+    pub route_mode: Option<SwapRouteMode>,
+    pub direction: Option<SwapRouteDirection>,
+    pub settlement: Option<SwapRouteSettlement>,
+    pub fee_mode: Option<SwapRouteFeeMode>,
+    pub fee_bps: u16,
+    pub gross_sol_in_lamports: u64,
+    pub gross_token_in_amount: u64,
+    pub min_net_output: u64,
+}
+
 /// Best-effort exact SOL-to-lamport conversion.
-fn parse_sol_amount_to_lamports(raw: &str) -> u64 {
+pub(crate) fn parse_sol_amount_to_lamports(raw: &str) -> u64 {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return 0;
@@ -155,6 +168,19 @@ fn parse_sol_amount_to_lamports(raw: &str) -> u64 {
     whole_lamports.checked_add(frac_lamports).unwrap_or(0)
 }
 
+pub(crate) fn format_lamports_as_sol(lamports: u64) -> String {
+    let whole = lamports / 1_000_000_000;
+    let frac = lamports % 1_000_000_000;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let mut frac_text = format!("{frac:09}");
+    while frac_text.ends_with('0') {
+        frac_text.pop();
+    }
+    format!("{whole}.{frac_text}")
+}
+
 fn buy_input_lamports(request: &TradeRuntimeRequest) -> u64 {
     request
         .buy_amount_sol
@@ -184,7 +210,7 @@ fn floor_fee_lamports(gross: u64, fee_bps: u16) -> u64 {
     (product / 10_000) as u64
 }
 
-/// Build the minimal wrapper `ExecuteRequest` plus local diagnostics.
+/// Build v3 route/fee metadata plus local diagnostics.
 pub fn build_wrapper_instruction_payload(
     selector: &LifecycleAndCanonicalMarket,
     request: &TradeRuntimeRequest,
@@ -196,28 +222,41 @@ pub fn build_wrapper_instruction_payload(
         WrapperRouteClassification::SolIn => buy_input_lamports(request),
         WrapperRouteClassification::SolOut | WrapperRouteClassification::NoSol => 0,
     };
-    let route_kind = route_classification
-        .to_abi()
-        .unwrap_or(WrapperRouteKind::SolIn);
     let min_net_output = match route_classification {
         WrapperRouteClassification::SolOut => sell_intent_target_lamports(request),
         _ => 0,
     };
-    let wrapper_request = ExecuteRequest {
+    let route_metadata = WrapperRouteMetadata {
         version: ABI_VERSION,
-        route_kind,
+        route_mode: match route_classification {
+            WrapperRouteClassification::SolIn => Some(SwapRouteMode::SolIn),
+            WrapperRouteClassification::SolOut => Some(SwapRouteMode::SolOut),
+            WrapperRouteClassification::NoSol => None,
+        },
+        direction: match route_classification {
+            WrapperRouteClassification::SolIn => Some(SwapRouteDirection::Buy),
+            WrapperRouteClassification::SolOut => Some(SwapRouteDirection::Sell),
+            WrapperRouteClassification::NoSol => None,
+        },
+        settlement: match route_classification {
+            WrapperRouteClassification::SolIn => Some(SwapRouteSettlement::Token),
+            WrapperRouteClassification::SolOut => Some(SwapRouteSettlement::NativeSol),
+            WrapperRouteClassification::NoSol => None,
+        },
+        fee_mode: match route_classification {
+            WrapperRouteClassification::SolIn => Some(SwapRouteFeeMode::SolPre),
+            WrapperRouteClassification::SolOut => Some(SwapRouteFeeMode::NativeSolPost),
+            WrapperRouteClassification::NoSol => None,
+        },
         fee_bps,
         gross_sol_in_lamports,
+        gross_token_in_amount: 0,
         min_net_output,
-        inner_accounts_offset: EXECUTE_FIXED_ACCOUNT_COUNT,
-        inner_ix_data: Vec::new(),
     };
-    let serialized_data = encode_execute_data(&wrapper_request).unwrap_or_default();
     let fee_lamports_estimate = floor_fee_lamports(gross_sol_in_lamports, fee_bps);
     WrapperInstructionPayload {
         route_classification,
-        request: wrapper_request,
-        serialized_data,
+        route_metadata,
         fee_lamports_estimate,
         gross_sol_in_lamports,
     }
@@ -395,6 +434,30 @@ mod tests {
     }
 
     #[test]
+    fn build_payload_uses_neutral_v3_route_metadata() {
+        let payload = build_wrapper_instruction_payload(
+            &selector(PlannerQuoteAsset::Sol, TradeVenueFamily::PumpBondingCurve),
+            &buy_request(BuyFundingPolicy::SolOnly),
+            "wallet".to_string(),
+        );
+
+        assert_eq!(payload.route_metadata.version, ABI_VERSION);
+        assert_eq!(
+            payload.route_metadata.route_mode,
+            Some(SwapRouteMode::SolIn)
+        );
+        assert_eq!(
+            payload.route_metadata.direction,
+            Some(SwapRouteDirection::Buy)
+        );
+        assert_eq!(
+            payload.route_metadata.fee_mode,
+            Some(SwapRouteFeeMode::SolPre)
+        );
+        assert_eq!(payload.route_metadata.gross_sol_in_lamports, 500_000_000);
+    }
+
+    #[test]
     fn parse_sol_amount_to_lamports_is_exact() {
         assert_eq!(parse_sol_amount_to_lamports("1"), 1_000_000_000);
         assert_eq!(parse_sol_amount_to_lamports("0.1"), 100_000_000);
@@ -422,7 +485,7 @@ mod tests {
             &buy_request(BuyFundingPolicy::SolOnly),
             "wallet".to_string(),
         );
-        assert!(payload.request.fee_bps <= MAX_FEE_BPS);
+        assert!(payload.route_metadata.fee_bps <= MAX_FEE_BPS);
         match prev {
             Some(value) => unsafe {
                 std::env::set_var("EXECUTION_ENGINE_WRAPPER_DEFAULT_FEE_BPS", value);

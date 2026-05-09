@@ -30,6 +30,7 @@ mod transport;
 mod ui_bridge;
 mod ui_config;
 mod vamp;
+mod vanity_pool;
 mod wallet;
 mod warm_manager;
 mod wrapper_compile;
@@ -100,8 +101,10 @@ use crate::{
         is_blockhash_valid, prewarm_helius_transaction_subscribe_endpoint,
         prewarm_hellomoon_bundle_endpoint, prewarm_hellomoon_quic_endpoint,
         prewarm_jito_bundle_endpoint, prewarm_rpc_endpoint, prewarm_watch_websocket_endpoint,
-        refresh_latest_blockhash_cache, simulate_transactions,
+        record_warm_rpc_failure, record_warm_rpc_success, refresh_latest_blockhash_cache,
+        reserve_warm_rpc_call, simulate_transactions,
         submit_independent_transactions_for_transport, submit_transactions_for_transport,
+        warm_rpc_cooldown_remaining_ms, warm_rpc_error_should_cooldown,
     },
     runtime::{
         RuntimeRegistry, RuntimeRequest, RuntimeResponse, fail_worker, heartbeat_worker,
@@ -126,6 +129,10 @@ use crate::{
         create_default_persistent_config, read_persistent_config, write_persistent_config,
     },
     vamp::{fetch_imported_token_metadata, import_remote_image_to_library},
+    vanity_pool::{
+        mark_vanity_reservation_used, preload_vanity_pool, refresh_vanity_pool_with_rpc,
+        vanity_pool_status_payload,
+    },
     wallet::{
         enrich_wallet_statuses, list_solana_env_wallets, load_solana_wallet_by_env_key,
         public_key_from_secret, read_keypair_bytes, selected_wallet_key_or_default,
@@ -154,9 +161,8 @@ use shared_fee_market::{
     DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE, FeeMarketSnapshot, SharedFeeMarketConfig,
     SharedFeeMarketRuntime, action_priority_estimate, action_tip_estimate,
     apply_auto_fee_estimate_buffer, format_lamports_to_sol_decimal, format_priority_price_note,
-    helius_fee_estimate_options, lamports_to_priority_fee_micro_lamports,
-    normalize_helius_priority_level, normalize_jito_tip_percentile, parse_auto_fee_cap_lamports,
-    parse_helius_priority_estimate_result, parse_sol_decimal_to_lamports,
+    lamports_to_priority_fee_micro_lamports, normalize_helius_priority_level,
+    normalize_jito_tip_percentile, parse_auto_fee_cap_lamports, parse_sol_decimal_to_lamports,
     priority_price_micro_lamports_to_sol_equivalent, provider_uses_auto_fee_priority,
     provider_uses_auto_fee_tip, resolve_auto_fee_components_with_total_cap,
     shared_fee_market_status_payload,
@@ -388,15 +394,77 @@ fn continuous_state_warm_probe_futures(
     main_rpc_url: &str,
     warm_rpc_url: &str,
 ) -> Vec<WarmProbeFuture> {
-    let mut futures = Vec::new();
+    let mut futures: Vec<WarmProbeFuture> = Vec::new();
     let warm_rpc_target = warm_rpc_url.to_string();
-    futures.push(boxed_warm_probe(
-        "state",
-        None,
-        "Warm RPC",
-        warm_rpc_target.clone(),
-        async move { prewarm_rpc_endpoint(&warm_rpc_target).await },
-    ));
+    let warm_rpc_label = if main_rpc_url.trim() == warm_rpc_url.trim() {
+        "Primary RPC"
+    } else {
+        "Warm RPC"
+    };
+    if main_rpc_url.trim() != warm_rpc_url.trim()
+        && !reserve_warm_rpc_call(&warm_rpc_target, "getVersion")
+    {
+        let warm_rpc_label = warm_rpc_label.to_string();
+        futures.push(Box::pin(async move {
+            warm_attempt_outcome(build_warm_target_attempt(
+                "state",
+                None,
+                &warm_rpc_label,
+                warm_rpc_target,
+                WarmAttemptResult::RateLimited(
+                    "optional warm RPC rate limit/cooldown active; skipping Shyft probe"
+                        .to_string(),
+                ),
+            ))
+        }));
+    } else {
+        let main_rpc_url = main_rpc_url.to_string();
+        let warm_rpc_label = warm_rpc_label.to_string();
+        futures.push(Box::pin(async move {
+            let timeout_ms = configured_warm_probe_timeout_ms();
+            let result = match tokio::time::timeout(
+                Duration::from_millis(timeout_ms),
+                prewarm_rpc_endpoint(&warm_rpc_target),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    if main_rpc_url.trim() != warm_rpc_target.trim() {
+                        record_warm_rpc_success(&warm_rpc_target);
+                    }
+                    WarmAttemptResult::Success
+                }
+                Ok(Err(error)) => {
+                    if main_rpc_url.trim() != warm_rpc_target.trim() {
+                        record_warm_rpc_failure(&warm_rpc_target, &error);
+                    }
+                    if main_rpc_url.trim() != warm_rpc_target.trim()
+                        && warm_rpc_error_should_cooldown(&error)
+                    {
+                        WarmAttemptResult::RateLimited(error)
+                    } else {
+                        WarmAttemptResult::Error(error)
+                    }
+                }
+                Err(_) => {
+                    let error = format!("timed out after {timeout_ms}ms");
+                    if main_rpc_url.trim() != warm_rpc_target.trim() {
+                        record_warm_rpc_failure(&warm_rpc_target, &error);
+                        WarmAttemptResult::RateLimited(error)
+                    } else {
+                        WarmAttemptResult::Error(error)
+                    }
+                }
+            };
+            warm_attempt_outcome(build_warm_target_attempt(
+                "state",
+                None,
+                &warm_rpc_label,
+                warm_rpc_target,
+                result,
+            ))
+        }));
+    }
     if should_prewarm_primary_rpc_separately(main_rpc_url, warm_rpc_url) {
         let primary_target = main_rpc_url.to_string();
         futures.push(boxed_warm_probe(
@@ -701,12 +769,10 @@ fn record_startup_warm_attempts(
     let recovered_targets = apply_warm_target_attempts(warm, attempts, attempt_at_ms);
     record_warm_recovery_summary("startup warm", &recovered_targets);
     warm.last_warm_attempt_at_ms = Some(u128::from(attempt_at_ms));
-    if attempts.iter().any(|attempt| {
-        matches!(
-            attempt.result,
-            WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)
-        )
-    }) {
+    if attempts
+        .iter()
+        .any(|attempt| matches!(attempt.result, WarmAttemptResult::Success))
+    {
         let attempt_at_ms_u128 = u128::from(attempt_at_ms);
         warm.last_warm_success_at_ms = Some(attempt_at_ms_u128);
         warm.last_activity_at_ms = attempt_at_ms_u128;
@@ -1567,6 +1633,7 @@ fn warm_gate_state(
 
 const IDLE_BACKGROUND_REQUEST_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const ENGINE_BLOCKHASH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const VANITY_POOL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 fn background_request_gate_active(warm: &WarmControlState, now_ms: u128) -> bool {
     if !configured_idle_warm_suspend_enabled() {
@@ -1622,10 +1689,21 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
     let state_targets = payload_warm_targets(&warm, "state", active);
     let endpoint_targets = payload_warm_targets(&warm, "endpoint", active);
     let watch_targets = payload_warm_targets(&warm, "watch-endpoint", active);
+    let main_rpc_url = configured_rpc_url();
+    let warm_rpc_url = configured_warm_rpc_url(&main_rpc_url);
+    let warm_rpc_configured = warm_rpc_url.trim() != main_rpc_url.trim();
+    let warm_rpc_cooldown_ms = if warm_rpc_configured {
+        warm_rpc_cooldown_remaining_ms(&warm_rpc_url)
+    } else {
+        None
+    };
     json!({
         "startupEnabled": configured_startup_warm_enabled(),
         "continuousEnabled": configured_continuous_warm_enabled(),
         "idleSuspendEnabled": configured_idle_warm_suspend_enabled(),
+        "warmRpcConfigured": warm_rpc_configured,
+        "warmRpcCooldownRemainingMs": warm_rpc_cooldown_ms,
+        "warmRpcMode": if warm_rpc_configured { "best-effort" } else { "primary" },
         "intervalMs": configured_continuous_warm_interval_ms(),
         "idleTimeoutMs": configured_idle_warm_timeout_ms(),
         "active": active,
@@ -2622,126 +2700,6 @@ fn shared_fee_market_runtime(rpc_url: &str) -> SharedFeeMarketRuntime {
     SharedFeeMarketRuntime::new(config)
 }
 
-fn sanitized_serialized_priority_probe_config(config: &NormalizedConfig) -> NormalizedConfig {
-    let mut probe_config = config.clone();
-    probe_config.tx.computeUnitPriceMicroLamports = Some(0);
-    probe_config.tx.jitoTipLamports = 0;
-    probe_config.tx.jitoTipAccount.clear();
-    probe_config.execution.priorityFeeSol.clear();
-    probe_config.execution.tipSol.clear();
-    probe_config.execution.buyPriorityFeeSol.clear();
-    probe_config.execution.buyTipSol.clear();
-    probe_config.execution.sellPriorityFeeSol.clear();
-    probe_config.execution.sellTipSol.clear();
-    probe_config
-}
-
-#[allow(dead_code)]
-fn compiled_transaction_serialized_base58(
-    transaction: &CompiledTransaction,
-) -> Result<String, String> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-
-    let bytes = BASE64
-        .decode(&transaction.serializedBase64)
-        .map_err(|error| format!("Failed to decode compiled transaction: {error}"))?;
-    Ok(bs58::encode(bytes).into_string())
-}
-
-#[allow(dead_code)]
-async fn fetch_helius_priority_estimate_for_serialized_transaction(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    helius_priority_level: &str,
-    request_id: &str,
-    serialized_transaction: &str,
-) -> Result<Option<u64>, String> {
-    record_outbound_provider_http_request();
-    let payload = client
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "getPriorityFeeEstimate",
-            "params": [{
-                "transaction": serialized_transaction,
-                "options": helius_fee_estimate_options(helius_priority_level)
-            }]
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("Helius serialized priority estimate request failed: {error}"))?
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Failed to decode Helius serialized fee estimate: {error}"))?;
-    if let Some(error) = payload.get("error") {
-        return Err(format!(
-            "Helius serialized priority estimate failed: {error}"
-        ));
-    }
-    let result = payload.get("result").unwrap_or(&payload);
-    Ok(parse_helius_priority_estimate_result(
-        result,
-        helius_priority_level,
-    ))
-}
-
-#[allow(dead_code)]
-async fn estimate_serialized_launch_priority_fee(
-    rpc_url: &str,
-    config: &NormalizedConfig,
-    transport_plan: &crate::transport::TransportPlan,
-    wallet_secret: &[u8],
-    creator_public_key: &str,
-) -> Result<Option<u64>, String> {
-    let probe_config = sanitized_serialized_priority_probe_config(config);
-
-    let native = compile_native_launch(NativeLaunchCompileRequest {
-        rpc_url,
-        config: &probe_config,
-        transport_plan,
-        wallet_secret,
-        built_at: now_timestamp_string(),
-        creator_public_key: creator_public_key.to_string(),
-        config_path: Some("Rust serialized fee probe".to_string()),
-        allow_ata_creation: true,
-        launch_blockhash_prime: None,
-    })
-    .await?
-    .ok_or_else(|| {
-        format!(
-            "Native {} compile is unavailable for serialized priority estimation.",
-            config.launchpad
-        )
-    })?;
-
-    let launch_transaction = native
-        .creation_transactions
-        .iter()
-        .find(|transaction| transaction.label == "launch")
-        .or_else(|| {
-            native
-                .compiled_transactions
-                .iter()
-                .find(|transaction| transaction.label == "launch")
-        })
-        .or_else(|| native.creation_transactions.first())
-        .or_else(|| native.compiled_transactions.first())
-        .ok_or_else(|| {
-            "No compiled launch transaction was available for fee estimation.".to_string()
-        })?;
-    let serialized_base58 = compiled_transaction_serialized_base58(launch_transaction)?;
-    let hel_priority_rpc = resolved_helius_priority_fee_rpc_url(rpc_url);
-    fetch_helius_priority_estimate_for_serialized_transaction(
-        shared_fee_market_http_client(),
-        &hel_priority_rpc,
-        &auto_fee_helius_priority_level(),
-        "launchdeck-helius-priority-estimate-serialized-launch",
-        &serialized_base58,
-    )
-    .await
-}
-
 fn helius_sender_ping_endpoint_url(endpoint_url: &str) -> String {
     let trimmed = endpoint_url.trim().trim_end_matches('/');
     if let Some(prefix) = trimmed.strip_suffix("/fast") {
@@ -2819,6 +2777,104 @@ fn spawn_engine_blockhash_refresh_task(
             } else {
                 tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL).await;
             }
+        }
+    });
+}
+
+fn log_vanity_pool_startup_format_diagnostics(status: &Value) {
+    let Some(launchpads) = status.get("launchpads").and_then(Value::as_array) else {
+        return;
+    };
+    let mut total_problem_lines = 0usize;
+    let mut diagnostics = Vec::new();
+    for launchpad in launchpads {
+        let invalid = launchpad
+            .get("invalid")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        let duplicates = launchpad
+            .get("duplicates")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as usize;
+        if invalid == 0 && duplicates == 0 {
+            continue;
+        }
+        total_problem_lines =
+            total_problem_lines.saturating_add(invalid.saturating_add(duplicates));
+        let launchpad_name = launchpad
+            .get("launchpad")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        for diagnostic in launchpad
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let line = diagnostic
+                .get("line")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let code = diagnostic
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid");
+            if code != "invalid" && code != "duplicate" {
+                continue;
+            }
+            let message = diagnostic
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Invalid vanity queue entry.");
+            diagnostics.push(format!("{launchpad_name}.txt line {line}: {message}"));
+        }
+    }
+    if total_problem_lines == 0 {
+        return;
+    }
+    let summary = format!(
+        "Vanity queue format warning: {total_problem_lines} invalid or duplicate line(s) were found. These entries will be skipped until fixed."
+    );
+    eprintln!("{summary}");
+    for diagnostic in diagnostics.iter().take(12) {
+        eprintln!("  - {diagnostic}");
+    }
+    if diagnostics.len() > 12 {
+        eprintln!(
+            "  - ... {} more vanity queue diagnostic(s).",
+            diagnostics.len().saturating_sub(12)
+        );
+    }
+    record_warn(
+        "vanity-pool",
+        summary,
+        Some(json!({
+            "diagnostics": diagnostics,
+        })),
+    );
+}
+
+fn spawn_vanity_pool_refresh_task(rpc_url: String) {
+    match preload_vanity_pool() {
+        Ok(status) => log_vanity_pool_startup_format_diagnostics(&status),
+        Err(error) => {
+            record_warn(
+                "vanity-pool",
+                format!("Vanity pool preload failed: {error}"),
+                None,
+            );
+        }
+    }
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = refresh_vanity_pool_with_rpc(&rpc_url).await {
+                record_warn(
+                    "vanity-pool",
+                    format!("Vanity pool background refresh failed: {error}"),
+                    None,
+                );
+            }
+            tokio::time::sleep(VANITY_POOL_REFRESH_INTERVAL).await;
         }
     });
 }
@@ -3265,6 +3321,7 @@ async fn compile_same_time_snipes(
     launch_creator: &str,
     snipes: &[crate::config::NormalizedFollowLaunchSnipe],
     allow_ata_creation: bool,
+    bags_launch: Option<&crate::follow::BagsLaunchMetadata>,
 ) -> Result<Vec<CompiledTransaction>, String> {
     let (predicted_dev_buy_tokens, predicted_dev_buy_quote_amount, pump_cashback_enabled) =
         resolve_predicted_creator_dev_buy_effect(rpc_url, normalized).await?;
@@ -3289,6 +3346,7 @@ async fn compile_same_time_snipes(
                 predicted_dev_buy_tokens,
                 predicted_dev_buy_quote_amount,
                 pump_cashback_enabled,
+                bags_launch,
                 normalized.wrapperDefaultFeeBps,
             )
             .await?;
@@ -3425,6 +3483,7 @@ async fn compile_presigned_follow_actions(
                     predicted_dev_buy_tokens,
                     predicted_dev_buy_quote_amount,
                     pump_cashback_enabled,
+                    None,
                     normalized.wrapperDefaultFeeBps,
                 )
                 .await?;
@@ -3501,6 +3560,12 @@ async fn build_status_payload(
         .get("runtimeWorkers")
         .cloned()
         .unwrap_or(Value::Array(vec![]));
+    payload["vanityQueues"] = vanity_pool_status_payload().unwrap_or_else(|error| {
+        json!({
+            "ok": false,
+            "error": error,
+        })
+    });
     Ok(payload)
 }
 
@@ -3654,6 +3719,15 @@ async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
     if idle_suspended_without_inflight(state, follow_active_jobs) {
         clear_outbound_provider_http_traffic();
     }
+    let warm = warm_state_payload(state, follow_active_jobs);
+    let mut diagnostics = runtime_diagnostics_from_warm_payload(&warm);
+    let vanity_queues = vanity_pool_status_payload().unwrap_or_else(|error| {
+        json!({
+            "ok": false,
+            "error": error,
+        })
+    });
+    diagnostics.extend(runtime_diagnostics_from_vanity_status(&vanity_queues));
     json!({
         "ok": true,
         "service": "launchdeck-engine",
@@ -3671,11 +3745,140 @@ async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
         "nativeFallbacks": {
             "bagsapp": bags_runtime_status_payload(),
         },
-        "warm": warm_state_payload(state, follow_active_jobs),
+        "warm": warm,
+        "vanityQueues": vanity_queues,
+        "diagnostics": diagnostics,
         "autoFee": shared_fee_market_status_payload(shared_fee_market_runtime(&configured_rpc_url()).config()),
         "runtimeWorkers": runtime_workers,
         "rpcTraffic": rpc_traffic_snapshot(),
     })
+}
+
+fn diagnostic_host(target: &str) -> Option<String> {
+    reqwest::Url::parse(target.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+}
+
+fn runtime_diagnostics_from_warm_payload(warm: &Value) -> Vec<Value> {
+    let mut diagnostics = Vec::new();
+    for field in ["stateTargets", "endpointTargets", "watchTargets"] {
+        let Some(targets) = warm.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for target in targets {
+            if target.get("active").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let has_error = target
+                .get("lastError")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if !has_error {
+                continue;
+            }
+            let label = target
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("warm target");
+            let target_url = target.get("target").and_then(Value::as_str).unwrap_or("");
+            let endpoint_kind = if label.eq_ignore_ascii_case("Warm RPC") {
+                "warm-rpc"
+            } else {
+                "provider"
+            };
+            let env_var = None;
+            let recovered_by_primary =
+                endpoint_kind == "warm-rpc"
+                    && targets.iter().any(|candidate| {
+                        candidate.get("label").and_then(Value::as_str).is_some_and(
+                            |candidate_label| candidate_label.eq_ignore_ascii_case("Primary RPC"),
+                        ) && candidate.get("active").and_then(Value::as_bool) != Some(false)
+                            && candidate
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .is_some_and(|status| status.eq_ignore_ascii_case("healthy"))
+                            && !candidate
+                                .get("lastError")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .is_some_and(|value| !value.is_empty())
+                    });
+            let host = diagnostic_host(target_url);
+            let fingerprint = format!(
+                "launchdeck-engine:{}:{}:{}:{}",
+                endpoint_kind,
+                env_var.unwrap_or(""),
+                host.as_deref().unwrap_or(""),
+                if recovered_by_primary {
+                    "warm_endpoint_failed_primary_used"
+                } else {
+                    "provider_degraded"
+                }
+            );
+            diagnostics.push(json!({
+                "key": fingerprint,
+                "fingerprint": fingerprint,
+                "severity": if endpoint_kind == "provider" || recovered_by_primary { "warning" } else { "critical" },
+                "source": "launchdeck-engine",
+                "code": if recovered_by_primary { "warm_endpoint_failed_primary_used" } else if endpoint_kind == "provider" { "provider_degraded" } else { "warm_endpoint_failed" },
+                "message": if recovered_by_primary { format!("{label} is degraded; using primary fallback.") } else { format!("{label} is degraded.") },
+                "detail": format!("{label} reported an error. Check the configured endpoint or provider key."),
+                "envVar": env_var,
+                "endpointKind": endpoint_kind,
+                "host": host,
+                "active": true,
+                "restartRequired": endpoint_kind == "warm-rpc" || endpoint_kind == "warm-ws",
+                "firstSeenAtMs": target.get("lastErrorAtMs").and_then(Value::as_u64).unwrap_or_else(|| current_time_ms() as u64),
+                "lastSeenAtMs": target.get("lastErrorAtMs").and_then(Value::as_u64).unwrap_or_else(|| current_time_ms() as u64),
+            }));
+        }
+    }
+    diagnostics
+}
+
+fn runtime_diagnostics_from_vanity_status(status: &Value) -> Vec<Value> {
+    let mut diagnostics = Vec::new();
+    let Some(launchpads) = status.get("launchpads").and_then(Value::as_array) else {
+        return diagnostics;
+    };
+    for launchpad in launchpads {
+        let launchpad_name = launchpad
+            .get("launchpad")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        for diagnostic in launchpad
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let code = diagnostic
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid");
+            if code != "invalid" && code != "duplicate" {
+                continue;
+            }
+            let line = diagnostic
+                .get("line")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let message = diagnostic
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Invalid vanity queue entry.");
+            diagnostics.push(json!({
+                "severity": "warning",
+                "source": "vanity-pool",
+                "code": format!("vanity_queue_{code}"),
+                "message": format!("{launchpad_name}.txt line {line}: {message}"),
+                "restartRequired": false,
+            }));
+        }
+    }
+    diagnostics
 }
 
 fn build_region_routing_payload() -> Value {
@@ -4154,6 +4357,7 @@ async fn execute_engine_action_payload(
         compile_timings: compile_breakdown,
         mint: compiled_mint,
         launch_creator: compiled_launch_creator,
+        vanity_reservation,
         bags_fee_estimate: _,
     } = native;
     let mut compiled_transaction_wallet_keys =
@@ -4931,6 +5135,7 @@ async fn execute_engine_action_payload(
                 &compiled_launch_creator,
                 &same_time_snipes,
                 action == "send",
+                None,
             )
             .await
             .map_err(|error| {
@@ -5011,6 +5216,16 @@ async fn execute_engine_action_payload(
                 derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64)
             })
             .unwrap_or_default();
+        mark_vanity_reservation_used(vanity_reservation.as_ref(), None).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("Failed to mark queued vanity mint as used before submit: {error}"),
+                    "traceId": trace.traceId.clone(),
+                })),
+            )
+        })?;
         let submit_started_ms = current_time_ms();
         let (mut launch_sent, mut warnings, submit_ms) = if same_time_independent_compiled
             .is_empty()
@@ -5344,6 +5559,7 @@ async fn execute_engine_action_payload(
                 &compiled_launch_creator,
                 &same_time_snipes,
                 true,
+                bags_launch_follow.as_ref(),
             )
             .await
             {
@@ -6667,7 +6883,7 @@ async fn api_startup_warm(
                 "provider": attempt.provider,
                 "label": attempt.label,
                 "target": attempt.target,
-                "ok": matches!(attempt.result, WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)),
+                "ok": matches!(attempt.result, WarmAttemptResult::Success),
                 "rateLimited": matches!(attempt.result, WarmAttemptResult::RateLimited(_)),
                 "error": match &attempt.result {
                     WarmAttemptResult::Success => None::<String>,
@@ -6683,7 +6899,7 @@ async fn api_startup_warm(
             json!({
                 "label": attempt.label,
                 "target": attempt.target,
-                "ok": matches!(attempt.result, WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)),
+                "ok": matches!(attempt.result, WarmAttemptResult::Success),
                 "rateLimited": matches!(attempt.result, WarmAttemptResult::RateLimited(_)),
                 "error": match &attempt.result {
                     WarmAttemptResult::Success => None::<String>,
@@ -6897,7 +7113,14 @@ async fn api_startup_warm(
             },
         ),
     ];
-    if should_prewarm_primary_rpc_separately(&main_rpc_url, &rpc_url) {
+    let warm_startup_state_failed = startup_attempts.iter().any(|attempt| {
+        attempt.category == "state"
+            && attempt.target == rpc_url
+            && matches!(attempt.result, WarmAttemptResult::Error(_))
+    });
+    if (warm_startup_state_failed && main_rpc_url.trim() != rpc_url.trim())
+        || should_prewarm_primary_rpc_separately(&main_rpc_url, &rpc_url)
+    {
         let primary_rpc_result = prewarm_rpc_endpoint(&main_rpc_url).await;
         startup_attempts.push(build_warm_target_attempt(
             "state",
@@ -7832,6 +8055,18 @@ async fn api_vanity_validate(
     })))
 }
 
+async fn api_vanity_status() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    vanity_pool_status_payload().map(Json).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+    })
+}
+
 async fn static_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(requested): AxumPath<String>,
@@ -7964,6 +8199,7 @@ mod tests {
     use super::*;
     use crate::follow::{FOLLOW_RESPONSE_SCHEMA_VERSION, FollowJobRecord, FollowJobState};
     use crate::report::FollowActionTimings;
+    use shared_fee_market::parse_helius_priority_estimate_result;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -8798,6 +9034,140 @@ mod tests {
     }
 
     #[test]
+    fn watch_target_diagnostics_are_provider_warnings_not_warm_ws() {
+        let warm = json!({
+            "stateTargets": [
+                {
+                    "label": "Primary RPC",
+                    "status": "healthy",
+                    "target": "https://rpc.example.test",
+                    "lastError": null
+                }
+            ],
+            "watchTargets": [
+                {
+                    "label": "Watcher WS",
+                    "status": "degraded",
+                    "target": "wss://watch.example.test/path?api-key=secret",
+                    "lastError": "connect failed",
+                    "lastErrorAtMs": 42
+                }
+            ]
+        });
+
+        let diagnostics = runtime_diagnostics_from_warm_payload(&warm);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].get("endpointKind").and_then(Value::as_str),
+            Some("provider")
+        );
+        assert_eq!(
+            diagnostics[0].get("envVar").unwrap_or(&Value::Null),
+            &Value::Null
+        );
+        assert_eq!(
+            diagnostics[0]
+                .get("restartRequired")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let fingerprint = diagnostics[0]
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(!fingerprint.contains("secret"));
+    }
+
+    #[test]
+    fn primary_rpc_diagnostic_is_not_reported_as_warm_rpc() {
+        let warm = json!({
+            "stateTargets": [
+                {
+                    "label": "Primary RPC",
+                    "status": "degraded",
+                    "target": "https://rpc.example.test/path?api-key=secret",
+                    "lastError": "request failed",
+                    "lastErrorAtMs": 42,
+                    "active": true
+                }
+            ]
+        });
+
+        let diagnostics = runtime_diagnostics_from_warm_payload(&warm);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].get("endpointKind").and_then(Value::as_str),
+            Some("provider")
+        );
+        assert_eq!(
+            diagnostics[0].get("envVar").unwrap_or(&Value::Null),
+            &Value::Null
+        );
+        let fingerprint = diagnostics[0]
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(!fingerprint.contains("secret"));
+    }
+
+    #[test]
+    fn inactive_warm_targets_do_not_emit_runtime_diagnostics() {
+        let warm = json!({
+            "stateTargets": [
+                {
+                    "label": "Warm RPC",
+                    "status": "degraded",
+                    "target": "https://warm.example.test",
+                    "lastError": "old failure",
+                    "lastErrorAtMs": 42,
+                    "active": false
+                }
+            ]
+        });
+
+        let diagnostics = runtime_diagnostics_from_warm_payload(&warm);
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inactive_primary_target_does_not_downgrade_warm_rpc_diagnostic() {
+        let warm = json!({
+            "stateTargets": [
+                {
+                    "label": "Warm RPC",
+                    "status": "degraded",
+                    "target": "https://warm.example.test",
+                    "lastError": "warm failed",
+                    "lastErrorAtMs": 42,
+                    "active": true
+                },
+                {
+                    "label": "Primary RPC",
+                    "status": "healthy",
+                    "target": "https://rpc.example.test",
+                    "lastError": null,
+                    "active": false
+                }
+            ]
+        });
+
+        let diagnostics = runtime_diagnostics_from_warm_payload(&warm);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].get("severity").and_then(Value::as_str),
+            Some("critical")
+        );
+        assert_eq!(
+            diagnostics[0].get("code").and_then(Value::as_str),
+            Some("warm_endpoint_failed")
+        );
+    }
+
+    #[test]
     fn stale_in_flight_warm_pass_is_detected() {
         let timeout_ms = u128::from(configured_continuous_warm_pass_timeout_ms());
         let now_ms = current_time_ms();
@@ -9116,17 +9486,17 @@ mod tests {
     }
 
     #[test]
-    fn total_auto_fee_cap_errors_when_tip_floor_leaves_no_priority_budget() {
-        let err = resolve_auto_fee_components_with_total_cap(
+    fn total_auto_fee_cap_allows_exact_provider_tip_floor() {
+        let (priority, tip) = resolve_auto_fee_components_with_total_cap(
             Some(700_000),
             Some(200_000),
             Some(1_000_000),
             "hellomoon",
             "Creation",
         )
-        .expect_err("cap should leave room above provider minimum tip");
-        assert!(err.contains("must be greater than"));
-        assert!(err.contains("hellomoon"));
+        .expect("cap equal to provider minimum tip should resolve");
+        assert_eq!(priority, Some(1));
+        assert_eq!(tip, Some(1_000_000));
     }
 
     #[tokio::test]
@@ -9196,7 +9566,8 @@ async fn main() {
         })),
     });
     spawn_fee_market_snapshot_refresh_task(state.clone(), rpc_url.clone());
-    spawn_engine_blockhash_refresh_task(state.clone(), rpc_url, "confirmed");
+    spawn_engine_blockhash_refresh_task(state.clone(), rpc_url.clone(), "confirmed");
+    spawn_vanity_pool_refresh_task(rpc_url);
     spawn_follow_job_activity_refresh_task(state.clone());
     spawn_continuous_warm_task(state.clone());
     spawn_startup_outbox_flush_task("launchdeck-engine");
@@ -9242,6 +9613,7 @@ async fn main() {
         .route("/api/images/delete", post(api_image_delete))
         .route("/api/vamp", post(api_vamp_import))
         .route("/api/vanity/validate", post(api_vanity_validate))
+        .route("/api/vanity/status", get(api_vanity_status))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authorized_api_request,

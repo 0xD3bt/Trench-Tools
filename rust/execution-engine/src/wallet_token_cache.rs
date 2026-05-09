@@ -1,10 +1,10 @@
 //! Tiny subscriber-backed per-wallet/per-mint token balance cache.
 //!
 //! The `balance_stream` crate already owns a persistent websocket that
-//! emits `StreamEvent::Balance` events containing per-ATA token
-//! amounts whenever the user's focused mints change. This module
-//! consumes those events and keeps a small `(env_key, mint)` → `(ui
-//! amount, decimals, at_ms)` map so the trade hot path can avoid the
+//! emits confirmed `StreamEvent::TokenBalanceCache` events containing
+//! per-ATA token amounts whenever the user's focused mints change. This
+//! module consumes those events and keeps a small `(env_key, mint)` →
+//! `(ui amount, decimals, at_ms)` map so the trade hot path can avoid the
 //! `getTokenAccountsByOwner` RPC round-trip when the balance is still
 //! reasonably fresh.
 //!
@@ -126,10 +126,9 @@ pub async fn fetch_token_balance_with_cache(
     fetch_token_balance_via_ata(owner, mint, decimals, "confirmed").await
 }
 
-/// Spawn a background task that consumes `StreamEvent::Balance` events
-/// from the shared balance stream and records any per-mint token
-/// balances we see. Safe to call multiple times — only the first call
-/// actually spawns.
+/// Spawn a background task that consumes confirmed per-mint token
+/// balance events from the shared balance stream. Safe to call multiple
+/// times — only the first call actually spawns.
 pub fn ensure_subscriber(stream: &BalanceStreamHandle) {
     static SPAWNED: OnceLock<()> = OnceLock::new();
     if SPAWNED.set(()).is_err() {
@@ -140,7 +139,23 @@ pub fn ensure_subscriber(stream: &BalanceStreamHandle) {
     tokio::spawn(async move {
         loop {
             match events.recv().await {
+                Ok(StreamEvent::TokenBalanceCache(payload)) => {
+                    if payload.commitment != "confirmed"
+                        || payload.env_key.is_empty()
+                        || payload.token_mint.is_empty()
+                        || !payload.token_balance.is_finite()
+                        || payload.token_balance < 0.0
+                    {
+                        continue;
+                    }
+                    cache
+                        .record(&payload.env_key, &payload.token_mint, payload.token_balance)
+                        .await;
+                }
                 Ok(StreamEvent::Balance(payload)) => {
+                    if payload.commitment.as_deref() != Some("confirmed") {
+                        continue;
+                    }
                     if let (Some(mint), Some(balance)) =
                         (payload.token_mint.as_ref(), payload.token_balance)
                     {

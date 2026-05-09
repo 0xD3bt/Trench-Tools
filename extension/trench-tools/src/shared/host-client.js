@@ -2,8 +2,7 @@ import {
   DEFAULT_HOST_BASE,
   DEFAULT_LAUNCHDECK_HOST_BASE,
   HOST_AUTH_TOKEN_STORAGE_KEY,
-  HOST_STORAGE_KEY,
-  LAUNCHDECK_HOST_STORAGE_KEY
+  HOST_STORAGE_KEY
 } from "./constants.js";
 
 export function normalizeHostBase(hostBase) {
@@ -60,11 +59,6 @@ export async function setHostAuthToken(token) {
 }
 
 export async function getLaunchdeckHostBase() {
-  return DEFAULT_LAUNCHDECK_HOST_BASE;
-}
-
-export async function setLaunchdeckHostBase(_hostBase) {
-  await chrome.storage.local.remove(LAUNCHDECK_HOST_STORAGE_KEY);
   return DEFAULT_LAUNCHDECK_HOST_BASE;
 }
 

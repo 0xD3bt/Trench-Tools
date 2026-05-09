@@ -4,9 +4,7 @@ use crate::{
         TradeSettlementAsset, TradeSide,
     },
     mint_warm_cache::{WarmFingerprint, build_fingerprint, shared_mint_warm_cache},
-    rollout::{
-        allow_non_canonical_pool_trades, runtime_execution_backend, wrapper_fee_vault_pubkey,
-    },
+    rollout::{allow_non_canonical_pool_trades, wrapper_fee_vault_pubkey},
     route_index::{RouteIndexKey, shared_route_index},
     rpc_client::{
         CompiledTransaction, SentResult, configured_rpc_url,
@@ -15,25 +13,27 @@ use crate::{
         submit_independent_transactions_for_transport,
     },
     trade_dispatch::{
-        TradeDispatchPlan, TransactionDependencyMode, adapter_for_selector,
+        CompiledAdapterTrade, TradeDispatchPlan, TransactionDependencyMode, adapter_for_selector,
         compile_trade_for_adapter, resolve_trade_plan, resolve_trade_plan_fresh,
     },
-    trade_planner::LifecycleAndCanonicalMarket,
+    trade_planner::{LifecycleAndCanonicalMarket, TradeVenueFamily},
     transport::{ExecutionTransportConfig, TransportPlan, build_transport_plan},
     wallet_store::load_solana_wallet_by_env_key,
     warming_service::shared_warming_service,
     wrapper_adapter::allowed_inner_program_pubkeys,
     wrapper_compile::{
-        WrapCompiledTransactionError, WrapCompiledTransactionRequest, wrap_compiled_transaction,
+        WrapCompiledTransactionError, WrapCompiledTransactionRequest, estimate_sol_in_fee_lamports,
+        validate_already_wrapped_transaction, wrap_compiled_transaction,
     },
     wrapper_payload::{
         WrapperInstructionPayload, WrapperRouteClassification, build_wrapper_instruction_payload,
-        classify_trade_route, trade_touches_sol,
+        classify_trade_route, format_lamports_as_sol, parse_sol_amount_to_lamports,
+        trade_touches_sol,
     },
 };
 use serde_json::{Value, json};
-use solana_sdk::signature::Signer;
-use std::collections::BTreeSet;
+use solana_sdk::signature::{Keypair, Signer};
+use std::{collections::BTreeSet, time::Instant};
 
 const SHARED_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc";
 const DEFAULT_TRADE_EXECUTION_HARD_TIMEOUT: std::time::Duration =
@@ -94,11 +94,24 @@ pub struct CompiledTradePlan {
     pub warm_invalidation_fingerprints: Vec<WarmFingerprint>,
     pub wrapper_route: WrapperRouteClassification,
     pub wrapper_payload: Option<WrapperInstructionPayload>,
+    pub wrapper_fee_plan: RuntimeWrapperFeePlan,
     pub transport_plan: TransportPlan,
     pub transactions: Vec<CompiledTransaction>,
     pub primary_tx_index: usize,
     pub dependency_mode: TransactionDependencyMode,
     pub entry_preference_asset: Option<TradeSettlementAsset>,
+    pub compile_metrics: crate::route_metrics::RouteMetricsSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeWrapperFeePlan {
+    pub is_trade_leg: bool,
+    pub fee_bps: u16,
+    pub side: TradeSide,
+    pub route: WrapperRouteClassification,
+    pub fee_asset: &'static str,
+    pub route_conversion: bool,
+    pub passthrough_allowed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -122,28 +135,243 @@ pub async fn compile_wallet_trade(
     compile_wallet_trade_with_route_mode(request, wallet_key, false).await
 }
 
+fn request_with_net_wrapper_buy_input(
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    wrapper_route: WrapperRouteClassification,
+    wrapper_payload: Option<&WrapperInstructionPayload>,
+) -> Result<TradeRuntimeRequest, String> {
+    if !matches!(request.side, TradeSide::Buy)
+        || !matches!(wrapper_route, WrapperRouteClassification::SolIn)
+        || adapter_builds_wrapped_gross_sol_route(selector, request, wrapper_route)
+    {
+        return Ok(request.clone());
+    }
+    let Some(payload) = wrapper_payload else {
+        return Ok(request.clone());
+    };
+    let gross = payload.route_metadata.gross_sol_in_lamports;
+    if gross == 0 {
+        return Ok(request.clone());
+    }
+    let fee = estimate_sol_in_fee_lamports(gross, payload.route_metadata.fee_bps);
+    let net = gross
+        .checked_sub(fee)
+        .ok_or_else(|| "Wrapper buy fee exceeds gross SOL input.".to_string())?;
+    if net == 0 {
+        return Err("Wrapper buy net venue input resolves to zero after fee.".to_string());
+    }
+    let original = request
+        .buy_amount_sol
+        .as_deref()
+        .map(parse_sol_amount_to_lamports)
+        .unwrap_or(0);
+    if original != gross {
+        return Err("Wrapper buy gross SOL input drifted from request amount.".to_string());
+    }
+    let mut adjusted = request.clone();
+    adjusted.buy_amount_sol = Some(format_lamports_as_sol(net));
+    Ok(adjusted)
+}
+
+fn adapter_builds_wrapped_gross_sol_route(
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    wrapper_route: WrapperRouteClassification,
+) -> bool {
+    matches!(request.side, TradeSide::Buy)
+        && matches!(wrapper_route, WrapperRouteClassification::SolIn)
+        && (matches!(
+            selector.family,
+            crate::trade_planner::TradeVenueFamily::BonkRaydium
+                | crate::trade_planner::TradeVenueFamily::BonkLaunchpad
+        ) && matches!(
+            selector.quote_asset,
+            crate::trade_planner::PlannerQuoteAsset::Usd1
+        ) || matches!(
+            selector.family,
+            crate::trade_planner::TradeVenueFamily::MeteoraDbc
+                | crate::trade_planner::TradeVenueFamily::MeteoraDammV2
+        ) && matches!(
+            selector.quote_asset,
+            crate::trade_planner::PlannerQuoteAsset::Usdc
+        ))
+}
+
+fn wrapper_inner_program_diagnostic_label(
+    selector: &LifecycleAndCanonicalMarket,
+    transactions: &[CompiledTransaction],
+) -> String {
+    let has_meteora_usdc_route = transactions
+        .iter()
+        .any(|transaction| transaction.label.starts_with("meteora-usdc"));
+    if has_meteora_usdc_route {
+        return match selector.family {
+            crate::trade_planner::TradeVenueFamily::MeteoraDbc => {
+                "raydium-clmm+meteora-dbc".to_string()
+            }
+            crate::trade_planner::TradeVenueFamily::MeteoraDammV2 => {
+                "raydium-clmm+meteora-damm-v2".to_string()
+            }
+            _ => crate::wrapper_adapter::inner_program_label_for_selector(selector)
+                .unwrap_or("<unknown>")
+                .to_string(),
+        };
+    }
+    crate::wrapper_adapter::inner_program_label_for_selector(selector)
+        .unwrap_or("<unknown>")
+        .to_string()
+}
+
+fn selector_allows_native_no_sol_trade(selector: &LifecycleAndCanonicalMarket) -> bool {
+    matches!(
+        selector.family,
+        crate::trade_planner::TradeVenueFamily::TrustedStableSwap
+    )
+}
+
+fn validate_compiled_adapter_trade(transactions: &CompiledAdapterTrade) -> Result<(), String> {
+    if transactions.transactions.is_empty() {
+        return Err("Trade compiler did not return any transactions.".to_string());
+    }
+    if transactions.primary_tx_index >= transactions.transactions.len() {
+        return Err(format!(
+            "Trade compiler returned invalid primary transaction index {} for {} transaction(s).",
+            transactions.primary_tx_index,
+            transactions.transactions.len()
+        ));
+    }
+    Ok(())
+}
+
 async fn compile_wallet_trade_with_route_mode(
     request: &TradeRuntimeRequest,
     wallet_key: &str,
     force_fresh_route: bool,
 ) -> Result<CompiledTradePlan, String> {
     let rpc_url = configured_rpc_url();
+    let wrapper_request = normalize_request_for_wrapper_trade(request);
+    let route_conversion = wrapper_request.policy.buy_funding_policy
+        != request.policy.buy_funding_policy
+        || wrapper_request.policy.sell_settlement_policy != request.policy.sell_settlement_policy
+        || wrapper_request.policy.sell_settlement_asset != request.policy.sell_settlement_asset;
     let dispatch_plan = if force_fresh_route {
-        let mut reroute_request = request.clone();
+        let mut reroute_request = wrapper_request.clone();
         reroute_request.planned_route = None;
         reroute_request.planned_trade = None;
         reroute_request.warm_key = None;
         resolve_trade_plan_fresh(&reroute_request).await?
-    } else if let Some(planned_route) = request.planned_route.clone() {
-        reuse_or_refresh_planned_route(&rpc_url, request, planned_route).await?
-    } else if let Some(selector) = request.planned_trade.clone() {
-        reuse_or_refresh_planned_selector(&rpc_url, request, selector).await?
+    } else if let Some(planned_route) = wrapper_request.planned_route.clone() {
+        reuse_or_refresh_planned_route(&rpc_url, &wrapper_request, planned_route).await?
+    } else if let Some(selector) = wrapper_request.planned_trade.clone() {
+        reuse_or_refresh_planned_selector(&rpc_url, &wrapper_request, selector).await?
     } else {
-        resolve_trade_plan(request).await?
+        resolve_trade_plan(&wrapper_request).await?
     };
-    let normalized_request = normalize_request_for_dispatch_plan(request, &dispatch_plan);
+    let wrapper_normalized_request =
+        normalize_request_for_dispatch_plan(&wrapper_request, &dispatch_plan);
+    let wrapper_route = classify_trade_route(&dispatch_plan.selector, &wrapper_normalized_request);
+    if !wrapper_route.touches_sol() && selector_allows_native_no_sol_trade(&dispatch_plan.selector)
+    {
+        let normalized_request = normalize_request_for_dispatch_plan(request, &dispatch_plan);
+        let warm_invalidation_fingerprints =
+            warm_invalidation_fingerprints(request, &normalized_request, &rpc_url);
+        shared_warming_service()
+            .cache_selector(
+                &rpc_url,
+                &normalized_request.policy.commitment,
+                side_label(&normalized_request.side),
+                &route_policy_label(&normalized_request),
+                &normalized_request.mint,
+                normalized_request.pinned_pool.as_deref(),
+                allow_non_canonical_pool_trades(),
+                dispatch_plan.selector.clone(),
+            )
+            .await;
+        let (transactions_result, compile_metrics) =
+            crate::route_metrics::collect_route_metrics(async {
+                let adapter_started_at = Instant::now();
+                let result = compile_trade_for_adapter(
+                    dispatch_plan.adapter,
+                    &dispatch_plan.selector,
+                    &normalized_request,
+                    wallet_key,
+                )
+                .await;
+                crate::route_metrics::record_phase_ms(
+                    "adapter_compile",
+                    adapter_started_at.elapsed().as_millis(),
+                );
+                result
+            })
+            .await;
+        let transactions = transactions_result?;
+        validate_compiled_adapter_trade(&transactions)?;
+        let transport_plan = build_transport_plan(
+            &ExecutionTransportConfig {
+                provider: normalized_request.policy.provider.clone(),
+                endpoint_profile: normalized_request.policy.endpoint_profile.clone(),
+                commitment: normalized_request.policy.commitment.clone(),
+                skip_preflight: normalized_request.policy.skip_preflight,
+                track_send_block_height: normalized_request.policy.track_send_block_height,
+                mev_mode: crate::launchdeck_bridge::to_launchdeck_execution(
+                    &normalized_request.policy,
+                )
+                .mevMode,
+                mev_protect: !matches!(normalized_request.policy.mev_mode, MevMode::Off),
+            },
+            transactions.transactions.len(),
+        );
+        validate_transport_for_compiled_trade(
+            &transport_plan,
+            transactions.dependency_mode,
+            transactions.transactions.len(),
+        )?;
+        eprintln!(
+            "[execution-engine][trade-runtime] compile wallet={} mint={} family={} market={} provider={} transport={} endpoint_profile={} pinned_pool={:?} warm_key={:?} native_no_sol=true",
+            wallet_key,
+            normalized_request.mint,
+            dispatch_plan.selector.family.label(),
+            dispatch_plan.selector.canonical_market_key,
+            normalized_request.policy.provider,
+            transport_plan.transport_type,
+            transport_plan.resolved_endpoint_profile,
+            normalized_request.pinned_pool,
+            normalized_request.warm_key,
+        );
+        validate_runtime_shared_alt_boundary(
+            &dispatch_plan.selector,
+            dispatch_plan.adapter.label(),
+            &transactions.transactions,
+        )?;
+        return Ok(CompiledTradePlan {
+            adapter: dispatch_plan.adapter.label(),
+            execution_backend: "native",
+            selector: dispatch_plan.selector,
+            normalized_request,
+            warm_invalidation_fingerprints,
+            wrapper_route,
+            wrapper_payload: None,
+            wrapper_fee_plan: RuntimeWrapperFeePlan {
+                is_trade_leg: false,
+                fee_bps: 0,
+                side: request.side.clone(),
+                route: wrapper_route,
+                fee_asset: "none",
+                route_conversion: false,
+                passthrough_allowed: true,
+            },
+            transport_plan,
+            transactions: transactions.transactions,
+            primary_tx_index: transactions.primary_tx_index,
+            dependency_mode: transactions.dependency_mode,
+            entry_preference_asset: transactions.entry_preference_asset,
+            compile_metrics,
+        });
+    }
+    let normalized_request = wrapper_normalized_request;
     let warm_invalidation_fingerprints =
-        warm_invalidation_fingerprints(request, &normalized_request, &rpc_url);
+        warm_invalidation_fingerprints(&wrapper_request, &normalized_request, &rpc_url);
     shared_warming_service()
         .cache_selector(
             &rpc_url,
@@ -156,41 +384,128 @@ async fn compile_wallet_trade_with_route_mode(
             dispatch_plan.selector.clone(),
         )
         .await;
-    let transactions = compile_trade_for_adapter(
-        dispatch_plan.adapter,
-        &dispatch_plan.selector,
-        &normalized_request,
-        wallet_key,
-    )
-    .await?;
-    if transactions.transactions.is_empty() {
-        return Err("Trade compiler did not return any transactions.".to_string());
-    }
-    if transactions.primary_tx_index >= transactions.transactions.len() {
+    if !wrapper_route.touches_sol() {
         return Err(format!(
-            "Trade compiler returned invalid primary transaction index {} for {} transaction(s).",
-            transactions.primary_tx_index,
-            transactions.transactions.len()
+            "Trade route cannot be routed through the Trench wrapper: side={} family={} quote={:?} policy={}.",
+            side_label(&normalized_request.side),
+            dispatch_plan.selector.family.label(),
+            dispatch_plan.selector.quote_asset,
+            route_policy_label(&normalized_request)
         ));
     }
-    let transport_plan = build_transport_plan(
-        &ExecutionTransportConfig {
-            provider: normalized_request.policy.provider.clone(),
-            endpoint_profile: normalized_request.policy.endpoint_profile.clone(),
-            commitment: normalized_request.policy.commitment.clone(),
-            skip_preflight: normalized_request.policy.skip_preflight,
-            track_send_block_height: normalized_request.policy.track_send_block_height,
-            mev_mode: crate::launchdeck_bridge::to_launchdeck_execution(&normalized_request.policy)
-                .mevMode,
-            mev_protect: !matches!(normalized_request.policy.mev_mode, MevMode::Off),
-        },
-        transactions.transactions.len(),
-    );
-    validate_transport_for_compiled_trade(
-        &transport_plan,
-        transactions.dependency_mode,
-        transactions.transactions.len(),
+    let wrapper_payer = load_solana_wallet_by_env_key(wallet_key)?;
+    let wallet_pubkey = wrapper_payer.pubkey().to_string();
+    let wrapper_payload = Some(build_wrapper_instruction_payload(
+        &dispatch_plan.selector,
+        &normalized_request,
+        wallet_pubkey,
+    ));
+    let adapter_request = request_with_net_wrapper_buy_input(
+        &dispatch_plan.selector,
+        &normalized_request,
+        wrapper_route,
+        wrapper_payload.as_ref(),
     )?;
+    let (compile_result, compile_metrics) = crate::route_metrics::collect_route_metrics(async {
+        let adapter_started_at = Instant::now();
+        let transactions = compile_trade_for_adapter(
+            dispatch_plan.adapter,
+            &dispatch_plan.selector,
+            &adapter_request,
+            wallet_key,
+        )
+        .await?;
+        crate::route_metrics::record_phase_ms(
+            "adapter_compile",
+            adapter_started_at.elapsed().as_millis(),
+        );
+        validate_compiled_adapter_trade(&transactions)?;
+        let transport_plan_started_at = Instant::now();
+        let transport_plan = build_transport_plan(
+            &ExecutionTransportConfig {
+                provider: normalized_request.policy.provider.clone(),
+                endpoint_profile: normalized_request.policy.endpoint_profile.clone(),
+                commitment: normalized_request.policy.commitment.clone(),
+                skip_preflight: normalized_request.policy.skip_preflight,
+                track_send_block_height: normalized_request.policy.track_send_block_height,
+                mev_mode: crate::launchdeck_bridge::to_launchdeck_execution(
+                    &normalized_request.policy,
+                )
+                .mevMode,
+                mev_protect: !matches!(normalized_request.policy.mev_mode, MevMode::Off),
+            },
+            transactions.transactions.len(),
+        );
+        crate::route_metrics::record_phase_ms(
+            "transport_plan",
+            transport_plan_started_at.elapsed().as_millis(),
+        );
+        validate_transport_for_compiled_trade(
+            &transport_plan,
+            transactions.dependency_mode,
+            transactions.transactions.len(),
+        )?;
+        validate_runtime_shared_alt_boundary(
+            &dispatch_plan.selector,
+            dispatch_plan.adapter.label(),
+            &transactions.transactions,
+        )?;
+        let wrapper_inner_program_label = wrapper_inner_program_diagnostic_label(
+            &dispatch_plan.selector,
+            &transactions.transactions,
+        );
+        let wrapper_fee_plan = RuntimeWrapperFeePlan {
+            is_trade_leg: true,
+            fee_bps: wrapper_payload
+                .as_ref()
+                .map(|payload| payload.route_metadata.fee_bps)
+                .unwrap_or_else(crate::rollout::wrapper_default_fee_bps),
+            side: normalized_request.side.clone(),
+            route: wrapper_route,
+            fee_asset: "sol/wsol",
+            route_conversion,
+            passthrough_allowed: false,
+        };
+        let wrapper_started_at = Instant::now();
+        let final_transactions = wrap_native_transactions(
+            &dispatch_plan.selector,
+            &normalized_request,
+            &transactions.transactions,
+            transactions.primary_tx_index,
+            &wrapper_payer,
+            &wrapper_payload,
+            wrapper_route,
+        )
+        .await?;
+        crate::route_metrics::record_phase_ms(
+            "wrapper_compile",
+            wrapper_started_at.elapsed().as_millis(),
+        );
+        Ok::<
+            (
+                CompiledAdapterTrade,
+                TransportPlan,
+                String,
+                RuntimeWrapperFeePlan,
+                Vec<CompiledTransaction>,
+            ),
+            String,
+        >((
+            transactions,
+            transport_plan,
+            wrapper_inner_program_label,
+            wrapper_fee_plan,
+            final_transactions,
+        ))
+    })
+    .await;
+    let (
+        transactions,
+        transport_plan,
+        wrapper_inner_program_label,
+        wrapper_fee_plan,
+        final_transactions,
+    ) = compile_result?;
     eprintln!(
         "[execution-engine][trade-runtime] compile wallet={} mint={} family={} market={} provider={} transport={} endpoint_profile={} pinned_pool={:?} warm_key={:?}",
         wallet_key,
@@ -203,60 +518,19 @@ async fn compile_wallet_trade_with_route_mode(
         normalized_request.pinned_pool,
         normalized_request.warm_key,
     );
-    validate_runtime_shared_alt_boundary(
-        &dispatch_plan.selector,
-        dispatch_plan.adapter.label(),
-        &transactions.transactions,
-    )?;
-    let wallet_pubkey = load_solana_wallet_by_env_key(wallet_key)?
-        .pubkey()
-        .to_string();
-    let wrapper_route = classify_trade_route(&dispatch_plan.selector, &normalized_request);
-    let wrapper_payload = if wrapper_route.touches_sol() {
-        Some(build_wrapper_instruction_payload(
-            &dispatch_plan.selector,
-            &normalized_request,
-            wallet_pubkey,
-        ))
-    } else {
-        None
-    };
-    let wrapper_inner_program_label = if wrapper_route.touches_sol() {
-        crate::wrapper_adapter::inner_program_label_for_selector(&dispatch_plan.selector)
-            .unwrap_or("<unknown>")
-    } else {
-        "<none>"
-    };
     eprintln!(
-        "[execution-engine][trade-runtime] wrapper-classify wallet={} mint={} family={} route={} touches_sol={} inner_program={}",
+        "[execution-engine][trade-runtime] wrapper-classify wallet={} mint={} family={} route={} fee_bps={} route_conversion={} touches_sol={} inner_program={}",
         wallet_key,
         normalized_request.mint,
         dispatch_plan.selector.family.label(),
         wrapper_route.label(),
+        wrapper_fee_plan.fee_bps,
+        wrapper_fee_plan.route_conversion,
         wrapper_route.touches_sol(),
         wrapper_inner_program_label
     );
 
-    // Route SOL-touching trades through the wrapper program.
-    let final_transactions = if wrapper_route.touches_sol() {
-        wrap_native_transactions(
-            &dispatch_plan.selector,
-            &normalized_request,
-            &transactions.transactions,
-            wallet_key,
-            &wrapper_payload,
-            wrapper_route,
-        )
-        .await?
-    } else {
-        transactions.transactions
-    };
-
-    let execution_backend = if wrapper_route.touches_sol() {
-        "wrapper"
-    } else {
-        runtime_execution_backend().label()
-    };
+    let execution_backend = "wrapper";
 
     Ok(CompiledTradePlan {
         adapter: dispatch_plan.adapter.label(),
@@ -266,11 +540,13 @@ async fn compile_wallet_trade_with_route_mode(
         warm_invalidation_fingerprints,
         wrapper_route,
         wrapper_payload,
+        wrapper_fee_plan,
         transport_plan,
         transactions: final_transactions,
         primary_tx_index: transactions.primary_tx_index,
         dependency_mode: transactions.dependency_mode,
         entry_preference_asset: transactions.entry_preference_asset,
+        compile_metrics,
     })
 }
 
@@ -279,25 +555,27 @@ async fn wrap_native_transactions(
     selector: &LifecycleAndCanonicalMarket,
     normalized_request: &TradeRuntimeRequest,
     transactions: &[CompiledTransaction],
-    wallet_key: &str,
+    primary_tx_index: usize,
+    payer: &Keypair,
     wrapper_payload: &Option<WrapperInstructionPayload>,
     wrapper_route: WrapperRouteClassification,
 ) -> Result<Vec<CompiledTransaction>, String> {
     let rpc_url = configured_rpc_url();
     let fee_vault = wrapper_fee_vault_pubkey();
-    let payer = load_solana_wallet_by_env_key(wallet_key)?;
     let lookup_tables = crate::pump_native::load_shared_super_lookup_tables(&rpc_url).await?;
     let allowed_programs = allowed_inner_program_pubkeys();
 
     // Missing payload falls back to a zeroed SolOut estimate.
     let (route_kind, fee_bps, gross_sol_in, min_net_output) = match wrapper_payload {
         Some(payload) => {
-            let req = &payload.request;
+            let metadata = &payload.route_metadata;
             (
-                req.route_kind,
-                req.fee_bps,
-                req.gross_sol_in_lamports,
-                req.min_net_output,
+                payload.route_classification.to_abi().ok_or_else(|| {
+                    "Internal error: wrapper payload cannot wrap NoSol route".to_string()
+                })?,
+                metadata.fee_bps,
+                metadata.gross_sol_in_lamports,
+                metadata.min_net_output,
             )
         }
         None => {
@@ -316,7 +594,7 @@ async fn wrap_native_transactions(
     };
 
     let mut wrapped = Vec::with_capacity(transactions.len());
-    for source in transactions {
+    for (index, source) in transactions.iter().enumerate() {
         let request = WrapCompiledTransactionRequest {
             label: source.label.clone(),
             route_kind,
@@ -338,15 +616,68 @@ async fn wrap_native_transactions(
         };
         match wrap_compiled_transaction(source, &payer, &lookup_tables, &allowed_programs, &request)
         {
-            Ok(tx) => wrapped.push(tx),
+            Ok(tx) => {
+                if index != primary_tx_index {
+                    return Err(format!(
+                        "Wrapper wrap refused non-primary venue transaction {} (mint={}, family={}): multiple trade legs require per-leg wrapper payloads.",
+                        source.label,
+                        normalized_request.mint,
+                        selector.family.label()
+                    ));
+                }
+                wrapped.push(tx);
+            }
             Err(WrapCompiledTransactionError::NoVenueInstruction) => {
-                // Non-venue transactions stay unchanged.
+                if index == primary_tx_index {
+                    return Err(format!(
+                        "Wrapper wrap failed for primary trade transaction {} (mint={}, family={}): {}",
+                        source.label,
+                        normalized_request.mint,
+                        selector.family.label(),
+                        WrapCompiledTransactionError::NoVenueInstruction
+                    ));
+                }
+                // Setup-only/non-venue transactions stay unchanged.
                 eprintln!(
-                    "[execution-engine][wrapper-wrap] skip label={} reason=no_venue_instruction family={}",
+                    "[execution-engine][wrapper-wrap] setup-passthrough label={} reason=no_venue_instruction family={}",
                     source.label,
                     selector.family.label()
                 );
                 wrapped.push(source.clone());
+            }
+            Err(WrapCompiledTransactionError::AlreadyWrapped)
+                if allow_already_wrapped_passthrough(selector, &source.label, wrapper_route) =>
+            {
+                validate_already_wrapped_transaction(
+                    source,
+                    &payer.pubkey(),
+                    &lookup_tables,
+                    &request,
+                )
+                .map_err(|error| {
+                    format!(
+                        "Wrapper wrap refused already-wrapped transaction {} (mint={}, family={}): {}",
+                        source.label,
+                        normalized_request.mint,
+                        selector.family.label(),
+                        error
+                    )
+                })?;
+                eprintln!(
+                    "[execution-engine][wrapper-wrap] passthrough label={} reason=already_wrapped_dynamic_route family={}",
+                    source.label,
+                    selector.family.label()
+                );
+                wrapped.push(source.clone());
+            }
+            Err(WrapCompiledTransactionError::AlreadyWrapped) => {
+                return Err(format!(
+                    "Wrapper wrap refused already-wrapped transaction {} (mint={}, family={}): {}",
+                    source.label,
+                    normalized_request.mint,
+                    selector.family.label(),
+                    WrapCompiledTransactionError::AlreadyWrapped
+                ));
             }
             Err(error) => {
                 return Err(format!(
@@ -360,6 +691,34 @@ async fn wrap_native_transactions(
         }
     }
     Ok(wrapped)
+}
+
+fn allow_already_wrapped_passthrough(
+    selector: &LifecycleAndCanonicalMarket,
+    source_label: &str,
+    wrapper_route: WrapperRouteClassification,
+) -> bool {
+    let bonk_dynamic = matches!(
+        selector.family,
+        crate::trade_planner::TradeVenueFamily::BonkRaydium
+            | crate::trade_planner::TradeVenueFamily::BonkLaunchpad
+    ) && matches!(
+        (source_label, wrapper_route),
+        ("follow-buy-atomic", WrapperRouteClassification::SolIn)
+            | ("follow-sell", WrapperRouteClassification::SolOut)
+    );
+    let meteora_usdc_dynamic = matches!(
+        selector.family,
+        crate::trade_planner::TradeVenueFamily::MeteoraDbc
+            | crate::trade_planner::TradeVenueFamily::MeteoraDammV2
+    ) && matches!(
+        (source_label, wrapper_route),
+        ("meteora-usdc-buy", WrapperRouteClassification::SolIn)
+            | ("meteora-usdc-damm-buy", WrapperRouteClassification::SolIn)
+            | ("meteora-usdc-sell", WrapperRouteClassification::SolOut)
+            | ("meteora-usdc-damm-sell", WrapperRouteClassification::SolOut)
+    );
+    bonk_dynamic || meteora_usdc_dynamic
 }
 
 pub fn trade_request_touches_sol(
@@ -585,6 +944,29 @@ fn normalize_request_for_dispatch_plan(
     normalized
 }
 
+fn normalize_request_for_wrapper_trade(request: &TradeRuntimeRequest) -> TradeRuntimeRequest {
+    let mut normalized = request.clone();
+    let original_policy = normalized.policy.clone();
+    match normalized.side {
+        TradeSide::Buy => {
+            normalized.policy.buy_funding_policy = BuyFundingPolicy::SolOnly;
+        }
+        TradeSide::Sell => {
+            normalized.policy.sell_settlement_policy = SellSettlementPolicy::AlwaysToSol;
+            normalized.policy.sell_settlement_asset = TradeSettlementAsset::Sol;
+        }
+    }
+    if normalized.policy.buy_funding_policy != original_policy.buy_funding_policy
+        || normalized.policy.sell_settlement_policy != original_policy.sell_settlement_policy
+        || normalized.policy.sell_settlement_asset != original_policy.sell_settlement_asset
+    {
+        normalized.planned_route = None;
+        normalized.planned_trade = None;
+        normalized.warm_key = None;
+    }
+    normalized
+}
+
 fn warm_invalidation_fingerprints(
     request: &TradeRuntimeRequest,
     normalized_request: &TradeRuntimeRequest,
@@ -617,6 +999,47 @@ fn stale_route_error_class(error: &str) -> Option<&'static str> {
         Some("canonical_damm_pool_not_found")
     } else if normalized.contains("no Pump AMM WSOL pool was found") {
         Some("pump_amm_missing_after_completion")
+    } else {
+        None
+    }
+}
+
+fn pump_creator_vault_auto_retry_enabled() -> bool {
+    match std::env::var("EXECUTION_ENGINE_ENABLE_PUMP_CREATOR_VAULT_AUTO_RETRY") {
+        Ok(value) => parse_bool_like_env(&value).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+fn parse_bool_like_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn pump_creator_vault_retry_error_class(
+    error: &str,
+    family: &TradeVenueFamily,
+) -> Option<&'static str> {
+    if !matches!(family, TradeVenueFamily::PumpBondingCurve)
+        || !pump_creator_vault_auto_retry_enabled()
+    {
+        return None;
+    }
+    let normalized = error.to_ascii_lowercase();
+    let has_creator_vault_context = normalized.contains("creator_vault")
+        || normalized.contains("constraintseeds")
+        || normalized.contains("seeds constraint was violated");
+    let has_custom_2006 = normalized.contains("\"custom\":2006")
+        || normalized.contains("\"custom\": 2006")
+        || normalized.contains("custom:2006")
+        || normalized.contains("custom: 2006")
+        || normalized.contains("error number: 2006")
+        || normalized.contains("custom program error: 0x7d6");
+    if has_custom_2006 || has_creator_vault_context {
+        Some("pump_creator_vault_constraint_seeds")
     } else {
         None
     }
@@ -788,6 +1211,8 @@ fn selector_requires_shared_alt(selector: &LifecycleAndCanonicalMarket) -> bool 
         crate::trade_planner::TradeVenueFamily::PumpBondingCurve
             | crate::trade_planner::TradeVenueFamily::PumpAmm
             | crate::trade_planner::TradeVenueFamily::RaydiumAmmV4
+            | crate::trade_planner::TradeVenueFamily::RaydiumCpmm
+            | crate::trade_planner::TradeVenueFamily::RaydiumLaunchLab
             | crate::trade_planner::TradeVenueFamily::BonkLaunchpad
             | crate::trade_planner::TradeVenueFamily::BonkRaydium
             | crate::trade_planner::TradeVenueFamily::MeteoraDbc
@@ -915,15 +1340,32 @@ fn sell_settlement_asset_label(asset: TradeSettlementAsset) -> &'static str {
 }
 
 fn route_policy_label(request: &TradeRuntimeRequest) -> String {
+    let fee_bps = crate::rollout::wrapper_default_fee_bps();
     match request.side {
         TradeSide::Buy => format!(
-            "buy:{}",
-            buy_funding_policy_label(request.policy.buy_funding_policy)
+            "buy:{}:wrapper_fee_bps={}:conversion={}",
+            buy_funding_policy_label(request.policy.buy_funding_policy),
+            fee_bps,
+            route_policy_conversion_label(request)
         ),
         TradeSide::Sell => format!(
-            "sell:{}",
-            sell_settlement_asset_label(request.policy.sell_settlement_asset)
+            "sell:{}:wrapper_fee_bps={}:conversion={}",
+            sell_settlement_asset_label(request.policy.sell_settlement_asset),
+            fee_bps,
+            route_policy_conversion_label(request)
         ),
+    }
+}
+
+fn route_policy_conversion_label(request: &TradeRuntimeRequest) -> &'static str {
+    match request.side {
+        TradeSide::Buy if request.policy.buy_funding_policy != BuyFundingPolicy::SolOnly => {
+            "to_sol_in"
+        }
+        TradeSide::Sell if request.policy.sell_settlement_asset != TradeSettlementAsset::Sol => {
+            "to_sol_out"
+        }
+        _ => "none",
     }
 }
 
@@ -934,7 +1376,7 @@ fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
-// Retry only on stale-route errors that happen before a signed tx lands.
+// Retry narrowly classified stale routes plus Pump creator-vault seed races.
 pub async fn execute_wallet_trade(
     request: TradeRuntimeRequest,
     wallet_key: String,
@@ -945,18 +1387,23 @@ pub async fn execute_wallet_trade(
     tokio::time::timeout(trade_execution_timeout, async move {
         let rpc_url = configured_rpc_url();
         let mut rerouted_once = false;
+        let mut creator_vault_retry_used = false;
         let mut active_request = request.clone();
         loop {
             let compile_started_at = now_unix_ms();
+            let force_fresh_route = rerouted_once || creator_vault_retry_used;
             let compiled = match compile_wallet_trade_with_route_mode(
                 &active_request,
                 &wallet_key,
-                rerouted_once,
+                force_fresh_route,
             )
             .await
             {
                 Ok(compiled) => compiled,
                 Err(error) => {
+                    if creator_vault_retry_used {
+                        return Err(error);
+                    }
                     if !rerouted_once && let Some(error_class) = stale_route_error_class(&error) {
                         eprintln!(
                             "[execution-engine][trade-runtime] stale-route retry phase=compile class={} address={}",
@@ -970,16 +1417,28 @@ pub async fn execute_wallet_trade(
                     return Err(error);
                 }
             };
+            let compile_elapsed_ms = now_unix_ms().saturating_sub(compile_started_at);
             eprintln!(
                 "[execution-engine][latency] phase=compile wallet={} mint={} family={} compile_ms={}",
                 wallet_key,
                 compiled.normalized_request.mint,
                 compiled.selector.family.label(),
-                now_unix_ms().saturating_sub(compile_started_at)
+                compile_elapsed_ms
+            );
+            eprintln!(
+            "[execution-engine][route-metrics] phase=compile wallet={} mint={} family={} elapsed_ms={} rpc_total={} rpc_methods={} phase_ms={}",
+                wallet_key,
+                compiled.normalized_request.mint,
+                compiled.selector.family.label(),
+                compiled.compile_metrics.elapsed_ms,
+                compiled.compile_metrics.rpc_total(),
+            compiled.compile_metrics.rpc_methods_json(),
+            compiled.compile_metrics.phases_json()
             );
             let entry_preference_asset = compiled.entry_preference_asset;
             let normalized_request = compiled.normalized_request.clone();
             let warm_invalidation_fingerprints = compiled.warm_invalidation_fingerprints.clone();
+            let selector_family = compiled.selector.family.clone();
             let execute_started_at = now_unix_ms();
             match execute_compiled_trade(compiled).await {
                 Ok(signature) => {
@@ -999,6 +1458,9 @@ pub async fn execute_wallet_trade(
                     });
                 }
                 Err(error) => {
+                    if creator_vault_retry_used {
+                        return Err(error);
+                    }
                     if !rerouted_once && let Some(error_class) = stale_route_error_class(&error) {
                         eprintln!(
                             "[execution-engine][trade-runtime] stale-route retry phase=execute class={} address={}",
@@ -1013,6 +1475,24 @@ pub async fn execute_wallet_trade(
                         .await;
                         active_request = reroute_request_after_stale_error(&active_request);
                         rerouted_once = true;
+                        continue;
+                    }
+                    if let Some(error_class) =
+                        pump_creator_vault_retry_error_class(&error, &selector_family)
+                    {
+                        eprintln!(
+                            "[execution-engine][trade-runtime] pump-creator-vault retry phase=execute class={} address={}",
+                            error_class, normalized_request.mint
+                        );
+                        invalidate_route_retry_caches(
+                            &active_request,
+                            Some(&normalized_request),
+                            &warm_invalidation_fingerprints,
+                            &rpc_url,
+                        )
+                        .await;
+                        active_request = reroute_request_after_stale_error(&active_request);
+                        creator_vault_retry_used = true;
                         continue;
                     }
                     return Err(error);
@@ -1072,6 +1552,12 @@ mod tests {
         PlannerQuoteAsset, PlannerVerificationSource, TradeLifecycle, TradeVenueFamily,
         WrapperAction,
     };
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn sample_runtime_request() -> TradeRuntimeRequest {
         TradeRuntimeRequest {
@@ -1114,6 +1600,23 @@ mod tests {
             market_subtype: None,
             direct_protocol_target: Some("raydium".to_string()),
             input_amount_hint: Some("0.5".to_string()),
+            minimum_output_hint: None,
+            runtime_bundle: None,
+        }
+    }
+
+    fn sample_direct_stable_selector() -> LifecycleAndCanonicalMarket {
+        LifecycleAndCanonicalMarket {
+            lifecycle: TradeLifecycle::PostMigration,
+            family: TradeVenueFamily::TrustedStableSwap,
+            canonical_market_key: "stable-pool-1".to_string(),
+            quote_asset: PlannerQuoteAsset::Usdc,
+            verification_source: PlannerVerificationSource::OnchainDerived,
+            wrapper_action: WrapperAction::TrustedStableSwapBuy,
+            wrapper_accounts: vec!["stable-pool-1".to_string()],
+            market_subtype: Some("raydium-clmm".to_string()),
+            direct_protocol_target: Some("raydium-clmm".to_string()),
+            input_amount_hint: None,
             minimum_output_hint: None,
             runtime_bundle: None,
         }
@@ -1222,6 +1725,189 @@ mod tests {
         assert_eq!(normalized.mint, "Mint111");
         assert_eq!(normalized.pinned_pool.as_deref(), Some("Pool222"));
         assert_eq!(normalized.warm_key.as_deref(), Some("warm-1"));
+    }
+
+    #[test]
+    fn normalize_request_for_wrapper_trade_converts_non_sol_buy_and_clears_cached_route() {
+        let mut request = sample_runtime_request();
+        request.policy.buy_funding_policy = BuyFundingPolicy::Usd1Only;
+        request.planned_trade = Some(sample_selector());
+        request.warm_key = Some("old-non-feeable-warm-key".to_string());
+
+        let normalized = normalize_request_for_wrapper_trade(&request);
+
+        assert_eq!(
+            normalized.policy.buy_funding_policy,
+            BuyFundingPolicy::SolOnly
+        );
+        assert!(normalized.planned_trade.is_none());
+        assert!(normalized.warm_key.is_none());
+    }
+
+    #[test]
+    fn trusted_stable_no_sol_routes_are_native_direct_eligible() {
+        let request = sample_runtime_request();
+        let selector = sample_direct_stable_selector();
+
+        assert_eq!(
+            classify_trade_route(&selector, &request),
+            WrapperRouteClassification::NoSol
+        );
+        assert!(selector_allows_native_no_sol_trade(&selector));
+        assert!(!selector_allows_native_no_sol_trade(&sample_selector()));
+    }
+
+    #[test]
+    fn wrapper_buy_adapter_request_uses_net_venue_input() {
+        let request = sample_runtime_request();
+        let mut selector = sample_selector();
+        selector.quote_asset = PlannerQuoteAsset::Sol;
+        let gross = 500_000_000;
+        let payload = WrapperInstructionPayload {
+            route_classification: WrapperRouteClassification::SolIn,
+            route_metadata: crate::wrapper_payload::WrapperRouteMetadata {
+                version: crate::wrapper_abi::ABI_VERSION,
+                route_mode: Some(crate::wrapper_abi::SwapRouteMode::SolIn),
+                direction: Some(crate::wrapper_abi::SwapRouteDirection::Buy),
+                settlement: Some(crate::wrapper_abi::SwapRouteSettlement::Token),
+                fee_mode: Some(crate::wrapper_abi::SwapRouteFeeMode::SolPre),
+                fee_bps: 10,
+                gross_sol_in_lamports: gross,
+                gross_token_in_amount: 0,
+                min_net_output: 0,
+            },
+            fee_lamports_estimate: 500_000,
+            gross_sol_in_lamports: gross,
+        };
+
+        let adjusted = request_with_net_wrapper_buy_input(
+            &selector,
+            &request,
+            WrapperRouteClassification::SolIn,
+            Some(&payload),
+        )
+        .expect("adjust");
+
+        assert_eq!(adjusted.buy_amount_sol.as_deref(), Some("0.4995"));
+    }
+
+    #[test]
+    fn wrapper_buy_adapter_request_preserves_bonk_usd1_gross_input() {
+        let request = sample_runtime_request();
+        let gross = 500_000_000;
+        let payload = WrapperInstructionPayload {
+            route_classification: WrapperRouteClassification::SolIn,
+            route_metadata: crate::wrapper_payload::WrapperRouteMetadata {
+                version: crate::wrapper_abi::ABI_VERSION,
+                route_mode: Some(crate::wrapper_abi::SwapRouteMode::SolIn),
+                direction: Some(crate::wrapper_abi::SwapRouteDirection::Buy),
+                settlement: Some(crate::wrapper_abi::SwapRouteSettlement::Token),
+                fee_mode: Some(crate::wrapper_abi::SwapRouteFeeMode::SolPre),
+                fee_bps: 10,
+                gross_sol_in_lamports: gross,
+                gross_token_in_amount: 0,
+                min_net_output: 0,
+            },
+            fee_lamports_estimate: 500_000,
+            gross_sol_in_lamports: gross,
+        };
+
+        let adjusted = request_with_net_wrapper_buy_input(
+            &sample_selector(),
+            &request,
+            WrapperRouteClassification::SolIn,
+            Some(&payload),
+        )
+        .expect("adjust");
+
+        assert_eq!(adjusted.buy_amount_sol.as_deref(), Some("0.5"));
+    }
+
+    #[test]
+    fn already_wrapped_passthrough_is_limited_to_known_dynamic_routes() {
+        let bonk = sample_selector();
+        assert!(allow_already_wrapped_passthrough(
+            &bonk,
+            "follow-buy-atomic",
+            WrapperRouteClassification::SolIn
+        ));
+        assert!(allow_already_wrapped_passthrough(
+            &bonk,
+            "follow-sell",
+            WrapperRouteClassification::SolOut
+        ));
+        assert!(!allow_already_wrapped_passthrough(
+            &bonk,
+            "follow-buy",
+            WrapperRouteClassification::SolIn
+        ));
+
+        let mut meteora = bonk.clone();
+        meteora.family = TradeVenueFamily::MeteoraDammV2;
+        meteora.quote_asset = PlannerQuoteAsset::Usdc;
+        assert!(allow_already_wrapped_passthrough(
+            &meteora,
+            "meteora-usdc-damm-buy",
+            WrapperRouteClassification::SolIn
+        ));
+        assert!(allow_already_wrapped_passthrough(
+            &meteora,
+            "meteora-usdc-damm-sell",
+            WrapperRouteClassification::SolOut
+        ));
+        assert!(!allow_already_wrapped_passthrough(
+            &meteora,
+            "follow-buy",
+            WrapperRouteClassification::SolIn
+        ));
+
+        let mut pump = bonk.clone();
+        pump.family = TradeVenueFamily::PumpBondingCurve;
+        assert!(!allow_already_wrapped_passthrough(
+            &pump,
+            "follow-buy-atomic",
+            WrapperRouteClassification::SolIn
+        ));
+    }
+
+    #[test]
+    fn normalize_request_for_wrapper_trade_converts_non_sol_sell_and_clears_cached_route() {
+        let mut request = sample_runtime_request();
+        request.side = TradeSide::Sell;
+        request.buy_amount_sol = None;
+        request.sell_intent = Some(RuntimeSellIntent::Percent("100".to_string()));
+        request.policy.sell_settlement_policy = SellSettlementPolicy::AlwaysToUsd1;
+        request.policy.sell_settlement_asset = TradeSettlementAsset::Usd1;
+        request.planned_trade = Some(sample_selector());
+        request.warm_key = Some("old-non-feeable-warm-key".to_string());
+
+        let normalized = normalize_request_for_wrapper_trade(&request);
+
+        assert_eq!(
+            normalized.policy.sell_settlement_policy,
+            SellSettlementPolicy::AlwaysToSol
+        );
+        assert_eq!(
+            normalized.policy.sell_settlement_asset,
+            TradeSettlementAsset::Sol
+        );
+        assert!(normalized.planned_trade.is_none());
+        assert!(normalized.warm_key.is_none());
+    }
+
+    #[test]
+    fn route_policy_label_includes_fee_tier_and_conversion_state() {
+        let mut request = sample_runtime_request();
+        request.policy.buy_funding_policy = BuyFundingPolicy::Usd1Only;
+        let buy_label = route_policy_label(&request);
+        assert!(buy_label.contains("wrapper_fee_bps="));
+        assert!(buy_label.contains("conversion=to_sol_in"));
+
+        request.side = TradeSide::Sell;
+        request.policy.sell_settlement_asset = TradeSettlementAsset::Usd1;
+        let sell_label = route_policy_label(&request);
+        assert!(sell_label.contains("wrapper_fee_bps="));
+        assert!(sell_label.contains("conversion=to_sol_out"));
     }
 
     #[test]
@@ -1351,6 +2037,71 @@ mod tests {
                 stale_route_error_class(error).is_none(),
                 "post-submit error must not be classified as stale-route: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn pump_creator_vault_retry_detects_pump_custom_2006() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("EXECUTION_ENGINE_ENABLE_PUMP_CREATOR_VAULT_AUTO_RETRY");
+        }
+        assert_eq!(
+            pump_creator_vault_retry_error_class(
+                r#"Transaction abc failed on-chain: {"InstructionError":[4,{"Custom":2006}]}"#,
+                &TradeVenueFamily::PumpBondingCurve,
+            ),
+            Some("pump_creator_vault_constraint_seeds")
+        );
+        assert_eq!(
+            pump_creator_vault_retry_error_class(
+                "Program log: AnchorError caused by account: creator_vault. Error Code: ConstraintSeeds. Error Number: 2006.",
+                &TradeVenueFamily::PumpBondingCurve,
+            ),
+            Some("pump_creator_vault_constraint_seeds")
+        );
+    }
+
+    #[test]
+    fn pump_creator_vault_retry_ignores_non_pump_or_non_2006_errors() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("EXECUTION_ENGINE_ENABLE_PUMP_CREATOR_VAULT_AUTO_RETRY");
+        }
+        assert_eq!(
+            pump_creator_vault_retry_error_class(
+                r#"Transaction abc failed on-chain: {"InstructionError":[4,{"Custom":2006}]}"#,
+                &TradeVenueFamily::PumpAmm,
+            ),
+            None
+        );
+        assert_eq!(
+            pump_creator_vault_retry_error_class(
+                r#"Transaction abc failed on-chain: {"InstructionError":[4,{"Custom":6003}]}"#,
+                &TradeVenueFamily::PumpBondingCurve,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pump_creator_vault_retry_respects_env_opt_out() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var(
+                "EXECUTION_ENGINE_ENABLE_PUMP_CREATOR_VAULT_AUTO_RETRY",
+                "false",
+            );
+        }
+        assert_eq!(
+            pump_creator_vault_retry_error_class(
+                r#"Transaction abc failed on-chain: {"InstructionError":[4,{"Custom":2006}]}"#,
+                &TradeVenueFamily::PumpBondingCurve,
+            ),
+            None
+        );
+        unsafe {
+            std::env::remove_var("EXECUTION_ENGINE_ENABLE_PUMP_CREATOR_VAULT_AUTO_RETRY");
         }
     }
 

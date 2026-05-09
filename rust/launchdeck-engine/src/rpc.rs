@@ -29,6 +29,9 @@ const HELIUS_SIGNATURE_STATUS_RECONCILE_INTERVAL_MS: u64 = 550;
 const SYSTEM_PROGRAM_ID_STR: &str = "11111111111111111111111111111111";
 pub const COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS: u64 = 20;
 const HELLOMOON_QUIC_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+const WARM_RPC_COOLDOWN_MS: u64 = 30_000;
+const WARM_RPC_WINDOW_MS: u64 = 1_000;
+const WARM_RPC_MAX_REQUESTS_PER_WINDOW: usize = 8;
 
 #[cfg(feature = "shared-transaction-submit-internal")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +317,164 @@ pub fn configured_warm_rpc_url(primary_rpc_url: &str) -> String {
         .unwrap_or_else(|| primary_rpc_url.to_string())
 }
 
+#[derive(Debug, Default)]
+struct WarmRpcCircuit {
+    cooldown_until: Option<Instant>,
+    recent_attempts: VecDeque<Instant>,
+}
+
+fn warm_rpc_circuits() -> &'static Mutex<HashMap<String, WarmRpcCircuit>> {
+    static CIRCUITS: OnceLock<Mutex<HashMap<String, WarmRpcCircuit>>> = OnceLock::new();
+    CIRCUITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn warm_rpc_method_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "getVersion"
+            | "getHealth"
+            | "getGenesisHash"
+            | "getEpochInfo"
+            | "getSlot"
+            | "getBlockHeight"
+            | "getLatestBlockhash"
+            | "isBlockhashValid"
+            | "getRecentPrioritizationFees"
+            | "getAccountInfo"
+            | "getMultipleAccounts"
+            | "getSignaturesForAddress"
+            | "getSignatureStatuses"
+            | "getTransaction"
+    )
+}
+
+pub fn warm_rpc_error_should_cooldown(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    [
+        "429",
+        "too many requests",
+        "rate limit",
+        "rate-limited",
+        "403",
+        "indexnotallowed",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn prune_warm_rpc_attempts(circuit: &mut WarmRpcCircuit, now: Instant) {
+    while circuit.recent_attempts.front().is_some_and(|attempt| {
+        now.duration_since(*attempt) >= Duration::from_millis(WARM_RPC_WINDOW_MS)
+    }) {
+        circuit.recent_attempts.pop_front();
+    }
+}
+
+pub fn warm_rpc_endpoint_available(endpoint: &str, method: &str) -> bool {
+    if !warm_rpc_method_allowed(method) {
+        return false;
+    }
+    let now = Instant::now();
+    let mut circuits = warm_rpc_circuits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(circuit) = circuits.get_mut(endpoint) else {
+        return true;
+    };
+    match circuit.cooldown_until {
+        Some(until) if until > now => false,
+        Some(_) => {
+            circuit.cooldown_until = None;
+            prune_warm_rpc_attempts(circuit, now);
+            circuit.recent_attempts.len() < WARM_RPC_MAX_REQUESTS_PER_WINDOW
+        }
+        None => {
+            prune_warm_rpc_attempts(circuit, now);
+            circuit.recent_attempts.len() < WARM_RPC_MAX_REQUESTS_PER_WINDOW
+        }
+    }
+}
+
+pub fn reserve_warm_rpc_call(endpoint: &str, method: &str) -> bool {
+    if !warm_rpc_method_allowed(method) {
+        return false;
+    }
+    let now = Instant::now();
+    let mut circuits = warm_rpc_circuits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let circuit = circuits.entry(endpoint.to_string()).or_default();
+    match circuit.cooldown_until {
+        Some(until) if until > now => return false,
+        Some(_) => circuit.cooldown_until = None,
+        None => {}
+    }
+    prune_warm_rpc_attempts(circuit, now);
+    if circuit.recent_attempts.len() >= WARM_RPC_MAX_REQUESTS_PER_WINDOW {
+        circuit.cooldown_until = Some(now + Duration::from_millis(WARM_RPC_WINDOW_MS));
+        return false;
+    }
+    circuit.recent_attempts.push_back(now);
+    true
+}
+
+pub fn record_warm_rpc_success(endpoint: &str) {
+    let mut circuits = warm_rpc_circuits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(circuit) = circuits.get_mut(endpoint) {
+        circuit.cooldown_until = None;
+    }
+}
+
+pub fn record_warm_rpc_failure(endpoint: &str, error: &str) {
+    if !warm_rpc_error_should_cooldown(error) {
+        return;
+    }
+    let mut circuits = warm_rpc_circuits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    circuits.insert(
+        endpoint.to_string(),
+        WarmRpcCircuit {
+            cooldown_until: Some(Instant::now() + Duration::from_millis(WARM_RPC_COOLDOWN_MS)),
+            recent_attempts: VecDeque::new(),
+        },
+    );
+}
+
+pub fn warm_rpc_cooldown_remaining_ms(endpoint: &str) -> Option<u64> {
+    let now = Instant::now();
+    let mut circuits = warm_rpc_circuits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let circuit = circuits.get_mut(endpoint)?;
+    match circuit.cooldown_until {
+        Some(until) if until > now => Some(
+            until
+                .duration_since(now)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        ),
+        Some(_) => {
+            circuit.cooldown_until = None;
+            None
+        }
+        None => None,
+    }
+}
+
+fn sampled_rpc_url(primary_rpc_url: &str, method: &str) -> String {
+    let warm_rpc_url = configured_warm_rpc_url(primary_rpc_url);
+    if warm_rpc_url != primary_rpc_url && warm_rpc_endpoint_available(&warm_rpc_url, method) {
+        warm_rpc_url
+    } else {
+        primary_rpc_url.to_string()
+    }
+}
+
 fn configured_block_height_cache_ttl() -> Duration {
     std::env::var("LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS")
         .ok()
@@ -331,32 +492,57 @@ fn configured_block_height_sample_max_age() -> Duration {
 }
 
 fn block_height_cache_lookup_key(rpc_url: &str, commitment: &str) -> String {
-    blockhash_cache_key(&configured_warm_rpc_url(rpc_url), commitment)
+    blockhash_cache_key(&sampled_rpc_url(rpc_url, "getBlockHeight"), commitment)
 }
 
 fn slot_cache_lookup_key(rpc_url: &str, commitment: &str) -> String {
-    blockhash_cache_key(&configured_warm_rpc_url(rpc_url), commitment)
+    blockhash_cache_key(&sampled_rpc_url(rpc_url, "getSlot"), commitment)
 }
 
 async fn refresh_block_height_sample(rpc_url: &str, commitment: &str) -> Result<u64, String> {
-    let block_height_rpc_url = configured_warm_rpc_url(rpc_url);
-    let cache_key = blockhash_cache_key(&block_height_rpc_url, commitment);
-    let result = rpc_request(
+    let warm_candidate = sampled_rpc_url(rpc_url, "getBlockHeight");
+    let block_height_rpc_url =
+        if warm_candidate != rpc_url && reserve_warm_rpc_call(&warm_candidate, "getBlockHeight") {
+            warm_candidate
+        } else {
+            rpc_url.to_string()
+        };
+    let (result, cache_rpc_url) = match rpc_request(
         &block_height_rpc_url,
         "getBlockHeight",
-        json!([
-            {
-                "commitment": commitment,
-            }
-        ]),
+        json!([{ "commitment": commitment }]),
     )
-    .await?;
+    .await
+    {
+        Ok(result) => {
+            if block_height_rpc_url != rpc_url {
+                record_warm_rpc_success(&block_height_rpc_url);
+            }
+            (result, block_height_rpc_url.as_str())
+        }
+        Err(error) if block_height_rpc_url != rpc_url => {
+            record_warm_rpc_failure(&block_height_rpc_url, &error);
+            eprintln!(
+                "[launchdeck-engine][rpc] warm RPC getBlockHeight unavailable; using primary sample"
+            );
+            (
+                rpc_request(
+                    rpc_url,
+                    "getBlockHeight",
+                    json!([{ "commitment": commitment }]),
+                )
+                .await?,
+                rpc_url,
+            )
+        }
+        Err(error) => return Err(error),
+    };
     let value = result
         .as_u64()
         .ok_or_else(|| "RPC getBlockHeight did not return a block height.".to_string())?;
     let mut cache = block_height_cache().lock().await;
     cache.insert(
-        cache_key,
+        blockhash_cache_key(cache_rpc_url, commitment),
         CachedBlockHeight {
             value,
             fetched_at: Instant::now(),
@@ -366,24 +552,44 @@ async fn refresh_block_height_sample(rpc_url: &str, commitment: &str) -> Result<
 }
 
 async fn refresh_slot_sample(rpc_url: &str, commitment: &str) -> Result<u64, String> {
-    let slot_rpc_url = configured_warm_rpc_url(rpc_url);
-    let cache_key = blockhash_cache_key(&slot_rpc_url, commitment);
-    let result = rpc_request(
+    let warm_candidate = sampled_rpc_url(rpc_url, "getSlot");
+    let slot_rpc_url =
+        if warm_candidate != rpc_url && reserve_warm_rpc_call(&warm_candidate, "getSlot") {
+            warm_candidate
+        } else {
+            rpc_url.to_string()
+        };
+    let (result, cache_rpc_url) = match rpc_request(
         &slot_rpc_url,
         "getSlot",
-        json!([
-            {
-                "commitment": commitment,
-            }
-        ]),
+        json!([{ "commitment": commitment }]),
     )
-    .await?;
+    .await
+    {
+        Ok(result) => {
+            if slot_rpc_url != rpc_url {
+                record_warm_rpc_success(&slot_rpc_url);
+            }
+            (result, slot_rpc_url.as_str())
+        }
+        Err(error) if slot_rpc_url != rpc_url => {
+            record_warm_rpc_failure(&slot_rpc_url, &error);
+            eprintln!(
+                "[launchdeck-engine][rpc] warm RPC getSlot unavailable; using primary sample"
+            );
+            (
+                rpc_request(rpc_url, "getSlot", json!([{ "commitment": commitment }])).await?,
+                rpc_url,
+            )
+        }
+        Err(error) => return Err(error),
+    };
     let value = result
         .as_u64()
         .ok_or_else(|| "RPC getSlot did not return a slot.".to_string())?;
     let mut cache = slot_cache().lock().await;
     cache.insert(
-        cache_key,
+        blockhash_cache_key(cache_rpc_url, commitment),
         CachedSlot {
             value,
             fetched_at: Instant::now(),
@@ -433,12 +639,20 @@ async fn fetch_sampled_block_height_snapshot(
     commitment: &str,
 ) -> Result<u64, String> {
     let cache_key = block_height_cache_lookup_key(rpc_url, commitment);
+    let primary_cache_key = blockhash_cache_key(rpc_url, commitment);
     let ttl = configured_block_height_cache_ttl();
     let sample_max_age = configured_block_height_sample_max_age();
     let cached = {
         let cache = block_height_cache().lock().await;
         cache
             .get(&cache_key)
+            .or_else(|| {
+                if primary_cache_key != cache_key {
+                    cache.get(&primary_cache_key)
+                } else {
+                    None
+                }
+            })
             .map(|entry| (entry.value, entry.fetched_at.elapsed()))
     };
     if let Some((value, age)) = cached {
@@ -455,12 +669,20 @@ async fn fetch_sampled_block_height_snapshot(
 
 async fn fetch_sampled_slot_snapshot(rpc_url: &str, commitment: &str) -> Result<u64, String> {
     let cache_key = slot_cache_lookup_key(rpc_url, commitment);
+    let primary_cache_key = blockhash_cache_key(rpc_url, commitment);
     let ttl = configured_block_height_cache_ttl();
     let sample_max_age = configured_block_height_sample_max_age();
     let cached = {
         let cache = slot_cache().lock().await;
         cache
             .get(&cache_key)
+            .or_else(|| {
+                if primary_cache_key != cache_key {
+                    cache.get(&primary_cache_key)
+                } else {
+                    None
+                }
+            })
             .map(|entry| (entry.value, entry.fetched_at.elapsed()))
     };
     if let Some((value, age)) = cached {

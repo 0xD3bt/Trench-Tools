@@ -71,7 +71,7 @@ Fill the practical starter values:
 - `SOLANA_WS_URL`
 - `USER_REGION`
 - `TRENCH_TOOL_FEE` only if you want to turn the voluntary fee off or increase it
-- `WARM_RPC_URL` if you want a separate warm/cache RPC
+- `WARM_RPC_URL` moves compatible warm/cache traffic off the primary RPC
 - `HELLOMOON_API_KEY` only if you want Hello Moon
 - `BAGS_API_KEY` only if you use Bags launchpad flows
 - `PINATA_JWT` only if you set `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
@@ -198,9 +198,23 @@ Before using real size:
 - auth token exists at `.local/trench-tools/default-engine-token.txt`
 - extension Options -> Global settings shows the expected host connection state
 - Axiom shows the enabled Trench Tools surfaces
+- the toolbar popup shows host status, active preset, wallet/group selection, and quick-buy amount
 - `j7tracker.io` is available in the codebase but currently disabled, so do not expect it to be live until re-enabled
 
 Start with a small test amount and the recommended providers: `Helius Sender` or `Hello Moon`.
+
+## First Extension Use
+
+For the first live test, keep the flow simple:
+
+1. Open the Trench Tools toolbar popup.
+2. Confirm it is connected to the host.
+3. Choose one execution preset.
+4. Choose one wallet or wallet group.
+5. Set a small quick-buy amount, or leave it blank and use the panel buttons.
+6. Open Axiom and refresh the page after changing Options.
+
+The popup and panel share the same selection. If you change the preset or wallets in the popup, the Axiom controls use that selection too.
 
 ## 8. Stop The Runtime
 

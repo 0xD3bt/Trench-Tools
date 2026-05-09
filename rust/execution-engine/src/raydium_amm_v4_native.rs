@@ -6,6 +6,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde_json::json;
 use shared_transaction_submit::{compiled_transaction_signers, fetch_multiple_account_data};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
@@ -74,6 +75,11 @@ const RAYDIUM_AMM_V4_SELL_COMPUTE_UNIT_LIMIT: u32 = 340_000;
 const HELIUS_SENDER_MIN_TIP_LAMPORTS: u64 = 200_000;
 const HELLO_MOON_MIN_TIP_LAMPORTS: u64 = 1_000_000;
 
+fn raydium_amm_v4_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RaydiumAmmV4PoolState {
     pubkey: Pubkey,
@@ -141,6 +147,49 @@ pub(crate) async fn plan_raydium_amm_v4_trade(
     let pool =
         enrich_raydium_amm_v4_pool_state(rpc_url, pool, &mint, &request.policy.commitment).await?;
     Ok(Some(build_raydium_amm_v4_selector(request, &pool)))
+}
+
+pub(crate) async fn plan_raydium_amm_v4_trade_for_pool_id(
+    rpc_url: &str,
+    request: &TradeRuntimeRequest,
+    pool_id: &Pubkey,
+) -> Result<Option<LifecycleAndCanonicalMarket>, String> {
+    let (owner, data) =
+        fetch_account_owner_and_data(rpc_url, &pool_id.to_string(), &request.policy.commitment)
+            .await?
+            .ok_or_else(|| format!("Raydium AMM v4 pool {pool_id} was not found."))?;
+    if owner != raydium_amm_v4_program_id()? {
+        return Ok(None);
+    }
+    let mint = parse_pubkey(&request.mint, "Raydium AMM v4 mint")?;
+    let pool = decode_raydium_amm_v4_pool_state(*pool_id, &data)?;
+    let pool =
+        enrich_raydium_amm_v4_pool_state(rpc_url, pool, &mint, &request.policy.commitment).await?;
+    Ok(Some(build_raydium_amm_v4_selector(request, &pool)))
+}
+
+pub(crate) async fn find_raydium_amm_v4_pool_for_pair(
+    rpc_url: &str,
+    mint: &Pubkey,
+    quote_mint: &Pubkey,
+    commitment: &str,
+) -> Result<Option<Pubkey>, String> {
+    let mut candidates = Vec::new();
+    for (left, right) in [(mint, quote_mint), (quote_mint, mint)] {
+        candidates.extend(
+            fetch_raydium_amm_v4_pools_for_ordered_pair(rpc_url, left, right, commitment).await?,
+        );
+    }
+    candidates.sort_by_key(|pool_id| pool_id.to_string());
+    candidates.dedup();
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [pool_id] => Ok(Some(*pool_id)),
+        _ => Err(format!(
+            "Multiple Raydium AMM v4 pools matched mint {} and quote {}; refusing ambiguous migrated LaunchLab route.",
+            mint, quote_mint
+        )),
+    }
 }
 
 pub(crate) async fn compile_raydium_amm_v4_trade(
@@ -332,7 +381,7 @@ pub(crate) async fn compile_raydium_amm_v4_trade(
             (None, None)
         };
     if matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure) {
-        apply_jitodontfront(&mut instructions)?;
+        apply_jitodontfront(&mut instructions, &owner_pubkey)?;
     }
 
     let label = match request.side {
@@ -441,6 +490,105 @@ fn build_raydium_amm_v4_selector(
     }
 }
 
+async fn fetch_raydium_amm_v4_pools_for_ordered_pair(
+    rpc_url: &str,
+    left_mint: &Pubkey,
+    right_mint: &Pubkey,
+    commitment: &str,
+) -> Result<Vec<Pubkey>, String> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": "execution-engine-raydium-amm-v4-pools",
+        "method": "getProgramAccounts",
+        "params": [
+            RAYDIUM_AMM_V4_PROGRAM_ID,
+            {
+                "commitment": commitment,
+                "encoding": "base64",
+                "filters": [
+                    {
+                        "dataSize": RAYDIUM_AMM_V4_ACCOUNT_LEN
+                    },
+                    {
+                        "memcmp": {
+                            "offset": RAYDIUM_AMM_V4_BASE_MINT_OFFSET,
+                            "bytes": left_mint.to_string()
+                        }
+                    },
+                    {
+                        "memcmp": {
+                            "offset": RAYDIUM_AMM_V4_QUOTE_MINT_OFFSET,
+                            "bytes": right_mint.to_string()
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+    let response = raydium_amm_v4_http_client()
+        .post(rpc_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to fetch Raydium AMM v4 pools from RPC: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to fetch Raydium AMM v4 pools from RPC: status {}.",
+            response.status()
+        ));
+    }
+    let parsed: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to parse Raydium AMM v4 pool RPC response: {error}"))?;
+    if let Some(error) = parsed.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        return Err(format!("Raydium AMM v4 pool RPC query failed: {message}"));
+    }
+    let accounts = parsed
+        .get("result")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            "Raydium AMM v4 pool RPC response did not include result accounts.".to_string()
+        })?;
+    let mut pools = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let Some(pubkey) = account.get("pubkey").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Ok(pool_id) = Pubkey::from_str(pubkey) else {
+            continue;
+        };
+        let Some(encoded_data) = account
+            .get("account")
+            .and_then(|value| value.get("data"))
+            .and_then(encoded_account_data)
+        else {
+            continue;
+        };
+        let Ok(data) = BASE64.decode(encoded_data.trim()) else {
+            continue;
+        };
+        if decode_raydium_amm_v4_pool_state(pool_id, &data).is_ok() {
+            pools.push(pool_id);
+        }
+    }
+    Ok(pools)
+}
+
+fn encoded_account_data(value: &serde_json::Value) -> Option<&str> {
+    value.as_str().or_else(|| {
+        value
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.as_str())
+    })
+}
+
 fn decode_raydium_amm_v4_pool_state(
     pubkey: Pubkey,
     data: &[u8],
@@ -501,10 +649,13 @@ async fn enrich_raydium_amm_v4_pool_state(
 ) -> Result<RaydiumAmmV4PoolState, String> {
     validate_raydium_amm_v4_pool_for_mint(&pool, mint)?;
     validate_raydium_amm_v4_market_program(&pool)?;
-    let (market_owner, market_data) =
-        fetch_account_owner_and_data(rpc_url, &pool.market.to_string(), commitment)
-            .await?
-            .ok_or_else(|| format!("Raydium AMM v4 market {} was not found.", pool.market))?;
+    let market_address = pool.market.to_string();
+    let (market_result, mint_token_program_result) = tokio::join!(
+        fetch_account_owner_and_data(rpc_url, &market_address, commitment),
+        fetch_mint_token_program(rpc_url, mint, commitment)
+    );
+    let (market_owner, market_data) = market_result?
+        .ok_or_else(|| format!("Raydium AMM v4 market {} was not found.", pool.market))?;
     if market_owner != pool.market_program {
         return Err(format!(
             "Raydium AMM v4 market {} is owned by {} rather than declared market program {}.",
@@ -547,7 +698,7 @@ async fn enrich_raydium_amm_v4_pool_state(
         &pool.market_program,
     )
     .map_err(|error| format!("Failed to derive Raydium AMM v4 market vault signer: {error}"))?;
-    pool.mint_token_program = fetch_mint_token_program(rpc_url, mint, commitment).await?;
+    pool.mint_token_program = mint_token_program_result?;
     validate_raydium_amm_v4_token_program(&pool)?;
     validate_raydium_amm_v4_market_accounts(&pool)?;
     Ok(pool)
@@ -779,13 +930,50 @@ pub(crate) async fn quote_raydium_amm_v4_holding_value_sol(
     token_amount_raw: u64,
     commitment: &str,
 ) -> Result<u64, String> {
+    quote_raydium_amm_v4_holding_value_sol_with_cache(
+        rpc_url,
+        selector,
+        mint,
+        token_amount_raw,
+        commitment,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn quote_raydium_amm_v4_holding_value_sol_fresh(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    mint: &str,
+    token_amount_raw: u64,
+    commitment: &str,
+) -> Result<u64, String> {
+    quote_raydium_amm_v4_holding_value_sol_with_cache(
+        rpc_url,
+        selector,
+        mint,
+        token_amount_raw,
+        commitment,
+        false,
+    )
+    .await
+}
+
+async fn quote_raydium_amm_v4_holding_value_sol_with_cache(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    mint: &str,
+    token_amount_raw: u64,
+    commitment: &str,
+    use_cache: bool,
+) -> Result<u64, String> {
     if token_amount_raw == 0 {
         return Ok(0);
     }
     let mint_pubkey = parse_pubkey(mint, "Raydium AMM v4 quote mint")?;
     let cache_key = raydium_amm_v4_quote_snapshot_key(rpc_url, selector, mint, commitment);
-    let cache_ttl = raydium_amm_v4_quote_snapshot_ttl(selector);
-    {
+    if use_cache {
+        let cache_ttl = raydium_amm_v4_quote_snapshot_ttl(selector);
         let cache = raydium_amm_v4_quote_snapshot_cache().lock().await;
         if let Some(snapshot) = cache.get(&cache_key)
             && snapshot.fetched_at.elapsed() <= cache_ttl
@@ -832,7 +1020,7 @@ pub(crate) async fn quote_raydium_amm_v4_holding_value_sol(
             },
         )?)?,
     };
-    {
+    if use_cache {
         let mut cache = raydium_amm_v4_quote_snapshot_cache().lock().await;
         cache.insert(cache_key, snapshot.clone());
         if cache.len() > 256 {
@@ -1129,20 +1317,21 @@ fn configured_tip_account() -> Result<Option<Pubkey>, String> {
     }
 }
 
-fn apply_jitodontfront(instructions: &mut [Instruction]) -> Result<(), String> {
-    let dontfront = parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront")?;
-    for instruction in instructions {
-        if instruction
-            .accounts
-            .iter()
-            .any(|account| account.pubkey == dontfront)
-        {
-            continue;
-        }
+fn apply_jitodontfront(instructions: &mut Vec<Instruction>, payer: &Pubkey) -> Result<(), String> {
+    if instructions.iter().any(|instruction| {
         instruction
             .accounts
-            .push(AccountMeta::new_readonly(dontfront, false));
+            .iter()
+            .any(|account| account.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+    }) {
+        return Ok(());
     }
+    let dontfront = parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront")?;
+    let mut instruction = transfer(payer, payer, 0);
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(dontfront, false));
+    instructions.insert(0, instruction);
     Ok(())
 }
 
@@ -1421,5 +1610,41 @@ mod tests {
         assert_eq!(instruction.accounts[17].pubkey, owner);
         assert!(instruction.accounts[17].is_signer);
         assert_eq!(instruction.data[0], 9);
+    }
+
+    #[test]
+    fn jitodontfront_does_not_mutate_raydium_swap_accounts() {
+        let pool = sample_pool();
+        let user_source = Pubkey::new_unique();
+        let user_destination = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let swap = build_raydium_amm_v4_swap_base_in_instruction(
+            &pool,
+            &pool.base_vault,
+            &pool.quote_vault,
+            &user_source,
+            &user_destination,
+            &owner,
+            990_000_000,
+            1,
+        )
+        .expect("raydium amm v4 instruction");
+        let original_accounts = swap.accounts.clone();
+        let mut instructions = vec![swap];
+
+        apply_jitodontfront(&mut instructions, &owner).expect("jitodontfront");
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[1].accounts, original_accounts);
+        assert_eq!(instructions[1].accounts.len(), 18);
+        assert_eq!(
+            instructions[0].program_id,
+            solana_system_interface::program::ID
+        );
+        assert_eq!(instructions[0].accounts.len(), 3);
+        assert_eq!(
+            instructions[0].accounts[2].pubkey,
+            parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront").unwrap()
+        );
     }
 }

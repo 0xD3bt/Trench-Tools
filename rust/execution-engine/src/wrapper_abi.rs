@@ -15,7 +15,7 @@ pub const PROGRAM_ID: Pubkey = Pubkey::new_from_array([
 ]);
 
 /// Byte value stamped on every wrapper instruction.
-pub const ABI_VERSION: u8 = 1;
+pub const ABI_VERSION: u8 = 3;
 
 /// Hard upper bound on the voluntary fee.
 pub const MAX_FEE_BPS: u16 = 20;
@@ -35,10 +35,13 @@ pub const WSOL_MINT: Pubkey = Pubkey::new_from_array([
 /// Discriminator prefixing the runtime `Execute` instruction.
 pub const EXECUTE_DISCRIMINATOR: u8 = 1;
 pub const EXECUTE_AMM_WSOL_DISCRIMINATOR: u8 = 7;
+pub const EXECUTE_SWAP_ROUTE_DISCRIMINATOR: u8 = 8;
 
 /// Seeds used to derive the program's singleton Config PDA.
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const AMM_WSOL_SEED: &[u8] = b"amm-wsol";
+pub const ROUTE_WSOL_SEED: &[u8] = b"route-wsol";
+pub const ROUTE_WSOL_LANE_COUNT: u8 = 8;
 
 /// Derive the singleton Config PDA. Returns `(pda, bump)`.
 pub fn config_pda() -> (Pubkey, u8) {
@@ -108,6 +111,86 @@ pub struct ExecuteAmmWsolRequest {
     pub inner_ix_data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum SwapRouteDirection {
+    Buy = 0,
+    Sell = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum SwapRouteSettlement {
+    Token = 0,
+    NativeSol = 1,
+    Wsol = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum SwapRouteMode {
+    SolIn = 0,
+    SolOut = 1,
+    TokenOnly = 2,
+    Mixed = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum SwapRouteFeeMode {
+    SolPre = 0,
+    NativeSolPost = 1,
+    WsolPost = 2,
+    TokenPre = 3,
+    TokenPost = 4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum SwapLegInputSource {
+    Fixed = 0,
+    GrossSolNetOfFee = 1,
+    PreviousTokenDelta = 2,
+    GrossTokenNetOfFee = 3,
+}
+
+pub const SWAP_ROUTE_NO_PATCH_OFFSET: u16 = u16::MAX;
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SwapRouteLeg {
+    pub program_account_index: u16,
+    pub accounts_start: u16,
+    pub accounts_len: u16,
+    pub input_source: SwapLegInputSource,
+    pub input_amount: u64,
+    pub input_patch_offset: u16,
+    pub output_account_index: u16,
+    pub ix_data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ExecuteSwapRouteRequest {
+    pub version: u8,
+    pub route_mode: SwapRouteMode,
+    pub direction: SwapRouteDirection,
+    pub settlement: SwapRouteSettlement,
+    pub fee_mode: SwapRouteFeeMode,
+    pub wsol_lane: u8,
+    pub fee_bps: u16,
+    pub gross_sol_in_lamports: u64,
+    pub gross_token_in_amount: u64,
+    pub min_net_output: u64,
+    pub route_accounts_offset: u16,
+    pub intermediate_account_index: u16,
+    pub token_fee_account_index: u16,
+    pub legs: Vec<SwapRouteLeg>,
+}
+
 /// Fixed order of the accounts that prefix every `Execute` call.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecuteAccounts<'a> {
@@ -138,6 +221,9 @@ pub struct ExecuteAccounts<'a> {
 
 pub const EXECUTE_FIXED_ACCOUNT_COUNT: u16 = 8;
 pub const EXECUTE_AMM_WSOL_FIXED_ACCOUNT_COUNT: u16 = 12;
+pub const EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT: u16 = 8;
+pub const EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT: u16 = 3;
+pub const EXECUTE_SWAP_ROUTE_TOKEN_FEE_ACCOUNT_COUNT: u16 = 1;
 
 impl<'a> ExecuteAccounts<'a> {
     pub fn to_account_metas(&self) -> Vec<AccountMeta> {
@@ -178,6 +264,61 @@ impl<'a> ExecuteAmmWsolAccounts<'a> {
 
 pub fn amm_wsol_pda(user: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[AMM_WSOL_SEED, user.as_ref()], &PROGRAM_ID)
+}
+
+pub fn route_wsol_pda(user: &Pubkey, lane: u8) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[ROUTE_WSOL_SEED, user.as_ref(), &[lane]], &PROGRAM_ID)
+}
+
+fn swap_route_uses_wsol(request: &ExecuteSwapRouteRequest) -> bool {
+    matches!(
+        (request.route_mode, request.fee_mode),
+        (SwapRouteMode::SolOut, SwapRouteFeeMode::WsolPost)
+            | (SwapRouteMode::Mixed, SwapRouteFeeMode::SolPre)
+            | (SwapRouteMode::Mixed, SwapRouteFeeMode::WsolPost)
+    )
+}
+
+fn swap_route_uses_token_fee(request: &ExecuteSwapRouteRequest) -> bool {
+    matches!(
+        request.fee_mode,
+        SwapRouteFeeMode::TokenPre | SwapRouteFeeMode::TokenPost
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExecuteSwapRouteAccounts<'a> {
+    pub execute: ExecuteAccounts<'a>,
+    pub token_fee_vault_ata: Option<&'a Pubkey>,
+}
+
+impl<'a> ExecuteSwapRouteAccounts<'a> {
+    pub fn to_account_metas(
+        &self,
+        request: &ExecuteSwapRouteRequest,
+    ) -> Result<Vec<AccountMeta>, String> {
+        if swap_route_uses_wsol(request) && request.wsol_lane >= ROUTE_WSOL_LANE_COUNT {
+            return Err(format!(
+                "wrapper route WSOL lane {} outside supported range 0..{}",
+                request.wsol_lane, ROUTE_WSOL_LANE_COUNT
+            ));
+        }
+        let mut metas = self.execute.to_account_metas();
+        if swap_route_uses_wsol(request) {
+            metas.extend([
+                AccountMeta::new_readonly(WSOL_MINT, false),
+                AccountMeta::new_readonly(system_program_id(), false),
+                AccountMeta::new_readonly(rent_sysvar_id(), false),
+            ]);
+        }
+        if swap_route_uses_token_fee(request) {
+            let token_fee_vault_ata = self
+                .token_fee_vault_ata
+                .ok_or_else(|| "token fee route requires token_fee_vault_ata".to_string())?;
+            metas.push(AccountMeta::new(*token_fee_vault_ata, false));
+        }
+        Ok(metas)
+    }
 }
 
 /// Serialize an `Execute` instruction payload.
@@ -221,6 +362,34 @@ pub fn encode_execute_amm_wsol_data(request: &ExecuteAmmWsolRequest) -> Result<V
     Ok(buf)
 }
 
+pub fn encode_execute_swap_route_data(
+    request: &ExecuteSwapRouteRequest,
+) -> Result<Vec<u8>, String> {
+    if request.version != ABI_VERSION {
+        return Err(format!(
+            "wrapper ABI version mismatch: got {}, expected {}",
+            request.version, ABI_VERSION
+        ));
+    }
+    if request.fee_bps > MAX_FEE_BPS {
+        return Err(format!(
+            "wrapper fee_bps {} exceeds hardcoded cap {}",
+            request.fee_bps, MAX_FEE_BPS
+        ));
+    }
+    let mut buf = Vec::with_capacity(
+        96 + request
+            .legs
+            .iter()
+            .map(|leg| leg.ix_data.len())
+            .sum::<usize>(),
+    );
+    buf.push(EXECUTE_SWAP_ROUTE_DISCRIMINATOR);
+    borsh::to_writer(&mut buf, request)
+        .map_err(|error| format!("Failed to serialize ExecuteSwapRoute request: {error}"))?;
+    Ok(buf)
+}
+
 /// Build a wrapper `Execute` instruction.
 pub fn build_execute_instruction(
     accounts: &ExecuteAccounts<'_>,
@@ -257,6 +426,38 @@ pub fn build_execute_amm_wsol_instruction(
     let mut metas = accounts.to_account_metas();
     metas.extend_from_slice(inner_accounts);
     let data = encode_execute_amm_wsol_data(request)?;
+    Ok(Instruction {
+        program_id: PROGRAM_ID,
+        accounts: metas,
+        data,
+    })
+}
+
+pub fn build_execute_swap_route_instruction(
+    accounts: &ExecuteSwapRouteAccounts<'_>,
+    request: &ExecuteSwapRouteRequest,
+    route_accounts: &[AccountMeta],
+) -> Result<Instruction, String> {
+    let mut expected_offset = EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT;
+    if swap_route_uses_wsol(request) {
+        expected_offset = expected_offset
+            .checked_add(EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT)
+            .ok_or_else(|| "route_accounts_offset overflowed".to_string())?;
+    }
+    if swap_route_uses_token_fee(request) {
+        expected_offset = expected_offset
+            .checked_add(EXECUTE_SWAP_ROUTE_TOKEN_FEE_ACCOUNT_COUNT)
+            .ok_or_else(|| "route_accounts_offset overflowed".to_string())?;
+    }
+    if request.route_accounts_offset != expected_offset {
+        return Err(format!(
+            "route_accounts_offset must equal expected v3 swap-route prefix ({}), got {}",
+            expected_offset, request.route_accounts_offset
+        ));
+    }
+    let mut metas = accounts.to_account_metas(request)?;
+    metas.extend_from_slice(route_accounts);
+    let data = encode_execute_swap_route_data(request)?;
     Ok(Instruction {
         program_id: PROGRAM_ID,
         accounts: metas,
@@ -347,6 +548,40 @@ mod tests {
     }
 
     #[test]
+    fn execute_swap_route_round_trips() {
+        let request = ExecuteSwapRouteRequest {
+            version: ABI_VERSION,
+            route_mode: SwapRouteMode::Mixed,
+            direction: SwapRouteDirection::Buy,
+            settlement: SwapRouteSettlement::Token,
+            fee_mode: SwapRouteFeeMode::SolPre,
+            wsol_lane: 0,
+            fee_bps: 10,
+            gross_sol_in_lamports: 500_000_000,
+            gross_token_in_amount: 0,
+            min_net_output: 1_000,
+            route_accounts_offset: EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT
+                + EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT,
+            intermediate_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+            token_fee_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+            legs: vec![SwapRouteLeg {
+                program_account_index: 0,
+                accounts_start: 1,
+                accounts_len: 4,
+                input_source: SwapLegInputSource::GrossSolNetOfFee,
+                input_amount: 0,
+                input_patch_offset: 8,
+                output_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+                ix_data: vec![0; 16],
+            }],
+        };
+        let bytes = encode_execute_swap_route_data(&request).expect("encode");
+        assert_eq!(bytes[0], EXECUTE_SWAP_ROUTE_DISCRIMINATOR);
+        let decoded = ExecuteSwapRouteRequest::try_from_slice(&bytes[1..]).expect("roundtrip");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn build_execute_amm_wsol_instruction_uses_v2_fixed_prefix() {
         let user = Pubkey::new_unique();
         let config = config_pda().0;
@@ -433,12 +668,21 @@ mod tests {
 
     #[test]
     fn abi_version_and_cap_are_frozen_until_lockstep_release() {
-        assert_eq!(ABI_VERSION, 1, "engine ABI_VERSION drifted from program");
+        assert_eq!(ABI_VERSION, 3, "engine ABI_VERSION drifted from program");
         assert_eq!(MAX_FEE_BPS, 20, "engine fee cap drifted from program");
     }
 
     #[test]
     fn execute_fixed_account_count_is_eight() {
         assert_eq!(EXECUTE_FIXED_ACCOUNT_COUNT, 8);
+    }
+
+    #[test]
+    fn route_wsol_lanes_are_distinct() {
+        let user = Pubkey::new_unique();
+        let (lane0, _) = route_wsol_pda(&user, 0);
+        let (lane1, _) = route_wsol_pda(&user, 1);
+        assert_ne!(lane0, lane1);
+        assert_eq!(route_wsol_pda(&user, 0).0, lane0);
     }
 }

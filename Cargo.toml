@@ -6,6 +6,7 @@ members = [
     "rust/shared-extension-runtime",
     "rust/shared-fee-market",
     "rust/shared-execution-routing",
+    "rust/shared-raydium-launchlab",
     "rust/shared-transaction-submit",
 ]
 # The on-chain fee-routing program lives outside this public workspace.

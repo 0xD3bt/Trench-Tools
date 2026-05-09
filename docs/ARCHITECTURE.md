@@ -5,7 +5,7 @@ Trench Tools is local-first. The browser talks to local Rust hosts, those hosts 
 ## The Three Pieces
 
 - `execution engine` (`execution-engine`, port `8788`) - local Rust trading host. Owns wallets, presets, fee/route resolution, transaction build/sign/send, confirmations, PnL, local ledger, event stream, and the voluntary Trench Tools fee setting.
-- `Trench Tools extension` - Chrome/Edge extension. Injects into supported terminals and sends trade requests to the execution engine. It also embeds LaunchDeck when the LaunchDeck host is running.
+- `Trench Tools extension` - Chrome/Edge extension. Injects into supported terminals, owns popup/options/panel browser UI, and sends trade requests to the execution engine. It also embeds LaunchDeck when the LaunchDeck host is running.
 - `LaunchDeck` (`launchdeck-engine`, port `8789`, plus `launchdeck-follow-daemon`, port `8790`) - launchpad feature. Owns deploy, snipe, dev-buy, dev-sell, follow, launch reports, and launchpad-specific UI routes.
 
 ## Process Map
@@ -73,24 +73,29 @@ The execution engine owns the trade path:
 - confirmation handling
 - local trade ledger and batch history
 - SSE balance/PnL/event stream
+- token split/consolidate transfer execution
+- route prewarm, warm cache, and route metrics
+- canonical config and route-family rollout settings
 - voluntary Trench Tools fee behavior
 - extension runtime status
 
 Anything that submits an extension trade goes through this host.
 
+Current route planning is route-aware. The extension may provide mint, pair/pool, surface, and URL context, but the engine still verifies the executable family from RPC owner/layout/mint state before compiling a trade.
+
 ## Extension Responsibilities
 
 The extension owns browser integration:
 
+- toolbar popup auth/status and quick-trade preference editing
+- Options page connection, presets, wallets, wallet groups, sites, rewards, and appearance
 - site injection
 - terminal-specific DOM adapters
-- floating launcher / panel / popout surfaces
-- Options page
-- preset editing
-- wallet group editing
-- host/token connection settings
+- floating launcher / persistent panel / quick anchored panel / popout surfaces
+- shared popup/panel preference storage
 - forwarding trade requests to `execution-engine`
 - forwarding LaunchDeck surfaces to `launchdeck-engine`
+- token split/consolidate UI requests for the active token
 
 Terminal adapters are the only place that should scrape site DOM. Panel/background code should consume normalized data from adapters.
 
@@ -105,6 +110,8 @@ LaunchDeck owns launchpad workflows:
 - follow jobs and follow sells
 - launch reports and local history
 - metadata/image workflows
+- Pump/Bonk vanity queue handling
+- LaunchDeck runtime diagnostics
 
 LaunchDeck can run standalone at:
 
@@ -124,6 +131,7 @@ It owns:
 - confirmed-block/offset actions
 - dev-auto-sell jobs
 - follow sells
+- market-cap triggered actions where supported
 - watcher health
 - persisted follow job state
 
@@ -143,6 +151,8 @@ Important files:
 - `.local/trench-tools/engine-runtime.json` - runtime settings/state
 - `.local/trench-tools/follow-daemon-state.json` - follow daemon state
 - `.local/trench-tools/launchdeck-pending-ledger.jsonl` - pending LaunchDeck ledger records when execution engine is offline
+- `.local/trench-tools/vanity/pump.txt` - optional Pump vanity mint queue
+- `.local/trench-tools/vanity/bonk.txt` - optional Bonk vanity mint queue
 
 Logs default to:
 
@@ -170,6 +180,34 @@ The provider is only the send path. The stack also has separate RPC and websocke
 - Warm/cache/block-height RPC: `WARM_RPC_URL`
 
 This split keeps low-latency sends separate from general reads, watchers, and warm probes.
+
+## Route And Warm Boundary
+
+Route planning is owned by `execution-engine`.
+
+```mermaid
+flowchart LR
+  Extension[Extension surface]
+  Prewarm["/api/extension/prewarm"]
+  Trade["buy/sell/preview"]
+  Planner[Route planner]
+  Warm[Warm cache]
+  Native[Native compiler]
+  Wrapper[Wrapper v3]
+  Send[Transport send]
+
+  Extension -->|"intent: mint, pair, surface"| Prewarm
+  Extension -->|"trade request"| Trade
+  Prewarm --> Planner
+  Planner --> Warm
+  Trade --> Planner
+  Warm --> Planner
+  Planner --> Native
+  Native --> Wrapper
+  Wrapper --> Send
+```
+
+Prewarm is best-effort latency work. It can reuse verified route state, but final trade build still validates the route and current accounts. Route metrics logs expose plan/compile timing and RPC counts for debugging.
 
 ## Security Boundary
 

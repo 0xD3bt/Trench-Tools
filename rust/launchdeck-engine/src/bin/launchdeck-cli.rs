@@ -38,6 +38,8 @@ mod reports_browser;
 mod rpc;
 #[path = "../transport.rs"]
 mod transport;
+#[path = "../vanity_pool.rs"]
+mod vanity_pool;
 #[path = "../wallet.rs"]
 mod wallet;
 #[path = "../wrapper_compile.rs"]
@@ -63,6 +65,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use transport::{TransportPlan, build_transport_plan, estimate_transaction_count};
+use vanity_pool::mark_vanity_reservation_used;
 use wallet::{
     load_solana_wallet_by_env_key, public_key_from_secret, selected_wallet_key_or_default,
 };
@@ -321,6 +324,7 @@ async fn run_cli() -> Result<(), String> {
     let bags_config_key = native.bags_config_key;
     let bags_metadata_uri = native.bags_metadata_uri;
     let compiled_mint = native.mint;
+    let vanity_reservation = native.vanity_reservation;
     let bags_requires_prelaunch_setup = normalized.launchpad == "bagsapp"
         && (!setup_bundles.is_empty() || !setup_transactions.is_empty());
     set_report_timing(&mut report, "compileAltLoadMs", compile_timings.alt_load_ms);
@@ -387,6 +391,7 @@ async fn run_cli() -> Result<(), String> {
         append_execution_warnings(&mut report, warnings);
         extra = Some(json!(simulation));
     } else if action == "send" {
+        mark_vanity_reservation_used(vanity_reservation.as_ref(), None)?;
         let mut bags_setup_timing = SendTimingBreakdown::default();
         let (sent, warnings, send_timing) = if normalized.launchpad == "bagsapp" {
             let bags_setup_transport_plan = standard_rpc_transport_plan(&transport_plan, &rpc_url);

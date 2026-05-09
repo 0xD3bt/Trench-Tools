@@ -2,6 +2,7 @@
 //! program.
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use borsh::BorshDeserialize;
 use shared_transaction_submit::compiled_transaction_signers;
 use solana_sdk::{
     hash::Hash,
@@ -19,11 +20,14 @@ use uuid::Uuid;
 use crate::{
     rpc_client::CompiledTransaction,
     wrapper_abi::{
-        ABI_VERSION, EXECUTE_AMM_WSOL_FIXED_ACCOUNT_COUNT, EXECUTE_FIXED_ACCOUNT_COUNT,
-        ExecuteAccounts, ExecuteAmmWsolAccounts, ExecuteAmmWsolRequest, ExecuteRequest,
-        MAX_FEE_BPS, PROGRAM_ID, TOKEN_PROGRAM_ID, WSOL_MINT, WrapperRouteKind, WsolAccountMode,
-        amm_wsol_pda, build_execute_amm_wsol_instruction, build_execute_instruction, config_pda,
-        instructions_sysvar_id, rent_sysvar_id, system_program_id,
+        ABI_VERSION, EXECUTE_AMM_WSOL_DISCRIMINATOR, EXECUTE_DISCRIMINATOR,
+        EXECUTE_SWAP_ROUTE_DISCRIMINATOR, EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT,
+        EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT, ExecuteAccounts, ExecuteSwapRouteAccounts,
+        ExecuteSwapRouteRequest, MAX_FEE_BPS, PROGRAM_ID, SWAP_ROUTE_NO_PATCH_OFFSET,
+        SwapLegInputSource, SwapRouteDirection, SwapRouteFeeMode, SwapRouteLeg, SwapRouteMode,
+        SwapRouteSettlement, TOKEN_PROGRAM_ID, WSOL_MINT, WrapperRouteKind,
+        build_execute_swap_route_instruction, config_pda, instructions_sysvar_id, rent_sysvar_id,
+        route_wsol_pda, system_program_id,
     },
 };
 
@@ -36,8 +40,23 @@ const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const RAYDIUM_AMM_V4_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const BONK_LAUNCHPAD_PROGRAM_ID: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+const PUMP_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const BAGS_DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+const BAGS_DAMM_V2_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+const RAYDIUM_CLMM_SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
+const RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
+const PUMP_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+const BONK_BUY_EXACT_IN_DISCRIMINATOR: [u8; 8] = [250, 234, 13, 123, 213, 156, 19, 236];
+const BONK_SELL_EXACT_IN_DISCRIMINATOR: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
+const PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
+const PUMP_AMM_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+const BAGS_SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
+const RAYDIUM_AMM_V4_SWAP_BASE_IN_DISCRIMINATOR: u8 = 9;
 const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
 const SYSTEM_CREATE_ACCOUNT_DISCRIMINATOR: u32 = 0;
+const SYSTEM_TRANSFER_DISCRIMINATOR: u32 = 2;
 const SPL_TOKEN_CLOSE_ACCOUNT_DISCRIMINATOR: u8 = 9;
 const SPL_TOKEN_SYNC_NATIVE_DISCRIMINATOR: u8 = 17;
 const SPL_TOKEN_INITIALIZE_ACCOUNT3_DISCRIMINATOR: u8 = 18;
@@ -127,7 +146,7 @@ pub fn estimate_sol_in_fee_lamports(gross_lamports: u64, fee_bps: u16) -> u64 {
     (product / BPS_DENOMINATOR) as u64
 }
 
-/// Build the wrapper `Execute` instruction from a compile request.
+/// Build the production wrapper route instruction from a compile request.
 pub fn build_wrapper_execute_instruction(
     request: &WrapperCompileRequest<'_>,
 ) -> Result<Instruction, WrapperCompileError> {
@@ -151,48 +170,95 @@ pub fn build_wrapper_execute_instruction(
         _ => {}
     }
 
-    // WSOL-settling SolOut routes need both WSOL ATA slots.
-    let (fee_vault_wsol_provided, user_wsol_provided) = (
-        request.fee_vault_wsol_ata.is_some(),
-        request.user_wsol_ata.is_some(),
-    );
-    if matches!(request.route_kind, WrapperRouteKind::SolOut)
-        && fee_vault_wsol_provided != user_wsol_provided
-    {
+    if request.user_wsol_ata.is_some() || request.fee_vault_wsol_ata.is_some() {
+        // Production WSOL routes must go through `wrap_compiled_transaction`,
+        // which replaces temp/user WSOL accounts with the deterministic route PDA.
         return Err(WrapperCompileError::InvalidRouteKind);
     }
 
     let user_pubkey = request.payer.pubkey();
     let (config_pda_pubkey, _bump) = config_pda();
-    let fee_vault_wsol_ata = request
-        .fee_vault_wsol_ata
-        .unwrap_or(ZEROED_WSOL_ATA_SENTINEL);
-    let user_wsol_ata = request.user_wsol_ata.unwrap_or(ZEROED_WSOL_ATA_SENTINEL);
+    let sentinel = ZEROED_WSOL_ATA_SENTINEL;
     let instructions_sysvar = instructions_sysvar_id();
     let token_program = TOKEN_PROGRAM_ID;
 
-    let accounts = ExecuteAccounts {
+    let execute_accounts = ExecuteAccounts {
         user: &user_pubkey,
         config_pda: &config_pda_pubkey,
         fee_vault: &request.fee_vault,
-        fee_vault_wsol_ata: &fee_vault_wsol_ata,
-        user_wsol_ata: &user_wsol_ata,
+        fee_vault_wsol_ata: &sentinel,
+        user_wsol_ata: &sentinel,
         instructions_sysvar: &instructions_sysvar,
         inner_program: &request.inner_program,
         token_program: &token_program,
     };
-
-    let execute_request = ExecuteRequest {
-        version: ABI_VERSION,
-        route_kind: request.route_kind,
-        fee_bps: request.fee_bps,
-        gross_sol_in_lamports: request.gross_sol_in_lamports,
-        min_net_output: request.min_net_output,
-        inner_accounts_offset: EXECUTE_FIXED_ACCOUNT_COUNT,
-        inner_ix_data: request.inner_ix_data.clone(),
+    let accounts = ExecuteSwapRouteAccounts {
+        execute: execute_accounts,
+        token_fee_vault_ata: None,
     };
 
-    build_execute_instruction(&accounts, &execute_request, &request.inner_accounts)
+    let direction = match request.route_kind {
+        WrapperRouteKind::SolIn => SwapRouteDirection::Buy,
+        WrapperRouteKind::SolOut => SwapRouteDirection::Sell,
+        WrapperRouteKind::SolThrough => return Err(WrapperCompileError::InvalidRouteKind),
+    };
+    let fee_mode = match request.route_kind {
+        WrapperRouteKind::SolIn => SwapRouteFeeMode::SolPre,
+        WrapperRouteKind::SolOut => SwapRouteFeeMode::NativeSolPost,
+        WrapperRouteKind::SolThrough => return Err(WrapperCompileError::InvalidRouteKind),
+    };
+    let settlement = match request.route_kind {
+        WrapperRouteKind::SolIn => SwapRouteSettlement::Token,
+        WrapperRouteKind::SolOut => SwapRouteSettlement::NativeSol,
+        WrapperRouteKind::SolThrough => return Err(WrapperCompileError::InvalidRouteKind),
+    };
+    let mut route_accounts = Vec::with_capacity(1 + request.inner_accounts.len());
+    route_accounts.push(AccountMeta::new_readonly(request.inner_program, false));
+    route_accounts.extend(request.inner_accounts.iter().cloned());
+    let accounts_len = u16::try_from(request.inner_accounts.len()).map_err(|_| {
+        WrapperCompileError::AccountMetaOverflow {
+            count: request.inner_accounts.len(),
+        }
+    })?;
+    let execute_request = ExecuteSwapRouteRequest {
+        version: ABI_VERSION,
+        route_mode: match request.route_kind {
+            WrapperRouteKind::SolIn => SwapRouteMode::SolIn,
+            WrapperRouteKind::SolOut => SwapRouteMode::SolOut,
+            WrapperRouteKind::SolThrough => return Err(WrapperCompileError::InvalidRouteKind),
+        },
+        direction,
+        settlement,
+        fee_mode,
+        wsol_lane: 0,
+        fee_bps: request.fee_bps,
+        gross_sol_in_lamports: request.gross_sol_in_lamports,
+        gross_token_in_amount: 0,
+        min_net_output: if matches!(request.route_kind, WrapperRouteKind::SolIn) {
+            0
+        } else {
+            request.min_net_output
+        },
+        route_accounts_offset: EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT,
+        intermediate_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+        token_fee_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+        legs: vec![SwapRouteLeg {
+            program_account_index: 0,
+            accounts_start: 1,
+            accounts_len,
+            input_source: if matches!(request.route_kind, WrapperRouteKind::SolIn) {
+                SwapLegInputSource::GrossSolNetOfFee
+            } else {
+                SwapLegInputSource::Fixed
+            },
+            input_amount: 0,
+            input_patch_offset: SWAP_ROUTE_NO_PATCH_OFFSET,
+            output_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+            ix_data: request.inner_ix_data.clone(),
+        }],
+    };
+
+    build_execute_swap_route_instruction(&accounts, &execute_request, &route_accounts)
         .map_err(WrapperCompileError::MessageCompile)
 }
 
@@ -223,6 +289,23 @@ pub fn compile_wrapper_transaction(
         request.blockhash,
     )
     .map_err(|error| WrapperCompileError::MessageCompile(error.to_string()))?;
+    let required_signer_count = usize::from(message.header.num_required_signatures);
+    let required_signers = message
+        .account_keys
+        .iter()
+        .take(required_signer_count)
+        .copied()
+        .collect::<Vec<_>>();
+    if required_signers.as_slice() != [request.payer.pubkey()] {
+        return Err(WrapperCompileError::SigningFailed(format!(
+            "v3 wrapper transactions must require exactly one signer (user); got [{}]",
+            required_signers
+                .iter()
+                .map(Pubkey::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
 
     let lookup_tables_used: Vec<String> = message
         .address_table_lookups
@@ -314,6 +397,7 @@ pub enum WrapCompiledTransactionError {
     AltAccountMissing(String),
     AltIndexOutOfBounds { alt: String, index: u8 },
     NoVenueInstruction,
+    AlreadyWrapped,
     MultipleVenueInstructions { count: usize },
     VenueAccountOutOfBounds,
     CompileFailed(String),
@@ -342,6 +426,7 @@ impl std::fmt::Display for WrapCompiledTransactionError {
                 f,
                 "no allowlisted venue instruction found inside the tx — cannot wrap"
             ),
+            Self::AlreadyWrapped => write!(f, "transaction is already wrapped"),
             Self::MultipleVenueInstructions { count } => write!(
                 f,
                 "found {count} allowlisted venue instructions; wrapper only supports exactly one per tx"
@@ -433,6 +518,236 @@ fn decompile_v0_transaction(
     Ok((instructions, account_keys))
 }
 
+fn is_wrapper_execute_instruction(instruction: &Instruction) -> bool {
+    if instruction.program_id != PROGRAM_ID {
+        return false;
+    }
+    matches!(
+        instruction.data.first().copied(),
+        Some(
+            EXECUTE_DISCRIMINATOR
+                | EXECUTE_AMM_WSOL_DISCRIMINATOR
+                | EXECUTE_SWAP_ROUTE_DISCRIMINATOR
+        )
+    )
+}
+
+fn decode_wrapper_swap_route_instruction(
+    instruction: &Instruction,
+) -> Option<ExecuteSwapRouteRequest> {
+    if instruction.program_id != PROGRAM_ID
+        || instruction.data.first().copied() != Some(EXECUTE_SWAP_ROUTE_DISCRIMINATOR)
+    {
+        return None;
+    }
+    ExecuteSwapRouteRequest::try_from_slice(&instruction.data[1..])
+        .ok()
+        .filter(|request| request.version == ABI_VERSION)
+}
+
+fn swap_route_uses_wsol(request: &ExecuteSwapRouteRequest) -> bool {
+    matches!(
+        (request.route_mode, request.fee_mode),
+        (SwapRouteMode::SolOut, SwapRouteFeeMode::WsolPost)
+            | (SwapRouteMode::Mixed, SwapRouteFeeMode::SolPre)
+            | (SwapRouteMode::Mixed, SwapRouteFeeMode::WsolPost)
+    )
+}
+
+fn validate_already_wrapped_route_accounts(
+    instruction: &Instruction,
+    payer: &Pubkey,
+    request: &WrapCompiledTransactionRequest,
+    route: &ExecuteSwapRouteRequest,
+) -> Result<(), WrapCompiledTransactionError> {
+    let account = |index: usize| {
+        instruction
+            .accounts
+            .get(index)
+            .ok_or_else(|| {
+                WrapCompiledTransactionError::CompileFailed(format!(
+                    "already-wrapped v3 route was missing fixed account {index}"
+                ))
+            })
+            .map(|meta| meta.pubkey)
+    };
+    if account(0)? != *payer || !instruction.accounts[0].is_signer {
+        return Err(WrapCompiledTransactionError::CompileFailed(
+            "already-wrapped v3 route user account did not match payer signer".to_string(),
+        ));
+    }
+    if account(1)? != config_pda().0
+        || account(2)? != request.fee_vault
+        || account(5)? != instructions_sysvar_id()
+        || account(7)? != TOKEN_PROGRAM_ID
+    {
+        return Err(WrapCompiledTransactionError::CompileFailed(
+            "already-wrapped v3 route fixed accounts did not match wrapper configuration"
+                .to_string(),
+        ));
+    }
+    let route_offset = usize::from(route.route_accounts_offset);
+    if route_offset >= instruction.accounts.len() {
+        return Err(WrapCompiledTransactionError::CompileFailed(
+            "already-wrapped v3 route_accounts_offset was out of bounds".to_string(),
+        ));
+    }
+    if account(6)? != instruction.accounts[route_offset].pubkey {
+        return Err(WrapCompiledTransactionError::CompileFailed(
+            "already-wrapped v3 route inner program did not match first route account".to_string(),
+        ));
+    }
+    if swap_route_uses_wsol(route) {
+        if route.wsol_lane != 0 {
+            return Err(WrapCompiledTransactionError::CompileFailed(
+                "already-wrapped passthrough only supports WSOL lane 0".to_string(),
+            ));
+        }
+        if account(4)? != route_wsol_pda(payer, route.wsol_lane).0
+            || account(8)? != WSOL_MINT
+            || account(9)? != system_program_id()
+            || account(10)? != rent_sysvar_id()
+        {
+            return Err(WrapCompiledTransactionError::CompileFailed(
+                "already-wrapped v3 WSOL route accounts did not match expected PDAs/programs"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_already_wrapped_transaction(
+    source: &CompiledTransaction,
+    payer: &Pubkey,
+    lookup_tables: &[AddressLookupTableAccount],
+    request: &WrapCompiledTransactionRequest,
+) -> Result<(), WrapCompiledTransactionError> {
+    let bytes = BASE64
+        .decode(source.serialized_base64.as_bytes())
+        .map_err(|error| WrapCompiledTransactionError::InvalidSerializedTx(error.to_string()))?;
+    let transaction: VersionedTransaction = bincode::deserialize(&bytes)
+        .map_err(|error| WrapCompiledTransactionError::InvalidSerializedTx(error.to_string()))?;
+    let required_signer_count = usize::from(transaction.message.header().num_required_signatures);
+    let required_signers = transaction
+        .message
+        .static_account_keys()
+        .iter()
+        .take(required_signer_count)
+        .copied()
+        .collect::<Vec<_>>();
+    if required_signers.as_slice() != [*payer] {
+        return Err(WrapCompiledTransactionError::CompileFailed(format!(
+            "already-wrapped v3 transaction must require exactly one signer (user); got [{}]",
+            required_signers
+                .iter()
+                .map(Pubkey::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    let (instructions, _account_keys) = decompile_v0_transaction(&transaction, lookup_tables)?;
+    if instructions.iter().any(|instruction| {
+        instruction.program_id == PROGRAM_ID
+            && matches!(
+                instruction.data.first().copied(),
+                Some(EXECUTE_DISCRIMINATOR | EXECUTE_AMM_WSOL_DISCRIMINATOR)
+            )
+    }) {
+        return Err(WrapCompiledTransactionError::CompileFailed(
+            "already-wrapped passthrough requires v3 ExecuteSwapRoute, not a legacy wrapper instruction"
+                .to_string(),
+        ));
+    }
+    let wrapper_count = instructions
+        .iter()
+        .filter(|instruction| is_wrapper_execute_instruction(instruction))
+        .count();
+    let routes = instructions
+        .iter()
+        .filter_map(|instruction| {
+            decode_wrapper_swap_route_instruction(instruction).map(|request| (instruction, request))
+        })
+        .collect::<Vec<_>>();
+    let [(route_instruction, route)] = routes.as_slice() else {
+        return Err(WrapCompiledTransactionError::CompileFailed(format!(
+            "already-wrapped passthrough expected exactly one v3 wrapper instruction, found {}",
+            routes.len()
+        )));
+    };
+    if wrapper_count != routes.len() {
+        return Err(WrapCompiledTransactionError::CompileFailed(
+            "already-wrapped passthrough found a malformed or non-current wrapper instruction"
+                .to_string(),
+        ));
+    }
+    if route.fee_bps != request.fee_bps {
+        return Err(WrapCompiledTransactionError::CompileFailed(format!(
+            "already-wrapped fee_bps {} did not match expected {}",
+            route.fee_bps, request.fee_bps
+        )));
+    }
+    match request.route_kind {
+        WrapperRouteKind::SolIn => {
+            if route.direction != SwapRouteDirection::Buy
+                || route.settlement != SwapRouteSettlement::Token
+                || route.fee_mode != SwapRouteFeeMode::SolPre
+                || !matches!(
+                    route.route_mode,
+                    SwapRouteMode::SolIn | SwapRouteMode::Mixed
+                )
+            {
+                return Err(WrapCompiledTransactionError::CompileFailed(
+                    "already-wrapped SolIn route metadata did not match expected buy/SolPre shape"
+                        .to_string(),
+                ));
+            }
+            if route.gross_sol_in_lamports != request.gross_sol_in_lamports {
+                return Err(WrapCompiledTransactionError::CompileFailed(format!(
+                    "already-wrapped gross SOL input {} did not match expected {}",
+                    route.gross_sol_in_lamports, request.gross_sol_in_lamports
+                )));
+            }
+        }
+        WrapperRouteKind::SolOut => {
+            if route.direction != SwapRouteDirection::Sell
+                || !matches!(
+                    route.settlement,
+                    SwapRouteSettlement::NativeSol | SwapRouteSettlement::Wsol
+                )
+                || !matches!(
+                    route.fee_mode,
+                    SwapRouteFeeMode::NativeSolPost | SwapRouteFeeMode::WsolPost
+                )
+                || !matches!(
+                    route.route_mode,
+                    SwapRouteMode::SolOut | SwapRouteMode::Mixed
+                )
+            {
+                return Err(WrapCompiledTransactionError::CompileFailed(
+                    "already-wrapped SolOut route metadata did not match expected sell/post-fee shape"
+                        .to_string(),
+                ));
+            }
+            if route.gross_sol_in_lamports != 0 {
+                return Err(WrapCompiledTransactionError::CompileFailed(
+                    "already-wrapped SolOut route unexpectedly set gross SOL input".to_string(),
+                ));
+            }
+        }
+        WrapperRouteKind::SolThrough => return Err(WrapCompiledTransactionError::InvalidRouteKind),
+    }
+    if request.min_net_output > 0 && route.min_net_output < request.min_net_output {
+        return Err(WrapCompiledTransactionError::CompileFailed(format!(
+            "already-wrapped min output {} was below expected {}",
+            route.min_net_output, request.min_net_output
+        )));
+    }
+    validate_already_wrapped_route_accounts(route_instruction, payer, request, route)?;
+    Ok(())
+}
+
 /// Derive the user WSOL settlement account and fee-vault WSOL ATA for
 /// WSOL-settled routes. The user-side account can be either the
 /// payer's WSOL ATA or a temporary wrapped-SOL account created around
@@ -440,9 +755,12 @@ fn decompile_v0_transaction(
 fn derive_wsol_route_accounts(
     payer: &Pubkey,
     fee_vault: &Pubkey,
+    route_kind: WrapperRouteKind,
     inner_program: &Pubkey,
     venue_accounts: &[AccountMeta],
-) -> (Option<Pubkey>, Option<Pubkey>) {
+    preamble: &[Instruction],
+    postamble: &[Instruction],
+) -> Result<(Option<Pubkey>, Option<Pubkey>), WrapCompiledTransactionError> {
     let payer_wsol_ata =
         get_associated_token_address_with_program_id(payer, &WSOL_MINT, &TOKEN_PROGRAM_ID);
     let user_wsol_account = if venue_accounts
@@ -450,13 +768,22 @@ fn derive_wsol_route_accounts(
         .any(|meta| meta.pubkey == payer_wsol_ata)
     {
         Some(payer_wsol_ata)
+    } else if let Some(account) = derive_temp_wsol_output_account(inner_program, venue_accounts) {
+        Some(account)
     } else {
-        derive_temp_wsol_output_account(inner_program, venue_accounts)
+        derive_closed_temp_wsol_output_account(
+            payer,
+            route_kind,
+            venue_accounts,
+            preamble,
+            postamble,
+        )
+        .map_err(WrapCompiledTransactionError::CompileFailed)?
     };
     let fee_vault_wsol_ata = user_wsol_account.map(|_| {
         get_associated_token_address_with_program_id(fee_vault, &WSOL_MINT, &TOKEN_PROGRAM_ID)
     });
-    (user_wsol_account, fee_vault_wsol_ata)
+    Ok((user_wsol_account, fee_vault_wsol_ata))
 }
 
 fn derive_temp_wsol_output_account(
@@ -475,9 +802,86 @@ fn derive_temp_wsol_output_account(
     None
 }
 
+fn derive_closed_temp_wsol_output_account(
+    payer: &Pubkey,
+    route_kind: WrapperRouteKind,
+    venue_accounts: &[AccountMeta],
+    preamble: &[Instruction],
+    postamble: &[Instruction],
+) -> Result<Option<Pubkey>, String> {
+    if !matches!(route_kind, WrapperRouteKind::SolOut) {
+        return Ok(None);
+    }
+    let mut close_candidates = Vec::new();
+    for instruction in postamble {
+        if instruction.program_id != TOKEN_PROGRAM_ID
+            || instruction.data.first().copied() != Some(SPL_TOKEN_CLOSE_ACCOUNT_DISCRIMINATOR)
+        {
+            continue;
+        }
+        let Some(closed_account) = instruction.accounts.first().map(|meta| meta.pubkey) else {
+            continue;
+        };
+        let Some(destination) = instruction.accounts.get(1).map(|meta| meta.pubkey) else {
+            continue;
+        };
+        let Some(owner) = instruction.accounts.get(2).map(|meta| meta.pubkey) else {
+            continue;
+        };
+        if destination != *payer || owner != *payer {
+            continue;
+        }
+        let referenced_by_venue = venue_accounts
+            .iter()
+            .any(|meta| meta.pubkey == closed_account && meta.is_writable);
+        if referenced_by_venue && !close_candidates.contains(&closed_account) {
+            close_candidates.push(closed_account);
+        }
+    }
+    if close_candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let proven_wsol = close_candidates
+        .iter()
+        .copied()
+        .filter(|account| preamble_initializes_wsol_account(preamble, account))
+        .collect::<Vec<_>>();
+    match proven_wsol.as_slice() {
+        [account] => Ok(Some(*account)),
+        [] => Err(format!(
+            "SolOut close-account candidate(s) [{}] could not be proven to be WSOL",
+            close_candidates
+                .iter()
+                .map(Pubkey::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        multiple => Err(format!(
+            "ambiguous SolOut WSOL close-account candidates [{}]",
+            multiple
+                .iter()
+                .map(Pubkey::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn preamble_initializes_wsol_account(preamble: &[Instruction], account: &Pubkey) -> bool {
+    preamble.iter().any(|instruction| {
+        instruction.program_id == TOKEN_PROGRAM_ID
+            && instruction.data.first().copied()
+                == Some(SPL_TOKEN_INITIALIZE_ACCOUNT3_DISCRIMINATOR)
+            && instruction.accounts.first().map(|meta| meta.pubkey) == Some(*account)
+            && instruction.accounts.get(1).map(|meta| meta.pubkey) == Some(WSOL_MINT)
+    })
+}
+
 fn derive_amm_wsol_input_account_index(
     inner_program: &Pubkey,
     venue_accounts: &[AccountMeta],
+    preamble: &[Instruction],
 ) -> Option<usize> {
     if *inner_program == raydium_clmm_program_id() {
         return derive_raydium_clmm_wsol_input_account_index(venue_accounts);
@@ -488,7 +892,28 @@ fn derive_amm_wsol_input_account_index(
     if *inner_program == raydium_amm_v4_program_id() {
         return derive_raydium_amm_v4_wsol_input_account_index(venue_accounts);
     }
-    None
+    if *inner_program == bonk_launchpad_program_id() {
+        return derive_bonk_launchpad_wsol_input_account_index(venue_accounts);
+    }
+    derive_generic_wsol_input_account_index(venue_accounts, preamble)
+}
+
+fn derive_generic_wsol_input_account_index(
+    venue_accounts: &[AccountMeta],
+    preamble: &[Instruction],
+) -> Option<usize> {
+    let candidates = venue_accounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, meta)| {
+            (meta.is_writable && preamble_prepares_wsol_input_account(preamble, &meta.pubkey))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
 }
 
 fn derive_raydium_clmm_wsol_input_account_index(venue_accounts: &[AccountMeta]) -> Option<usize> {
@@ -523,10 +948,56 @@ fn derive_raydium_amm_v4_wsol_input_account_index(venue_accounts: &[AccountMeta]
     (user_input_account.is_writable && user_owner.is_signer).then_some(15)
 }
 
+fn derive_bonk_launchpad_wsol_input_account_index(venue_accounts: &[AccountMeta]) -> Option<usize> {
+    let user_input_account = venue_accounts.get(6)?;
+    let input_mint = venue_accounts.get(10)?;
+    (user_input_account.is_writable && input_mint.pubkey == WSOL_MINT).then_some(6)
+}
+
 fn derive_raydium_amm_v4_wsol_output_account(venue_accounts: &[AccountMeta]) -> Option<Pubkey> {
     let user_output_account = venue_accounts.get(16)?;
     let user_owner = venue_accounts.get(17)?;
     (user_output_account.is_writable && user_owner.is_signer).then_some(user_output_account.pubkey)
+}
+
+fn read_u64_le(data: &[u8], range: std::ops::Range<usize>) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(data.get(range)?);
+    Some(u64::from_le_bytes(buf))
+}
+
+fn infer_sol_out_min_lamports_from_venue_instruction(instruction: &Instruction) -> Option<u64> {
+    let data = instruction.data.as_slice();
+    let discriminator = data.get(0..8)?;
+    let program_id = instruction.program_id;
+    if program_id == Pubkey::from_str(PUMP_PROGRAM_ID).ok()?
+        && discriminator == PUMP_SELL_DISCRIMINATOR
+    {
+        return read_u64_le(data, 16..24);
+    }
+    if program_id == pump_amm_program_id() && discriminator == PUMP_AMM_SELL_DISCRIMINATOR {
+        return read_u64_le(data, 16..24);
+    }
+    if program_id == bonk_launchpad_program_id()
+        && discriminator == BONK_SELL_EXACT_IN_DISCRIMINATOR
+    {
+        return read_u64_le(data, 16..24);
+    }
+    if (program_id == raydium_cpmm_program_id()
+        && discriminator == RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR)
+        || (program_id == raydium_clmm_program_id()
+            && discriminator == RAYDIUM_CLMM_SWAP_V2_DISCRIMINATOR)
+        || ((program_id == bags_dbc_program_id() || program_id == bags_damm_v2_program_id())
+            && discriminator == BAGS_SWAP_DISCRIMINATOR)
+    {
+        return read_u64_le(data, 16..24);
+    }
+    if program_id == raydium_amm_v4_program_id()
+        && data.first().copied() == Some(RAYDIUM_AMM_V4_SWAP_BASE_IN_DISCRIMINATOR)
+    {
+        return read_u64_le(data, 9..17);
+    }
+    None
 }
 
 fn append_system_program_inner_account(inner_accounts: &mut Vec<AccountMeta>) {
@@ -542,6 +1013,28 @@ fn append_system_program_inner_account(inner_accounts: &mut Vec<AccountMeta>) {
 
 fn should_append_system_program_inner_account(inner_program: &Pubkey) -> bool {
     *inner_program != raydium_amm_v4_program_id()
+}
+
+fn patch_amm_wsol_input_amount(
+    inner_program: Pubkey,
+    inner_ix_data: &[u8],
+    net_input_lamports: u64,
+) -> Vec<u8> {
+    let mut patched = inner_ix_data.to_vec();
+    let supports_amount_patch = (inner_program == raydium_clmm_program_id()
+        && patched.get(0..8) == Some(RAYDIUM_CLMM_SWAP_V2_DISCRIMINATOR.as_slice()))
+        || (inner_program == raydium_cpmm_program_id()
+            && patched.get(0..8) == Some(RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR.as_slice()))
+        || (inner_program == bonk_launchpad_program_id()
+            && patched.get(0..8) == Some(BONK_BUY_EXACT_IN_DISCRIMINATOR.as_slice()))
+        || (inner_program == pump_amm_program_id()
+            && patched.get(0..8) == Some(PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR.as_slice()))
+        || ((inner_program == bags_dbc_program_id() || inner_program == bags_damm_v2_program_id())
+            && patched.get(0..8) == Some(BAGS_SWAP_DISCRIMINATOR.as_slice()));
+    if supports_amount_patch && patched.len() >= 16 {
+        patched[8..16].copy_from_slice(&net_input_lamports.to_le_bytes());
+    }
+    patched
 }
 
 #[derive(Debug, Clone)]
@@ -566,11 +1059,15 @@ fn try_build_amm_wsol_v2_plan(
     }
 
     let inner_wsol_account_index =
-        derive_amm_wsol_input_account_index(&venue_ix.program_id, &venue_ix.accounts)?;
+        derive_amm_wsol_input_account_index(&venue_ix.program_id, &venue_ix.accounts, preamble)?;
     let original_wsol_account = venue_ix.accounts.get(inner_wsol_account_index)?.pubkey;
-    let create_lamports = find_temp_wsol_create_lamports(preamble, &original_wsol_account)?;
-    let rent_lamports = Rent::default().minimum_balance(SPL_TOKEN_ACCOUNT_LEN);
-    let pda_wsol_lamports = create_lamports.checked_sub(rent_lamports)?;
+    let source_wsol_lamports =
+        find_preamble_wsol_funding_lamports(preamble, &original_wsol_account)?;
+    let fee_lamports = estimate_sol_in_fee_lamports(request.gross_sol_in_lamports, request.fee_bps);
+    let pda_wsol_lamports = request
+        .gross_sol_in_lamports
+        .checked_sub(fee_lamports)
+        .filter(|net| *net <= source_wsol_lamports)?;
     if pda_wsol_lamports == 0 {
         return None;
     }
@@ -578,7 +1075,7 @@ fn try_build_amm_wsol_v2_plan(
     let preamble = strip_temp_wsol_lifecycle_instructions(preamble, &original_wsol_account)?;
     let postamble = strip_temp_wsol_lifecycle_instructions(postamble, &original_wsol_account)?;
 
-    let (amm_wsol_account, _) = amm_wsol_pda(payer);
+    let (amm_wsol_account, _) = route_wsol_pda(payer, 0);
     let mut inner_accounts = venue_ix.accounts.clone();
     let original_meta = inner_accounts.get_mut(inner_wsol_account_index)?;
     original_meta.pubkey = amm_wsol_account;
@@ -598,6 +1095,43 @@ fn try_build_amm_wsol_v2_plan(
     })
 }
 
+fn try_build_wsol_out_v3_plan(
+    payer: &Pubkey,
+    request: &WrapCompiledTransactionRequest,
+    venue_ix: &Instruction,
+    preamble: &[Instruction],
+    postamble: &[Instruction],
+    user_wsol_account: Option<Pubkey>,
+) -> Option<AmmWsolV2Plan> {
+    if !matches!(request.route_kind, WrapperRouteKind::SolOut) {
+        return None;
+    }
+    let original_wsol_account = user_wsol_account?;
+    let route_wsol_account = route_wsol_pda(payer, 0).0;
+    let mut inner_accounts = venue_ix.accounts.clone();
+    let output_index = inner_accounts
+        .iter()
+        .position(|meta| meta.pubkey == original_wsol_account && meta.is_writable)?;
+    let output_meta = inner_accounts.get_mut(output_index)?;
+    output_meta.pubkey = route_wsol_account;
+    output_meta.is_signer = false;
+    output_meta.is_writable = true;
+
+    let preamble = strip_temp_wsol_lifecycle_instructions(preamble, &original_wsol_account)?;
+    let postamble = strip_temp_wsol_lifecycle_instructions(postamble, &original_wsol_account)?;
+    if should_append_system_program_inner_account(&venue_ix.program_id) {
+        append_system_program_inner_account(&mut inner_accounts);
+    }
+    Some(AmmWsolV2Plan {
+        inner_wsol_account_index: output_index,
+        amm_wsol_account: route_wsol_account,
+        pda_wsol_lamports: 0,
+        inner_accounts,
+        preamble,
+        postamble,
+    })
+}
+
 fn find_temp_wsol_create_lamports(
     instructions: &[Instruction],
     temp_wsol_account: &Pubkey,
@@ -610,6 +1144,41 @@ fn find_temp_wsol_create_lamports(
         buf.copy_from_slice(instruction.data.get(4..12)?);
         Some(u64::from_le_bytes(buf))
     })
+}
+
+fn find_preamble_wsol_funding_lamports(
+    instructions: &[Instruction],
+    wsol_account: &Pubkey,
+) -> Option<u64> {
+    if let Some(create_lamports) = find_temp_wsol_create_lamports(instructions, wsol_account) {
+        let rent_lamports = Rent::default().minimum_balance(SPL_TOKEN_ACCOUNT_LEN);
+        return create_lamports.checked_sub(rent_lamports);
+    }
+    find_system_transfer_lamports_to(instructions, wsol_account)
+}
+
+fn find_system_transfer_lamports_to(
+    instructions: &[Instruction],
+    destination: &Pubkey,
+) -> Option<u64> {
+    instructions.iter().find_map(|instruction| {
+        if !is_system_transfer_to(instruction, destination) {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(instruction.data.get(4..12)?);
+        Some(u64::from_le_bytes(buf))
+    })
+}
+
+fn preamble_prepares_wsol_input_account(preamble: &[Instruction], account: &Pubkey) -> bool {
+    find_preamble_wsol_funding_lamports(preamble, account).is_some()
+        && preamble.iter().any(|instruction| {
+            (instruction.program_id == TOKEN_PROGRAM_ID
+                && instruction.data.first().copied() == Some(SPL_TOKEN_SYNC_NATIVE_DISCRIMINATOR)
+                && instruction.accounts.first().map(|meta| meta.pubkey) == Some(*account))
+                || preamble_initializes_wsol_account(preamble, account)
+        })
 }
 
 fn strip_temp_wsol_lifecycle_instructions(
@@ -642,6 +1211,8 @@ fn is_temp_wsol_lifecycle_instruction(
     temp_wsol_account: &Pubkey,
 ) -> bool {
     is_system_create_account_for(instruction, temp_wsol_account)
+        || is_system_transfer_to(instruction, temp_wsol_account)
+        || is_associated_token_account_create_for_wsol(instruction, temp_wsol_account)
         || is_spl_token_wsol_lifecycle_instruction(instruction, temp_wsol_account)
 }
 
@@ -665,6 +1236,27 @@ fn is_system_create_account_for(instruction: &Instruction, temp_wsol_account: &P
     let mut owner = [0u8; 32];
     owner.copy_from_slice(&instruction.data[20..52]);
     Pubkey::new_from_array(owner) == TOKEN_PROGRAM_ID
+}
+
+fn is_system_transfer_to(instruction: &Instruction, destination: &Pubkey) -> bool {
+    if instruction.program_id != system_program_id()
+        || instruction.accounts.get(1).map(|meta| meta.pubkey) != Some(*destination)
+        || instruction.data.len() < 12
+    {
+        return false;
+    }
+    let mut discriminator = [0u8; 4];
+    discriminator.copy_from_slice(&instruction.data[0..4]);
+    u32::from_le_bytes(discriminator) == SYSTEM_TRANSFER_DISCRIMINATOR
+}
+
+fn is_associated_token_account_create_for_wsol(
+    instruction: &Instruction,
+    wsol_account: &Pubkey,
+) -> bool {
+    instruction.program_id == spl_associated_token_account::id()
+        && instruction.accounts.get(1).map(|meta| meta.pubkey) == Some(*wsol_account)
+        && instruction.accounts.get(3).map(|meta| meta.pubkey) == Some(WSOL_MINT)
 }
 
 fn is_spl_token_wsol_lifecycle_instruction(
@@ -708,6 +1300,22 @@ fn raydium_amm_v4_program_id() -> Pubkey {
     Pubkey::from_str(RAYDIUM_AMM_V4_PROGRAM_ID).expect("Raydium AMM v4 program id must be valid")
 }
 
+fn bonk_launchpad_program_id() -> Pubkey {
+    Pubkey::from_str(BONK_LAUNCHPAD_PROGRAM_ID).expect("Bonk Launchpad program id must be valid")
+}
+
+fn pump_amm_program_id() -> Pubkey {
+    Pubkey::from_str(PUMP_AMM_PROGRAM_ID).expect("Pump AMM program id must be valid")
+}
+
+fn bags_dbc_program_id() -> Pubkey {
+    Pubkey::from_str(BAGS_DBC_PROGRAM_ID).expect("Bags DBC program id must be valid")
+}
+
+fn bags_damm_v2_program_id() -> Pubkey {
+    Pubkey::from_str(BAGS_DAMM_V2_PROGRAM_ID).expect("Bags DAMM v2 program id must be valid")
+}
+
 fn is_memo_instruction(instruction: &Instruction) -> bool {
     instruction.program_id == memo_program_id()
 }
@@ -745,6 +1353,9 @@ pub fn wrap_compiled_transaction(
     };
 
     let (instructions, _account_keys) = decompile_v0_transaction(&transaction, lookup_tables)?;
+    if instructions.iter().any(is_wrapper_execute_instruction) {
+        return Err(WrapCompiledTransactionError::AlreadyWrapped);
+    }
 
     // Find the ONE venue instruction. More than one means the adapter
     // produced a multi-CPI venue (not currently used by any family) and
@@ -772,18 +1383,7 @@ pub fn wrap_compiled_transaction(
             }
         }
     };
-
-    let venue_ix = instructions[venue_idx].clone();
-    let (user_wsol_ata, fee_vault_wsol_ata) = derive_wsol_route_accounts(
-        &payer.pubkey(),
-        &request.fee_vault,
-        &venue_ix.program_id,
-        &venue_ix.accounts,
-    );
-    let mut inner_accounts = venue_ix.accounts.clone();
-    if should_append_system_program_inner_account(&venue_ix.program_id) {
-        append_system_program_inner_account(&mut inner_accounts);
-    }
+    let mut request = request.clone();
 
     // Assemble the preamble (everything before venue) and postamble
     // (everything after venue). The wrapper Execute replaces the venue
@@ -794,57 +1394,160 @@ pub fn wrap_compiled_transaction(
         .filter(|instruction| !is_memo_instruction(instruction))
         .cloned()
         .collect();
+
     let postamble: Vec<Instruction> = rest[1..]
         .iter()
         .filter(|instruction| !is_memo_instruction(instruction))
         .cloned()
         .collect();
 
-    let v2_plan =
-        try_build_amm_wsol_v2_plan(&payer.pubkey(), request, &venue_ix, &preamble, &postamble);
-    let (wrapper_execute, preamble, postamble, wrapper_mode) = if let Some(plan) = v2_plan {
+    let venue_ix = instructions[venue_idx].clone();
+    if matches!(request.route_kind, WrapperRouteKind::SolOut) && request.min_net_output == 0 {
+        let gross_min_output = infer_sol_out_min_lamports_from_venue_instruction(&venue_ix)
+            .ok_or_else(|| {
+                WrapCompiledTransactionError::CompileFailed(format!(
+                    "could not infer SOL output minimum for {}",
+                    venue_ix.program_id
+                ))
+            })?;
+        request.min_net_output = gross_min_output
+            .checked_sub(estimate_sol_in_fee_lamports(
+                gross_min_output,
+                request.fee_bps,
+            ))
+            .ok_or_else(|| {
+                WrapCompiledTransactionError::CompileFailed(
+                    "wrapper fee exceeds minimum SOL output".to_string(),
+                )
+            })?;
+    }
+    let (user_wsol_ata, fee_vault_wsol_ata) = derive_wsol_route_accounts(
+        &payer.pubkey(),
+        &request.fee_vault,
+        request.route_kind,
+        &venue_ix.program_id,
+        &venue_ix.accounts,
+        &preamble,
+        &postamble,
+    )?;
+    let mut inner_accounts = venue_ix.accounts.clone();
+    if should_append_system_program_inner_account(&venue_ix.program_id) {
+        append_system_program_inner_account(&mut inner_accounts);
+    }
+
+    let v3_wsol_plan =
+        try_build_amm_wsol_v2_plan(&payer.pubkey(), &request, &venue_ix, &preamble, &postamble)
+            .or_else(|| {
+                try_build_wsol_out_v3_plan(
+                    &payer.pubkey(),
+                    &request,
+                    &venue_ix,
+                    &preamble,
+                    &postamble,
+                    user_wsol_ata,
+                )
+            });
+    let (wrapper_execute, preamble, postamble, wrapper_mode) = if let Some(plan) = v3_wsol_plan {
         let user_pubkey = payer.pubkey();
         let (config_pda_pubkey, _bump) = config_pda();
-        let fee_vault_wsol_sentinel = ZEROED_WSOL_ATA_SENTINEL;
-        let user_wsol_sentinel = ZEROED_WSOL_ATA_SENTINEL;
+        let fee_vault_wsol = fee_vault_wsol_ata.unwrap_or(ZEROED_WSOL_ATA_SENTINEL);
         let instructions_sysvar = instructions_sysvar_id();
         let token_program = TOKEN_PROGRAM_ID;
-        let system_program = system_program_id();
-        let rent_sysvar = rent_sysvar_id();
         let execute_accounts = ExecuteAccounts {
             user: &user_pubkey,
             config_pda: &config_pda_pubkey,
             fee_vault: &request.fee_vault,
-            fee_vault_wsol_ata: &fee_vault_wsol_sentinel,
-            user_wsol_ata: &user_wsol_sentinel,
+            fee_vault_wsol_ata: &fee_vault_wsol,
+            user_wsol_ata: &plan.amm_wsol_account,
             instructions_sysvar: &instructions_sysvar,
             inner_program: &venue_ix.program_id,
             token_program: &token_program,
         };
-        let accounts = ExecuteAmmWsolAccounts {
+        let accounts = ExecuteSwapRouteAccounts {
             execute: execute_accounts,
-            amm_wsol_account: &plan.amm_wsol_account,
-            wsol_mint: &WSOL_MINT,
-            system_program: &system_program,
-            rent_sysvar: &rent_sysvar,
+            token_fee_vault_ata: None,
         };
-        let execute_request = ExecuteAmmWsolRequest {
+        let route_mode = match request.route_kind {
+            WrapperRouteKind::SolIn => SwapRouteMode::Mixed,
+            WrapperRouteKind::SolOut => SwapRouteMode::SolOut,
+            WrapperRouteKind::SolThrough => {
+                return Err(WrapCompiledTransactionError::InvalidRouteKind);
+            }
+        };
+        let direction = match request.route_kind {
+            WrapperRouteKind::SolIn => SwapRouteDirection::Buy,
+            WrapperRouteKind::SolOut => SwapRouteDirection::Sell,
+            WrapperRouteKind::SolThrough => {
+                return Err(WrapCompiledTransactionError::InvalidRouteKind);
+            }
+        };
+        let fee_mode = match request.route_kind {
+            WrapperRouteKind::SolIn => SwapRouteFeeMode::SolPre,
+            WrapperRouteKind::SolOut => SwapRouteFeeMode::WsolPost,
+            WrapperRouteKind::SolThrough => {
+                return Err(WrapCompiledTransactionError::InvalidRouteKind);
+            }
+        };
+        let settlement = match request.route_kind {
+            WrapperRouteKind::SolIn => SwapRouteSettlement::Token,
+            WrapperRouteKind::SolOut => SwapRouteSettlement::Wsol,
+            WrapperRouteKind::SolThrough => {
+                return Err(WrapCompiledTransactionError::InvalidRouteKind);
+            }
+        };
+        let mut route_accounts = Vec::with_capacity(1 + plan.inner_accounts.len());
+        route_accounts.push(AccountMeta::new_readonly(venue_ix.program_id, false));
+        route_accounts.extend(plan.inner_accounts.iter().cloned());
+        let accounts_len = u16::try_from(plan.inner_accounts.len())
+            .map_err(|_| WrapCompiledTransactionError::VenueAccountOutOfBounds)?;
+        let output_account_index = if matches!(request.route_kind, WrapperRouteKind::SolOut) {
+            u16::try_from(1usize.saturating_add(plan.inner_wsol_account_index))
+                .map_err(|_| WrapCompiledTransactionError::VenueAccountOutOfBounds)?
+        } else {
+            SWAP_ROUTE_NO_PATCH_OFFSET
+        };
+        let execute_request = ExecuteSwapRouteRequest {
             version: ABI_VERSION,
-            route_kind: request.route_kind,
+            route_mode,
+            direction,
+            settlement,
+            fee_mode,
+            wsol_lane: 0,
             fee_bps: request.fee_bps,
-            gross_sol_in_lamports: plan.pda_wsol_lamports,
+            gross_sol_in_lamports: request.gross_sol_in_lamports,
+            gross_token_in_amount: 0,
             min_net_output: request.min_net_output,
-            inner_accounts_offset: EXECUTE_AMM_WSOL_FIXED_ACCOUNT_COUNT,
-            wsol_account_mode: WsolAccountMode::CreateOrReuse,
-            pda_wsol_lamports: plan.pda_wsol_lamports,
-            inner_wsol_account_index: u16::try_from(plan.inner_wsol_account_index)
-                .map_err(|_| WrapCompiledTransactionError::VenueAccountOutOfBounds)?,
-            inner_ix_data: venue_ix.data.clone(),
+            route_accounts_offset: EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT
+                + EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT,
+            intermediate_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+            token_fee_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+            legs: vec![SwapRouteLeg {
+                program_account_index: 0,
+                accounts_start: 1,
+                accounts_len,
+                input_source: if matches!(request.route_kind, WrapperRouteKind::SolIn) {
+                    SwapLegInputSource::GrossSolNetOfFee
+                } else {
+                    SwapLegInputSource::Fixed
+                },
+                input_amount: plan.pda_wsol_lamports,
+                input_patch_offset: SWAP_ROUTE_NO_PATCH_OFFSET,
+                output_account_index,
+                ix_data: if matches!(request.route_kind, WrapperRouteKind::SolIn) {
+                    patch_amm_wsol_input_amount(
+                        venue_ix.program_id,
+                        &venue_ix.data,
+                        plan.pda_wsol_lamports,
+                    )
+                } else {
+                    venue_ix.data.clone()
+                },
+            }],
         };
         let instruction =
-            build_execute_amm_wsol_instruction(&accounts, &execute_request, &plan.inner_accounts)
+            build_execute_swap_route_instruction(&accounts, &execute_request, &route_accounts)
                 .map_err(|error| WrapCompiledTransactionError::CompileFailed(error.to_string()))?;
-        (instruction, plan.preamble, plan.postamble, "v2-amm-wsol")
+        (instruction, plan.preamble, plan.postamble, "v3-route-wsol")
     } else {
         let instruction = build_wrapper_execute_instruction(&WrapperCompileRequest {
             label: source.label.clone(),
@@ -872,7 +1575,7 @@ pub fn wrap_compiled_transaction(
             inline_tip_account: source.inline_tip_account.clone(),
         })
         .map_err(|error| WrapCompiledTransactionError::CompileFailed(error.to_string()))?;
-        (instruction, preamble, postamble, "legacy")
+        (instruction, preamble, postamble, "v3-native")
     };
 
     let mut new_instructions: Vec<Instruction> =
@@ -902,6 +1605,16 @@ pub fn wrap_compiled_transaction(
         .take(required_signer_count)
         .copied()
         .collect::<Vec<_>>();
+    if required_signers.as_slice() != [payer.pubkey()] {
+        return Err(WrapCompiledTransactionError::CompileFailed(format!(
+            "v3 wrapper transactions must require exactly one signer (user); got [{}]",
+            required_signers
+                .iter()
+                .map(Pubkey::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let mut signers: Vec<&Keypair> = Vec::with_capacity(1 + restored_signers.len());
     signers.push(payer);
     signers.extend(
@@ -962,6 +1675,7 @@ pub fn wrap_compiled_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrapper_abi::rent_sysvar_id;
     use borsh::BorshDeserialize;
     use solana_sdk::instruction::AccountMeta;
 
@@ -1052,8 +1766,11 @@ mod tests {
         let request = stub_request(&payer, WrapperRouteKind::SolIn, 10_000);
         let ix = build_wrapper_execute_instruction(&request).expect("build");
         assert_eq!(ix.program_id, PROGRAM_ID);
-        assert_eq!(ix.accounts.len(), EXECUTE_FIXED_ACCOUNT_COUNT as usize + 2);
-        assert_eq!(ix.data[0], 1);
+        assert_eq!(
+            ix.accounts.len(),
+            EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT as usize + 3
+        );
+        assert_eq!(ix.data[0], EXECUTE_SWAP_ROUTE_DISCRIMINATOR);
         assert_eq!(ix.accounts[7].pubkey, TOKEN_PROGRAM_ID);
         assert!(!ix.accounts[7].is_writable);
     }
@@ -1069,18 +1786,214 @@ mod tests {
     }
 
     #[test]
-    fn build_execute_wsol_sell_populates_both_wsol_slots() {
+    fn build_execute_wsol_sell_is_not_a_direct_legacy_path() {
         let payer = stub_payer();
         let user_wsol = Pubkey::new_unique();
         let vault_wsol = Pubkey::new_unique();
         let mut request = stub_request(&payer, WrapperRouteKind::SolOut, 0);
         request.user_wsol_ata = Some(user_wsol);
         request.fee_vault_wsol_ata = Some(vault_wsol);
-        let ix = build_wrapper_execute_instruction(&request).expect("build");
-        assert_eq!(ix.accounts[3].pubkey, vault_wsol);
-        assert_eq!(ix.accounts[4].pubkey, user_wsol);
-        assert!(ix.accounts[3].is_writable);
-        assert!(ix.accounts[4].is_writable);
+        let err = build_wrapper_execute_instruction(&request).unwrap_err();
+        assert!(matches!(err, WrapperCompileError::InvalidRouteKind));
+    }
+
+    #[test]
+    fn infers_sol_out_minimum_from_known_sell_instructions() {
+        let mut pump_sell_data = PUMP_SELL_DISCRIMINATOR.to_vec();
+        pump_sell_data.extend_from_slice(&250_000u64.to_le_bytes());
+        pump_sell_data.extend_from_slice(&1_000_000u64.to_le_bytes());
+        let pump_sell = Instruction {
+            program_id: Pubkey::from_str(PUMP_PROGRAM_ID).unwrap(),
+            accounts: vec![],
+            data: pump_sell_data,
+        };
+
+        assert_eq!(
+            infer_sol_out_min_lamports_from_venue_instruction(&pump_sell),
+            Some(1_000_000)
+        );
+
+        let mut pump_amm_sell_data = PUMP_AMM_SELL_DISCRIMINATOR.to_vec();
+        pump_amm_sell_data.extend_from_slice(&300_000u64.to_le_bytes());
+        pump_amm_sell_data.extend_from_slice(&2_000_000u64.to_le_bytes());
+        let pump_amm_sell = Instruction {
+            program_id: pump_amm_program_id(),
+            accounts: vec![],
+            data: pump_amm_sell_data,
+        };
+        assert_eq!(
+            infer_sol_out_min_lamports_from_venue_instruction(&pump_amm_sell),
+            Some(2_000_000)
+        );
+
+        let mut raydium_v4_sell_data = vec![RAYDIUM_AMM_V4_SWAP_BASE_IN_DISCRIMINATOR];
+        raydium_v4_sell_data.extend_from_slice(&400_000u64.to_le_bytes());
+        raydium_v4_sell_data.extend_from_slice(&3_000_000u64.to_le_bytes());
+        let raydium_v4_sell = Instruction {
+            program_id: raydium_amm_v4_program_id(),
+            accounts: vec![],
+            data: raydium_v4_sell_data,
+        };
+        assert_eq!(
+            infer_sol_out_min_lamports_from_venue_instruction(&raydium_v4_sell),
+            Some(3_000_000)
+        );
+    }
+
+    #[test]
+    fn already_wrapped_detection_includes_legacy_discriminators() {
+        for discriminator in [
+            EXECUTE_DISCRIMINATOR,
+            EXECUTE_AMM_WSOL_DISCRIMINATOR,
+            EXECUTE_SWAP_ROUTE_DISCRIMINATOR,
+        ] {
+            let instruction = Instruction {
+                program_id: PROGRAM_ID,
+                accounts: vec![],
+                data: vec![discriminator],
+            };
+            assert!(is_wrapper_execute_instruction(&instruction));
+        }
+    }
+
+    #[test]
+    fn already_wrapped_account_validation_rejects_wrong_fee_vault() {
+        let payer = Pubkey::new_unique();
+        let fee_vault = Pubkey::new_unique();
+        let inner_program = Pubkey::new_unique();
+        let route_wsol = route_wsol_pda(&payer, 0).0;
+        let route = ExecuteSwapRouteRequest {
+            version: ABI_VERSION,
+            route_mode: SwapRouteMode::Mixed,
+            direction: SwapRouteDirection::Buy,
+            settlement: SwapRouteSettlement::Token,
+            fee_mode: SwapRouteFeeMode::SolPre,
+            wsol_lane: 0,
+            fee_bps: 10,
+            gross_sol_in_lamports: 1_000_000,
+            gross_token_in_amount: 0,
+            min_net_output: 0,
+            route_accounts_offset: EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT
+                + EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT,
+            intermediate_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+            token_fee_account_index: SWAP_ROUTE_NO_PATCH_OFFSET,
+            legs: vec![],
+        };
+        let mut instruction = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new_readonly(config_pda().0, false),
+                AccountMeta::new(fee_vault, false),
+                AccountMeta::new(ZEROED_WSOL_ATA_SENTINEL, false),
+                AccountMeta::new(route_wsol, false),
+                AccountMeta::new_readonly(instructions_sysvar_id(), false),
+                AccountMeta::new_readonly(inner_program, false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(WSOL_MINT, false),
+                AccountMeta::new_readonly(system_program_id(), false),
+                AccountMeta::new_readonly(rent_sysvar_id(), false),
+                AccountMeta::new_readonly(inner_program, false),
+            ],
+            data: vec![EXECUTE_SWAP_ROUTE_DISCRIMINATOR],
+        };
+        let request = WrapCompiledTransactionRequest {
+            label: "follow-buy-atomic".to_string(),
+            route_kind: WrapperRouteKind::SolIn,
+            fee_bps: 10,
+            fee_vault,
+            gross_sol_in_lamports: 1_000_000,
+            min_net_output: 0,
+            select_first_allowlisted_venue_instruction: true,
+            select_last_allowlisted_venue_instruction: false,
+        };
+
+        validate_already_wrapped_route_accounts(&instruction, &payer, &request, &route)
+            .expect("valid account metas");
+        instruction.accounts[2].pubkey = Pubkey::new_unique();
+        let error = validate_already_wrapped_route_accounts(&instruction, &payer, &request, &route)
+            .expect_err("wrong fee vault must fail");
+        assert!(error.to_string().contains("fixed accounts"));
+    }
+
+    #[test]
+    fn derives_temp_wsol_output_account_from_postamble_close() {
+        let payer = stub_payer();
+        let fee_vault = Pubkey::new_unique();
+        let temp_wsol = Pubkey::new_unique();
+        let venue_accounts = vec![
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new(temp_wsol, false),
+        ];
+        let postamble = vec![Instruction {
+            program_id: TOKEN_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(temp_wsol, false),
+                AccountMeta::new(payer.pubkey(), false),
+                AccountMeta::new_readonly(payer.pubkey(), true),
+            ],
+            data: vec![SPL_TOKEN_CLOSE_ACCOUNT_DISCRIMINATOR],
+        }];
+        let preamble = vec![
+            spl_token::instruction::initialize_account3(
+                &TOKEN_PROGRAM_ID,
+                &temp_wsol,
+                &WSOL_MINT,
+                &payer.pubkey(),
+            )
+            .expect("initialize temp wsol"),
+        ];
+
+        let (user_wsol, fee_vault_wsol) = derive_wsol_route_accounts(
+            &payer.pubkey(),
+            &fee_vault,
+            WrapperRouteKind::SolOut,
+            &Pubkey::new_unique(),
+            &venue_accounts,
+            &preamble,
+            &postamble,
+        )
+        .expect("derive wsol route accounts");
+
+        assert_eq!(user_wsol, Some(temp_wsol));
+        assert_eq!(
+            fee_vault_wsol,
+            Some(get_associated_token_address_with_program_id(
+                &fee_vault,
+                &WSOL_MINT,
+                &TOKEN_PROGRAM_ID,
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_unproven_temp_wsol_output_close() {
+        let payer = stub_payer();
+        let fee_vault = Pubkey::new_unique();
+        let temp_account = Pubkey::new_unique();
+        let venue_accounts = vec![AccountMeta::new(temp_account, false)];
+        let postamble = vec![Instruction {
+            program_id: TOKEN_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(temp_account, false),
+                AccountMeta::new(payer.pubkey(), false),
+                AccountMeta::new_readonly(payer.pubkey(), true),
+            ],
+            data: vec![SPL_TOKEN_CLOSE_ACCOUNT_DISCRIMINATOR],
+        }];
+
+        let error = derive_wsol_route_accounts(
+            &payer.pubkey(),
+            &fee_vault,
+            WrapperRouteKind::SolOut,
+            &Pubkey::new_unique(),
+            &venue_accounts,
+            &[],
+            &postamble,
+        )
+        .expect_err("unproven close must fail");
+
+        assert!(error.to_string().contains("could not be proven to be WSOL"));
     }
 
     #[test]
@@ -1444,10 +2357,10 @@ mod tests {
     }
 
     #[test]
-    fn raydium_v4_v2_wsol_plan_preserves_exact_inner_account_count() {
+    fn raydium_v4_v3_wsol_plan_preserves_exact_inner_account_count() {
         let payer = Pubkey::new_unique();
         let temp_wsol = Pubkey::new_unique();
-        let (amm_wsol, _) = amm_wsol_pda(&payer);
+        let (route_wsol, _) = route_wsol_pda(&payer, 0);
         let rent_lamports = Rent::default().minimum_balance(SPL_TOKEN_ACCOUNT_LEN);
         let swap_lamports = 100_000_000;
         let mut venue_accounts = (0..18)
@@ -1481,7 +2394,7 @@ mod tests {
         let plan = try_build_amm_wsol_v2_plan(&payer, &request, &venue_ix, &preamble, &[]).unwrap();
 
         assert_eq!(plan.inner_accounts.len(), 18);
-        assert_eq!(plan.inner_accounts[15].pubkey, amm_wsol);
+        assert_eq!(plan.inner_accounts[15].pubkey, route_wsol);
         assert!(!plan.inner_accounts[15].is_signer);
         assert!(plan.inner_accounts[15].is_writable);
         assert!(
@@ -1493,7 +2406,153 @@ mod tests {
     }
 
     #[test]
-    fn raydium_v4_legacy_sell_preserves_exact_inner_account_count() {
+    fn generic_temp_wsol_input_uses_route_pda() {
+        let payer = Pubkey::new_unique();
+        let temp_wsol = Pubkey::new_unique();
+        let (route_wsol, _) = route_wsol_pda(&payer, 0);
+        let rent_lamports = Rent::default().minimum_balance(SPL_TOKEN_ACCOUNT_LEN);
+        let swap_lamports = 100_000_000;
+        let mut venue_accounts = (0..23)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
+            .collect::<Vec<_>>();
+        venue_accounts[1] = AccountMeta::new_readonly(payer, true);
+        venue_accounts[6] = AccountMeta::new(temp_wsol, false);
+        let venue_ix = Instruction {
+            program_id: pump_amm_program_id(),
+            accounts: venue_accounts,
+            data: PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR.to_vec(),
+        };
+        let preamble = vec![
+            solana_system_interface::instruction::create_account(
+                &payer,
+                &temp_wsol,
+                rent_lamports + swap_lamports,
+                SPL_TOKEN_ACCOUNT_LEN as u64,
+                &TOKEN_PROGRAM_ID,
+            ),
+            spl_token::instruction::initialize_account3(
+                &TOKEN_PROGRAM_ID,
+                &temp_wsol,
+                &WSOL_MINT,
+                &payer,
+            )
+            .expect("initialize temp wsol"),
+            spl_token::instruction::sync_native(&TOKEN_PROGRAM_ID, &temp_wsol)
+                .expect("sync temp wsol"),
+        ];
+        let postamble = vec![
+            spl_token::instruction::close_account(
+                &TOKEN_PROGRAM_ID,
+                &temp_wsol,
+                &payer,
+                &payer,
+                &[],
+            )
+            .expect("close temp wsol"),
+        ];
+        let request = WrapCompiledTransactionRequest {
+            label: "pump-amm-v3-plan".to_string(),
+            route_kind: WrapperRouteKind::SolIn,
+            fee_bps: 10,
+            fee_vault: Pubkey::new_unique(),
+            gross_sol_in_lamports: swap_lamports,
+            min_net_output: 1,
+            select_first_allowlisted_venue_instruction: false,
+            select_last_allowlisted_venue_instruction: false,
+        };
+
+        let plan =
+            try_build_amm_wsol_v2_plan(&payer, &request, &venue_ix, &preamble, &postamble).unwrap();
+
+        assert_eq!(plan.inner_wsol_account_index, 6);
+        assert_eq!(plan.inner_accounts[6].pubkey, route_wsol);
+        assert!(!plan.inner_accounts[6].is_signer);
+        assert!(plan.inner_accounts[6].is_writable);
+        assert!(plan.preamble.is_empty());
+        assert!(plan.postamble.is_empty());
+    }
+
+    #[test]
+    fn generic_wsol_ata_input_uses_route_pda() {
+        let payer = Pubkey::new_unique();
+        let input_wsol_ata =
+            get_associated_token_address_with_program_id(&payer, &WSOL_MINT, &TOKEN_PROGRAM_ID);
+        let (route_wsol, _) = route_wsol_pda(&payer, 0);
+        let gross_lamports = 100_000_000;
+        let fee_bps = 10;
+        let net_lamports = gross_lamports - estimate_sol_in_fee_lamports(gross_lamports, fee_bps);
+        let mut venue_accounts = (0..15)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
+            .collect::<Vec<_>>();
+        venue_accounts[3] = AccountMeta::new(input_wsol_ata, false);
+        venue_accounts[9] = AccountMeta::new_readonly(payer, true);
+        let venue_ix = Instruction {
+            program_id: bags_dbc_program_id(),
+            accounts: venue_accounts,
+            data: BAGS_SWAP_DISCRIMINATOR.to_vec(),
+        };
+        let preamble = vec![
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &payer,
+                &payer,
+                &WSOL_MINT,
+                &TOKEN_PROGRAM_ID,
+            ),
+            solana_system_interface::instruction::transfer(&payer, &input_wsol_ata, net_lamports),
+            spl_token::instruction::sync_native(&TOKEN_PROGRAM_ID, &input_wsol_ata)
+                .expect("sync wsol ata"),
+        ];
+        let postamble = vec![
+            spl_token::instruction::close_account(
+                &TOKEN_PROGRAM_ID,
+                &input_wsol_ata,
+                &payer,
+                &payer,
+                &[],
+            )
+            .expect("close wsol ata"),
+        ];
+        let request = WrapCompiledTransactionRequest {
+            label: "bags-v3-plan".to_string(),
+            route_kind: WrapperRouteKind::SolIn,
+            fee_bps,
+            fee_vault: Pubkey::new_unique(),
+            gross_sol_in_lamports: gross_lamports,
+            min_net_output: 1,
+            select_first_allowlisted_venue_instruction: false,
+            select_last_allowlisted_venue_instruction: false,
+        };
+
+        let plan =
+            try_build_amm_wsol_v2_plan(&payer, &request, &venue_ix, &preamble, &postamble).unwrap();
+
+        assert_eq!(plan.inner_wsol_account_index, 3);
+        assert_eq!(plan.inner_accounts[3].pubkey, route_wsol);
+        assert_eq!(plan.pda_wsol_lamports, net_lamports);
+        assert!(plan.preamble.is_empty());
+        assert!(plan.postamble.is_empty());
+    }
+
+    #[test]
+    fn patches_net_input_amount_for_pump_amm_and_bags_buys() {
+        let net_lamports = 99_900_000u64;
+        let mut pump_data = PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR.to_vec();
+        pump_data.extend_from_slice(&123u64.to_le_bytes());
+        pump_data.extend_from_slice(&456u64.to_le_bytes());
+        let patched_pump =
+            patch_amm_wsol_input_amount(pump_amm_program_id(), &pump_data, net_lamports);
+        assert_eq!(&patched_pump[8..16], &net_lamports.to_le_bytes());
+
+        let mut bags_data = BAGS_SWAP_DISCRIMINATOR.to_vec();
+        bags_data.extend_from_slice(&123u64.to_le_bytes());
+        bags_data.extend_from_slice(&456u64.to_le_bytes());
+        let patched_bags =
+            patch_amm_wsol_input_amount(bags_damm_v2_program_id(), &bags_data, net_lamports);
+        assert_eq!(&patched_bags[8..16], &net_lamports.to_le_bytes());
+    }
+
+    #[test]
+    fn raydium_v4_v3_sell_preserves_exact_inner_account_count() {
         let payer = stub_payer();
         let fee_vault = Pubkey::new_unique();
         let venue_program = raydium_amm_v4_program_id();
@@ -1510,6 +2569,8 @@ mod tests {
             fee_vault,
             get_associated_token_address_with_program_id(&fee_vault, &WSOL_MINT, &TOKEN_PROGRAM_ID),
             user_wsol_account,
+            route_wsol_pda(&payer.pubkey(), 0).0,
+            WSOL_MINT,
             TOKEN_PROGRAM_ID,
             system_program_id(),
             venue_program,
@@ -1574,19 +2635,25 @@ mod tests {
 
         assert_eq!(
             wrapper_ix.accounts.len(),
-            EXECUTE_FIXED_ACCOUNT_COUNT as usize + 18
+            (EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT + EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT)
+                as usize
+                + 1
+                + 18
         );
         assert!(
             !wrapper_ix
                 .accounts
                 .iter()
-                .skip(EXECUTE_FIXED_ACCOUNT_COUNT as usize)
+                .skip(
+                    (EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT + EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT)
+                        as usize
+                )
                 .any(|meta| meta.pubkey == system_program_id())
         );
     }
 
     #[test]
-    fn wrap_compiled_transaction_uses_v2_for_raydium_wsol_input() {
+    fn wrap_compiled_transaction_uses_v3_route_wsol_for_raydium_wsol_input() {
         let payer = stub_payer();
         let temp_wsol = Keypair::new();
         let temp_wsol_pubkey = temp_wsol.pubkey();
@@ -1595,7 +2662,7 @@ mod tests {
         let blockhash = Hash::new_unique();
         let rent_lamports = Rent::default().minimum_balance(SPL_TOKEN_ACCOUNT_LEN);
         let swap_lamports = 100_000_000;
-        let (amm_wsol, _) = amm_wsol_pda(&payer.pubkey());
+        let (route_wsol, _) = route_wsol_pda(&payer.pubkey(), 0);
         let token_program = TOKEN_PROGRAM_ID;
         let setup_ixs = vec![
             solana_system_interface::instruction::create_account(
@@ -1664,7 +2731,7 @@ mod tests {
                 system_program_id(),
                 rent_sysvar_id(),
                 WSOL_MINT,
-                amm_wsol,
+                route_wsol,
                 temp_wsol_pubkey,
             ],
         };
@@ -1723,18 +2790,24 @@ mod tests {
             .expect("wrapper ix");
         assert_eq!(
             wrapper_ix.data[0],
-            crate::wrapper_abi::EXECUTE_AMM_WSOL_DISCRIMINATOR
+            crate::wrapper_abi::EXECUTE_SWAP_ROUTE_DISCRIMINATOR
         );
         assert!(
             wrapper_ix
                 .accounts
                 .iter()
-                .any(|meta| meta.pubkey == amm_wsol)
+                .any(|meta| meta.pubkey == route_wsol)
         );
         let execute_request =
-            ExecuteAmmWsolRequest::try_from_slice(&wrapper_ix.data[1..]).expect("decode v2");
-        assert_eq!(execute_request.gross_sol_in_lamports, swap_lamports);
-        assert_eq!(execute_request.pda_wsol_lamports, swap_lamports);
+            ExecuteSwapRouteRequest::try_from_slice(&wrapper_ix.data[1..]).expect("decode v3");
+        assert_eq!(execute_request.gross_sol_in_lamports, swap_lamports + 42);
+        assert_eq!(execute_request.route_mode, SwapRouteMode::Mixed);
+        assert_eq!(execute_request.fee_mode, SwapRouteFeeMode::SolPre);
+        assert_eq!(
+            execute_request.legs[0].input_amount,
+            (swap_lamports + 42)
+                - estimate_sol_in_fee_lamports(swap_lamports + 42, execute_request.fee_bps)
+        );
         assert!(
             decoded
                 .iter()
@@ -1798,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_compiled_transaction_reuses_registered_extra_signers() {
+    fn wrap_compiled_transaction_rejects_extra_signers_in_v3() {
         let payer = stub_payer();
         let temp_signer = Keypair::new();
         let venue_program = Pubkey::new_unique();
@@ -1851,7 +2924,7 @@ mod tests {
             &[&temp_signer],
         );
 
-        let wrapped = wrap_compiled_transaction(
+        let err = wrap_compiled_transaction(
             &native_compiled,
             &payer,
             std::slice::from_ref(&alt),
@@ -1867,8 +2940,11 @@ mod tests {
                 select_last_allowlisted_venue_instruction: false,
             },
         )
-        .expect("wrap succeeds with restored signer");
-        assert_eq!(wrapped.format, "v0-alt-wrapper");
+        .expect_err("v3 wrapper must reject extra signer routes");
+        assert!(
+            err.to_string().contains("must require exactly one signer"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2059,9 +3135,13 @@ mod tests {
         let (user_wsol_account, fee_vault_route_account) = derive_wsol_route_accounts(
             &payer.pubkey(),
             &fee_vault,
+            WrapperRouteKind::SolOut,
             &raydium_clmm_program_id(),
             &venue_accounts,
-        );
+            &[],
+            &[],
+        )
+        .expect("derive raydium wsol route accounts");
 
         assert_eq!(user_wsol_account, Some(temp_wsol_account));
         assert_eq!(fee_vault_route_account, Some(fee_vault_wsol_ata));

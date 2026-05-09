@@ -7,7 +7,9 @@ pub use rpc::{
     COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS, CompiledTransaction, JitoWarmResult,
     SendTimingBreakdown, SentResult, TransactionTokenBalance, fetch_account_data,
     fetch_account_data_with_owner, fetch_latest_blockhash_cached,
-    fetch_latest_blockhash_cached_with_prime, fetch_multiple_account_data,
+    fetch_latest_blockhash_cached_with_prime, fetch_multiple_account_data, record_warm_rpc_failure,
+    record_warm_rpc_success, reserve_warm_rpc_call, warm_rpc_cooldown_remaining_ms,
+    warm_rpc_endpoint_available, warm_rpc_error_should_cooldown, warm_rpc_method_allowed,
 };
 pub use transport::{JitoBundleEndpoint, TransportEnvironment, TransportPlan};
 

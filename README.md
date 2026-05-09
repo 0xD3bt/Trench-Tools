@@ -28,7 +28,7 @@
 
 Trench Tools is a self-hosted Solana trading stack. You run it, you choose the RPCs and senders, and your wallets stay on your own machine or VPS.
 
-The browser extension plugs into the terminals you already use, so you can trade with your own presets and wallet groups instead of routing everything through another platform account. LaunchDeck is the launch side: deploy, snipe, dev-buy, dev-sell, follow flows, reports, and automation.
+The browser extension plugs into the terminals you already use, so you can trade with your own presets and wallet groups instead of routing everything through another platform account. The toolbar popup lets you check connection/auth state, choose the active preset and wallet selection, and set a quick-buy amount without opening the full Options page. LaunchDeck is the launch side: deploy, snipe, dev-buy, dev-sell, follow flows, reports, and automation.
 
 No mandatory accounts. No required platform fees. Clone it, run it, own what gets built, signed, and sent.
 
@@ -89,7 +89,7 @@ For most operators today:
 - [Helius Developer tier](https://www.helius.dev/pricing), about $50/month, or better for the main infrastructure
 - `SOLANA_RPC_URL`: Helius Gatekeeper HTTP, `https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`
 - `SOLANA_WS_URL`: Helius standard websocket, `wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`
-- `WARM_RPC_URL`: separate [Shyft](https://shyft.to/) RPC if you want warm/cache traffic off your main Helius budget
+- `WARM_RPC_URL`: separate [Shyft](https://shyft.to/) RPC for compatible warm/cache traffic off the main Helius budget
 - execution provider: `Helius Sender` or `Hello Moon`
 
 Why this split: Helius Gatekeeper HTTP has been the best Helius HTTP path in our testing, while Helius standard websocket has been the better watcher websocket path. Shyft is a good low-priority warm RPC because its free tier is useful for warmup, cache, and block-height traffic.
@@ -110,9 +110,15 @@ The extension site list is moving fast. Current status:
 
 - Live: `axiom.trade`
 - Available, currently disabled: `j7tracker.io`
-- Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, and more terminals
+- Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, X, and more terminals
 
-The foundation is ready, so adding more terminals is incremental. See [docs/EXTENSION.md](docs/EXTENSION.md) for the current extension setup and site-status details.
+Axiom currently has the richest integration: token-page controls, Pulse quick buy and manual panel controls, watchlist and wallet-tracker quick buys, floating panel, LaunchDeck popout, Vamp import helpers, and DexScreener shortcuts. See [docs/EXTENSION.md](docs/EXTENSION.md) for the current extension setup and site-status details.
+
+## Current Route Coverage
+
+The execution engine verifies routes from on-chain state before trading. Current native coverage includes Pump bonding curve and Pump AMM, Bonk routes, Raydium AMM v4 and CPMM WSOL pool inputs, Raydium LaunchLab SOL pools, Meteora DBC and DAMM v2 launchpad routes, and a small trusted stable-route allowlist.
+
+Pool/pair support is intentionally not the same as "anything a website labels as a pair." See [docs/SUPPORTED_POOLS.md](docs/SUPPORTED_POOLS.md) before assuming a route is executable.
 
 ## Voluntary Support Fee
 
@@ -148,6 +154,7 @@ After setup:
 - the token file exists at `.local/trench-tools/default-engine-token.txt`
 - Extension Options -> Global settings shows the expected host connection state
 - Axiom shows the enabled Trench Tools surfaces
+- the toolbar popup shows the expected preset, wallet/group, and quick-buy controls
 
 If the runtime is on a VPS and your browser is on your own computer, add both forwards to your SSH config so Cursor/SSH opens them automatically:
 

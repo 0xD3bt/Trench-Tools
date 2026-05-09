@@ -1,12 +1,11 @@
 {
   "name": "trench-tools-extension",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Standalone Chrome extension surface for the execution-engine product.",
   "scripts": {
     "check": "node ./scripts/check-manifest.mjs",
     "package:launchdeck-shell": "node ./scripts/package-launchdeck-shell.mjs",
-    "smoke:axiom": "node ./scripts/smoke-axiom-preferred.mjs",
     "test:layout": "node ./tests/layout-invariants.mjs"
   },
   "devDependencies": {

@@ -1,6 +1,7 @@
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { printStartupDiagnostics } = require("./runtime-diagnostics");
 
 const action = process.argv[2];
 const validActions = new Set(["start", "stop", "restart"]);
@@ -49,6 +50,7 @@ function run(kind) {
   const scriptPath = scriptPathFor(kind);
   const child = spawn(command, argsFor(scriptPath), {
     cwd: projectRoot,
+    env: { ...process.env, TRENCH_TOOLS_FINAL_DIAGNOSTICS: "1" },
     stdio: "inherit",
   });
 
@@ -91,9 +93,13 @@ function run(kind) {
 (async () => {
   if (action === "restart") {
     await run("start");
+    await printStartupDiagnostics({ includeExecution: true, includeLaunchdeck: true });
     return;
   }
   await run(action);
+  if (action === "start") {
+    await printStartupDiagnostics({ includeExecution: true, includeLaunchdeck: true });
+  }
 })().catch((error) => {
   if (error && error.signal) {
     process.kill(process.pid, error.signal);

@@ -32,6 +32,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   const BOOTSTRAP_REVISION_KEY = "trenchTools.bootstrapRevision";
   const WALLET_STATUS_REVISION_KEY = "trenchTools.walletStatusRevision";
   const WALLET_STATUS_DIFF_KEY = "trenchTools.walletStatusDiff";
+  const WALLET_STATUS_MARK_REVISION_KEY = "trenchTools.walletStatusMarkRevision";
+  const WALLET_STATUS_MARK_DIFF_KEY = "trenchTools.walletStatusMarkDiff";
+  const RUNTIME_DIAGNOSTICS_REVISION_KEY = "trenchTools.runtimeDiagnosticsRevision";
+  const RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY = "trenchTools.runtimeDiagnosticsSnapshot";
   const LAST_TRADE_EVENT_KEY = "trenchTools.lastTradeEvent";
   const HOST_AUTH_TOKEN_KEY = "trenchTools.hostAuthToken";
   const LAUNCHDECK_HOST_KEY = "trenchTools.launchdeckHostBaseUrl";
@@ -48,9 +52,34 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   const QUICK_PANEL_DEFAULT_WIDTH = 375;
   const QUICK_PANEL_DEFAULT_HEIGHT = 453;
   const EXTENSION_RELOAD_TOAST_FALLBACK_DELAY_MS = 1800;
-  const WALLET_STATUS_QUOTE_REFRESH_MS = 2500;
+  const WALLET_STATUS_QUOTE_REFRESH_MS = 1250;
+  const WALLET_STATUS_FAST_QUOTE_REFRESH_MS = 75;
   const EXTENSION_RELOAD_FRIENDLY_MESSAGE =
     "Extension connection lost. Refresh to reconnect.";
+  const PANEL_Z_INDEX = {
+    DEFAULT: "999999",
+    FLYOUT: "1000000",
+    LOWERED_FLYOUT: "51",
+    LOWERED: "50"
+  };
+  const AXIOM_PANEL_LAYER_OVERLAY_SELECTOR = [
+    '[class*="fixed"][class*="z-[100]"]',
+    '[class*="fixed"][class*="z-[199]"]',
+    '[class*="fixed"][class*="z-[200]"]',
+    '[class*="fixed"][class*="z-[9999]"]',
+    ".fixed.z-\\[100\\]",
+    ".fixed.z-\\[200\\]",
+    ".fixed.z-\\[9999\\]",
+    '[class*="z-[9999]"][style*="position: fixed"]',
+    '[data-popper-placement]:not([style*="visibility: hidden"])',
+    '[data-popper-reference-hidden]:not([style*="visibility: hidden"])',
+    '[data-popper-escaped]:not([style*="visibility: hidden"])',
+    '[class*="popper"]:not([style*="visibility: hidden"])',
+    '[role="dialog"]:not([style*="visibility: hidden"])',
+    '[role="alertdialog"]:not([style*="visibility: hidden"])',
+    '[role="menu"]:not([style*="visibility: hidden"])',
+    ".p-overlaypanel:not(.p-overlaypanel-hidden)"
+  ].join(", ");
   const contentRuntime = window.TrenchToolsContentRuntime;
   if (!contentRuntime) {
     console.error("Trench Tools content runtime missing.");
@@ -100,8 +129,11 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     localExecutionPendings: new Map(),
     localExecutionPendingBatchIds: new Map(),
     batchToastIds: new Map(),
+    runtimeDiagnosticToastKeys: new Set(),
+    runtimeDiagnosticNotice: null,
     toastCleanupInterval: null,
     mutationObserver: null,
+    panelLayerObservers: new Map(),
     pendingMintRequests: new Map(),
     prewarmSnapshots: new Map(),
     activeDrag: null,
@@ -189,6 +221,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       openInlinePanelForMint,
       prewarmForMint,
       handleTradeRequest,
+      handleTokenDistributionRequest,
       resolveQuickBuyAmount,
       quickBuyLabel,
       openPanel,
@@ -244,6 +277,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
     attachStorageChangeListener();
     attachPanelMessageListener();
+    void callBackground("trench:get-runtime-status").catch(() => {});
+    void callBackground("trench:get-runtime-diagnostics")
+      .then(surfaceRuntimeDiagnostics)
+      .catch(() => {});
     installNavigationHooks();
     mountPlatformObserver();
     scheduleMountSweeps("init");
@@ -254,6 +291,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     // content scripts (fires on bfcache navigations too).
     lifecycle.pagehideListener = () => {
       setTradeReadiness(false, platform);
+      clearActiveMarkForSurface();
       clearActiveMintForSurface();
     };
     window.addEventListener("pagehide", lifecycle.pagehideListener, { once: true });
@@ -264,9 +302,136 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   function ensureLaunchdeckShell() {
     if (!state.launchdeckShell) {
-      state.launchdeckShell = createLaunchdeckShellController();
+      state.launchdeckShell = createLaunchdeckShellController({
+        onPostDeploySuccess: handleLaunchdeckPostDeploySuccess
+      });
     }
     return state.launchdeckShell;
+  }
+
+  function normalizePostDeployDestination(value, fallback = "axiom") {
+    const destination = String(value || "").trim().toLowerCase();
+    return destination === "axiom" ? destination : fallback;
+  }
+
+  function normalizePostDeployAddress(value) {
+    const text = String(value || "").trim();
+    return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text) ? text : "";
+  }
+
+  function readPostDeployNestedString(value, path) {
+    let current = value;
+    for (const key of path) {
+      if (!current || typeof current !== "object") return "";
+      current = current[key];
+    }
+    return typeof current === "string" ? current : "";
+  }
+
+  function resolveLaunchdeckPostDeployRoute(destination, report) {
+    if (normalizePostDeployDestination(destination) !== "axiom" || !report || typeof report !== "object") {
+      return "";
+    }
+    const candidates = [
+      report.pair,
+      report.pairAddress,
+      report.routeAddress,
+      report.poolAddress,
+      report.poolId,
+      report.launchpadPoolAddress,
+      report.bondingCurve,
+      report.bondingCurveAddress,
+      report.marketKey,
+      report.marketAddress,
+      report.preMigrationDbcPoolAddress,
+      report.postMigrationDammPoolAddress,
+      readPostDeployNestedString(report, ["launch", "pairAddress"]),
+      readPostDeployNestedString(report, ["launch", "routeAddress"]),
+      readPostDeployNestedString(report, ["launch", "poolAddress"]),
+      readPostDeployNestedString(report, ["bagsLaunch", "preMigrationDbcPoolAddress"]),
+      readPostDeployNestedString(report, ["bagsLaunch", "postMigrationDammPoolAddress"])
+    ];
+    for (const candidate of candidates) {
+      const route = normalizePostDeployAddress(candidate);
+      if (route) return route;
+    }
+    return "";
+  }
+
+  function buildLaunchdeckPostDeployUrl(destination, report) {
+    const route = resolveLaunchdeckPostDeployRoute(destination, report);
+    return route && normalizePostDeployDestination(destination) === "axiom"
+      ? `https://axiom.trade/meme/${encodeURIComponent(route)}`
+      : "";
+  }
+
+  function normalizePostDeployUrl(value) {
+    const url = String(value || "").trim();
+    if (!url) return "";
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.toString() : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function launchdeckPostDeployPreferences() {
+    const axiom = state.siteFeatures?.axiom || {};
+    return {
+      action: normalizeAxiomPostDeployAction(axiom.postDeployAction, "close_modal_toast"),
+      destination: normalizePostDeployDestination(axiom.postDeployDestination, "axiom")
+    };
+  }
+
+  function launchdeckPostDeployTitle(payload, report) {
+    const supplied = String(payload?.title || "").trim();
+    if (supplied) return supplied;
+    const ticker = String(report?.symbol || report?.ticker || report?.tokenSymbol || report?.token?.symbol || "")
+      .trim()
+      .replace(/^\$+/, "")
+      .toUpperCase()
+      .slice(0, 24);
+    return ticker ? `$${ticker} successfully deployed` : "Token successfully deployed";
+  }
+
+  function openLaunchdeckPostDeployUrl(url, mode = "tab") {
+    const normalizedUrl = normalizePostDeployUrl(url);
+    if (!normalizedUrl) return;
+    const normalizedMode = mode === "window" ? "window" : "tab";
+    void callBackground("trench:open-external-url", {
+      url: normalizedUrl,
+      mode: normalizedMode
+    }).catch(() => {
+      if (normalizedMode === "window") {
+        window.open(normalizedUrl, "_blank", "popup=yes,width=1100,height=760,resizable=yes,scrollbars=yes");
+      } else {
+        window.open(normalizedUrl, "_blank", "noopener,noreferrer");
+      }
+    });
+  }
+
+  function handleLaunchdeckPostDeploySuccess(payload, shellActions = {}) {
+    const report = payload?.report && typeof payload.report === "object" ? payload.report : null;
+    const preferences = launchdeckPostDeployPreferences();
+    const url = normalizePostDeployUrl(payload?.url) || buildLaunchdeckPostDeployUrl(preferences.destination, report);
+    const title = launchdeckPostDeployTitle(payload, report);
+    renderToast({
+      id: `launchdeck-post-deploy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      kind: "success",
+      ttlMs: 5000,
+      linkHref: url,
+      linkLabel: "Open",
+      clickHandler: url ? () => openLaunchdeckPostDeployUrl(url, "tab") : null
+    });
+    if (preferences.action === "close_modal_toast") {
+      shellActions.closeOverlay?.();
+    } else if (preferences.action === "open_tab_toast" && url) {
+      openLaunchdeckPostDeployUrl(url, "tab");
+    } else if (preferences.action === "open_window_toast" && url) {
+      openLaunchdeckPostDeployUrl(url, "window");
+    }
   }
 
   function installNavigationHooks() {
@@ -307,9 +472,11 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         scheduleRouteReconcile("visibility", 0);
         scheduleMountSweeps("visibility");
         syncWalletStatusQuoteRefresh();
+        syncActiveMarkSubscription();
       } else {
         setTradeReadiness(false, platform);
         syncWalletStatusQuoteRefresh();
+        syncActiveMarkSubscription();
       }
     };
     window.addEventListener("popstate", lifecycle.popstateListener);
@@ -475,6 +642,11 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         pulsePanel: true,
         pulseVamp: true,
         pulseVampMode: "prefill",
+        instantTradeButtonModeCount: 3,
+        vampIconMode: "both",
+        dexScreenerIconMode: "both",
+        postDeployAction: "close_modal_toast",
+        postDeployDestination: "axiom",
         walletTracker: true,
         watchlist: true
       },
@@ -512,6 +684,40 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   function normalizePulseVampMode(value, fallback = "prefill") {
     const mode = String(value || "").trim().toLowerCase();
     return mode === "insta" || mode === "prefill" ? mode : fallback;
+  }
+
+  function normalizeDexScreenerIconMode(value, fallback = "both") {
+    const mode = String(value || "").trim().toLowerCase();
+    return mode === "both" || mode === "pulse" || mode === "token" || mode === "off"
+      ? mode
+      : fallback;
+  }
+
+  function normalizeVampIconMode(value, fallback = "both") {
+    const mode = String(value || "").trim().toLowerCase();
+    return mode === "both" || mode === "pulse" || mode === "token" || mode === "off"
+      ? mode
+      : fallback;
+  }
+
+  function normalizeAxiomInstantTradeButtonModeCount(value, fallback = 3) {
+    const count = Number(value);
+    return count === 1 || count === 2 || count === 3 ? count : fallback;
+  }
+
+  function normalizeAxiomPostDeployAction(value, fallback = "close_modal_toast") {
+    const action = String(value || "").trim().toLowerCase();
+    return action === "close_modal_toast" ||
+      action === "toast_only" ||
+      action === "open_tab_toast" ||
+      action === "open_window_toast"
+      ? action
+      : fallback;
+  }
+
+  function normalizeAxiomPostDeployDestination(value, fallback = "axiom") {
+    const destination = String(value || "").trim().toLowerCase();
+    return destination === "axiom" ? destination : fallback;
   }
 
   function panelStorageScope() {
@@ -591,6 +797,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     state.preview = null;
     state.batchStatus = null;
     state.activePanelBatchId = null;
+    syncActiveMarkSubscription();
   }
 
   function clearPendingRouteReconcile(delayKey) {
@@ -640,9 +847,18 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     return Number.isFinite(amount) && amount > 0 ? tokenContext : null;
   }
 
-  function scheduleWalletStatusQuoteRefresh(delayMs = WALLET_STATUS_QUOTE_REFRESH_MS) {
-    if (lifecycle.destroyed || state.walletStatusQuoteRefreshTimer) {
+  function scheduleWalletStatusQuoteRefresh(
+    delayMs = WALLET_STATUS_QUOTE_REFRESH_MS,
+    { reset = false } = {}
+  ) {
+    if (lifecycle.destroyed) {
       return;
+    }
+    if (state.walletStatusQuoteRefreshTimer) {
+      if (!reset) {
+        return;
+      }
+      clearWalletStatusQuoteRefreshTimer();
     }
     if (!activeQuoteRefreshTokenContext()) {
       return;
@@ -653,11 +869,11 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       if (!tokenContext) {
         return;
       }
-      void refreshPanelWalletStatus({ tokenContext, force: false })
+      void refreshPanelWalletStatus({ tokenContext, force: true })
         .finally(() => {
           scheduleWalletStatusQuoteRefresh();
         });
-    }, Math.max(250, Number(delayMs) || WALLET_STATUS_QUOTE_REFRESH_MS));
+    }, Math.max(50, Number(delayMs) || WALLET_STATUS_QUOTE_REFRESH_MS));
   }
 
   function syncWalletStatusQuoteRefresh() {
@@ -679,6 +895,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     } else {
       clearActiveMintForSurface();
     }
+    syncActiveMarkSubscription();
   }
 
   function setPageTokenContext(tokenContext) {
@@ -1209,6 +1426,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         state.mutationObserver.disconnect();
         state.mutationObserver = null;
       }
+      disconnectPanelLayerObservers();
       if (debounceTimer) {
         window.clearTimeout(debounceTimer);
         debounceTimer = 0;
@@ -1240,6 +1458,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       document.querySelectorAll(".trench-tools-pulse-panel-owner").forEach((element) => {
         element.classList.remove("trench-tools-pulse-panel-owner");
       });
+    });
+    runBestEffortTeardownStep("active-mark", () => {
+      clearActiveMarkForSurface();
     });
     runBestEffortTeardownStep("active-mint", () => {
       clearActiveMintForSurface();
@@ -1502,6 +1723,26 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         pulsePanel: value.axiom?.pulsePanel ?? defaults.axiom.pulsePanel,
         pulseVamp: value.axiom?.pulseVamp ?? defaults.axiom.pulseVamp,
         pulseVampMode: normalizePulseVampMode(value.axiom?.pulseVampMode, defaults.axiom.pulseVampMode),
+        instantTradeButtonModeCount: normalizeAxiomInstantTradeButtonModeCount(
+          value.axiom?.instantTradeButtonModeCount,
+          defaults.axiom.instantTradeButtonModeCount
+        ),
+        vampIconMode: normalizeVampIconMode(
+          value.axiom?.vampIconMode,
+          value.axiom?.pulseVamp === false ? "off" : defaults.axiom.vampIconMode
+        ),
+        dexScreenerIconMode: normalizeDexScreenerIconMode(
+          value.axiom?.dexScreenerIconMode,
+          defaults.axiom.dexScreenerIconMode
+        ),
+        postDeployAction: normalizeAxiomPostDeployAction(
+          value.axiom?.postDeployAction,
+          defaults.axiom.postDeployAction
+        ),
+        postDeployDestination: normalizeAxiomPostDeployDestination(
+          value.axiom?.postDeployDestination,
+          defaults.axiom.postDeployDestination
+        ),
         walletTracker: value.axiom?.walletTracker ?? defaults.axiom.walletTracker,
         watchlist: value.axiom?.watchlist ?? defaults.axiom.watchlist
       },
@@ -1983,6 +2224,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       usd1Balance,
     };
     pushPanelState();
+    syncActiveMarkSubscription();
     return true;
   }
 
@@ -2122,17 +2364,91 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       pnlNet: nextPnlNet,
       pnlPercentGross: nextPnlPercentGross,
       pnlPercentNet: nextPnlPercentNet,
-      pnlRequiresQuote: aggregateMintUi > 0 && (shouldRefreshQuote || walletStatus.pnlRequiresQuote === true),
+      pnlRequiresQuote:
+        aggregateMintUi > 0 && (shouldRefreshQuote || walletStatus.pnlRequiresQuote === true),
     };
     pushPanelState();
+    syncActiveMarkSubscription();
     syncWalletStatusQuoteRefresh();
     if (shouldRefreshQuote) {
-      scheduleWalletStatusRefresh({
-        force: true,
-        tokenContext: currentActivePanelTokenContext() || state.tokenContext,
-        delayMs: 160
-      });
+      scheduleWalletStatusQuoteRefresh(WALLET_STATUS_FAST_QUOTE_REFRESH_MS, { reset: true });
     }
+    return true;
+  }
+
+  function sortedStringList(values) {
+    return (Array.isArray(values) ? values : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+      .sort();
+  }
+
+  function sameStringList(left, right) {
+    const a = sortedStringList(left);
+    const b = sortedStringList(right);
+    return a.length === b.length && a.every((value, index) => value === b[index]);
+  }
+
+  function applyLiveWalletStatusMarkDiff(diff) {
+    if (!diff || typeof diff !== "object" || !state.walletStatus) {
+      return false;
+    }
+    const diffSurfaceId = String(diff.surfaceId || "").trim();
+    if (diffSurfaceId && diffSurfaceId !== ACTIVE_MINTS_SURFACE_ID) {
+      return false;
+    }
+    const currentMint = String(
+      currentActivePanelTokenContext()?.mint ||
+      state.tokenContext?.mint ||
+      state.walletStatus?.mint ||
+      ""
+    ).trim();
+    const diffMint = String(diff.mint || "").trim();
+    if (!currentMint || !diffMint || currentMint !== diffMint) {
+      return false;
+    }
+    const walletStatusMint = String(state.walletStatus?.mint || "").trim();
+    if (walletStatusMint && walletStatusMint !== diffMint) {
+      return false;
+    }
+    if (!sameStringList(state.walletStatus?.walletKeys, diff.walletKeys)) {
+      return false;
+    }
+    const currentGroup = String(state.walletStatus?.walletGroupId || "").trim();
+    const diffGroup = String(diff.walletGroupId || "").trim();
+    if (currentGroup !== diffGroup) {
+      return false;
+    }
+    const holdingValueSol = Number(diff.holdingValueSol ?? diff.holding);
+    const pnlGross = Number(diff.pnlGross);
+    const pnlNet = Number(diff.pnlNet);
+    const tokenBalance = Number(diff.tokenBalance);
+    const tokenBalanceRaw = Number(diff.tokenBalanceRaw);
+    state.walletStatus = {
+      ...state.walletStatus,
+      holdingValueSol: Number.isFinite(holdingValueSol) ? holdingValueSol : state.walletStatus.holdingValueSol,
+      holding: Number.isFinite(holdingValueSol) ? holdingValueSol : state.walletStatus.holding,
+      pnlGross: Number.isFinite(pnlGross) ? pnlGross : state.walletStatus.pnlGross,
+      pnlNet: Number.isFinite(pnlNet) ? pnlNet : state.walletStatus.pnlNet,
+      pnlPercentGross: Number.isFinite(Number(diff.pnlPercentGross))
+        ? Number(diff.pnlPercentGross)
+        : state.walletStatus.pnlPercentGross,
+      pnlPercentNet: Number.isFinite(Number(diff.pnlPercentNet))
+        ? Number(diff.pnlPercentNet)
+        : state.walletStatus.pnlPercentNet,
+      tokenBalance: Number.isFinite(tokenBalance) ? tokenBalance : state.walletStatus.tokenBalance,
+      mintBalance: Number.isFinite(tokenBalance) ? tokenBalance : state.walletStatus.mintBalance,
+      mintBalanceUi: Number.isFinite(tokenBalance) ? tokenBalance : state.walletStatus.mintBalanceUi,
+      holdingAmount: Number.isFinite(tokenBalance) ? tokenBalance : state.walletStatus.holdingAmount,
+      tokenBalanceRaw: Number.isFinite(tokenBalanceRaw) ? tokenBalanceRaw : state.walletStatus.tokenBalanceRaw,
+      mintBalanceRaw: Number.isFinite(tokenBalanceRaw) ? tokenBalanceRaw : state.walletStatus.mintBalanceRaw,
+      holdingQuoteSource: diff.quoteSource || state.walletStatus.holdingQuoteSource,
+      holdingQuoteAsset: "SOL",
+      holdingQuoteAgeMs: 0,
+      holdingQuoteError: null,
+      pnlRequiresQuote: false,
+    };
+    pushPanelState();
     return true;
   }
 
@@ -2216,6 +2532,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       state.walletStatus = nextWalletStatus;
       state.hostError = "";
       pushPanelState();
+      syncActiveMarkSubscription();
       syncWalletStatusQuoteRefresh();
       return state.walletStatus;
     } catch (error) {
@@ -2632,7 +2949,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       position: "fixed",
       right: "18px",
       bottom: "18px",
-      zIndex: "2147483646",
+      zIndex: PANEL_Z_INDEX.DEFAULT,
       width: "48px",
       height: "48px",
       border: "1px solid rgba(255, 255, 255, 0.16)",
@@ -2690,7 +3007,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       height: "430px",
       backgroundColor: "#000000",
       overflow: "hidden",
-      zIndex: "2147483647",
+      zIndex: PANEL_Z_INDEX.DEFAULT,
       pointerEvents: "auto",
       border: "0",
       borderRadius: "12px",
@@ -2718,6 +3035,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     state.panelFrame = iframe;
     attachPanelResizeHandle(wrapper);
     applyPanelShellMetrics();
+    ensurePanelLayerObserver(wrapper);
   }
 
   function ensureQuickPanelFrame() {
@@ -2736,7 +3054,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       borderRadius: "12px",
       overflow: "hidden",
       boxShadow: "0 20px 60px rgba(0, 0, 0, 0.42)",
-      zIndex: "2147483647",
+      zIndex: PANEL_Z_INDEX.DEFAULT,
       display: "none",
       background: "#000000",
       border: "0"
@@ -2757,9 +3075,155 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     document.documentElement.appendChild(wrapper);
     state.quickPanelWrapper = wrapper;
     state.quickPanelFrame = iframe;
+    ensurePanelLayerObserver(wrapper);
+  }
+
+  function shouldIgnorePanelLayerCandidate(element) {
+    const role = element.getAttribute("role");
+    return Boolean(
+      role === "tooltip" ||
+      role === "menu" ||
+      role === "listbox" ||
+      element.hasAttribute("data-popper-placement")
+    );
+  }
+
+  function panelLayerRectsIntersect(target, candidate) {
+    const targetRect = target.getBoundingClientRect();
+    const candidateRect = candidate.getBoundingClientRect();
+    if (candidateRect.width === 0 || candidateRect.height === 0) {
+      return false;
+    }
+    return (
+      targetRect.left < candidateRect.right &&
+      targetRect.right > candidateRect.left &&
+      targetRect.top < candidateRect.bottom &&
+      targetRect.bottom > candidateRect.top
+    );
+  }
+
+  function hasOverlappingAxiomLayerOverlay(target) {
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+    return Array.from(document.querySelectorAll(AXIOM_PANEL_LAYER_OVERLAY_SELECTOR))
+      .filter((candidate) => (
+        candidate instanceof HTMLElement &&
+        candidate !== target &&
+        !target.contains(candidate) &&
+        !shouldIgnorePanelLayerCandidate(candidate) &&
+        panelLayerRectsIntersect(target, candidate)
+      ))
+      .length > 0;
+  }
+
+  function applyPanelLayeringForTarget(target) {
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const lowered = hasOverlappingAxiomLayerOverlay(target);
+    const defaultZIndex =
+      target.id === "trench-tools-panel-flyout-overlay"
+        ? PANEL_Z_INDEX.FLYOUT
+        : PANEL_Z_INDEX.DEFAULT;
+    const loweredZIndex =
+      target.id === "trench-tools-panel-flyout-overlay"
+        ? PANEL_Z_INDEX.LOWERED_FLYOUT
+        : PANEL_Z_INDEX.LOWERED;
+    target.style.zIndex = lowered ? loweredZIndex : defaultZIndex;
+  }
+
+  function applyPanelLayering() {
+    if (platform !== "axiom") {
+      return;
+    }
+    [state.panelWrapper, state.quickPanelWrapper, state.panelFlyoutOverlay]
+      .filter((target) => target instanceof HTMLElement)
+      .forEach((target) => applyPanelLayeringForTarget(target));
+  }
+
+  function panelLayerMutationTouchesCandidate(mutations) {
+    for (const mutation of mutations) {
+      if (mutation.addedNodes.length > 0) {
+        for (const node of mutation.addedNodes) {
+          if (
+            node instanceof HTMLElement &&
+            (node.matches?.(AXIOM_PANEL_LAYER_OVERLAY_SELECTOR) ||
+              node.querySelector?.(AXIOM_PANEL_LAYER_OVERLAY_SELECTOR))
+          ) {
+            return true;
+          }
+        }
+      }
+      if (mutation.removedNodes.length > 0) {
+        for (const node of mutation.removedNodes) {
+          if (
+            node instanceof HTMLElement &&
+            (node.matches?.(AXIOM_PANEL_LAYER_OVERLAY_SELECTOR) ||
+              node.querySelector?.(AXIOM_PANEL_LAYER_OVERLAY_SELECTOR))
+          ) {
+            return true;
+          }
+        }
+      }
+      if (
+        mutation.type === "attributes" &&
+        (
+          mutation.attributeName === "class" ||
+          mutation.attributeName === "role" ||
+          mutation.attributeName?.startsWith("data-popper-")
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function ensurePanelLayerObserver(target) {
+    if (platform !== "axiom") {
+      return;
+    }
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    applyPanelLayeringForTarget(target);
+    if (state.panelLayerObservers.has(target)) {
+      return;
+    }
+    const root = document.body || document.documentElement;
+    if (!root) {
+      return;
+    }
+    const observer = new MutationObserver((mutations) => {
+      if (panelLayerMutationTouchesCandidate(mutations)) {
+        applyPanelLayeringForTarget(target);
+      }
+    });
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true
+    });
+    state.panelLayerObservers.set(target, observer);
+  }
+
+  function disconnectPanelLayerObserver(target) {
+    const observer = state.panelLayerObservers.get(target);
+    if (!observer) {
+      return;
+    }
+    observer.disconnect();
+    state.panelLayerObservers.delete(target);
+  }
+
+  function disconnectPanelLayerObservers() {
+    state.panelLayerObservers.forEach((observer) => observer.disconnect());
+    state.panelLayerObservers.clear();
   }
 
   function destroyPersistentPanelFrame() {
+    disconnectPanelLayerObserver(state.panelWrapper);
     if (state.panelWrapper) {
       state.panelWrapper.remove();
     }
@@ -2823,7 +3287,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       border: "1px solid rgba(255, 255, 255, 0.12)",
       background: "rgba(10, 10, 10, 0.98)",
       boxShadow: "0 12px 32px rgba(0, 0, 0, 0.42)",
-      zIndex: "2147483647",
+      zIndex: PANEL_Z_INDEX.FLYOUT,
       pointerEvents: "auto",
       fontFamily: '"Inter", "Segoe UI", system-ui, -apple-system, sans-serif',
       fontSize: "12px",
@@ -2838,6 +3302,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     });
     document.documentElement.appendChild(overlay);
     state.panelFlyoutOverlay = overlay;
+    ensurePanelLayerObserver(overlay);
     return overlay;
   }
 
@@ -3248,6 +3713,16 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           }
         }
       }
+      if (changes[WALLET_STATUS_MARK_REVISION_KEY] || changes[WALLET_STATUS_MARK_DIFF_KEY]) {
+        applyLiveWalletStatusMarkDiff(changes[WALLET_STATUS_MARK_DIFF_KEY]?.newValue);
+      }
+      if (changes[RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY]) {
+        surfaceRuntimeDiagnostics(changes[RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY]?.newValue);
+      } else if (changes[RUNTIME_DIAGNOSTICS_REVISION_KEY]) {
+        void callBackground("trench:get-runtime-diagnostics")
+          .then(surfaceRuntimeDiagnostics)
+          .catch(() => {});
+      }
       if (changes[LAST_TRADE_EVENT_KEY]?.newValue) {
         const tradeEvent = changes[LAST_TRADE_EVENT_KEY].newValue;
         applyTradeEventToBatchStatus(tradeEvent);
@@ -3292,12 +3767,13 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         : "buy";
       const prewarmResponse = await ensurePrewarmResponse(tokenContext, previewSide);
       const warmReuseFields = buildWarmReuseFields(prewarmResponse, previewSide);
-      const requestAddress = getTokenContextRouteAddress(tokenContext) || String(tokenContext.mint || "").trim();
+      const routeRequest = getTokenContextRouteRequest(tokenContext);
+      const requestAddress = routeRequest.address;
       const previewPayload = {
         address: requestAddress,
         platform: normalizeRouteValue(tokenContext?.platform || state.platform) || undefined,
         mint: normalizeRouteValue(tokenContext?.mint) || undefined,
-        pair: getTokenContextPairAddress(tokenContext) || undefined,
+        pair: routeRequest.pair || undefined,
         presetId: state.preferences.presetId,
         side: previewSide,
         buyAmountSol:
@@ -3419,7 +3895,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     return route ? `${route}: ${error}` : error;
   }
 
-  async function handleTokenDistributionRequest(action, payload) {
+  async function handleTokenDistributionRequest(action, payload, options = {}) {
     const normalizedAction = action === "consolidate" ? "consolidate" : "split";
     if (state.tokenDistributionPending) {
       showToast("Token distribution already in progress.", "error");
@@ -3433,7 +3909,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const failureMessage = normalizedAction === "split" ? "Token split failed." : "Token consolidation failed.";
 
     try {
-      await savePreferences(payload);
+      if (options.persistPreferences !== false) {
+        await savePreferences(payload);
+      }
       const tokenContext =
         (await refreshPanelTokenContext({ silent: true })) ||
         currentActivePanelTokenContext() ||
@@ -3472,6 +3950,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         }
         request = {
           mint,
+          presetId: normalizeRouteValue(payload.presetId || state.preferences.presetId) || undefined,
           walletKeys: selectedWalletKeys,
           sourceWalletKeys
         };
@@ -3482,6 +3961,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         }
         request = {
           mint,
+          presetId: normalizeRouteValue(payload.presetId || state.preferences.presetId) || undefined,
           destinationWalletKey: selectedWalletKeys[0]
         };
       }
@@ -3555,14 +4035,15 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         side,
         skipBlockingPrewarm: true
       });
-      const requestAddress = getTokenContextRouteAddress(tokenContext) || String(tokenContext.mint || "").trim();
+      const routeRequest = getTokenContextRouteRequest(tokenContext);
+      const requestAddress = routeRequest.address;
       const request = {
         clientRequestId,
         clientStartedAtUnixMs: Date.now(),
         address: requestAddress,
         mint: normalizeRouteValue(tokenContext?.mint) || undefined,
         platform: String(tokenContext?.platform || state.platform || "").trim() || undefined,
-        pair: getTokenContextPairAddress(tokenContext) || undefined,
+        pair: routeRequest.pair || undefined,
         presetId: state.preferences.presetId,
         ...selection,
         ...warmReuseFields
@@ -4138,6 +4619,24 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     return normalizeCompanionPair(getTokenContextRouteAddress(tokenContext), pair);
   }
 
+  function shouldPreferPairRouteForTokenContext(tokenContext) {
+    return String(tokenContext?.platform || state.platform || platform || "").trim().toLowerCase() === "axiom";
+  }
+
+  function getTokenContextRouteRequest(tokenContext) {
+    const routeAddress = getTokenContextRouteAddress(tokenContext) || normalizeRouteValue(tokenContext?.mint);
+    const pairAddress = getTokenContextPairAddress(tokenContext);
+    // Axiom supplies pair + mint identities; execute against the pair so the
+    // engine takes the direct pair-classifier route instead of mint+pair.
+    const address = shouldPreferPairRouteForTokenContext(tokenContext) && pairAddress
+      ? pairAddress
+      : routeAddress;
+    return {
+      address,
+      pair: normalizeCompanionPair(address, pairAddress)
+    };
+  }
+
   function buildRouteRequestKey(surface, address, pair = "") {
     const normalizedAddress = normalizeRouteValue(address);
     return [
@@ -4282,14 +4781,16 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   function prewarmRouteShapeFromTokenContext(tokenContext) {
+    const routeRequest = getTokenContextRouteRequest(tokenContext);
     return {
-      address: getTokenContextRouteAddress(tokenContext) || normalizeRouteValue(tokenContext?.mint),
-      pair: getTokenContextPairAddress(tokenContext)
+      address: routeRequest.address,
+      pair: routeRequest.pair
     };
   }
 
   function buildPrewarmPayload(tokenContext, side = "") {
-    const address = getTokenContextRouteAddress(tokenContext);
+    const routeRequest = getTokenContextRouteRequest(tokenContext);
+    const address = routeRequest.address;
     if (!address) {
       return null;
     }
@@ -4297,7 +4798,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const payload = {
       address,
       mint: normalizeRouteValue(tokenContext?.mint) || undefined,
-      pair: getTokenContextPairAddress(tokenContext) || undefined,
+      pair: routeRequest.pair || undefined,
       platform: normalizeRouteValue(tokenContext?.platform || state.platform) || undefined,
       sourceUrl: tokenContext.sourceUrl || tokenContext.url || window.location.href
     };
@@ -4502,12 +5003,15 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       return;
     }
     const policyShape = prewarmPolicyShapeFromSource();
+    const side = String(options.side || "").trim().toLowerCase();
     schedulePrewarm(
       {
         address: routeRef.address,
         mint: routeRef.mint || undefined,
         pair: routeRef.pair || undefined,
+        platform: normalizeRouteValue(options.platform || platform) || undefined,
         sourceUrl: options.sourceUrl || window.location.href,
+        ...(side === "buy" || side === "sell" ? { side } : {}),
         ...(policyShape.buyFundingPolicy ? { buyFundingPolicy: policyShape.buyFundingPolicy } : {}),
         ...(policyShape.sellSettlementPolicy ? { sellSettlementPolicy: policyShape.sellSettlementPolicy } : {})
       },
@@ -4520,8 +5024,11 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   // script currently cares about so the wallet-token cache actually
   // receives events (and so SOL-panel balance polling collapses into
   // one live subscription instead of polling).
-  const ACTIVE_MINTS_SURFACE_ID = `content:${platform || "unknown"}`;
+  const ACTIVE_MINTS_SURFACE_ID = `content:${platform || "unknown"}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
   let lastActiveMint = "";
+  let lastActiveMarkSignature = "";
+  let activeMarkInflight = null;
+  let pendingActiveMarkRequest = null;
   function setActiveMintForSurface(mint) {
     const normalized = typeof mint === "string" ? mint.trim() : "";
     if (normalized === lastActiveMint) {
@@ -4539,6 +5046,117 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
   function clearActiveMintForSurface() {
     setActiveMintForSurface("");
+  }
+
+  function clearActiveMarkForSurface() {
+    enqueueActiveMarkPayload({ active: false, surfaceId: ACTIVE_MINTS_SURFACE_ID }, { force: true });
+  }
+
+  function walletStatusTokenAmount(status = state.walletStatus) {
+    const amount = Number(
+      status?.holdingAmount ??
+      status?.tokenBalance ??
+      status?.mintBalanceUi ??
+      status?.mintBalance
+    );
+    return Number.isFinite(amount) ? amount : 0;
+  }
+
+  function walletStatusTokenDecimals(status = state.walletStatus) {
+    const decimals = Number(status?.tokenDecimals ?? status?.mintDecimals);
+    return Number.isInteger(decimals) && decimals >= 0 ? decimals : null;
+  }
+
+  function walletStatusTokenRaw(status = state.walletStatus) {
+    const raw = Number(status?.tokenBalanceRaw ?? status?.mintBalanceRaw);
+    return Number.isFinite(raw) && raw >= 0 ? Math.round(raw) : null;
+  }
+
+  function activeMarkWalletBalances(status = state.walletStatus) {
+    return Array.isArray(status?.wallets)
+      ? status.wallets
+        .map((wallet) => ({
+          envKey: String(wallet?.envKey || wallet?.key || "").trim(),
+          tokenBalance: Number(
+            wallet?.tokenBalance ??
+            wallet?.mintBalanceUi ??
+            wallet?.mintBalance ??
+            wallet?.holdingAmount
+          )
+        }))
+        .filter((entry) => entry.envKey && Number.isFinite(entry.tokenBalance) && entry.tokenBalance >= 0)
+      : [];
+  }
+
+  function buildActiveMarkPayload() {
+    if (!(state.panelOpen || state.quickPanelOpen) || document.visibilityState === "hidden") {
+      return { active: false, surfaceId: ACTIVE_MINTS_SURFACE_ID };
+    }
+    const tokenContext = currentActivePanelTokenContext();
+    const mint = String(tokenContext?.mint || state.walletStatus?.mint || "").trim();
+    if (!tokenContext || !mint) {
+      return { active: false, surfaceId: ACTIVE_MINTS_SURFACE_ID };
+    }
+    const walletStatusMint = String(state.walletStatus?.mint || "").trim();
+    if (walletStatusMint && walletStatusMint !== mint) {
+      return { active: false, surfaceId: ACTIVE_MINTS_SURFACE_ID };
+    }
+    const tokenBalance = walletStatusTokenAmount();
+    if (!(tokenBalance > 0)) {
+      return { active: false, surfaceId: ACTIVE_MINTS_SURFACE_ID };
+    }
+    const payload = buildWalletStatusRequestPayload({ tokenContext, force: false });
+    payload.active = true;
+    payload.surfaceId = ACTIVE_MINTS_SURFACE_ID;
+    payload.mint = mint;
+    payload.tokenBalance = tokenBalance;
+    const raw = walletStatusTokenRaw();
+    if (raw != null) {
+      payload.tokenBalanceRaw = raw;
+    }
+    const decimals = walletStatusTokenDecimals();
+    if (decimals != null) {
+      payload.tokenDecimals = decimals;
+    }
+    payload.walletTokenBalances = activeMarkWalletBalances();
+    return payload;
+  }
+
+  function syncActiveMarkSubscription() {
+    const payload = buildActiveMarkPayload();
+    enqueueActiveMarkPayload(payload);
+  }
+
+  function enqueueActiveMarkPayload(payload, { force = false } = {}) {
+    const signature = JSON.stringify(payload);
+    if (!force && signature === lastActiveMarkSignature && !activeMarkInflight) {
+      return;
+    }
+    pendingActiveMarkRequest = { payload, signature, force };
+    flushActiveMarkQueue();
+  }
+
+  function flushActiveMarkQueue() {
+    if (activeMarkInflight || !pendingActiveMarkRequest) {
+      return;
+    }
+    const request = pendingActiveMarkRequest;
+    pendingActiveMarkRequest = null;
+    if (!request.force && request.signature === lastActiveMarkSignature) {
+      flushActiveMarkQueue();
+      return;
+    }
+    activeMarkInflight = callBackground("trench:set-active-mark", request.payload)
+      .then(() => {
+        lastActiveMarkSignature = request.signature;
+      })
+      .catch(() => {
+        lastActiveMarkSignature = "";
+      })
+      .finally(() => {
+        activeMarkInflight = null;
+        flushActiveMarkQueue();
+      });
   }
 
   async function getCurrentTokenCandidate() {
@@ -5168,6 +5786,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     clearQuickPanelLifecycleCleanup();
     hidePanelFlyoutOverlay();
     if (state.quickPanelWrapper) {
+      disconnectPanelLayerObserver(state.quickPanelWrapper);
       state.quickPanelWrapper.remove();
     }
     document.querySelectorAll(".trench-tools-pulse-panel-owner").forEach((element) => {
@@ -5262,6 +5881,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     state.quickPanelWrapper.style.display = "block";
     state.quickPanelOpen = true;
     positionQuickPanel(anchor || currentQuickPanelAnchor() || state.quickPanelWrapper);
+    applyPanelLayering();
     registerQuickPanelCloseHandlers(anchor);
   }
 
@@ -5303,6 +5923,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     closeQuickPanel();
     setPanelTokenContext(tokenContext);
     setPanelHidden(false);
+    applyPanelLayering();
   }
 
   function startPersistentPanelDataRefresh(tokenContext) {
@@ -5353,7 +5974,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
             preview: state.preview,
             batchStatus: state.batchStatus,
             tokenDistributionPending: state.tokenDistributionPending,
-            hostError: state.hostError
+            hostError: state.hostError,
+            runtimeDiagnosticNotice: state.runtimeDiagnosticNotice
           }
         },
         PANEL_ORIGIN
@@ -5753,6 +6375,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       progressTrack,
       progress,
       actionHandler: null,
+      clickHandler: null,
       timeoutId: null,
       remainingMs: 0,
       dismissStartedAt: 0,
@@ -5762,6 +6385,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     toast.addEventListener("click", (event) => {
       if (event.target.tagName === "A" || event.target.closest("a")) {
         return;
+      }
+      if (typeof entry.clickHandler === "function") {
+        entry.clickHandler();
       }
       dismissToast(toastId);
     });
@@ -5863,6 +6489,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     actionHandler = null,
     actionLabel = "",
     titleLink = null,
+    clickHandler = null,
     ttlMs = 3200,
     persistent = false,
     pending = false
@@ -5916,6 +6543,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     entry.detail.style.display = detail ? "block" : "none";
     entry.progress.style.background = "rgba(255, 255, 255, 0.92)";
     entry.actionHandler = !linkHref && typeof actionHandler === "function" ? actionHandler : null;
+    entry.clickHandler = typeof clickHandler === "function" ? clickHandler : null;
+    entry.element.style.cursor = entry.clickHandler ? "pointer" : "default";
     const resolvedActionLabel = actionLabel || linkLabel;
     if (linkHref || entry.actionHandler) {
       if (linkHref) {
@@ -5954,6 +6583,100 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       kind,
       ttlMs: kind === "error" ? 4200 : 3200
     });
+  }
+
+  function runtimeDiagnosticKind(diagnostic) {
+    return String(diagnostic?.severity || "").toLowerCase() === "critical" ? "error" : "info";
+  }
+
+  function runtimeDiagnosticDetail(diagnostic) {
+    const parts = [];
+    if (diagnostic?.envVar) parts.push(diagnostic.envVar);
+    if (diagnostic?.host) parts.push(diagnostic.host);
+    if (diagnostic?.restartRequired) parts.push("restart may be required");
+    const detail = String(diagnostic?.detail || "").trim();
+    if (detail) parts.push(detail);
+    return parts.join(" | ");
+  }
+
+  function runtimeDiagnosticToastKey(diagnostic) {
+    const fingerprint = String(diagnostic?.fingerprint || diagnostic?.key || "").trim();
+    if (!fingerprint) return "";
+    const signature = [
+      diagnostic?.severity || "",
+      diagnostic?.source || "",
+      diagnostic?.code || "",
+      diagnostic?.message || "",
+      diagnostic?.detail || "",
+      diagnostic?.envVar || "",
+      diagnostic?.endpointKind || "",
+      diagnostic?.host || "",
+      diagnostic?.restartRequired ? "restart" : ""
+    ].map((part) => String(part || "").trim()).join("|");
+    return `${fingerprint}:${signature}`;
+  }
+
+  function surfaceRuntimeDiagnostics(snapshot = null) {
+    const diagnostics = Array.isArray(snapshot?.diagnostics) ? snapshot.diagnostics : [];
+    const dismissed = snapshot?.dismissed && typeof snapshot.dismissed === "object"
+      ? snapshot.dismissed
+      : {};
+    const activeKeys = new Set(
+      diagnostics
+        .filter((diagnostic) => diagnostic && diagnostic.active !== false)
+        .map(runtimeDiagnosticToastKey)
+        .filter(Boolean)
+    );
+    for (const key of Array.from(state.runtimeDiagnosticToastKeys)) {
+      if (!activeKeys.has(key)) state.runtimeDiagnosticToastKeys.delete(key);
+    }
+    const panelDiagnostic = diagnostics.find(
+      (diagnostic) =>
+        diagnostic &&
+        diagnostic.active !== false &&
+        !dismissed[diagnostic.fingerprint || diagnostic.key]
+    );
+    if (panelDiagnostic) {
+      const detail = runtimeDiagnosticDetail(panelDiagnostic);
+      state.runtimeDiagnosticNotice = {
+        title: panelDiagnostic.message || "Runtime diagnostic",
+        message: detail || panelDiagnostic.message || "Runtime diagnostic",
+        kind: runtimeDiagnosticKind(panelDiagnostic),
+        source: "runtime-diagnostic"
+      };
+      pushPanelError(state.runtimeDiagnosticNotice.message, {
+        title: panelDiagnostic.message || "Runtime diagnostic",
+        kind: runtimeDiagnosticKind(panelDiagnostic),
+        source: "runtime-diagnostic"
+      });
+    } else {
+      state.runtimeDiagnosticNotice = null;
+      pushPanelError("", { source: "runtime-diagnostic" });
+    }
+    diagnostics
+      .filter((diagnostic) => diagnostic && diagnostic.active !== false)
+      .filter((diagnostic) => !dismissed[diagnostic.fingerprint || diagnostic.key])
+      .slice(0, 2)
+      .forEach((diagnostic) => {
+        const fingerprint = String(diagnostic.fingerprint || diagnostic.key || "").trim();
+        const toastKey = runtimeDiagnosticToastKey(diagnostic);
+        if (!fingerprint) return;
+        if (!toastKey) return;
+        if (state.runtimeDiagnosticToastKeys.has(toastKey)) return;
+        state.runtimeDiagnosticToastKeys.add(toastKey);
+        renderToast({
+          id: `runtime-diagnostic-${fingerprint}`,
+          title: diagnostic.message || "Runtime diagnostic",
+          detail: runtimeDiagnosticDetail(diagnostic),
+          kind: runtimeDiagnosticKind(diagnostic),
+          ttlMs: 6200,
+          actionLabel: "Dismiss",
+          actionHandler: () => {
+            void callBackground("trench:dismiss-runtime-diagnostic", { fingerprint }).catch(() => {});
+            dismissToast(`runtime-diagnostic-${fingerprint}`);
+          }
+        });
+      });
   }
 
   function capitalize(value) {
@@ -6065,6 +6788,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     if (state.panelWrapper) {
       state.panelWrapper.style.display = hidden ? "none" : "block";
     }
+    applyPanelLayering();
     if (state.launcherButton) {
       state.launcherButton.style.display = hidden && shouldMountLauncher(state.tokenContext) ? "flex" : "none";
     }
@@ -6162,7 +6886,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       width: "18px",
       height: "18px",
       cursor: "nwse-resize",
-      zIndex: "2147483648",
+      zIndex: "100",
       background: "transparent",
       pointerEvents: "auto",
       touchAction: "none"

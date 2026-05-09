@@ -14,6 +14,8 @@ pub enum TradeVenueFamily {
     PumpBondingCurve,
     PumpAmm,
     RaydiumAmmV4,
+    RaydiumCpmm,
+    RaydiumLaunchLab,
     TrustedStableSwap,
     BonkLaunchpad,
     BonkRaydium,
@@ -56,6 +58,10 @@ pub enum WrapperAction {
     PumpAmmWsolSell,
     RaydiumAmmV4WsolBuy,
     RaydiumAmmV4WsolSell,
+    RaydiumCpmmWsolBuy,
+    RaydiumCpmmWsolSell,
+    RaydiumLaunchLabSolBuy,
+    RaydiumLaunchLabSolSell,
     TrustedStableSwapBuy,
     TrustedStableSwapSell,
     BonkLaunchpadSolBuy,
@@ -137,6 +143,33 @@ pub struct RaydiumAmmV4RuntimeBundle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RaydiumCpmmRuntimeBundle {
+    pub pool: String,
+    pub config_id: String,
+    pub vault_a: String,
+    pub vault_b: String,
+    pub token_0_mint: String,
+    pub token_1_mint: String,
+    pub token_0_program: String,
+    pub token_1_program: String,
+    pub observation_id: String,
+    pub mint_decimals_a: u8,
+    pub mint_decimals_b: u8,
+    pub protocol_fees_mint_a: u64,
+    pub protocol_fees_mint_b: u64,
+    pub fund_fees_mint_a: u64,
+    pub fund_fees_mint_b: u64,
+    pub enable_creator_fee: bool,
+    pub creator_fees_mint_a: u64,
+    pub creator_fees_mint_b: u64,
+    pub reserve_a: u64,
+    pub reserve_b: u64,
+    pub trade_fee_rate: u64,
+    pub creator_fee_rate: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BagsRuntimeBundle {
     pub bags_launch: BagsLaunchMetadata,
 }
@@ -158,6 +191,7 @@ pub enum PlannerRuntimeBundle {
     PumpBondingCurve(PumpBondingCurveRuntimeBundle),
     PumpAmm(PumpAmmRuntimeBundle),
     RaydiumAmmV4(RaydiumAmmV4RuntimeBundle),
+    RaydiumCpmm(RaydiumCpmmRuntimeBundle),
     TrustedStable(TrustedStableRuntimeBundle),
     Bags(BagsRuntimeBundle),
 }
@@ -191,6 +225,8 @@ impl TradeVenueFamily {
             Self::PumpBondingCurve => "pump-bonding-curve",
             Self::PumpAmm => "pump-amm",
             Self::RaydiumAmmV4 => "raydium-amm-v4",
+            Self::RaydiumCpmm => "raydium-cpmm",
+            Self::RaydiumLaunchLab => "raydium-launchlab",
             Self::TrustedStableSwap => "trusted-stable-swap",
             Self::BonkLaunchpad => "bonk-launchpad",
             Self::BonkRaydium => "bonk-raydium",
@@ -225,6 +261,8 @@ impl LifecycleAndCanonicalMarket {
         match self.family {
             TradeVenueFamily::PumpBondingCurve | TradeVenueFamily::PumpAmm => true,
             TradeVenueFamily::RaydiumAmmV4
+            | TradeVenueFamily::RaydiumCpmm
+            | TradeVenueFamily::RaydiumLaunchLab
             | TradeVenueFamily::TrustedStableSwap
             | TradeVenueFamily::BonkLaunchpad
             | TradeVenueFamily::BonkRaydium
@@ -254,6 +292,11 @@ mod tests {
         assert_eq!(TradeVenueFamily::BonkLaunchpad.label(), "bonk-launchpad");
         assert_eq!(TradeVenueFamily::MeteoraDammV2.label(), "meteora-damm-v2");
         assert_eq!(TradeVenueFamily::RaydiumAmmV4.label(), "raydium-amm-v4");
+        assert_eq!(TradeVenueFamily::RaydiumCpmm.label(), "raydium-cpmm");
+        assert_eq!(
+            TradeVenueFamily::RaydiumLaunchLab.label(),
+            "raydium-launchlab"
+        );
     }
 
     #[test]

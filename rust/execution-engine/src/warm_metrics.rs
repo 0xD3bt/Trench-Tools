@@ -72,7 +72,7 @@ impl FamilyBucket {
         match self {
             Self::Pump => "pump",
             Self::Bonk => "bonk",
-            Self::Bags => "bags",
+            Self::Bags => "meteora",
             Self::Other => "other",
             Self::Unresolved => "unresolved",
         }
@@ -83,7 +83,9 @@ impl FamilyBucket {
         use crate::trade_planner::TradeVenueFamily;
         match family {
             TradeVenueFamily::PumpBondingCurve | TradeVenueFamily::PumpAmm => Self::Pump,
-            TradeVenueFamily::RaydiumAmmV4 => Self::Other,
+            TradeVenueFamily::RaydiumAmmV4
+            | TradeVenueFamily::RaydiumCpmm
+            | TradeVenueFamily::RaydiumLaunchLab => Self::Other,
             TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium => Self::Bonk,
             TradeVenueFamily::TrustedStableSwap => Self::Other,
             TradeVenueFamily::MeteoraDbc | TradeVenueFamily::MeteoraDammV2 => Self::Bags,

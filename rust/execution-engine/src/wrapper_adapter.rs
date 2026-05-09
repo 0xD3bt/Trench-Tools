@@ -28,6 +28,10 @@ pub const ALLOWED_INNER_PROGRAMS: &[(&str, &str)] = &[
         "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
     ),
     (
+        "raydium-launchlab",
+        "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
+    ),
+    (
         "raydium-clmm",
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
     ),
@@ -74,6 +78,8 @@ pub fn inner_program_label_for_selector(
         TradeVenueFamily::PumpBondingCurve => "pump-bonding-curve",
         TradeVenueFamily::PumpAmm => "pump-amm",
         TradeVenueFamily::RaydiumAmmV4 => "raydium-amm-v4",
+        TradeVenueFamily::RaydiumCpmm => "raydium-cpmm",
+        TradeVenueFamily::RaydiumLaunchLab => "raydium-launchlab",
         TradeVenueFamily::BonkLaunchpad => "bonk-launchpad",
         TradeVenueFamily::BonkRaydium => {
             if subtype.contains("cpmm") || target.contains("cpmm") {
@@ -241,6 +247,12 @@ mod tests {
                 TradeVenueFamily::RaydiumAmmV4,
                 Some("amm-v4"),
                 "raydium-amm-v4",
+            ),
+            (TradeVenueFamily::RaydiumCpmm, Some("cpmm"), "raydium-cpmm"),
+            (
+                TradeVenueFamily::RaydiumLaunchLab,
+                None,
+                "raydium-launchlab",
             ),
             (TradeVenueFamily::BonkLaunchpad, None, "bonk-launchpad"),
             (TradeVenueFamily::BonkRaydium, Some("clmm"), "raydium-clmm"),

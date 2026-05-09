@@ -262,6 +262,174 @@
       .input-shell .field-input {
         padding-left: 38px;
       }
+      .control-label {
+        display: flex;
+        min-width: 0;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .control-caption {
+        color: #a1a1aa;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      .quick-settings-grid {
+        display: grid;
+        grid-template-columns: 92px minmax(0, 1fr) minmax(0, 1fr);
+        gap: 10px;
+        align-items: end;
+      }
+      .quick-settings-grid .field-input {
+        min-width: 0;
+      }
+      .field-select {
+        width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+        appearance: none;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: #0d0d0d;
+        color: #f5f5f5;
+        padding: 11px 30px 11px 12px;
+        font: inherit;
+        cursor: pointer;
+      }
+      .select-shell {
+        position: relative;
+      }
+      .select-shell::after {
+        content: "";
+        position: absolute;
+        right: 12px;
+        top: 50%;
+        width: 7px;
+        height: 7px;
+        border-right: 1px solid #a1a1aa;
+        border-bottom: 1px solid #a1a1aa;
+        transform: translateY(-65%) rotate(45deg);
+        pointer-events: none;
+      }
+      .field-select:focus {
+        outline: none;
+        border-color: rgba(255, 255, 255, 0.16);
+        background: #101010;
+      }
+      .wallet-dropdown {
+        position: relative;
+      }
+      .wallet-dropdown-button {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        text-align: left;
+        font-weight: 400;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .wallet-dropdown-button[aria-expanded="true"] {
+        border-color: rgba(255, 255, 255, 0.16);
+        background: #101010;
+      }
+      .wallet-dropdown-button-label {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .wallet-dropdown-button-label.placeholder {
+        color: #71717a;
+      }
+      .wallet-dropdown-menu {
+        position: absolute;
+        top: calc(100% + 6px);
+        right: 0;
+        z-index: 30;
+        min-width: 100%;
+        max-width: 240px;
+        max-height: 220px;
+        overflow-y: auto;
+        padding: 6px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: #0d0d0d;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45);
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .wallet-dropdown-menu[hidden] {
+        display: none;
+      }
+      .wallet-dropdown-section {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .wallet-dropdown-section + .wallet-dropdown-section {
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+        padding-top: 6px;
+      }
+      .wallet-dropdown-section-label {
+        color: #a1a1aa;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        padding: 4px 8px 2px;
+      }
+      .wallet-dropdown-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 8px;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        color: #d4d4d8;
+        font-size: 12px;
+        font-weight: 500;
+        text-align: left;
+        cursor: pointer;
+        line-height: 1.2;
+      }
+      .wallet-dropdown-item:hover {
+        background: rgba(255, 255, 255, 0.05);
+      }
+      .wallet-dropdown-item.active {
+        background: rgba(255, 255, 255, 0.08);
+        color: #ffffff;
+      }
+      .wallet-dropdown-item:disabled {
+        cursor: default;
+        color: #71717a;
+      }
+      .wallet-dropdown-item:disabled:hover {
+        background: transparent;
+      }
+      .wallet-dropdown-item-mark {
+        width: 14px;
+        height: 14px;
+        flex: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: #71717a;
+      }
+      .wallet-dropdown-item.active .wallet-dropdown-item-mark {
+        color: #ffffff;
+      }
+      .wallet-dropdown-item-label {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .field-help {
         color: #71717a;
         font-size: 11px;
@@ -416,17 +584,54 @@
 
         <section class="section" aria-label="Quick Buy">
           <div class="section-copy">
-            <div class="section-kicker">Global quick-buy amount</div>
+            <div class="section-kicker">Quick trade controls</div>
           </div>
-          <div class="input-shell">
-            <img class="input-icon" src="../../assets/sol-icon-white.png" alt="" aria-hidden="true" />
-            <input
-              id="quick-buy-amount"
-              class="field-input"
-              type="text"
-              inputmode="decimal"
-              placeholder="Leave blank"
-            />
+          <div class="quick-settings-grid">
+            <label class="control-label">
+              <span class="control-caption">Quick buy</span>
+              <span class="input-shell">
+                <img class="input-icon" src="../../assets/sol-icon-white.png" alt="" aria-hidden="true" />
+                <input
+                  id="quick-buy-amount"
+                  class="field-input"
+                  type="text"
+                  inputmode="decimal"
+                  placeholder="Blank"
+                />
+              </span>
+            </label>
+            <label class="control-label">
+              <span class="control-caption">Preset</span>
+              <span class="select-shell">
+                <select id="preset-select" class="field-select" aria-label="Active preset"></select>
+              </span>
+            </label>
+            <div class="control-label">
+              <span class="control-caption">Wallets</span>
+              <div class="wallet-dropdown">
+                <span class="select-shell">
+                  <button
+                    id="wallet-dropdown-button"
+                    class="field-select wallet-dropdown-button"
+                    type="button"
+                    aria-haspopup="listbox"
+                    aria-expanded="false"
+                    aria-label="Wallet selection"
+                  >
+                    <span id="wallet-dropdown-label" class="wallet-dropdown-button-label placeholder">
+                      No wallets
+                    </span>
+                  </button>
+                </span>
+                <div
+                  id="wallet-dropdown-menu"
+                  class="wallet-dropdown-menu"
+                  role="listbox"
+                  aria-multiselectable="true"
+                  hidden
+                ></div>
+              </div>
+            </div>
           </div>
         </section>
 

@@ -656,7 +656,16 @@ function applyState(payload) {
       kind: "error",
       source: "host"
     };
-  } else if (state.panelNotice) {
+  } else if (Object.prototype.hasOwnProperty.call(payload, "runtimeDiagnosticNotice")) {
+    state.panelNotice = payload.runtimeDiagnosticNotice?.source === "runtime-diagnostic"
+      ? {
+          title: String(payload.runtimeDiagnosticNotice.title || "Runtime diagnostic"),
+          message: String(payload.runtimeDiagnosticNotice.message || ""),
+          kind: String(payload.runtimeDiagnosticNotice.kind || "info"),
+          source: "runtime-diagnostic"
+        }
+      : null;
+  } else if (state.panelNotice?.source !== "runtime-diagnostic") {
     state.panelNotice = null;
   }
   render();
@@ -664,11 +673,13 @@ function applyState(payload) {
 
 function applyPanelNotice(payload) {
   const message = String(payload?.message || "").trim();
+  const source = String(payload?.source || "notice").trim() || "notice";
   if (!message) {
-    state.panelNotice = null;
+    if (!source || state.panelNotice?.source === source) {
+      state.panelNotice = null;
+    }
     return;
   }
-  const source = String(payload?.source || "notice").trim() || "notice";
   const title = String(payload?.title || "").trim()
     || (source === "host" ? "Execution engine unavailable" : "Panel notice");
   state.panelNotice = {
@@ -806,13 +817,13 @@ function renderEngineStatus() {
   if (!elements.engineStatusRow || !elements.engineStatusTitle || !elements.engineStatusMessage) {
     return;
   }
-  const notice = state.panelNotice || (state.hostError
+  const notice = state.hostError
     ? {
         title: "Execution engine unavailable",
         message: state.hostError,
         source: "host"
       }
-    : null);
+    : state.panelNotice;
   const message = String(notice?.message || "").trim();
   const source = String(notice?.source || "").trim();
   elements.engineStatusRow.classList.toggle("hidden", !message);

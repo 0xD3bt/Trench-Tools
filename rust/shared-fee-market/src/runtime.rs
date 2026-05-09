@@ -467,7 +467,7 @@ where
     Ok(())
 }
 
-fn try_acquire_lease(config: &SharedFeeMarketConfig, kind: &str) -> bool {
+fn acquire_lease(config: &SharedFeeMarketConfig, kind: &str, replace_other_owner: bool) -> bool {
     let path = config.lease_path(kind);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -487,7 +487,10 @@ fn try_acquire_lease(config: &SharedFeeMarketConfig, kind: &str) -> bool {
     let _ = file.read_to_string(&mut text);
     let now = unix_ms_now();
     if let Ok(existing) = serde_json::from_str::<FeeMarketLeaseFile>(&text) {
-        if existing.expires_at_unix_ms > now && existing.owner != config.owner {
+        if !replace_other_owner
+            && existing.expires_at_unix_ms > now
+            && existing.owner != config.owner
+        {
             let _ = file.unlock();
             return false;
         }
@@ -510,6 +513,14 @@ fn try_acquire_lease(config: &SharedFeeMarketConfig, kind: &str) -> bool {
     }
     let _ = file.unlock();
     true
+}
+
+fn try_acquire_lease(config: &SharedFeeMarketConfig, kind: &str) -> bool {
+    acquire_lease(config, kind, false)
+}
+
+fn force_acquire_lease(config: &SharedFeeMarketConfig, kind: &str) -> bool {
+    acquire_lease(config, kind, true)
 }
 
 pub struct SharedFeeMarketRuntime {
@@ -607,15 +618,22 @@ impl SharedFeeMarketRuntime {
             self.fetch_helius_priority_snapshot_live(),
             self.fetch_jito_tip_floor_live()
         );
-        let helius_snapshot = helius_snapshot?;
-        let snapshot = FeeMarketSnapshot {
-            helius_priority_lamports: helius_snapshot.helius_priority_lamports,
-            helius_launch_priority_lamports: helius_snapshot.helius_launch_priority_lamports,
-            helius_trade_priority_lamports: helius_snapshot.helius_trade_priority_lamports,
-            jito_tip_p99_lamports: jito_tip_p99_lamports.unwrap_or(None),
-        };
-        self.cache_full_snapshot(snapshot.clone())?;
-        Ok(snapshot)
+        let helius_snapshot = helius_snapshot.map_err(|error| {
+            self.record_helius_error(error.clone());
+            error
+        })?;
+        self.update_helius_snapshot(&helius_snapshot)?;
+        match jito_tip_p99_lamports {
+            Ok(Some(tip_lamports)) => self.update_jito_tip_snapshot(Some(tip_lamports))?,
+            Ok(None) => self.record_jito_error(format!(
+                "Jito tip floor response did not include {}",
+                self.config.jito_tip_percentile
+            )),
+            Err(error) => self.record_jito_error(error),
+        }
+        self.read_snapshot_status()
+            .map(|status| status.snapshot)
+            .ok_or_else(|| "live fee-market refresh did not write a readable snapshot".to_string())
     }
 
     pub async fn fetch_fee_market_snapshot(&self) -> Result<FeeMarketSnapshot, String> {
@@ -635,6 +653,70 @@ impl SharedFeeMarketRuntime {
             return Ok(status.snapshot);
         }
         Err("Fee market snapshot unavailable and another process owns the fetch lease.".to_string())
+    }
+
+    pub async fn initialize_fee_market_snapshot(
+        &self,
+    ) -> Result<SharedFeeMarketSnapshotStatus, String> {
+        let _ = force_acquire_lease(&self.config, "live");
+        let _ = force_acquire_lease(&self.config, "helius");
+        let _ = force_acquire_lease(&self.config, "jito");
+
+        let (helius_result, jito_result) = tokio::join!(
+            self.fetch_helius_priority_snapshot_live(),
+            self.fetch_jito_tip_floor_live()
+        );
+        let mut refresh_errors = Vec::new();
+
+        match helius_result {
+            Ok(snapshot) => {
+                if let Err(error) = self.update_helius_snapshot(&snapshot) {
+                    refresh_errors.push(format!("helius cache update failed: {error}"));
+                }
+            }
+            Err(error) => {
+                self.record_helius_error(error.clone());
+                refresh_errors.push(format!("helius refresh failed: {error}"));
+            }
+        }
+
+        match jito_result {
+            Ok(Some(tip_lamports)) => {
+                if let Err(error) = self.update_jito_tip_snapshot(Some(tip_lamports)) {
+                    refresh_errors.push(format!("jito cache update failed: {error}"));
+                }
+            }
+            Ok(None) => {
+                let error = format!(
+                    "Jito tip floor response did not include {}",
+                    self.config.jito_tip_percentile
+                );
+                self.record_jito_error(error.clone());
+                refresh_errors.push(format!("jito refresh failed: {error}"));
+            }
+            Err(error) => {
+                self.record_jito_error(error.clone());
+                refresh_errors.push(format!("jito refresh failed: {error}"));
+            }
+        }
+
+        let status = self.read_snapshot_status().ok_or_else(|| {
+            format!(
+                "fee-market startup refresh did not write a readable snapshot: {}",
+                refresh_errors.join("; ")
+            )
+        })?;
+        if !status.helius_fresh || !status.jito_fresh {
+            return Err(format!(
+                "fee-market startup refresh did not produce a fresh complete snapshot: helius_fresh={} helius_age_ms={:?} jito_fresh={} jito_age_ms={:?} refresh_errors={}",
+                status.helius_fresh,
+                status.helius_age_ms,
+                status.jito_fresh,
+                status.jito_age_ms,
+                refresh_errors.join("; ")
+            ));
+        }
+        Ok(status)
     }
 
     pub fn cache_full_snapshot(&self, snapshot: FeeMarketSnapshot) -> Result<(), String> {
@@ -725,8 +807,14 @@ impl SharedFeeMarketRuntime {
             return;
         }
         match self.fetch_jito_tip_floor_live().await {
-            Ok(jito_tip_p99_lamports) => {
-                let _ = self.update_jito_tip_snapshot(jito_tip_p99_lamports);
+            Ok(Some(jito_tip_p99_lamports)) => {
+                let _ = self.update_jito_tip_snapshot(Some(jito_tip_p99_lamports));
+            }
+            Ok(None) => {
+                self.record_jito_error(format!(
+                    "Jito tip floor response did not include {}",
+                    self.config.jito_tip_percentile
+                ));
             }
             Err(error) => self.record_jito_error(error),
         }
@@ -941,6 +1029,23 @@ pub fn resolve_buffered_auto_fee_components(
         Some(_) => None,
         None => None,
     };
+    if uses_priority && uses_tip {
+        if let Some(minimum_tip_lamports) = provider_required_tip_lamports(input.provider) {
+            if minimum_tip_lamports > 0
+                && cap_lamports == Some(minimum_tip_lamports)
+                && priority_lamports == Some(1)
+            {
+                degradations.push(AutoFeeDegradation {
+                    source: "cap".to_string(),
+                    message: format!(
+                        "Auto Fee cap equals the {} minimum tip of {} SOL, so priority fee was reduced to 1 lamport. Increase max auto fee to include priority fee.",
+                        input.provider,
+                        crate::format_lamports_to_sol_decimal(minimum_tip_lamports)
+                    ),
+                });
+            }
+        }
+    }
 
     Ok(AutoFeeResolutionOutput {
         priority_lamports,
@@ -1315,7 +1420,9 @@ mod tests {
 
         assert_eq!(output.priority_lamports, Some(1));
         assert_eq!(output.tip_lamports, Some(1_000_000));
-        assert!(output.degradations.is_empty());
+        assert_eq!(output.degradations.len(), 1);
+        assert!(output.degradations[0].message.contains("minimum tip"));
+        assert!(output.degradations[0].message.contains("1 lamport"));
     }
 
     #[test]
@@ -1492,6 +1599,42 @@ mod tests {
         let status = runtime.read_snapshot_status().expect("status");
         assert_eq!(status.snapshot.helius_priority_lamports, Some(300));
         assert_eq!(status.snapshot.helius_launch_priority_lamports, Some(200));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn source_errors_preserve_existing_jito_tip_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "shared-fee-market-jito-preserve-test-{}-{}.json",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        let config = SharedFeeMarketConfig::new(
+            path.clone(),
+            "https://primary.example".to_string(),
+            "https://helius.example".to_string(),
+            "test".to_string(),
+            Vec::new(),
+        );
+        let runtime = SharedFeeMarketRuntime::new(config);
+        runtime
+            .cache_full_snapshot(FeeMarketSnapshot {
+                helius_priority_lamports: Some(100),
+                helius_launch_priority_lamports: None,
+                helius_trade_priority_lamports: None,
+                jito_tip_p99_lamports: Some(200),
+            })
+            .expect("cache seed");
+        runtime.record_jito_error("temporary jito error".to_string());
+
+        let status = runtime.read_snapshot_status().expect("status");
+        assert_eq!(status.snapshot.jito_tip_p99_lamports, Some(200));
+        assert!(status.jito_fresh);
+        assert_eq!(
+            status.jito_last_error.as_deref(),
+            Some("temporary jito error")
+        );
 
         let _ = fs::remove_file(path);
     }

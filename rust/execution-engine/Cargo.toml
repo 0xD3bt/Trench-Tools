@@ -1,6 +1,6 @@
 [package]
 name = "execution-engine"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 default-run = "execution-engine"
 
@@ -27,6 +27,7 @@ shared-auth = { path = "../shared-auth" }
 shared-extension-runtime = { path = "../shared-extension-runtime" }
 shared-execution-routing = { path = "../shared-execution-routing" }
 shared-fee-market = { path = "../shared-fee-market" }
+shared-raydium-launchlab = { path = "../shared-raydium-launchlab" }
 shared-transaction-submit = { path = "../shared-transaction-submit" }
 tokio-stream = { version = "0.1", features = ["sync"] }
 solana-address-lookup-table-interface = { version = "3.0.1", features = ["bincode", "bytemuck"] }

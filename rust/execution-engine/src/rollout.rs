@@ -27,6 +27,12 @@ pub fn family_execution_enabled(family: &TradeVenueFamily) -> bool {
         TradeVenueFamily::RaydiumAmmV4 => {
             read_bool_env("EXECUTION_ENGINE_ENABLE_RAYDIUM_AMM_V4_NATIVE", true)
         }
+        TradeVenueFamily::RaydiumCpmm => {
+            read_bool_env("EXECUTION_ENGINE_ENABLE_RAYDIUM_CPMM_NATIVE", true)
+        }
+        TradeVenueFamily::RaydiumLaunchLab => {
+            read_bool_env("EXECUTION_ENGINE_ENABLE_RAYDIUM_LAUNCHLAB_NATIVE", true)
+        }
         TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium => {
             read_bool_env("EXECUTION_ENGINE_ENABLE_BONK_NATIVE", true)
         }
@@ -47,6 +53,10 @@ pub fn family_warm_enabled(family: &TradeVenueFamily) -> bool {
         }
         TradeVenueFamily::RaydiumAmmV4 => {
             read_bool_env("EXECUTION_ENGINE_WARM_RAYDIUM_AMM_V4", true)
+        }
+        TradeVenueFamily::RaydiumCpmm => read_bool_env("EXECUTION_ENGINE_WARM_RAYDIUM_CPMM", true),
+        TradeVenueFamily::RaydiumLaunchLab => {
+            read_bool_env("EXECUTION_ENGINE_WARM_RAYDIUM_LAUNCHLAB", true)
         }
         TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium => {
             read_bool_env("EXECUTION_ENGINE_WARM_BONK", true)
@@ -69,12 +79,17 @@ pub fn family_warm_enabled_by_label(family_label: &str) -> bool {
         "raydium" | "raydium-amm-v4" | "raydium_amm_v4" | "amm-v4" => {
             read_bool_env("EXECUTION_ENGINE_WARM_RAYDIUM_AMM_V4", true)
         }
+        "raydium-cpmm" | "raydium_cpmm" | "cpmm" => {
+            read_bool_env("EXECUTION_ENGINE_WARM_RAYDIUM_CPMM", true)
+        }
+        "raydium-launchlab" | "raydium_launchlab" | "launchlab" | "launch-lab" => {
+            read_bool_env("EXECUTION_ENGINE_WARM_RAYDIUM_LAUNCHLAB", true)
+        }
         "bonk" | "letsbonk" | "lets-bonk" | "bonk-fun" => {
             read_bool_env("EXECUTION_ENGINE_WARM_BONK", true)
         }
-        "bags" | "bagsapp" | "bags-app" | "meteora" | "dbc" | "damm" | "damm-v2" => {
-            read_bool_env("EXECUTION_ENGINE_WARM_BAGS", true)
-        }
+        "bags" | "bagsapp" | "bags-app" | "meteora" | "generic-meteora" | "printr" | "moonshot"
+        | "daos" | "dbc" | "damm" | "damm-v2" => read_bool_env("EXECUTION_ENGINE_WARM_BAGS", true),
         _ => true,
     }
 }
@@ -216,6 +231,8 @@ pub fn family_guard_env_name(family: &TradeVenueFamily) -> &'static str {
             "EXECUTION_ENGINE_ENABLE_PUMP_NATIVE"
         }
         TradeVenueFamily::RaydiumAmmV4 => "EXECUTION_ENGINE_ENABLE_RAYDIUM_AMM_V4_NATIVE",
+        TradeVenueFamily::RaydiumCpmm => "EXECUTION_ENGINE_ENABLE_RAYDIUM_CPMM_NATIVE",
+        TradeVenueFamily::RaydiumLaunchLab => "EXECUTION_ENGINE_ENABLE_RAYDIUM_LAUNCHLAB_NATIVE",
         TradeVenueFamily::BonkLaunchpad | TradeVenueFamily::BonkRaydium => {
             "EXECUTION_ENGINE_ENABLE_BONK_NATIVE"
         }

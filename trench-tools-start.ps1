@@ -168,7 +168,7 @@ function Get-DisplayNameForBinary {
   switch ($BinaryName) {
     "execution-engine" { return "Execution Engine" }
     "launchdeck-engine" { return "LaunchDeck Engine" }
-    "launchdeck-follow-daemon" { return "LaunchDeck Follow Daemon" }
+    "launchdeck-follow-daemon" { return "Follow Daemon" }
     default { return $BinaryName }
   }
 }
@@ -185,6 +185,55 @@ function Get-DescriptionForBinary {
     "launchdeck-follow-daemon" { return "background follow-trading worker" }
     default { return "local service" }
   }
+}
+
+function Get-NowMilliseconds {
+  return [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+}
+
+function Format-ElapsedMilliseconds {
+  param(
+    [Parameter(Mandatory = $true)]
+    [int64]$Milliseconds
+  )
+
+  if ($Milliseconds -lt 1000) {
+    return "$Milliseconds`ms"
+  }
+  if ($Milliseconds -lt 60000) {
+    return ("{0:N1}s" -f ($Milliseconds / 1000)).Replace(",", "")
+  }
+  return ("{0}m {1:00}s" -f [math]::Floor($Milliseconds / 60000), [math]::Floor(($Milliseconds % 60000) / 1000))
+}
+
+function Write-StepRow {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Status,
+    [Parameter(Mandatory = $true)]
+    [string]$Label,
+    [string]$Detail = ""
+  )
+
+  Write-Host ("  {0,-5} {1,-28} {2}" -f $Status, $Label, $Detail).TrimEnd()
+}
+
+function Start-Step {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Label,
+    [string]$Status = "WAIT",
+    [string]$Detail = ""
+  )
+
+  $script:CurrentStepLabel = $Label
+  $script:CurrentStepStartedAt = Get-NowMilliseconds
+  Write-StepRow -Status $Status -Label $Label -Detail $Detail
+}
+
+function Complete-Step {
+  $elapsed = (Get-NowMilliseconds) - $script:CurrentStepStartedAt
+  Write-StepRow -Status "OK" -Label $script:CurrentStepLabel -Detail (Format-ElapsedMilliseconds -Milliseconds $elapsed)
 }
 
 function Get-HealthUrlForBinary {
@@ -219,25 +268,11 @@ function Show-StartupOverview {
   }
 
   Write-Host ""
-  Write-Host "Starting Trench Tools"
+  Write-Host "Trench Tools startup"
   Write-Host "Mode: $Mode ($modeDescription)"
+  Write-Host "Logs: $LogDirectory"
   Write-Host ""
-  Write-Host "This script will:"
-  Write-Host "  1. Stop any old Trench Tools processes for this mode."
-  Write-Host "  2. Build the selected apps in release mode."
-  Write-Host "  3. Launch the local services in the background."
-  Write-Host "  4. Check that each service is ready before it finishes."
-  Write-Host ""
-  Write-Host "Services selected:"
-  foreach ($target in $Targets) {
-    $displayName = Get-DisplayNameForBinary -BinaryName $target.Binary
-    $description = Get-DescriptionForBinary -BinaryName $target.Binary
-    $port = Get-PortForBinary -BinaryName $target.Binary
-    Write-Host "  - $displayName ($($target.Binary)): $description on port $port"
-  }
-  Write-Host ""
-  Write-Host "Logs will be saved in: $LogDirectory"
-  Write-Host ""
+  Write-Host "Steps"
 }
 
 function Get-LogViewerMarker {
@@ -289,9 +324,7 @@ function Build-Targets {
     $binaryNames.Add($target.Binary) | Out-Null
   }
 
-  Write-Host "Step 2/4: Building selected apps in release mode."
-  Write-Host "Building: $($binaryNames -join ', ')"
-  Write-Host "This can take a minute on the first run."
+  Start-Step -Label "Build services" -Status "BUILD" -Detail ($binaryNames -join ", ")
   Push-Location $projectRoot
   try {
     & cargo @cargoArgs
@@ -308,6 +341,7 @@ function Build-Targets {
       throw "Expected built binary at $binaryPath."
     }
   }
+  Complete-Step
 }
 
 function Wait-ForHealthEndpoint {
@@ -397,13 +431,9 @@ function Show-BrowserTunnelGuidance {
 
   Write-Host ""
   Write-Host "Browser tunnel"
-  Write-Host "  - If your browser runs on another machine, forward local port(s) $forwardedPorts to this VPS."
-  Write-Host "  - Recommended: add LocalForward entries to your SSH config so Cursor/SSH opens them automatically."
-  Write-Host "  - One-off tunnel:"
-  Write-Host "    $manualTunnel"
-  Write-Host "  - Windows check from the browser machine:"
-  Write-Host "    $checkCommands"
-  Write-Host "  - Do not expose ports 8788, 8789, or 8790 directly to the public internet."
+  Write-Host "  Remote browser: forward local port(s) $forwardedPorts to this VPS."
+  Write-Host "  One-off: $manualTunnel"
+  Write-Host "  Do not expose ports 8788, 8789, or 8790 publicly."
 }
 
 function Show-FinalSummary {
@@ -416,7 +446,11 @@ function Show-FinalSummary {
   )
 
   Write-Host ""
-  Write-Host "Trench Tools is ready."
+  Write-Host "Trench Tools services are ready."
+  if ($env:TRENCH_TOOLS_FINAL_DIAGNOSTICS -eq "1") {
+    Show-BrowserTunnelGuidance -Mode $Mode
+    return
+  }
   Write-Host ""
   Write-Host "Launched services:"
   foreach ($entry in $Entries) {
@@ -445,11 +479,8 @@ function Show-FinalSummary {
     return
   }
 
-  Write-Host "  1. Open this token file:"
-  Write-Host "     $tokenFilePath"
-  Write-Host "  2. Copy the token inside the file."
-  Write-Host "  3. Paste it into the Trench Tools / LaunchDeck browser extension when it asks for authentication."
-  Write-Host "  4. Keep the file and token private. Anyone with the token can connect to your local engine."
+  Write-Host "  Token file: $tokenFilePath"
+  Write-Host "  Paste this token into the extension. Keep it private."
 }
 
 function Wait-ForStartedProcessesHealthy {
@@ -492,8 +523,6 @@ function Wait-ForStartedProcessesHealthy {
       }
 
       if ($healthy) {
-        $displayName = Get-DisplayNameForBinary -BinaryName $entry.Name
-        Write-Host "  Ready: $displayName ($($entry.Name))"
         $pending.RemoveAt($index)
         continue
       }
@@ -684,8 +713,9 @@ New-Item -ItemType Directory -Path $env:LAUNCHDECK_SEND_LOG_DIR -Force | Out-Nul
 $targets = @(Get-TargetSpecsForMode -Mode $mode)
 Show-StartupOverview -Mode $mode -Targets $targets -LogDirectory $logDir
 
-Write-Host "Step 1/4: Stopping old Trench Tools processes for mode '$mode'."
+Start-Step -Label "Stop old processes" -Status "WAIT" -Detail "mode $mode"
 & (Join-Path $projectRoot "trench-tools-stop.ps1") --mode $mode | Out-Host
+Complete-Step
 
 $started = New-Object System.Collections.Generic.List[object]
 
@@ -693,13 +723,13 @@ try {
   Build-Targets -Targets $targets
 
   Write-Host ""
-  Write-Host "Step 3/4: Launching local services in the background."
+  Write-Host "Launched"
+  Start-Step -Label "Launch services" -Status "WAIT"
   foreach ($target in $targets) {
     $binaryPath = Get-BinaryPath -Binary $target.Binary
     $stdoutLogPath = Join-Path $logDir "$($target.Binary).log"
     $stderrLogPath = Join-Path $logDir "$($target.Binary).stderr.log"
     $displayName = Get-DisplayNameForBinary -BinaryName $target.Binary
-    Write-Host "  Launching $displayName ($($target.Binary))..."
     $entry = Start-DetachedBinary `
       -BinaryName $target.Binary `
       -BinaryPath $binaryPath `
@@ -712,12 +742,15 @@ try {
       Start-LogViewerTerminal -BinaryName $target.Binary -LogPath $entry.LogPath -RunDirectory $runDir
       Write-Host "    Opened a log window for $displayName."
     }
-    Write-Host "    Started process $($entry.ProcessId). Logs: $($entry.LogPath)"
+    $port = Get-PortForBinary -BinaryName $target.Binary
+    Write-Host ("  OK    {0,-24} http://127.0.0.1:{1,-5} pid {2,-8} logs {3}" -f $displayName, $port, $entry.ProcessId, $entry.LogPath)
   }
+  Complete-Step
 
   Write-Host ""
-  Write-Host "Step 4/4: Checking that each service is ready."
+  Start-Step -Label "Wait for readiness" -Status "WAIT"
   Wait-ForStartedProcessesHealthy -Entries $started.ToArray()
+  Complete-Step
 } catch {
   try {
     & (Join-Path $projectRoot "trench-tools-stop.ps1") --mode $mode | Out-Host

@@ -56,6 +56,7 @@
       renderBackendRegionSummary,
       queueWarmActivity,
       hideSettingsModal,
+      handlePostDeploySuccess = () => {},
     } = config;
 
     function formatBootTaskList(labels) {
@@ -319,6 +320,10 @@
             applyVanityValue("", { publicKey: "" });
           }
           refreshWalletStatus(true, true).catch(() => {});
+          await Promise.resolve(handlePostDeploySuccess({
+            report: payload.report || null,
+            formPayload,
+          })).catch(() => {});
         }
       } catch (error) {
         setStatusLabel("Error");

@@ -16,7 +16,7 @@ For most operators today:
 - use [Helius Developer tier](https://www.helius.dev/pricing), about $50/month, or better for primary infrastructure
 - `SOLANA_RPC_URL`: Helius Gatekeeper HTTP
 - `SOLANA_WS_URL`: Helius standard websocket
-- `WARM_RPC_URL`: separate [Shyft](https://shyft.to/) RPC if you want warm/cache traffic off the main Helius budget
+- `WARM_RPC_URL`: separate [Shyft](https://shyft.to/) RPC for compatible warm/cache traffic off the main Helius budget
 - provider: `Helius Sender` or `Hello Moon`
 
 Examples:
@@ -32,7 +32,7 @@ Why this split:
 
 - Helius Gatekeeper HTTP has benchmarked best for the main HTTP/read path.
 - Helius standard websocket has benchmarked best for watcher websocket subscriptions.
-- Shyft is a good low-priority warm RPC so warm/cache/block-height traffic does not drain your main Helius budget.
+- Shyft provides low-priority warm RPC capacity for warm/cache/block-height traffic.
 
 Benchmark your own setup from the exact machine and region you use. Do not assume shared latency numbers will match your VPS, provider tier, or route.
 
@@ -144,9 +144,14 @@ In practice:
 - `Helius Sender` or `Hello Moon` handle the low-latency send path.
 - `SOLANA_RPC_URL` handles reads, confirmations, and general runtime RPC behavior.
 - `SOLANA_WS_URL` handles realtime watchers.
-- `WARM_RPC_URL` handles startup warm, keep-warm probes, and block-height reads.
+- `WARM_RPC_URL` handles compatible best-effort startup/keep-warm probes and low-priority sampled state reads.
+- `WARM_WS_URL` handles optional warm websocket probes or non-authoritative observers only.
 
 Default behavior:
+
+- Blank `WARM_RPC_URL` or `WARM_WS_URL` keeps warm behavior on the primary Helius endpoints.
+- Configured warm endpoints add optional cost-saving capacity. Failures or rate limits trigger cooldown; user-visible/execution paths stay on primary Helius endpoints.
+- Env-backed warm endpoint changes apply after local services restart.
 
 - startup warm runs once when the runtime starts
 - continuous warm keeps active routes hot while the app is being used
@@ -196,7 +201,7 @@ Restart the runtime after changing `.env`. If Trench Tools has saved you money a
 
 ## Metadata Upload
 
-Blank/default uses pump-fun metadata upload.
+Blank/default uses the launchpad's native metadata flow: pump-fun for Pump, Bonk's upload endpoints for Bonk, and Bags API prepare for Bagsapp.
 
 Use Pinata only when you want it:
 
@@ -206,6 +211,19 @@ PINATA_JWT=YOUR_PINATA_JWT
 ```
 
 Get a JWT from [Pinata](https://pinata.cloud/).
+
+Pump and Bonk use the shared LaunchDeck metadata/IPFS flow. Bagsapp uses the Bags API prepare flow and returns its own mint and metadata URI. See [launchdeck/METADATA_AND_VANITY.md](launchdeck/METADATA_AND_VANITY.md) for platform behavior and vanity queue formatting.
+
+## Token Distribution
+
+Token split/consolidate is an execution-engine extension feature, not a LaunchDeck launch action. It uses the active execution preset for provider, priority fee, and tip behavior.
+
+Current provider support:
+
+- `Helius Sender`
+- `Hello Moon`
+
+If token distribution fails with a provider error, switch the active execution preset to one of those providers before retrying.
 
 ## Local State
 
@@ -239,6 +257,7 @@ Use [.env.advanced](../.env.advanced) and [ENV_REFERENCE.md](ENV_REFERENCE.md) f
 - Auto Fee tuning
 - follow daemon capacity
 - launchpad compute/slippage overrides
+- execution route-family rollout and warm switches
 - local state path overrides
 - deferred provider settings
 
