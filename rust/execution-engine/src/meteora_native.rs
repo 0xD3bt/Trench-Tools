@@ -5,6 +5,7 @@ use std::{
 };
 
 use shared_extension_runtime::follow_contract::BagsLaunchMetadata;
+use solana_sdk::signature::Signer;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -20,6 +21,7 @@ use crate::{
     },
     trade_runtime::{RuntimeSellIntent, TradeRuntimeRequest},
     wallet_store::load_solana_wallet_by_env_key,
+    wrapper_payload::parse_sol_amount_to_lamports,
 };
 
 const BAGS_IMPORT_CONTEXT_TTL: Duration = Duration::from_millis(2_500);
@@ -269,69 +271,77 @@ pub async fn compile_meteora_trade(
         .as_deref()
         .unwrap_or_else(|| selector.family.label());
     let quote_asset = selector.quote_asset.label();
-    let compiled =
-        match request.side {
-            TradeSide::Buy => {
-                let buy_amount_sol = request
-                    .buy_amount_sol
-                    .as_deref()
-                    .ok_or_else(|| "Missing buyAmountSol for Meteora buy request.".to_string())?;
-                let context_started_at = Instant::now();
-                let follow_buy_context = match warmed_bags_follow_buy_context(request).await {
-                    Some(context) => Some(context),
-                    None => {
-                        let loaded = launchdeck_bags::load_follow_buy_context(
-                            &rpc_url,
-                            &request.mint,
-                            &launchdeck_execution.commitment,
-                            Some(&bags_launch),
-                        )
-                        .await?;
-                        if let (Some(warm_key), Some(context)) =
-                            (request.warm_key.as_deref(), loaded.as_ref())
-                        {
-                            cache_bags_follow_buy_context(warm_key, context).await;
-                        }
-                        loaded
+    let compiled = match request.side {
+        TradeSide::Buy => {
+            let buy_amount_sol = request
+                .buy_amount_sol
+                .as_deref()
+                .ok_or_else(|| "Missing buyAmountSol for Meteora buy request.".to_string())?;
+            let context_started_at = Instant::now();
+            let follow_buy_context = match warmed_bags_follow_buy_context(request).await {
+                Some(context) => Some(context),
+                None => {
+                    let loaded = launchdeck_bags::load_follow_buy_context(
+                        &rpc_url,
+                        &request.mint,
+                        &launchdeck_execution.commitment,
+                        Some(&bags_launch),
+                    )
+                    .await?;
+                    if let (Some(warm_key), Some(context)) =
+                        (request.warm_key.as_deref(), loaded.as_ref())
+                    {
+                        cache_bags_follow_buy_context(warm_key, context).await;
                     }
-                };
-                crate::route_metrics::record_phase_ms(
-                    "context_fetch",
-                    context_started_at.elapsed().as_millis(),
-                );
-                launchdeck_bags::compile_follow_buy_transaction_for_meteora_target(
-                    &rpc_url,
-                    &launchdeck_execution,
-                    &tip_account,
-                    &owner_bytes,
-                    &request.mint,
-                    buy_amount_sol,
-                    Some(&bags_launch),
-                    follow_buy_context.as_ref(),
-                    direct_protocol_target,
-                    quote_asset,
-                )
-                .await?
-            }
-            TradeSide::Sell => {
-                let sell_percent =
-                    parse_sell_percent(request.sell_intent.as_ref().ok_or_else(|| {
-                        "Missing sell intent for Meteora sell request.".to_string()
-                    })?)?;
-                launchdeck_bags::compile_follow_sell_transaction_for_meteora_target(
-                    &rpc_url,
-                    &launchdeck_execution,
-                    &tip_account,
-                    &owner_bytes,
-                    &request.mint,
-                    sell_percent,
-                    Some(&bags_launch),
-                    direct_protocol_target,
-                    quote_asset,
-                )
-                .await?
-            }
-        };
+                    loaded
+                }
+            };
+            crate::route_metrics::record_phase_ms(
+                "context_fetch",
+                context_started_at.elapsed().as_millis(),
+            );
+            launchdeck_bags::compile_follow_buy_transaction_for_meteora_target(
+                &rpc_url,
+                &launchdeck_execution,
+                &tip_account,
+                &owner_bytes,
+                &request.mint,
+                buy_amount_sol,
+                Some(&bags_launch),
+                follow_buy_context.as_ref(),
+                direct_protocol_target,
+                quote_asset,
+            )
+            .await?
+        }
+        TradeSide::Sell => {
+            let (sell_percent, token_amount_override) = resolve_meteora_sell_amount(
+                &rpc_url,
+                selector,
+                request,
+                wallet_key,
+                &owner.pubkey().to_string(),
+                request
+                    .sell_intent
+                    .as_ref()
+                    .ok_or_else(|| "Missing sell intent for Meteora sell request.".to_string())?,
+            )
+            .await?;
+            launchdeck_bags::compile_follow_sell_transaction_for_meteora_target(
+                &rpc_url,
+                &launchdeck_execution,
+                &tip_account,
+                &owner_bytes,
+                &request.mint,
+                sell_percent,
+                token_amount_override,
+                Some(&bags_launch),
+                direct_protocol_target,
+                quote_asset,
+            )
+            .await?
+        }
+    };
     Ok(CompiledAdapterTrade {
         transactions: vec![map_compiled_transaction(compiled)],
         primary_tx_index: 0,
@@ -556,6 +566,160 @@ fn parse_sell_percent(intent: &RuntimeSellIntent) -> Result<u8, String> {
                 .to_string(),
         ),
     }
+}
+
+async fn resolve_meteora_sell_amount(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    wallet_key: &str,
+    owner: &str,
+    intent: &RuntimeSellIntent,
+) -> Result<(u8, Option<u64>), String> {
+    match intent {
+        RuntimeSellIntent::Percent(_) => Ok((parse_sell_percent(intent)?, None)),
+        RuntimeSellIntent::SolOutput(value) => {
+            let target_lamports = parse_sol_amount_to_lamports(value);
+            if target_lamports == 0 {
+                return Err("sellOutputSol must be greater than zero.".to_string());
+            }
+            let decimals = read_mint_decimals(
+                &crate::rpc_client::fetch_account_data(
+                    rpc_url,
+                    &request.mint,
+                    &request.policy.commitment,
+                )
+                .await?,
+            )?;
+            let balance = crate::wallet_token_cache::fetch_token_balance_with_cache(
+                Some(wallet_key),
+                owner,
+                &request.mint,
+                decimals,
+            )
+            .await?;
+            let bags_launch = selector_to_bags_launch(selector);
+            let amount = choose_meteora_target_sized_amount(
+                rpc_url,
+                selector,
+                request,
+                Some(&bags_launch),
+                balance.amount_raw,
+                target_lamports,
+            )
+            .await?;
+            Ok((100, Some(amount)))
+        }
+    }
+}
+
+async fn choose_meteora_target_sized_amount(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    bags_launch: Option<&BagsLaunchMetadata>,
+    available_raw: u64,
+    target_lamports: u64,
+) -> Result<u64, String> {
+    if available_raw == 0 {
+        return Err("You have 0 tokens.".to_string());
+    }
+    let full_quote =
+        quote_meteora_target_sell_value_sol(rpc_url, selector, request, bags_launch, available_raw)
+            .await?;
+    if full_quote == 0 {
+        return Err("Meteora sell quote resolved to zero SOL.".to_string());
+    }
+    if full_quote < target_lamports {
+        return Err(crate::sell_target_sizing::unreachable_target_message(
+            target_lamports,
+            full_quote,
+        ));
+    }
+
+    let mut best = Some((available_raw, full_quote));
+    let mut low = 1u64;
+    let mut high = available_raw.saturating_sub(1);
+    let estimate = crate::sell_target_sizing::target_amount_estimate(
+        available_raw,
+        target_lamports,
+        full_quote,
+    );
+    if estimate < available_raw {
+        let quoted =
+            quote_meteora_target_sell_value_sol(rpc_url, selector, request, bags_launch, estimate)
+                .await?;
+        if quoted == 0 {
+            low = estimate.saturating_add(1);
+        } else {
+            best = Some(crate::sell_target_sizing::prefer_better_target_amount(
+                best,
+                estimate,
+                quoted,
+                target_lamports,
+            ));
+            if quoted < target_lamports {
+                low = estimate.saturating_add(1);
+            } else {
+                high = estimate.saturating_sub(1);
+            }
+        }
+    }
+    for _ in 0..crate::sell_target_sizing::RPC_TARGET_SIZING_MAX_REFINEMENT_PROBES {
+        if low > high {
+            break;
+        }
+        let amount = low + (high - low) / 2;
+        let quoted =
+            quote_meteora_target_sell_value_sol(rpc_url, selector, request, bags_launch, amount)
+                .await?;
+        if quoted == 0 {
+            low = amount.saturating_add(1);
+            continue;
+        }
+        best = Some(crate::sell_target_sizing::prefer_better_target_amount(
+            best,
+            amount,
+            quoted,
+            target_lamports,
+        ));
+        if quoted < target_lamports {
+            low = amount.saturating_add(1);
+        } else {
+            high = amount - 1;
+        }
+    }
+    best.map(|(amount, _)| amount)
+        .ok_or_else(|| "Meteora sell quote resolved to zero SOL.".to_string())
+}
+
+async fn quote_meteora_target_sell_value_sol(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    bags_launch: Option<&BagsLaunchMetadata>,
+    amount: u64,
+) -> Result<u64, String> {
+    let gross_sol_lamports = launchdeck_bags::quote_bags_target_sell_value_sol(
+        rpc_url,
+        &request.mint,
+        amount,
+        &request.policy.commitment,
+        bags_launch,
+        selector
+            .direct_protocol_target
+            .as_deref()
+            .unwrap_or_else(|| selector.family.label()),
+        selector.quote_asset.label(),
+    )
+    .await?;
+    crate::sell_target_sizing::net_sol_after_wrapper_fee(gross_sol_lamports)
+}
+
+fn read_mint_decimals(data: &[u8]) -> Result<u8, String> {
+    data.get(44)
+        .copied()
+        .ok_or_else(|| "Mint account data was shorter than expected (decimals).".to_string())
 }
 
 #[cfg(test)]

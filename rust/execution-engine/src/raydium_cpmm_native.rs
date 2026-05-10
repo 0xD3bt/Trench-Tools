@@ -217,12 +217,6 @@ pub(crate) async fn compile_raydium_cpmm_trade(
             selector.family.label()
         ));
     }
-    if matches!(request.side, TradeSide::Sell)
-        && matches!(request.sell_intent, Some(RuntimeSellIntent::SolOutput(_)))
-    {
-        return Err("Raydium CPMM exact-output sells are not enabled for this route.".to_string());
-    }
-
     let rpc_url = crate::rpc_client::configured_rpc_url();
     let owner = load_solana_wallet_by_env_key(wallet_key)?;
     let context = load_raydium_cpmm_pool_context_for_selector(
@@ -544,14 +538,6 @@ async fn compile_cpmm_sell_transaction(
         .sell_intent
         .as_ref()
         .ok_or_else(|| "Missing sell intent for Raydium CPMM sell.".to_string())?;
-    let percent_bps = match sell_intent {
-        RuntimeSellIntent::Percent(value) => parse_percent_to_bps(value)?,
-        RuntimeSellIntent::SolOutput(_) => {
-            return Err(
-                "Raydium CPMM exact-output sells are not enabled for this route.".to_string(),
-            );
-        }
-    };
     let balance = crate::wallet_token_cache::fetch_token_balance_with_cache(
         Some(wallet_key),
         &owner_pubkey.to_string(),
@@ -559,8 +545,25 @@ async fn compile_cpmm_sell_transaction(
         token_decimals(context, &token_mint),
     )
     .await?;
-    let amount_in = ((u128::from(balance.amount_raw) * u128::from(percent_bps)) / 10_000u128)
-        .min(u128::from(u64::MAX)) as u64;
+    let amount_in = match sell_intent {
+        RuntimeSellIntent::Percent(value) => {
+            let percent_bps = parse_percent_to_bps(value)?;
+            ((u128::from(balance.amount_raw) * u128::from(percent_bps)) / 10_000u128)
+                .min(u128::from(u64::MAX)) as u64
+        }
+        RuntimeSellIntent::SolOutput(value) => {
+            let target_lamports = parse_decimal_units(value, 9, "sellOutputSol")?;
+            crate::sell_target_sizing::choose_target_sized_token_amount(
+                balance.amount_raw,
+                target_lamports,
+                |amount| {
+                    raydium_cpmm_quote_exact_input(context, &token_mint, amount, 0)
+                        .map(|(expected, _)| expected)
+                        .and_then(crate::sell_target_sizing::net_sol_after_wrapper_fee)
+                },
+            )?
+        }
+    };
     if amount_in == 0 {
         return Err("Raydium CPMM sell amount resolved to zero.".to_string());
     }

@@ -13,6 +13,8 @@ const WALLET_STATUS_DIFF_KEY = "trenchTools.walletStatusDiff";
 const WALLET_STATUS_MARK_REVISION_KEY = "trenchTools.walletStatusMarkRevision";
 const WALLET_STATUS_MARK_DIFF_KEY = "trenchTools.walletStatusMarkDiff";
 const LAST_TRADE_EVENT_KEY = "trenchTools.lastTradeEvent";
+const BATCH_STATUS_EVENT_KEY = "trenchTools.lastBatchStatusEvent";
+const BATCH_STATUS_REVISION_KEY = "trenchTools.batchStatusRevision";
 
 const STORE = {
   balances: new Map(),
@@ -405,6 +407,38 @@ export function handleTradeEvent(event) {
         receivedAt: Date.now(),
       },
     });
+  } catch (_error) {}
+}
+
+export function handleBatchStatusEvent(event) {
+  if (!event || typeof event !== "object") return;
+  const snapshot = event.snapshot && typeof event.snapshot === "object"
+    ? event.snapshot
+    : event;
+  const batchId = String(snapshot?.batchId || event.batchId || "").trim();
+  if (!batchId) return;
+  const receivedAt = Date.now();
+  try {
+    chrome.storage.local.set({
+      [BATCH_STATUS_EVENT_KEY]: {
+        ...snapshot,
+        batchId,
+        clientRequestId: snapshot?.clientRequestId || event.clientRequestId || "",
+        revision: Number.isInteger(event.revision) ? event.revision : snapshot?.revision,
+        streamReason: snapshot?.streamReason || event.reason || "",
+        streamReceivedAtUnixMs: receivedAt,
+        streamEmittedAtUnixMs: snapshot?.streamEmittedAtUnixMs || event.atMs || null
+      },
+      [BATCH_STATUS_REVISION_KEY]: nextStorageRevision()
+    });
+    const emittedAt = Number(snapshot?.streamEmittedAtUnixMs || event.atMs || 0);
+    if (emittedAt > 0) {
+      console.debug("[trench][latency] phase=background-sse-batch batch=%s revision=%s stream_to_background_ms=%s",
+        batchId,
+        Number.isInteger(event.revision) ? event.revision : snapshot?.revision,
+        Math.max(0, receivedAt - emittedAt)
+      );
+    }
   } catch (_error) {}
 }
 

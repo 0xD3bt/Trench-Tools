@@ -30,6 +30,7 @@ import {
   deleteWalletGroup,
   postActiveMark,
   postPrewarm,
+  primeTradeRuntime,
   previewBatch,
   resetPnlHistory,
   refreshHostConnectionState,
@@ -279,6 +280,85 @@ const CONTENT_REINJECTION_TARGETS = [
   }
 ];
 
+const SUPPORTED_CONTENT_ORIGINS = new Set([
+  "https://axiom.trade",
+  "https://j7tracker.io"
+]);
+
+const EXTENSION_PAGE_PATH_PREFIXES = [
+  "/src/popup/",
+  "/src/options/",
+  "/src/panel/",
+  "/launchdeck/"
+];
+
+const CONTENT_ALLOWED_MESSAGE_TYPES = new Set([
+  "trench:buy",
+  "trench:dismiss-runtime-diagnostic",
+  "trench:get-batch-status",
+  "trench:get-bootstrap",
+  "trench:get-launchdeck-host-settings",
+  "trench:get-launchdeck-settings",
+  "trench:get-runtime-diagnostics",
+  "trench:get-runtime-status",
+  "trench:get-wallet-status",
+  "trench:invalidate-balances",
+  "trench:open-external-url",
+  "trench:open-options",
+  "trench:play-sound",
+  "trench:prime-trade-runtime",
+  "trench:prewarm-mint",
+  "trench:preview-batch",
+  "trench:reset-pnl-history",
+  "trench:resolve-token",
+  "trench:resync-pnl-history",
+  "trench:sell",
+  "trench:set-active-mark",
+  "trench:set-active-mints",
+  "trench:set-trade-readiness",
+  "trench:token-consolidate",
+  "trench:token-split"
+]);
+
+function senderUrl(sender = {}) {
+  return sender.url || sender.tab?.url || "";
+}
+
+function senderSurface(sender = {}) {
+  let parsed;
+  try {
+    parsed = new URL(senderUrl(sender));
+  } catch (_error) {
+    return "unknown";
+  }
+
+  if (SUPPORTED_CONTENT_ORIGINS.has(parsed.origin)) {
+    return "content";
+  }
+
+  if (
+    parsed.protocol === "chrome-extension:" &&
+    parsed.host === chrome.runtime.id &&
+    EXTENSION_PAGE_PATH_PREFIXES.some((prefix) => parsed.pathname.startsWith(prefix))
+  ) {
+    return "extension-page";
+  }
+
+  return "unknown";
+}
+
+function assertAllowedSender(message, sender) {
+  const type = String(message?.type || "");
+  const surface = senderSurface(sender);
+  if (surface === "extension-page") {
+    return;
+  }
+  if (surface === "content" && CONTENT_ALLOWED_MESSAGE_TYPES.has(type)) {
+    return;
+  }
+  throw new Error("Unauthorized extension message sender.");
+}
+
 async function openExternalUrl(payload = {}) {
   const url = String(payload.url || "").trim();
   const mode = String(payload.mode || "tab").trim().toLowerCase();
@@ -308,8 +388,20 @@ async function openExternalUrl(payload = {}) {
 }
 
 async function handleMessage(message) {
+  const type = String(message?.type || "");
+  const backgroundReadyStartedAt = Date.now();
   await backgroundRuntimeReady;
-  switch (message?.type) {
+  const backgroundReadyMs = Date.now() - backgroundReadyStartedAt;
+  if (["trench:buy", "trench:sell", "trench:prime-trade-runtime"].includes(type)) {
+    console.debug(
+      "[trench][latency] phase=background-ready type=%s clientRequestId=%s reason=%s background_ready_ms=%s",
+      type,
+      message?.payload?.clientRequestId || "",
+      message?.payload?.reason || "",
+      backgroundReadyMs
+    );
+  }
+  switch (type) {
     case "trench:get-health":
       return fetchHealth();
     case "trench:get-auth-bootstrap":
@@ -332,6 +424,25 @@ async function handleMessage(message) {
     }
     case "trench:get-runtime-diagnostics":
       return getDiagnosticsSnapshot();
+    case "trench:prime-trade-runtime": {
+      const primeStartedAt = Date.now();
+      const payload = message.payload || {};
+      const surfaceId = String(payload.surfaceId || "").trim();
+      const surface = String(payload.surface || surfaceId || "trade").trim();
+      if (surfaceId) {
+        setTradeReadinessSurface(surfaceId, true, surface);
+      }
+      startEventsClient();
+      const result = await primeTradeRuntime({
+        reason: payload.reason,
+        surface
+      });
+      return {
+        ...result,
+        backgroundReadyMs,
+        backgroundPrimeMs: Date.now() - primeStartedAt
+      };
+    }
     case "trench:dismiss-runtime-diagnostic":
       return dismissDiagnostic(message.payload?.fingerprint);
     case "trench:get-launchdeck-host-settings":
@@ -524,14 +635,16 @@ async function handleMessage(message) {
   }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // The offscreen document relays playback requests via chrome.runtime.sendMessage,
   // which also hits this listener. Ignore its own envelope so the background doesn't
   // reply to itself (and so it doesn't bounce through handleMessage).
   if (message?.type === "trench:offscreen-play-sound") {
     return false;
   }
-  handleMessage(message)
+  Promise.resolve()
+    .then(() => assertAllowedSender(message, sender))
+    .then(() => handleMessage(message))
     .then((data) => sendResponse({ ok: true, data }))
     .catch((error) => {
       const serialized = serializeHostError(error);

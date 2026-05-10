@@ -8394,6 +8394,20 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
         if raw_amount == 0 {
             return Ok(None);
         }
+        let fresh_balance = fetch_bonk_owner_token_balance_with_token_program(
+            rpc_url,
+            &execution.commitment,
+            &owner_pubkey,
+            &mint_pubkey,
+            &pool_context.token_program,
+        )
+        .await?
+        .ok_or_else(|| "Bonk target-sized sell token account was not found.".to_string())?;
+        if raw_amount > fresh_balance {
+            return Err(format!(
+                "Bonk target-sized sell exceeds current wallet balance. Need {raw_amount}, have {fresh_balance}."
+            ));
+        }
         let sell_amount = (u128::from(raw_amount) * u128::from(sell_percent) / 100u128) as u64;
         if sell_amount == 0 {
             return Ok(None);
@@ -8452,6 +8466,20 @@ async fn native_compile_follow_sell_transaction_with_token_amount(
         }
     };
     let raw_amount = if let Some(value) = token_amount_override {
+        let fresh_balance = fetch_bonk_owner_token_balance_with_token_program(
+            rpc_url,
+            &execution.commitment,
+            &owner_pubkey,
+            &mint_pubkey,
+            &token_program,
+        )
+        .await?
+        .ok_or_else(|| "Bonk target-sized sell token account was not found.".to_string())?;
+        if value > fresh_balance {
+            return Err(format!(
+                "Bonk target-sized sell exceeds current wallet balance. Need {value}, have {fresh_balance}."
+            ));
+        }
         value
     } else {
         match fetch_bonk_owner_token_balance_with_token_program(

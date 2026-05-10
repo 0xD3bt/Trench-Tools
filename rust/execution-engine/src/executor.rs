@@ -6,6 +6,7 @@ use crate::{
         CompiledTradePlan, RuntimeExecutionPolicy, RuntimeSellIntent, TradeRuntimeRequest,
         execute_wallet_trade as execute_wallet_trade_with_adapter,
         execute_wallet_trade_with_pre_submit_check,
+        execute_wallet_trade_with_pre_submit_check_and_submit_callback,
     },
 };
 
@@ -75,6 +76,7 @@ impl ExecutionExecutor {
             request,
             wallet_key,
             Option::<fn(&str, &CompiledTradePlan) -> Result<(), String>>::None,
+            Option::<fn(&str)>::None,
         )
         .await
     }
@@ -88,18 +90,45 @@ impl ExecutionExecutor {
     where
         F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
     {
-        self.execute_wallet_trade_inner(request, wallet_key, Some(pre_submit_check))
-            .await
+        self.execute_wallet_trade_inner(
+            request,
+            wallet_key,
+            Some(pre_submit_check),
+            Option::<fn(&str)>::None,
+        )
+        .await
     }
 
-    async fn execute_wallet_trade_inner<F>(
+    pub async fn execute_wallet_trade_checked_with_submit_callback<F, C>(
+        &self,
+        request: WalletTradeRequest,
+        wallet_key: String,
+        pre_submit_check: F,
+        on_submitted: C,
+    ) -> Result<ExecutedTrade, String>
+    where
+        F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
+        C: Fn(&str) + Send + Sync,
+    {
+        self.execute_wallet_trade_inner(
+            request,
+            wallet_key,
+            Some(pre_submit_check),
+            Some(on_submitted),
+        )
+        .await
+    }
+
+    async fn execute_wallet_trade_inner<F, C>(
         &self,
         request: WalletTradeRequest,
         wallet_key: String,
         pre_submit_check: Option<F>,
+        on_submitted: Option<C>,
     ) -> Result<ExecutedTrade, String>
     where
         F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
+        C: Fn(&str) + Send + Sync,
     {
         let runtime_request = TradeRuntimeRequest {
             side: request.side,
@@ -131,10 +160,21 @@ impl ExecutionExecutor {
             warm_key: request.warm_key,
         };
         let result = match pre_submit_check {
-            Some(check) => {
-                execute_wallet_trade_with_pre_submit_check(runtime_request, wallet_key, check)
+            Some(check) => match on_submitted {
+                Some(callback) => {
+                    execute_wallet_trade_with_pre_submit_check_and_submit_callback(
+                        runtime_request,
+                        wallet_key,
+                        check,
+                        callback,
+                    )
                     .await?
-            }
+                }
+                None => {
+                    execute_wallet_trade_with_pre_submit_check(runtime_request, wallet_key, check)
+                        .await?
+                }
+            },
             None => execute_wallet_trade_with_adapter(runtime_request, wallet_key).await?,
         };
         Ok(ExecutedTrade {

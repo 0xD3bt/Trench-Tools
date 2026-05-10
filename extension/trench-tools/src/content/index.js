@@ -37,8 +37,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   const RUNTIME_DIAGNOSTICS_REVISION_KEY = "trenchTools.runtimeDiagnosticsRevision";
   const RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY = "trenchTools.runtimeDiagnosticsSnapshot";
   const LAST_TRADE_EVENT_KEY = "trenchTools.lastTradeEvent";
+  const BATCH_STATUS_EVENT_KEY = "trenchTools.lastBatchStatusEvent";
   const HOST_AUTH_TOKEN_KEY = "trenchTools.hostAuthToken";
   const LAUNCHDECK_HOST_KEY = "trenchTools.launchdeckHostBaseUrl";
+  const BATCH_STATUS_STREAM_STALE_FALLBACK_MS = 2500;
   const BUY_SOUND_TEMPLATE_PATHS = {
     "notification-1": "assets/Notification-1.mp3",
     "notification-2": "assets/notification-2.mp3",
@@ -54,6 +56,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   const EXTENSION_RELOAD_TOAST_FALLBACK_DELAY_MS = 1800;
   const WALLET_STATUS_QUOTE_REFRESH_MS = 1250;
   const WALLET_STATUS_FAST_QUOTE_REFRESH_MS = 75;
+  const TRADE_PRIME_HEARTBEAT_MS = 15000;
+  const TRADE_PRIME_MIN_INTERVAL_MS = 4000;
   const EXTENSION_RELOAD_FRIENDLY_MESSAGE =
     "Extension connection lost. Refresh to reconnect.";
   const PANEL_Z_INDEX = {
@@ -100,6 +104,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     preview: null,
     batchStatus: null,
     batchStatuses: new Map(),
+    batchStatusStreamRevisions: new Map(),
     activePanelBatchId: null,
     launchdeckShell: null,
     panelFrame: null,
@@ -133,6 +138,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     prewarmSnapshots: new Map(),
     activeDrag: null,
     hostRevisionTimer: null,
+    lastTradePrimeAt: 0,
     currentRouteUrl: window.location.href,
     routeReconcileTimer: null,
     routeReconcileDelays: new Map(),
@@ -160,6 +166,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     popstateListener: null,
     hashchangeListener: null,
     visibilityChangeListener: null,
+    focusListener: null,
     errorListener: null,
     unhandledRejectionListener: null,
     originalPushState: null,
@@ -188,6 +195,33 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       active: Boolean(active),
       surface
     }).catch(() => {});
+  }
+
+  function primeTradeRuntime(reason = "manual", options = {}) {
+    if (lifecycle.destroyed || document.visibilityState === "hidden") {
+      return;
+    }
+    const now = Date.now();
+    if (!options.force && now - state.lastTradePrimeAt < TRADE_PRIME_MIN_INTERVAL_MS) {
+      return;
+    }
+    state.lastTradePrimeAt = now;
+    const startedAt = now;
+    callBackground("trench:prime-trade-runtime", {
+      surfaceId: tradeReadinessSurfaceId(),
+      surface: platform,
+      reason
+    })
+      .then((result) => {
+        console.debug(
+          "[trench][latency] phase=content-prime reason=%s roundtrip_ms=%s background_ready_ms=%s prime_ms=%s",
+          reason,
+          Date.now() - startedAt,
+          result?.backgroundReadyMs ?? "",
+          result?.primeMs ?? result?.backgroundPrimeMs ?? ""
+        );
+      })
+      .catch(() => {});
   }
 
   function getPlatformHelpers() {
@@ -267,12 +301,12 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     await refreshBootstrap();
     if (!state.hostRevisionTimer) {
       state.hostRevisionTimer = window.setInterval(() => {
-        void callBackground("trench:get-runtime-status").catch(() => {});
-      }, 15000);
+        primeTradeRuntime("heartbeat");
+      }, TRADE_PRIME_HEARTBEAT_MS);
     }
     attachStorageChangeListener();
     attachPanelMessageListener();
-    void callBackground("trench:get-runtime-status").catch(() => {});
+    primeTradeRuntime("init", { force: true });
     void callBackground("trench:get-runtime-diagnostics")
       .then(surfaceRuntimeDiagnostics)
       .catch(() => {});
@@ -464,6 +498,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     lifecycle.visibilityChangeListener = () => {
       if (document.visibilityState === "visible") {
         setTradeReadiness(true, platform);
+        primeTradeRuntime("visibility", { force: true });
         scheduleRouteReconcile("visibility", 0);
         scheduleMountSweeps("visibility");
         syncWalletStatusQuoteRefresh();
@@ -474,9 +509,14 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         syncActiveMarkSubscription();
       }
     };
+    lifecycle.focusListener = () => {
+      setTradeReadiness(true, platform);
+      primeTradeRuntime("focus", { force: true });
+    };
     window.addEventListener("popstate", lifecycle.popstateListener);
     window.addEventListener("hashchange", lifecycle.hashchangeListener);
     document.addEventListener("visibilitychange", lifecycle.visibilityChangeListener);
+    window.addEventListener("focus", lifecycle.focusListener);
   }
 
   function scheduleRouteReconcile(reason, delayMs = 0) {
@@ -548,6 +588,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       state.tokenContext = null;
       clearPanelTokenScopedState();
       state.batchStatuses.clear();
+      state.batchStatusStreamRevisions.clear();
       state.activePanelBatchId = null;
       pushPanelState();
       pushPanelPreview();
@@ -622,6 +663,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
 
     syncActiveMintSubscription();
+    primeTradeRuntime(`route-${reason}`, { force: routeChanged });
     scheduleMountSweeps(`reconcile-${reason}`);
   }
 
@@ -792,6 +834,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     state.preview = null;
     state.batchStatus = null;
     state.activePanelBatchId = null;
+    state.batchStatusStreamRevisions.clear();
     syncActiveMarkSubscription();
   }
 
@@ -1394,6 +1437,12 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       if (lifecycle.visibilityChangeListener) {
         document.removeEventListener("visibilitychange", lifecycle.visibilityChangeListener);
         lifecycle.visibilityChangeListener = null;
+      }
+    });
+    runBestEffortTeardownStep("focus-listener", () => {
+      if (lifecycle.focusListener) {
+        window.removeEventListener("focus", lifecycle.focusListener);
+        lifecycle.focusListener = null;
       }
     });
     runBestEffortTeardownStep("error-listener", () => {
@@ -3844,6 +3893,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           scheduleWalletStatusRefresh({ force: true, delayMs: 180 });
         }
       }
+      if (changes[BATCH_STATUS_EVENT_KEY]?.newValue) {
+        applyStreamedBatchStatus(changes[BATCH_STATUS_EVENT_KEY].newValue);
+      }
       if (changes[PREFERENCES_KEY]) {
         state.preferences = normalizePreferencesValue(changes[PREFERENCES_KEY].newValue || {});
         pushPanelState();
@@ -4014,7 +4066,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     state.tokenDistributionPending = normalizedAction;
     pushPanelState();
 
-    const startingToast = normalizedAction === "split" ? "Splitting tokens" : "Consolidation tokens";
+    const toastId = `token-distribution-${normalizedAction}`;
+    let toastStarted = false;
+    const startingToast = normalizedAction === "split" ? "Splitting tokens" : "Consolidating tokens";
     const completeToast = normalizedAction === "split" ? "Tokens split" : "Consolidation complete";
     const failureMessage = normalizedAction === "split" ? "Token split failed." : "Token consolidation failed.";
 
@@ -4076,7 +4130,15 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         };
       }
 
-      showToast(startingToast, "info");
+      toastStarted = true;
+      renderToast({
+        id: toastId,
+        title: `${startingToast}...`,
+        kind: "info",
+        pending: true,
+        persistent: true,
+        ttlMs: 0
+      });
 
       const result = await callBackground(
         normalizedAction === "split" ? "trench:token-split" : "trench:token-consolidate",
@@ -4087,10 +4149,26 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       if (Number.isFinite(failedCount) && failedCount > 0) {
         throw new Error(summarizeTokenDistributionFailure(result, failureMessage));
       }
-      showToast(completeToast, "info");
+      renderToast({
+        id: toastId,
+        title: completeToast,
+        kind: "success",
+        ttlMs: 3200
+      });
     } catch (error) {
       state.hostError = isHostAvailabilityError(error) ? userFacingErrorMessage(error) : "";
-      surfaceUserFacingError(error, { pushToPanel: true });
+      if (toastStarted) {
+        renderToast({
+          id: toastId,
+          title: failureMessage,
+          detail: userFacingErrorMessage(error),
+          kind: "error",
+          ttlMs: 4200
+        });
+        surfaceUserFacingError(error, { pushToPanel: true, toast: false });
+      } else {
+        surfaceUserFacingError(error, { pushToPanel: true });
+      }
     } finally {
       if (state.tokenDistributionPending === normalizedAction) {
         state.tokenDistributionPending = "";
@@ -4100,6 +4178,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   async function handleTradeRequest(side, payload, options = {}) {
+    const requestEntryStartedAt = Date.now();
     let clientRequestId = "";
     try {
       const requestedBuyAmount = String(payload?.buyAmountSol || "").trim();
@@ -4143,7 +4222,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       const requestAddress = routeRequest.address;
       const request = {
         clientRequestId,
-        clientStartedAtUnixMs: Date.now(),
+        clientStartedAtUnixMs: requestEntryStartedAt,
+        clientRequestStartedAtUnixMs: requestEntryStartedAt,
         address: requestAddress,
         mint: normalizeRouteValue(tokenContext?.mint) || undefined,
         platform: String(tokenContext?.platform || state.platform || "").trim() || undefined,
@@ -4168,14 +4248,30 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         side,
         walletCount: selectedWalletCountForRequest(selection)
       });
+      const dispatchStartedAt = Date.now();
+      console.debug(
+        "[trench][latency] phase=content-prep clientRequestId=%s side=%s prep_ms=%s",
+        clientRequestId,
+        side,
+        dispatchStartedAt - requestEntryStartedAt
+      );
       const result =
         side === "buy"
           ? await callBackground("trench:buy", hostPayload)
           : await callBackground("trench:sell", hostPayload);
+      console.debug(
+        "[trench][latency] phase=content-accepted clientRequestId=%s batch=%s click_to_accepted_ms=%s background_roundtrip_ms=%s",
+        clientRequestId,
+        result?.batchId || "",
+        Date.now() - requestEntryStartedAt,
+        Date.now() - dispatchStartedAt
+      );
       surfaceAutoFeeWarnings(result);
       bindLocalExecutionPendingToBatch(clientRequestId, result.batchId);
 
-      setActivePanelBatchStatus(createAcceptedBatchStatus(result, side, tokenContext));
+      setActivePanelBatchStatus(
+        state.batchStatuses.get(result.batchId) || createAcceptedBatchStatus(result, side, tokenContext)
+      );
       pushPanelBatchStatus();
       await pollBatchStatus(result.batchId, side, result.walletCount, result.clientRequestId);
     } catch (error) {
@@ -4296,6 +4392,66 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       state.activePanelBatchId = remembered.batchId;
       state.batchStatus = remembered;
       pushPanelBatchStatus();
+    }
+  }
+
+  function applyStreamedBatchStatus(event) {
+    if (!event || typeof event !== "object") {
+      return;
+    }
+    const batchId = String(event.batchId || "").trim();
+    if (!batchId) {
+      return;
+    }
+    const clientRequestId = String(event.clientRequestId || "").trim();
+    const revision = Number.isInteger(event.revision) ? event.revision : 0;
+    const previousRevision = state.batchStatusStreamRevisions.get(batchId) || 0;
+    if (revision > 0 && previousRevision > 0 && revision <= previousRevision) {
+      return;
+    }
+    if (revision > 0) {
+      state.batchStatusStreamRevisions.set(batchId, revision);
+    }
+    const localPending = localExecutionPendingForBatch(batchId, clientRequestId);
+    if (localPending && !localPending.batchId) {
+      bindLocalExecutionPendingToBatch(localPending.clientRequestId, batchId);
+    }
+    if (localPending && !state.activePanelBatchId) {
+      state.activePanelBatchId = batchId;
+    }
+    const isKnownBatch =
+      state.activePanelBatchId === batchId ||
+      state.batchStatuses.has(batchId) ||
+      Boolean(localPending);
+    if (!isKnownBatch) {
+      rememberBatchStatus(event);
+      return;
+    }
+    clearBatchStatusPoller(batchId);
+    updatePanelBatchStatus(event);
+    syncExecutionToastsFromBatchStatus(event, {
+      side: event.side,
+      walletCount: event.summary?.totalWallets,
+      clientRequestId
+    });
+    const emittedAt = Number(event.streamEmittedAtUnixMs || 0);
+    if (emittedAt > 0) {
+      console.debug(
+        "[trench][latency] phase=content-batch-applied batch=%s revision=%s stream_to_ui_ms=%s",
+        batchId,
+        revision,
+        Math.max(0, Date.now() - emittedAt)
+      );
+    }
+    const status = String(event.status || "").trim().toLowerCase();
+    if (status === "confirmed") {
+      void callBackground("trench:invalidate-balances", { afterTrade: true }).catch(() => {});
+      window.setTimeout(() => {
+        void refreshPanelWalletStatus({ force: true });
+      }, 900);
+    }
+    if (status && !["confirmed", "failed"].includes(status)) {
+      scheduleBatchStatusFallback(batchId, event.side, event.summary?.totalWallets, clientRequestId, revision);
     }
   }
 
@@ -4426,14 +4582,33 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     syncExecutionToastsFromBatchStatus(next, { side: next.side });
   }
 
-  async function pollBatchStatus(batchId, side, walletCount, clientRequestId = "") {
+  function scheduleBatchStatusFallback(
+    batchId,
+    side,
+    walletCount,
+    clientRequestId = "",
+    expectedRevision = 0,
+    attempt = 0
+  ) {
     clearBatchStatusPoller(batchId);
-    let latestStatus = "pending";
-
-    const refresh = async () => {
+    const hasStreamRevision =
+      expectedRevision > 0 || (state.batchStatusStreamRevisions.get(batchId) || 0) > 0;
+    const delayMs = hasStreamRevision
+      ? BATCH_STATUS_STREAM_STALE_FALLBACK_MS
+      : attempt < 6
+        ? 350
+        : attempt < 12
+          ? 750
+          : 1500;
+    const timer = window.setTimeout(async () => {
+      state.statusPollTimers.delete(batchId);
+      const latestRevision = state.batchStatusStreamRevisions.get(batchId) || 0;
+      if (expectedRevision > 0 && latestRevision > expectedRevision) {
+        return;
+      }
       try {
         const batchStatus = await callBackground("trench:get-batch-status", { batchId });
-        latestStatus = String(batchStatus?.status || "").toLowerCase();
+        const latestStatus = String(batchStatus?.status || "").toLowerCase();
         updatePanelBatchStatus(batchStatus);
         syncExecutionToastsFromBatchStatus(batchStatus, { side, walletCount, clientRequestId });
         if (["confirmed", "failed"].includes(latestStatus)) {
@@ -4447,8 +4622,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           clearBatchStatusPoller(batchId);
           return;
         }
+        scheduleBatchStatusFallback(batchId, side, walletCount, clientRequestId, latestRevision, attempt + 1);
       } catch (error) {
-        latestStatus = "failed";
         clearBatchStatusPoller(batchId);
         dismissLocalExecutionPending({ batchId, clientRequestId });
         state.hostError = isHostAvailabilityError(error) ? userFacingErrorMessage(error) : "";
@@ -4470,11 +4645,34 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           });
         }
       }
-    };
+    }, delayMs);
+    state.statusPollTimers.set(batchId, timer);
+  }
 
-    await refresh();
-    if (!["confirmed", "failed"].includes(latestStatus)) {
-      state.statusPollTimers.set(batchId, window.setInterval(refresh, 1500));
+  async function pollBatchStatus(batchId, side, walletCount, clientRequestId = "") {
+    clearBatchStatusPoller(batchId);
+    try {
+      const batchStatus = await callBackground("trench:get-batch-status", { batchId });
+      const latestStatus = String(batchStatus?.status || "").toLowerCase();
+      updatePanelBatchStatus(batchStatus);
+      syncExecutionToastsFromBatchStatus(batchStatus, { side, walletCount, clientRequestId });
+      if (latestStatus === "confirmed") {
+        void callBackground("trench:invalidate-balances", { afterTrade: true }).catch(() => {});
+        window.setTimeout(() => {
+          void refreshPanelWalletStatus({ force: true });
+        }, 900);
+      }
+      if (!["confirmed", "failed"].includes(latestStatus)) {
+        scheduleBatchStatusFallback(
+          batchId,
+          side,
+          walletCount,
+          clientRequestId,
+          state.batchStatusStreamRevisions.get(batchId) || 0
+        );
+      }
+    } catch (error) {
+      scheduleBatchStatusFallback(batchId, side, walletCount, clientRequestId, 0, 1);
     }
   }
 

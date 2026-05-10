@@ -189,13 +189,6 @@ fn buy_input_lamports(request: &TradeRuntimeRequest) -> u64 {
         .unwrap_or(0)
 }
 
-fn sell_intent_target_lamports(request: &TradeRuntimeRequest) -> u64 {
-    match request.sell_intent.as_ref() {
-        Some(RuntimeSellIntent::SolOutput(value)) => parse_sol_amount_to_lamports(value),
-        _ => 0,
-    }
-}
-
 fn clamp_fee_bps(raw: u16) -> u16 {
     if raw > MAX_FEE_BPS { MAX_FEE_BPS } else { raw }
 }
@@ -223,8 +216,8 @@ pub fn build_wrapper_instruction_payload(
         WrapperRouteClassification::SolOut | WrapperRouteClassification::NoSol => 0,
     };
     let min_net_output = match route_classification {
-        WrapperRouteClassification::SolOut => sell_intent_target_lamports(request),
-        _ => 0,
+        WrapperRouteClassification::SolOut => sell_output_target_lamports(request),
+        WrapperRouteClassification::SolIn | WrapperRouteClassification::NoSol => 0,
     };
     let route_metadata = WrapperRouteMetadata {
         version: ABI_VERSION,
@@ -262,6 +255,13 @@ pub fn build_wrapper_instruction_payload(
     }
 }
 
+fn sell_output_target_lamports(request: &TradeRuntimeRequest) -> u64 {
+    match request.sell_intent.as_ref() {
+        Some(RuntimeSellIntent::SolOutput(value)) => parse_sol_amount_to_lamports(value),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,7 +273,7 @@ mod tests {
             PlannerQuoteAsset, PlannerVerificationSource, TradeLifecycle, TradeVenueFamily,
             WrapperAction,
         },
-        trade_runtime::{RuntimeExecutionPolicy, TradeRuntimeRequest},
+        trade_runtime::{RuntimeExecutionPolicy, RuntimeSellIntent, TradeRuntimeRequest},
     };
 
     fn policy(
@@ -455,6 +455,28 @@ mod tests {
             Some(SwapRouteFeeMode::SolPre)
         );
         assert_eq!(payload.route_metadata.gross_sol_in_lamports, 500_000_000);
+    }
+
+    #[test]
+    fn sell_output_sol_sets_hard_net_output_floor() {
+        let mut request = sell_request(SellSettlementPolicy::AlwaysToSol);
+        request.sell_intent = Some(RuntimeSellIntent::SolOutput("1.25".to_string()));
+        let payload = build_wrapper_instruction_payload(
+            &selector(PlannerQuoteAsset::Sol, TradeVenueFamily::PumpBondingCurve),
+            &request,
+            "wallet".to_string(),
+        );
+        assert_eq!(payload.route_metadata.min_net_output, 1_250_000_000);
+    }
+
+    #[test]
+    fn percent_sell_keeps_slippage_inferred_net_output_floor() {
+        let payload = build_wrapper_instruction_payload(
+            &selector(PlannerQuoteAsset::Sol, TradeVenueFamily::PumpBondingCurve),
+            &sell_request(SellSettlementPolicy::AlwaysToSol),
+            "wallet".to_string(),
+        );
+        assert_eq!(payload.route_metadata.min_net_output, 0);
     }
 
     #[test]

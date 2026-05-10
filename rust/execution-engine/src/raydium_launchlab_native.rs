@@ -186,15 +186,6 @@ pub(crate) async fn compile_raydium_launchlab_trade(
             selector.family.label()
         ));
     }
-    if matches!(request.side, TradeSide::Sell)
-        && matches!(request.sell_intent, Some(RuntimeSellIntent::SolOutput(_)))
-    {
-        return Err(
-            "Raydium LaunchLab exact-output sells are gated until on-chain exact-out instruction parity is verified."
-                .to_string(),
-        );
-    }
-
     let rpc_url = crate::rpc_client::configured_rpc_url();
     let owner = load_solana_wallet_by_env_key(wallet_key)?;
     let context = load_live_launchlab_context(&rpc_url, selector, request).await?;
@@ -216,12 +207,7 @@ pub(crate) async fn compile_raydium_launchlab_trade(
             })
         }
         TradeSide::Sell => {
-            let sell_percent =
-                parse_sell_percent(request.sell_intent.as_ref().ok_or_else(|| {
-                    "Missing sell intent for Raydium LaunchLab sell.".to_string()
-                })?)?;
-            let compiled =
-                compile_sell_transaction(&rpc_url, request, &owner, &context, sell_percent).await?;
+            let compiled = compile_sell_transaction(&rpc_url, request, &owner, &context).await?;
             Ok(CompiledAdapterTrade {
                 transactions: vec![compiled],
                 primary_tx_index: 0,
@@ -457,7 +443,6 @@ async fn compile_sell_transaction(
     request: &TradeRuntimeRequest,
     owner: &Keypair,
     context: &LaunchLabPoolContext,
-    sell_percent: u8,
 ) -> Result<CompiledTransaction, String> {
     let owner_pubkey = owner.pubkey();
     let user_token_account_a = get_associated_token_address_with_program_id(
@@ -472,13 +457,34 @@ async fn compile_sell_transaction(
     )
     .await?;
     let balance = read_token_account_amount(&token_account_data)?;
-    let amount_a = ((u128::from(balance) * u128::from(sell_percent)) / 100u128)
-        .min(u128::from(u64::MAX)) as u64;
+    let sell_intent = request
+        .sell_intent
+        .as_ref()
+        .ok_or_else(|| "Missing sell intent for Raydium LaunchLab sell.".to_string())?;
+    let quote_config = quote_config_from_context(context);
+    let amount_a = match sell_intent {
+        RuntimeSellIntent::Percent(_) => {
+            let sell_percent = parse_sell_percent(sell_intent)?;
+            ((u128::from(balance) * u128::from(sell_percent)) / 100u128).min(u128::from(u64::MAX))
+                as u64
+        }
+        RuntimeSellIntent::SolOutput(value) => {
+            let target_lamports = parse_decimal_units(value, 9, "sellOutputSol")?;
+            crate::sell_target_sizing::choose_target_sized_token_amount(
+                balance,
+                target_lamports,
+                |amount| {
+                    quote_sell_exact_in_amount_b(&quote_config, &BigUint::from(amount))
+                        .and_then(|quote| biguint_to_u64(&quote, "Raydium LaunchLab sell quote"))
+                        .and_then(crate::sell_target_sizing::net_sol_after_wrapper_fee)
+                },
+            )?
+        }
+    };
     if amount_a == 0 {
         return Err("Raydium LaunchLab sell amount resolved to zero.".to_string());
     }
     let slippage_bps = parse_slippage_bps(Some(request.policy.slippage_percent.as_str()))?;
-    let quote_config = quote_config_from_context(context);
     let expected_amount_b = quote_sell_exact_in_amount_b(&quote_config, &BigUint::from(amount_a))?;
     if expected_amount_b == BigUint::from(0u8) {
         return Err("Raydium LaunchLab sell quote resolved to zero SOL.".to_string());

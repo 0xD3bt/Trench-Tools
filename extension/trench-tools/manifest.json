@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Trench Tools",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Adds Trench.Tools trading buttons to your favorite terminals for the fastest possible execution and deployments.",
   "icons": {
     "16": "assets/trench-tools-favicon.png",

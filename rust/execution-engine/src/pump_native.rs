@@ -1349,22 +1349,14 @@ async fn compile_pump_amm_trade(
             pool.coin_creator != Pubkey::default(),
         )
         .await?;
-        let min_quote_amount_out = match sell_intent {
-            RuntimeSellIntent::SolOutput(value) => {
-                let desired_quote = parse_decimal_units(value, 9, "sellOutputSol")?;
-                apply_sell_side_slippage(desired_quote, slippage_bps)
-            }
-            RuntimeSellIntent::Percent(_) => {
-                let quote_amount_out = pump_amm_sell_base_input(
-                    base_amount_in,
-                    base_reserve,
-                    quote_reserve,
-                    fees,
-                    pool.coin_creator != Pubkey::default(),
-                )?;
-                apply_sell_side_slippage(quote_amount_out, slippage_bps)
-            }
-        };
+        let quote_amount_out = pump_amm_sell_base_input(
+            base_amount_in,
+            base_reserve,
+            quote_reserve,
+            fees,
+            pool.coin_creator != Pubkey::default(),
+        )?;
+        let min_quote_amount_out = apply_sell_side_slippage(quote_amount_out, slippage_bps);
         instructions.push(build_pump_amm_sell_instruction(
             &pool,
             &owner_pubkey,
@@ -1510,7 +1502,15 @@ async fn resolve_sell_token_amount(
             if desired_output == 0 {
                 return Err("sellOutputSol must be greater than zero.".to_string());
             }
-            required_tokens_for_net_sol_output(curve, global, desired_output)?
+            crate::sell_target_sizing::choose_target_sized_token_amount(
+                balance.amount_raw,
+                desired_output,
+                |amount| {
+                    crate::sell_target_sizing::net_sol_after_wrapper_fee(quote_sell_sol_from_curve(
+                        curve, global, amount,
+                    ))
+                },
+            )?
         }
     };
     if token_amount == 0 {
@@ -1773,6 +1773,7 @@ async fn quote_pump_holding_value_sol_with_cache(
     quote_pump_snapshot(&snapshot, token_amount_raw)
 }
 
+#[cfg(test)]
 fn required_tokens_for_net_sol_output(
     curve: &PumpBondingCurveState,
     global: &PumpGlobalState,
@@ -2193,6 +2194,7 @@ fn pump_amm_sell_base_input(
         .min(u128::from(u64::MAX)) as u64)
 }
 
+#[cfg(test)]
 fn pump_amm_sell_quote_input(
     quote: u64,
     base_reserve: u64,
@@ -2263,12 +2265,19 @@ async fn resolve_pump_amm_sell_input_amount(
             if desired_quote == 0 {
                 return Err("sellOutputSol must be greater than zero.".to_string());
             }
-            pump_amm_sell_quote_input(
+            crate::sell_target_sizing::choose_target_sized_token_amount(
+                balance.amount_raw,
                 desired_quote,
-                base_reserve,
-                quote_reserve,
-                fees,
-                has_coin_creator,
+                |amount| {
+                    pump_amm_sell_base_input(
+                        amount,
+                        base_reserve,
+                        quote_reserve,
+                        fees,
+                        has_coin_creator,
+                    )
+                    .and_then(crate::sell_target_sizing::net_sol_after_wrapper_fee)
+                },
             )?
         }
     };

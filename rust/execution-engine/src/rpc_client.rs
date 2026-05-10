@@ -1330,6 +1330,25 @@ pub async fn fetch_token_balance_via_ata(
     decimals: u8,
     commitment: &str,
 ) -> Result<TokenBalance, String> {
+    fetch_token_balance_via_ata_with_policy(owner, mint, decimals, commitment, true).await
+}
+
+pub async fn fetch_token_balance_via_ata_immediate(
+    owner: &str,
+    mint: &str,
+    decimals: u8,
+    commitment: &str,
+) -> Result<TokenBalance, String> {
+    fetch_token_balance_via_ata_with_policy(owner, mint, decimals, commitment, false).await
+}
+
+async fn fetch_token_balance_via_ata_with_policy(
+    owner: &str,
+    mint: &str,
+    decimals: u8,
+    commitment: &str,
+    retry_missing_ata: bool,
+) -> Result<TokenBalance, String> {
     let rpc_url = configured_rpc_url();
     let retry_commitments = ata_balance_retry_commitments(commitment);
     let owner_pubkey =
@@ -1351,8 +1370,13 @@ pub async fn fetch_token_balance_via_ata(
         get_associated_token_address_with_program_id(&owner_pubkey, &mint_pubkey, &token_program)
             .to_string();
 
+    let retry_delays = if retry_missing_ata {
+        ATA_BALANCE_RETRY_DELAYS_MS.as_slice()
+    } else {
+        &[]
+    };
     for read_commitment in &retry_commitments {
-        for delay_ms in std::iter::once(0).chain(ATA_BALANCE_RETRY_DELAYS_MS.into_iter()) {
+        for delay_ms in std::iter::once(0).chain(retry_delays.iter().copied()) {
             if delay_ms > 0 {
                 sleep(Duration::from_millis(delay_ms)).await;
             }
@@ -1376,10 +1400,17 @@ pub async fn fetch_token_balance_via_ata(
         }
     }
 
-    Err(format!(
-        "Token account {ata_address} for mint {mint} was not visible after retries at {} commitment(s). A recent buy may still be settling on RPC; try the sell again in a moment.",
-        retry_commitments.join(" -> ")
-    ))
+    if retry_missing_ata {
+        Err(format!(
+            "Token account {ata_address} for mint {mint} was not visible after retries at {} commitment(s). A recent buy may still be settling on RPC; try the sell again in a moment.",
+            retry_commitments.join(" -> ")
+        ))
+    } else {
+        Ok(TokenBalance {
+            amount_raw: 0,
+            decimals,
+        })
+    }
 }
 
 pub async fn fetch_owned_token_mints(

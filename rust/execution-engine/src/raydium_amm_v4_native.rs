@@ -345,13 +345,7 @@ pub(crate) async fn compile_raydium_amm_v4_trade(
             pool.trade_fee_numerator,
             pool.trade_fee_denominator,
         )?;
-        let min_out = match sell_intent {
-            RuntimeSellIntent::SolOutput(value) => apply_sell_side_slippage(
-                parse_decimal_units(value, 9, "sellOutputSol")?,
-                slippage_bps,
-            ),
-            RuntimeSellIntent::Percent(_) => apply_sell_side_slippage(quoted_out, slippage_bps),
-        };
+        let min_out = apply_sell_side_slippage(quoted_out, slippage_bps);
         instructions.push(build_raydium_amm_v4_swap_base_in_instruction(
             &pool,
             &input_vault,
@@ -1083,33 +1077,6 @@ fn raydium_amm_v4_quote_exact_in(
     Ok((numerator / denominator).min(u128::from(u64::MAX)) as u64)
 }
 
-fn raydium_amm_v4_required_input_for_output(
-    desired_output: u64,
-    input_reserve: u64,
-    output_reserve: u64,
-    fee_numerator: u64,
-    fee_denominator: u64,
-) -> Result<u64, String> {
-    if desired_output == 0 {
-        return Ok(0);
-    }
-    if desired_output >= output_reserve {
-        return Err("Requested Raydium AMM v4 output exceeds pool reserves.".to_string());
-    }
-    if fee_denominator == 0 || fee_numerator >= fee_denominator {
-        return Err("Raydium AMM v4 fee configuration is invalid.".to_string());
-    }
-    let effective_input = ceil_div(
-        u128::from(input_reserve).saturating_mul(u128::from(desired_output)),
-        u128::from(output_reserve.saturating_sub(desired_output)),
-    );
-    let gross_input = ceil_div(
-        effective_input.saturating_mul(u128::from(fee_denominator)),
-        u128::from(fee_denominator.saturating_sub(fee_numerator)),
-    );
-    Ok(gross_input.min(u128::from(u64::MAX)) as u64)
-}
-
 async fn resolve_raydium_amm_v4_sell_input_amount(
     sell_intent: &RuntimeSellIntent,
     wallet_key: &str,
@@ -1139,12 +1106,19 @@ async fn resolve_raydium_amm_v4_sell_input_amount(
         }
         RuntimeSellIntent::SolOutput(value) => {
             let desired_output = parse_decimal_units(value, 9, "sellOutputSol")?;
-            raydium_amm_v4_required_input_for_output(
+            crate::sell_target_sizing::choose_target_sized_token_amount(
+                balance.amount_raw,
                 desired_output,
-                input_reserve,
-                output_reserve,
-                fee_numerator,
-                fee_denominator,
+                |amount| {
+                    raydium_amm_v4_quote_exact_in(
+                        amount,
+                        input_reserve,
+                        output_reserve,
+                        fee_numerator,
+                        fee_denominator,
+                    )
+                    .and_then(crate::sell_target_sizing::net_sol_after_wrapper_fee)
+                },
             )?
         }
     };
@@ -1495,13 +1469,6 @@ fn parse_decimal_scaled(value: &str, decimals: usize, label: &str) -> Result<u12
         .checked_mul(scale)
         .and_then(|value| value.checked_add(fractional_value))
         .ok_or_else(|| format!("{label} is too large."))
-}
-
-fn ceil_div(numerator: u128, denominator: u128) -> u128 {
-    if denominator == 0 {
-        return u128::MAX;
-    }
-    numerator.saturating_add(denominator.saturating_sub(1)) / denominator
 }
 
 fn now_unix_ms() -> u64 {

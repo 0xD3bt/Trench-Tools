@@ -143,7 +143,32 @@ pub async fn execute_wallet_trade_with_pre_submit_check<F>(
 where
     F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
 {
-    execute_wallet_trade_inner(request, wallet_key, Some(pre_submit_check)).await
+    execute_wallet_trade_inner(
+        request,
+        wallet_key,
+        Some(pre_submit_check),
+        Option::<fn(&str)>::None,
+    )
+    .await
+}
+
+pub async fn execute_wallet_trade_with_pre_submit_check_and_submit_callback<F, C>(
+    request: TradeRuntimeRequest,
+    wallet_key: String,
+    pre_submit_check: F,
+    on_submitted: C,
+) -> Result<ExecutedRuntimeTrade, String>
+where
+    F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
+    C: Fn(&str) + Send + Sync,
+{
+    execute_wallet_trade_inner(
+        request,
+        wallet_key,
+        Some(pre_submit_check),
+        Some(on_submitted),
+    )
+    .await
 }
 
 fn request_with_net_wrapper_buy_input(
@@ -746,6 +771,16 @@ pub async fn plan_trade_request(
 }
 
 pub async fn execute_compiled_trade(plan: CompiledTradePlan) -> Result<String, String> {
+    execute_compiled_trade_inner(plan, Option::<&fn(&str)>::None).await
+}
+
+async fn execute_compiled_trade_inner<C>(
+    plan: CompiledTradePlan,
+    on_submitted: Option<&C>,
+) -> Result<String, String>
+where
+    C: Fn(&str) + Send + Sync,
+{
     let rpc_url = configured_rpc_url();
     validate_runtime_shared_alt_boundary(&plan.selector, plan.adapter, &plan.transactions)?;
     validate_transport_for_compiled_trade(
@@ -769,6 +804,19 @@ pub async fn execute_compiled_trade(plan: CompiledTradePlan) -> Result<String, S
             &plan.transactions,
         )
         .await?;
+    if let Some(signature) = submitted
+        .get(plan.primary_tx_index)
+        .and_then(|result| result.signature.as_deref())
+        .filter(|signature| !signature.trim().is_empty())
+    {
+        if let Some(callback) = on_submitted {
+            callback(signature);
+        }
+        eprintln!(
+            "[execution-engine][latency] phase=transport-submitted adapter={} transport={} submit_ms={} signature={}",
+            plan.adapter, plan.transport_plan.transport_type, submit_elapsed_ms, signature
+        );
+    }
     let (confirm_warnings, confirm_elapsed_ms) = confirm_submitted_transactions_for_transport(
         &rpc_url,
         &plan.transport_plan,
@@ -1396,17 +1444,20 @@ pub async fn execute_wallet_trade(
         request,
         wallet_key,
         Option::<fn(&str, &CompiledTradePlan) -> Result<(), String>>::None,
+        Option::<fn(&str)>::None,
     )
     .await
 }
 
-async fn execute_wallet_trade_inner<F>(
+async fn execute_wallet_trade_inner<F, C>(
     request: TradeRuntimeRequest,
     wallet_key: String,
     pre_submit_check: Option<F>,
+    on_submitted: Option<C>,
 ) -> Result<ExecutedRuntimeTrade, String>
 where
     F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
+    C: Fn(&str) + Send + Sync,
 {
     let timeout_wallet_label = crate::shared_config::wallet_display_label(&wallet_key);
     let timeout_side = side_label(&request.side).to_string();
@@ -1470,7 +1521,7 @@ where
                 check(&wallet_key, &compiled)?;
             }
             let execute_started_at = now_unix_ms();
-            match execute_compiled_trade(compiled).await {
+            match execute_compiled_trade_inner(compiled, on_submitted.as_ref()).await {
                 Ok(signature) => {
                     invalidate_mint_warm_entries(&warm_invalidation_fingerprints).await;
                     crate::wallet_token_cache::shared_wallet_token_cache()

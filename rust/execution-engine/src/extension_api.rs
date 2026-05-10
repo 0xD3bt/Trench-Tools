@@ -33,8 +33,8 @@ use uuid::Uuid;
 
 use shared_extension_runtime::{
     balance_stream::{
-        BalanceEventPayload, BalanceStreamHandle, DiagnosticEventPayload, MarkEventPayload,
-        StreamConfig as BalanceStreamConfig, StreamEvent, TradeEventPayload,
+        BalanceEventPayload, BalanceStreamHandle, BatchStatusEventPayload, DiagnosticEventPayload,
+        MarkEventPayload, StreamConfig as BalanceStreamConfig, StreamEvent, TradeEventPayload,
         spawn as spawn_balance_stream,
     },
     catalog::{
@@ -421,6 +421,7 @@ pub struct AppState {
     executor: ExecutionExecutor,
     auth: Arc<AuthManager>,
     balance_stream: BalanceStreamHandle,
+    batch_status_revisions: Arc<Mutex<HashMap<String, u64>>>,
     live_mark_targets: Arc<RwLock<HashMap<String, LiveMarkTarget>>>,
     persist_failures: Arc<PersistFailureCounters>,
 }
@@ -714,6 +715,7 @@ impl AppState {
             executor: ExecutionExecutor::default(),
             auth,
             balance_stream,
+            batch_status_revisions: Arc::new(Mutex::new(HashMap::new())),
             live_mark_targets: Arc::new(RwLock::new(HashMap::new())),
             persist_failures: Arc::new(PersistFailureCounters::default()),
         };
@@ -987,7 +989,7 @@ pub struct EngineSettings {
     pub execution_endpoint_profile: String,
     #[serde(default = "default_execution_commitment")]
     pub execution_commitment: String,
-    #[serde(default)]
+    #[serde(default = "default_execution_skip_preflight")]
     pub execution_skip_preflight: bool,
     #[serde(default)]
     pub track_send_block_height: bool,
@@ -1838,6 +1840,8 @@ pub struct BuyRequest {
     pub client_request_id: String,
     #[serde(default)]
     pub client_started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub client_request_started_at_unix_ms: Option<u64>,
     /// Authoritative raw route input supplied by the extension. Must be a
     /// token mint or supported pool/pair address.
     #[serde(default)]
@@ -1870,6 +1874,8 @@ pub struct SellRequest {
     pub client_request_id: String,
     #[serde(default)]
     pub client_started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub client_request_started_at_unix_ms: Option<u64>,
     /// Authoritative raw route input supplied by the extension. Must be a
     /// token mint or supported pool/pair address.
     #[serde(default)]
@@ -2217,6 +2223,10 @@ fn default_execution_endpoint_profile() -> String {
 
 fn default_execution_commitment() -> String {
     "confirmed".to_string()
+}
+
+fn default_execution_skip_preflight() -> bool {
+    true
 }
 
 fn default_wallet_enabled() -> bool {
@@ -4487,6 +4497,10 @@ async fn buy(
     Json(request): Json<BuyRequest>,
 ) -> Result<Json<ExecutionAcceptedResponse>, (StatusCode, String)> {
     state.tick_trade_activity();
+    let planning_started = Instant::now();
+    let client_click_started_at = request
+        .client_request_started_at_unix_ms
+        .or(request.client_started_at_unix_ms);
     let client_request_id = normalize_client_request_id(request.client_request_id)?;
     let engine = state.engine.read().await.clone();
     let trade_ledger = state.trade_ledger.read().await.clone();
@@ -4588,17 +4602,18 @@ async fn buy(
             execution_adapter: None,
             execution_backend,
             planned_execution: None,
-            client_started_at_unix_ms: request.client_started_at_unix_ms,
+            client_started_at_unix_ms: client_click_started_at,
             batch_policy: execution_plan.batch_policy,
             execution_plan: execution_plan.wallets,
             warnings: policy.auto_fee_warnings.clone(),
         },
     )
     .await?;
-    if let Some(client_started_at) = request.client_started_at_unix_ms {
+    if let Some(client_started_at) = client_click_started_at {
         eprintln!(
-            "[execution-engine][latency] batch={} phase=enqueue-accepted side=buy click_to_enqueue_ms={}",
+            "[execution-engine][latency] batch={} phase=enqueue-accepted side=buy planning_ms={} click_to_enqueue_ms={}",
             accepted.batch_id,
+            planning_started.elapsed().as_millis(),
             accepted
                 .accepted_at_unix_ms
                 .saturating_sub(client_started_at)
@@ -4612,6 +4627,10 @@ async fn sell(
     Json(request): Json<SellRequest>,
 ) -> Result<Json<ExecutionAcceptedResponse>, (StatusCode, String)> {
     state.tick_trade_activity();
+    let planning_started = Instant::now();
+    let client_click_started_at = request
+        .client_request_started_at_unix_ms
+        .or(request.client_started_at_unix_ms);
     let client_request_id = normalize_client_request_id(request.client_request_id)?;
     let engine = state.engine.read().await.clone();
     let trade_ledger = state.trade_ledger.read().await.clone();
@@ -4700,17 +4719,18 @@ async fn sell(
             execution_adapter: None,
             execution_backend,
             planned_execution: None,
-            client_started_at_unix_ms: request.client_started_at_unix_ms,
+            client_started_at_unix_ms: client_click_started_at,
             batch_policy: execution_plan.batch_policy,
             execution_plan: execution_plan.wallets,
             warnings: policy.auto_fee_warnings.clone(),
         },
     )
     .await?;
-    if let Some(client_started_at) = request.client_started_at_unix_ms {
+    if let Some(client_started_at) = client_click_started_at {
         eprintln!(
-            "[execution-engine][latency] batch={} phase=enqueue-accepted side=sell click_to_enqueue_ms={}",
+            "[execution-engine][latency] batch={} phase=enqueue-accepted side=sell planning_ms={} click_to_enqueue_ms={}",
             accepted.batch_id,
+            planning_started.elapsed().as_millis(),
             accepted
                 .accepted_at_unix_ms
                 .saturating_sub(client_started_at)
@@ -5309,8 +5329,9 @@ async fn enqueue_batch(
             .collect(),
     };
 
-    batches.insert(batch_id.clone(), status);
+    batches.insert(batch_id.clone(), status.clone());
     persist_batch_history(&state.batch_history_path, &batches)?;
+    publish_batch_status_snapshot(&state, &status, "queued");
     let accepted = ExecutionAcceptedResponse {
         batch_id: batch_id.clone(),
         client_request_id: submission.client_request_id.clone(),
@@ -5374,10 +5395,13 @@ async fn update_batch_execution_metadata(
     if batch_policy.is_some() {
         batch.batch_policy = batch_policy;
     }
+    let batch_snapshot = batch.clone();
     if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
         eprintln!("[execution-engine][persist] batch history write failed: {error}");
         state.persist_failures.record_batch_history_failure(&error);
     }
+    drop(guard);
+    publish_batch_status_snapshot(state, &batch_snapshot, "metadata");
 }
 
 async fn sync_batch_wallet_plan_summaries(
@@ -5421,10 +5445,13 @@ async fn sync_batch_wallet_plan_summaries(
         }
     }
     batch.updated_at_unix_ms = now;
+    let batch_snapshot = batch.clone();
     if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
         eprintln!("[execution-engine][persist] batch history write failed: {error}");
         state.persist_failures.record_batch_history_failure(&error);
     }
+    drop(guard);
+    publish_batch_status_snapshot(state, &batch_snapshot, "plan_summary");
 }
 
 async fn execute_batch_runtime(
@@ -5581,6 +5608,8 @@ async fn execute_batch_runtime(
         let planned_summary = entry.planned_summary.clone();
         let hellomoon_deadline_for_execution = hellomoon_deadline_unix_ms;
         let balance_gate = Arc::clone(&balance_gate);
+        let state_for_submit = state.clone();
+        let batch_id_for_submit = batch_id.clone();
         executions.spawn(async move {
             let request_for_result = request.clone();
             let provider = request.policy.provider.clone();
@@ -5605,16 +5634,35 @@ async fn execute_batch_runtime(
                 }
             }
             let wallet_id = wallet_key.clone();
+            let submit_state = state_for_submit.clone();
+            let submit_batch_id = batch_id_for_submit.clone();
+            let submit_wallet_key = wallet_key.clone();
+            let on_submitted = move |signature: &str| {
+                let submit_state = submit_state.clone();
+                let submit_batch_id = submit_batch_id.clone();
+                let submit_wallet_key = submit_wallet_key.clone();
+                let signature = signature.to_string();
+                tokio::spawn(async move {
+                    apply_wallet_submitted(
+                        &submit_state,
+                        &submit_batch_id,
+                        &submit_wallet_key,
+                        &signature,
+                    )
+                    .await;
+                });
+            };
             let execution_result = if let Some(error) = delayed_timeout_error {
                 Err(error)
             } else if uses_hellomoon {
                 match hellomoon_remaining_timeout(hellomoon_deadline_for_execution, "transaction") {
                     Ok(timeout) => match tokio::time::timeout(timeout, {
                         let gate = Arc::clone(&balance_gate);
-                        executor.execute_wallet_trade_checked(
+                        executor.execute_wallet_trade_checked_with_submit_callback(
                             request,
                             wallet_key,
                             move |wallet_key, compiled| gate.check_compiled(wallet_key, compiled),
+                            on_submitted,
                         )
                     })
                     .await
@@ -5627,10 +5675,11 @@ async fn execute_batch_runtime(
             } else {
                 let gate = Arc::clone(&balance_gate);
                 executor
-                    .execute_wallet_trade_checked(
+                    .execute_wallet_trade_checked_with_submit_callback(
                         request,
                         wallet_key,
                         move |wallet_key, compiled| gate.check_compiled(wallet_key, compiled),
+                        on_submitted,
                     )
                     .await
             };
@@ -5748,10 +5797,66 @@ async fn fail_unresolved_batch_wallets(state: &AppState, batch_id: &str, error: 
     }
     recompute_batch_summary(batch);
     batch.updated_at_unix_ms = now;
+    let batch_snapshot = batch.clone();
     if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
         eprintln!("[execution-engine][persist] batch history write failed: {error}");
         state.persist_failures.record_batch_history_failure(&error);
     }
+    drop(guard);
+    publish_batch_status_snapshot(state, &batch_snapshot, "wallet_failure_reconcile");
+}
+
+async fn apply_wallet_submitted(
+    state: &AppState,
+    batch_id: &str,
+    wallet_key: &str,
+    signature: &str,
+) {
+    let normalized_signature = signature.trim();
+    if normalized_signature.is_empty() {
+        return;
+    }
+    let now = now_unix_ms();
+    let mut guard = state.batches.write().await;
+    let Some(batch) = guard.get_mut(batch_id) else {
+        return;
+    };
+    let client_request_id = batch.client_request_id.clone();
+    let Some(wallet) = batch
+        .wallets
+        .iter_mut()
+        .find(|wallet| wallet.wallet_key == wallet_key)
+    else {
+        return;
+    };
+    if matches!(
+        wallet.status,
+        BatchLifecycleStatus::Confirmed | BatchLifecycleStatus::Failed
+    ) {
+        return;
+    }
+    if matches!(wallet.status, BatchLifecycleStatus::Submitted)
+        && wallet.tx_signature.as_deref() == Some(normalized_signature)
+    {
+        return;
+    }
+    wallet.status = BatchLifecycleStatus::Submitted;
+    wallet.tx_signature = Some(normalized_signature.to_string());
+    wallet.error = None;
+    recompute_batch_summary(batch);
+    batch.updated_at_unix_ms = now;
+    let batch_snapshot = batch.clone();
+    if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
+        eprintln!("[execution-engine][persist] batch history write failed: {error}");
+        state.persist_failures.record_batch_history_failure(&error);
+    }
+    drop(guard);
+    state.balance_stream.register_trade(
+        client_request_id.clone(),
+        batch_id.to_string(),
+        normalized_signature.to_string(),
+    );
+    publish_batch_status_snapshot(state, &batch_snapshot, "wallet_submitted");
 }
 
 fn is_hellomoon_provider(provider: &str) -> bool {
@@ -5968,6 +6073,7 @@ async fn fetch_sell_balance_gate_snapshot(
     state: AppState,
     execution_plan: Vec<PlannedWalletExecution>,
 ) -> Result<TradeBalanceGateSnapshot, String> {
+    let started = Instant::now();
     let mint = execution_plan
         .iter()
         .find_map(|entry| {
@@ -5981,13 +6087,70 @@ async fn fetch_sell_balance_gate_snapshot(
         .collect::<Vec<_>>();
     let token_decimals = token_decimals_for_balance_gate(&state, &mint).await;
     let wallet_public_keys = wallet_public_keys_for_balance_gate(&state, &wallet_keys).await;
-    let balances =
-        fetch_wallet_token_balances_once(&configured_rpc_url(), &wallet_public_keys, &mint).await?;
+    let (mut balances, missing_wallets) = if let Some(decimals) = token_decimals {
+        cached_sell_token_balances_for_gate(&wallet_public_keys, &mint, decimals).await
+    } else {
+        (HashMap::new(), wallet_public_keys.clone())
+    };
+    if missing_wallets.is_empty() {
+        eprintln!(
+            "[execution-engine][latency] phase=balance-gate side=sell balance_source=stream_cache balance_gate_ready_ms={}",
+            started.elapsed().as_millis()
+        );
+        return Ok(TradeBalanceGateSnapshot::SellToken {
+            mint,
+            balances,
+            token_decimals,
+        });
+    }
+    let fetched =
+        fetch_wallet_token_balances_once(&configured_rpc_url(), &missing_wallets, &mint).await?;
+    if let Some(decimals) = token_decimals {
+        for (wallet_key, raw) in &fetched {
+            crate::wallet_token_cache::record_raw_token_balance(wallet_key, &mint, *raw, decimals)
+                .await;
+        }
+    }
+    let had_cached = !balances.is_empty();
+    balances.extend(fetched);
+    let balance_source = if had_cached {
+        "stream_cache+getMultipleAccounts"
+    } else {
+        "getMultipleAccounts"
+    };
+    eprintln!(
+        "[execution-engine][latency] phase=balance-gate side=sell balance_source={} balance_gate_ready_ms={}",
+        balance_source,
+        started.elapsed().as_millis()
+    );
     Ok(TradeBalanceGateSnapshot::SellToken {
         mint,
         balances,
         token_decimals,
     })
+}
+
+async fn cached_sell_token_balances_for_gate(
+    wallet_public_keys: &[(String, String)],
+    mint: &str,
+    token_decimals: u8,
+) -> (HashMap<String, u64>, Vec<(String, String)>) {
+    if wallet_public_keys.is_empty() {
+        return (HashMap::new(), Vec::new());
+    }
+    let cache = crate::wallet_token_cache::shared_wallet_token_cache();
+    let scale = 10u128.pow(u32::from(token_decimals));
+    let mut balances = HashMap::with_capacity(wallet_public_keys.len());
+    let mut missing = Vec::new();
+    for (wallet_key, public_key) in wallet_public_keys {
+        if let Some(cached) = cache.lookup(wallet_key, mint).await {
+            let raw = (cached.ui_amount.max(0.0) * scale as f64) as u128;
+            balances.insert(wallet_key.clone(), u64::try_from(raw).unwrap_or(u64::MAX));
+        } else {
+            missing.push((wallet_key.clone(), public_key.clone()));
+        }
+    }
+    (balances, missing)
 }
 
 async fn wallet_public_keys_for_balance_gate(
@@ -6000,8 +6163,7 @@ async fn wallet_public_keys_for_balance_gate(
         .into_iter()
         .filter(|wallet| wallet.enabled)
         .collect::<Vec<_>>();
-    let use_all_enabled =
-        enabled_wallets.len() <= TRADE_BALANCE_GATE_FRONTEND_REFRESH_WALLET_LIMIT;
+    let use_all_enabled = enabled_wallets.len() <= TRADE_BALANCE_GATE_FRONTEND_REFRESH_WALLET_LIMIT;
     enabled_wallets
         .into_iter()
         .filter(|wallet| use_all_enabled || requested.contains(&wallet.key))
@@ -6017,7 +6179,10 @@ async fn token_decimals_for_balance_gate(state: &AppState, mint: &str) -> Option
         .and_then(|target| target.token_decimals)
 }
 
-fn publish_balance_gate_snapshot(stream: &BalanceStreamHandle, snapshot: &TradeBalanceGateSnapshot) {
+fn publish_balance_gate_snapshot(
+    stream: &BalanceStreamHandle,
+    snapshot: &TradeBalanceGateSnapshot,
+) {
     let at_ms = u128::from(now_unix_ms());
     match snapshot {
         TradeBalanceGateSnapshot::BuySol(balances) => {
@@ -6044,8 +6209,8 @@ fn publish_balance_gate_snapshot(stream: &BalanceStreamHandle, snapshot: &TradeB
             token_decimals,
         } => {
             for (env_key, raw) in balances {
-                let token_balance = token_decimals
-                    .map(|decimals| *raw as f64 / 10_f64.powi(i32::from(decimals)));
+                let token_balance =
+                    token_decimals.map(|decimals| *raw as f64 / 10_f64.powi(i32::from(decimals)));
                 stream.publish_balance_event(BalanceEventPayload {
                     env_key: env_key.clone(),
                     balance_sol: None,
@@ -6282,7 +6447,7 @@ fn required_sell_token_balance_raw(
         }
         RuntimeSellIntent::SolOutput(output_sol) => {
             parse_sol_to_lamports(output_sol)?;
-            Some(1)
+            None
         }
     }
 }
@@ -6910,7 +7075,7 @@ async fn apply_wallet_execution_outcome(
     mut outcome: WalletExecutionState,
 ) {
     let now = now_unix_ms();
-    let (batch_client_request_id, duplicate_owner) = {
+    let (batch_client_request_id, duplicate_owner, already_registered_signature) = {
         let guard = state.batches.read().await;
         let Some(batch) = guard.get(batch_id) else {
             return;
@@ -6922,10 +7087,30 @@ async fn apply_wallet_execution_outcome(
         } else {
             None
         };
-        (batch.client_request_id.clone(), duplicate_owner)
+        let already_registered_signature = outcome
+            .tx_signature
+            .as_deref()
+            .and_then(|signature| {
+                batch
+                    .wallets
+                    .iter()
+                    .find(|wallet| wallet.wallet_key == outcome.wallet_key)
+                    .and_then(|wallet| wallet.tx_signature.as_deref())
+                    .map(|existing| existing.trim() == signature.trim())
+            })
+            .unwrap_or(false);
+        (
+            batch.client_request_id.clone(),
+            duplicate_owner,
+            already_registered_signature,
+        )
     };
 
-    let mut register_trade_signature = outcome.tx_signature.clone();
+    let mut register_trade_signature = if already_registered_signature {
+        None
+    } else {
+        outcome.tx_signature.clone()
+    };
     let mut confirmed_trade_event: Option<(String, Option<u64>)> = None;
 
     if let Some((owner_batch_id, owner_wallet_key)) = duplicate_owner {
@@ -7007,11 +7192,13 @@ async fn apply_wallet_execution_outcome(
 
     recompute_batch_summary(batch);
     batch.updated_at_unix_ms = now;
+    let batch_snapshot = batch.clone();
     if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
         eprintln!("[execution-engine][persist] batch history write failed: {error}");
         state.persist_failures.record_batch_history_failure(&error);
     }
     drop(guard);
+    publish_batch_status_snapshot(state, &batch_snapshot, "wallet_outcome");
 
     // Register the signature with the balance stream so every surface receives
     // a trade event (and the stream subscribes to any follow-up status). The
@@ -10472,6 +10659,44 @@ fn submitted_signature_from_confirmation_gap_error(error: &str) -> Option<String
     }
 }
 
+fn next_batch_status_revision(state: &AppState, batch_id: &str) -> u64 {
+    let Ok(mut guard) = state.batch_status_revisions.lock() else {
+        return now_unix_ms();
+    };
+    let next = guard
+        .get(batch_id)
+        .copied()
+        .unwrap_or_default()
+        .saturating_add(1);
+    guard.insert(batch_id.to_string(), next);
+    next
+}
+
+fn publish_batch_status_snapshot(state: &AppState, batch: &BatchStatusResponse, reason: &str) {
+    let revision = next_batch_status_revision(state, &batch.batch_id);
+    let at_ms = u128::from(now_unix_ms());
+    let mut snapshot = serde_json::to_value(batch).unwrap_or_else(|_| json!({}));
+    if let Value::Object(ref mut object) = snapshot {
+        object.insert("revision".to_string(), json!(revision));
+        object.insert("streamReason".to_string(), json!(reason));
+        object.insert("streamEmittedAtUnixMs".to_string(), json!(at_ms));
+    }
+    state
+        .balance_stream
+        .publish_batch_status_event(BatchStatusEventPayload {
+            batch_id: batch.batch_id.clone(),
+            client_request_id: batch.client_request_id.clone(),
+            revision,
+            snapshot,
+            reason: reason.to_string(),
+            at_ms,
+        });
+    eprintln!(
+        "[execution-engine][latency] phase=sse-emit event=batchStatus batch={} clientRequestId={} revision={} reason={} emitted_at_ms={}",
+        batch.batch_id, batch.client_request_id, revision, reason, at_ms
+    );
+}
+
 fn duplicate_signature_owner(
     batches: &HashMap<String, BatchStatusResponse>,
     current_batch_id: &str,
@@ -10618,10 +10843,13 @@ async fn reconcile_batch_with_trade_event(
     }
     batch.updated_at_unix_ms = now_unix_ms();
     recompute_batch_summary(batch);
+    let batch_snapshot = batch.clone();
     if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
         eprintln!("[execution-engine][persist] batch history write failed: {error}");
         state.persist_failures.record_batch_history_failure(&error);
     }
+    drop(guard);
+    publish_batch_status_snapshot(state, &batch_snapshot, "trade_reconcile");
     Ok(())
 }
 
@@ -11415,20 +11643,35 @@ fn validate_sell_intent_for_family(
     sell_intent: &SellIntent,
     selector: &LifecycleAndCanonicalMarket,
 ) -> Result<(), (StatusCode, String)> {
-    if matches!(sell_intent, SellIntent::SolOutput(_))
-        && !matches!(
-            selector.family,
-            crate::trade_planner::TradeVenueFamily::PumpBondingCurve
-                | crate::trade_planner::TradeVenueFamily::PumpAmm
-                | crate::trade_planner::TradeVenueFamily::RaydiumAmmV4
-        )
-    {
+    if !matches!(sell_intent, SellIntent::SolOutput(_)) {
+        return Ok(());
+    }
+    if matches!(selector.family, TradeVenueFamily::TrustedStableSwap) {
+        let output_mint = match selector.runtime_bundle.as_ref() {
+            Some(PlannerRuntimeBundle::TrustedStable(bundle)) => bundle.sell_output_mint.as_str(),
+            _ => {
+                crate::stable_native::trusted_stable_route_for_pool(&selector.canonical_market_key)
+                    .map(|route| route.sell_output_mint)
+                    .unwrap_or_default()
+            }
+        };
+        if output_mint != crate::wrapper_abi::WSOL_MINT.to_string() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Trusted stable sellOutputSol requires a SOL-output route.".to_string(),
+            ));
+        }
+    }
+    if matches!(
+        selector.family,
+        TradeVenueFamily::MeteoraDbc | TradeVenueFamily::MeteoraDammV2
+    ) && matches!(
+        selector.quote_asset,
+        PlannerQuoteAsset::Usd1 | PlannerQuoteAsset::Usdt
+    ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!(
-                "{} sells currently support percent-based exits only; sellOutputSol is only supported on SOL-output-capable routes.",
-                selector.family.label()
-            ),
+            "Meteora sellOutputSol stable routing is currently USDC-only.".to_string(),
         ));
     }
     Ok(())
@@ -13688,7 +13931,7 @@ fn sample_engine_state() -> StoredEngineState {
         execution_provider: "standard-rpc".to_string(),
         execution_endpoint_profile: "global".to_string(),
         execution_commitment: "confirmed".to_string(),
-        execution_skip_preflight: false,
+        execution_skip_preflight: true,
         track_send_block_height: true,
         max_active_batches: 32,
         rpc_url: String::new(),
@@ -14622,11 +14865,11 @@ mod tests {
     }
 
     #[test]
-    fn sell_balance_gate_sol_output_requires_nonzero_token_balance() {
+    fn sell_balance_gate_sol_output_is_resolved_by_compiler() {
         let request =
             sell_balance_gate_request(Some(RuntimeSellIntent::SolOutput("0.1".to_string())));
-        assert_eq!(required_sell_token_balance_raw(&request, 0), Some(1));
-        assert_eq!(required_sell_token_balance_raw(&request, 500), Some(1));
+        assert_eq!(required_sell_token_balance_raw(&request, 0), None);
+        assert_eq!(required_sell_token_balance_raw(&request, 500), None);
     }
 
     #[test]
@@ -16887,7 +17130,7 @@ mod tests {
     }
 
     #[test]
-    fn bonk_sell_output_is_rejected_up_front() {
+    fn bonk_sell_output_is_allowed_for_target_sizing() {
         let selector = LifecycleAndCanonicalMarket {
             lifecycle: crate::trade_planner::TradeLifecycle::PreMigration,
             family: crate::trade_planner::TradeVenueFamily::BonkLaunchpad,
@@ -16902,10 +17145,90 @@ mod tests {
             minimum_output_hint: None,
             runtime_bundle: None,
         };
-        let error =
+        validate_sell_intent_for_family(&SellIntent::SolOutput("0.1".to_string()), &selector)
+            .expect("bonk sellOutputSol should pass API validation");
+    }
+
+    #[test]
+    fn trusted_stable_sell_output_requires_sol_output_route() {
+        let selector = LifecycleAndCanonicalMarket {
+            lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
+            family: crate::trade_planner::TradeVenueFamily::TrustedStableSwap,
+            canonical_market_key: "pool-1".to_string(),
+            quote_asset: crate::trade_planner::PlannerQuoteAsset::Usdc,
+            verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+            wrapper_action: crate::trade_planner::WrapperAction::TrustedStableSwapSell,
+            wrapper_accounts: vec![],
+            market_subtype: Some("orca-whirlpool".to_string()),
+            direct_protocol_target: None,
+            input_amount_hint: None,
+            minimum_output_hint: None,
+            runtime_bundle: Some(crate::trade_planner::PlannerRuntimeBundle::TrustedStable(
+                crate::trade_planner::TrustedStableRuntimeBundle {
+                    pool: "pool-1".to_string(),
+                    venue: "orca-whirlpool".to_string(),
+                    buy_input_mint: crate::wrapper_abi::WSOL_MINT.to_string(),
+                    buy_output_mint: "token-mint".to_string(),
+                    sell_input_mint: "token-mint".to_string(),
+                    sell_output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                },
+            )),
+        };
+        let err =
             validate_sell_intent_for_family(&SellIntent::SolOutput("0.1".to_string()), &selector)
-                .expect_err("bonk sellOutputSol should fail");
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                .expect_err("non-SOL trusted stable route should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn trusted_stable_sell_output_allows_sol_output_route() {
+        let selector = LifecycleAndCanonicalMarket {
+            lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
+            family: crate::trade_planner::TradeVenueFamily::TrustedStableSwap,
+            canonical_market_key: "pool-1".to_string(),
+            quote_asset: crate::trade_planner::PlannerQuoteAsset::Sol,
+            verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+            wrapper_action: crate::trade_planner::WrapperAction::TrustedStableSwapSell,
+            wrapper_accounts: vec![],
+            market_subtype: Some("raydium-clmm".to_string()),
+            direct_protocol_target: None,
+            input_amount_hint: None,
+            minimum_output_hint: None,
+            runtime_bundle: Some(crate::trade_planner::PlannerRuntimeBundle::TrustedStable(
+                crate::trade_planner::TrustedStableRuntimeBundle {
+                    pool: "pool-1".to_string(),
+                    venue: "raydium-clmm".to_string(),
+                    buy_input_mint: crate::wrapper_abi::WSOL_MINT.to_string(),
+                    buy_output_mint: "token-mint".to_string(),
+                    sell_input_mint: "token-mint".to_string(),
+                    sell_output_mint: crate::wrapper_abi::WSOL_MINT.to_string(),
+                },
+            )),
+        };
+        validate_sell_intent_for_family(&SellIntent::SolOutput("0.1".to_string()), &selector)
+            .expect("SOL-output trusted stable route should pass API validation");
+    }
+
+    #[test]
+    fn meteora_sell_output_rejects_non_usdc_stable_routes() {
+        let selector = LifecycleAndCanonicalMarket {
+            lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
+            family: crate::trade_planner::TradeVenueFamily::MeteoraDammV2,
+            canonical_market_key: "pool-1".to_string(),
+            quote_asset: crate::trade_planner::PlannerQuoteAsset::Usd1,
+            verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+            wrapper_action: crate::trade_planner::WrapperAction::MeteoraDammV2Sell,
+            wrapper_accounts: vec![],
+            market_subtype: Some("damm-v2".to_string()),
+            direct_protocol_target: Some("damm-v2".to_string()),
+            input_amount_hint: None,
+            minimum_output_hint: None,
+            runtime_bundle: None,
+        };
+        let err =
+            validate_sell_intent_for_family(&SellIntent::SolOutput("0.1".to_string()), &selector)
+                .expect_err("USD1 Meteora sellOutputSol should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[test]

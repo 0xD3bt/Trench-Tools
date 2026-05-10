@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use solana_sdk::signature::Signer;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -19,6 +20,7 @@ use crate::{
     },
     trade_runtime::{RuntimeSellIntent, TradeRuntimeRequest},
     wallet_store::load_solana_wallet_by_env_key,
+    wrapper_payload::parse_sol_amount_to_lamports,
 };
 
 const BONK_IMPORT_CONTEXT_TTL: Duration = Duration::from_millis(2_500);
@@ -383,12 +385,19 @@ pub async fn compile_bonk_trade(
             });
         }
         TradeSide::Sell => {
-            let sell_percent = parse_sell_percent(
+            let (sell_percent, token_amount_override) = resolve_bonk_sell_amount(
+                &rpc_url,
+                selector,
+                request,
+                wallet_key,
+                &owner.pubkey().to_string(),
+                quote_asset,
                 request
                     .sell_intent
                     .as_ref()
                     .ok_or_else(|| "Missing sell intent for Bonk sell request.".to_string())?,
-            )?;
+            )
+            .await?;
             let settlement_asset = match request.policy.sell_settlement_asset {
                 TradeSettlementAsset::Usd1 => "usd1",
                 TradeSettlementAsset::Sol => "sol",
@@ -401,7 +410,7 @@ pub async fn compile_bonk_trade(
                 &owner_bytes,
                 &request.mint,
                 sell_percent,
-                None,
+                token_amount_override,
                 bonk_sell_pool_override(request, selector),
                 bonk_sell_market_subtype_override(selector),
                 launch_creator_override,
@@ -619,6 +628,164 @@ fn parse_sell_percent(intent: &RuntimeSellIntent) -> Result<u8, String> {
                 .to_string(),
         ),
     }
+}
+
+async fn resolve_bonk_sell_amount(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    wallet_key: &str,
+    owner: &str,
+    quote_asset: &str,
+    intent: &RuntimeSellIntent,
+) -> Result<(u8, Option<u64>), String> {
+    match intent {
+        RuntimeSellIntent::Percent(_) => Ok((parse_sell_percent(intent)?, None)),
+        RuntimeSellIntent::SolOutput(value) => {
+            let target_lamports = parse_sol_amount_to_lamports(value);
+            if target_lamports == 0 {
+                return Err("sellOutputSol must be greater than zero.".to_string());
+            }
+            let decimals = read_mint_decimals(
+                &crate::rpc_client::fetch_account_data(
+                    rpc_url,
+                    &request.mint,
+                    &request.policy.commitment,
+                )
+                .await?,
+            )?;
+            let balance = crate::wallet_token_cache::fetch_token_balance_with_cache(
+                Some(wallet_key),
+                owner,
+                &request.mint,
+                decimals,
+            )
+            .await?;
+            let amount = choose_bonk_target_sized_amount(
+                rpc_url,
+                selector,
+                request,
+                quote_asset,
+                balance.amount_raw,
+                target_lamports,
+            )
+            .await?;
+            Ok((100, Some(amount)))
+        }
+    }
+}
+
+async fn choose_bonk_target_sized_amount(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    quote_asset: &str,
+    available_raw: u64,
+    target_lamports: u64,
+) -> Result<u64, String> {
+    if available_raw == 0 {
+        return Err("You have 0 tokens.".to_string());
+    }
+    let full_quote =
+        quote_bonk_token_amount_to_sol(rpc_url, selector, request, quote_asset, available_raw)
+            .await?;
+    if full_quote == 0 {
+        return Err("Bonk sell quote resolved to zero SOL.".to_string());
+    }
+    if full_quote < target_lamports {
+        return Err(crate::sell_target_sizing::unreachable_target_message(
+            target_lamports,
+            full_quote,
+        ));
+    }
+    let mut best = Some((available_raw, full_quote));
+    let mut low = 1u64;
+    let mut high = available_raw.saturating_sub(1);
+    let estimate = crate::sell_target_sizing::target_amount_estimate(
+        available_raw,
+        target_lamports,
+        full_quote,
+    );
+    if estimate < available_raw {
+        let quoted =
+            quote_bonk_token_amount_to_sol(rpc_url, selector, request, quote_asset, estimate)
+                .await?;
+        if quoted == 0 {
+            low = estimate.saturating_add(1);
+        } else {
+            best = Some(crate::sell_target_sizing::prefer_better_target_amount(
+                best,
+                estimate,
+                quoted,
+                target_lamports,
+            ));
+            if quoted < target_lamports {
+                low = estimate.saturating_add(1);
+            } else {
+                high = estimate.saturating_sub(1);
+            }
+        }
+    }
+    for _ in 0..crate::sell_target_sizing::RPC_TARGET_SIZING_MAX_REFINEMENT_PROBES {
+        if low > high {
+            break;
+        }
+        let amount = low + (high - low) / 2;
+        let quoted =
+            quote_bonk_token_amount_to_sol(rpc_url, selector, request, quote_asset, amount).await?;
+        if quoted == 0 {
+            low = amount.saturating_add(1);
+            continue;
+        }
+        best = Some(crate::sell_target_sizing::prefer_better_target_amount(
+            best,
+            amount,
+            quoted,
+            target_lamports,
+        ));
+        if quoted < target_lamports {
+            low = amount.saturating_add(1);
+        } else {
+            high = amount - 1;
+        }
+    }
+    best.map(|(amount, _)| amount)
+        .ok_or_else(|| "Bonk sell quote resolved to zero SOL.".to_string())
+}
+
+async fn quote_bonk_token_amount_to_sol(
+    rpc_url: &str,
+    selector: &LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+    quote_asset: &str,
+    token_amount_raw: u64,
+) -> Result<u64, String> {
+    let (quote_raw, raw_quote_asset) = launchdeck_bonk::quote_bonk_holding_value_quote_raw(
+        rpc_url,
+        &request.mint,
+        bonk_sell_pool_override(request, selector),
+        quote_asset,
+        token_amount_raw,
+        &request.policy.commitment,
+    )
+    .await?;
+    let gross_sol_lamports = if raw_quote_asset.eq_ignore_ascii_case("usd1") {
+        launchdeck_bonk::quote_sol_lamports_for_exact_usd1_input_with_max_setup_age(
+            rpc_url,
+            quote_raw,
+            Duration::from_millis(1_500),
+        )
+        .await
+    } else {
+        Ok(quote_raw)
+    }?;
+    crate::sell_target_sizing::net_sol_after_wrapper_fee(gross_sol_lamports)
+}
+
+fn read_mint_decimals(data: &[u8]) -> Result<u8, String> {
+    data.get(44)
+        .copied()
+        .ok_or_else(|| "Mint account data was shorter than expected (decimals).".to_string())
 }
 
 fn is_raydium_detection_source(value: &str) -> bool {

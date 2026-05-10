@@ -223,6 +223,7 @@ async function performJsonRequest(routeKey, path, options = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   const authToken = hostState.authToken || "";
+  const requestStartedAt = Date.now();
 
   try {
     const response = await fetch(`${baseUrl}${path}`, {
@@ -255,6 +256,16 @@ async function performJsonRequest(routeKey, path, options = {}) {
 
     const payload = await response.json();
     await maybeSyncBootstrapRevision(payload);
+    if (["buy", "sell", "batchStatus"].includes(routeKey) || options.logLatency) {
+      console.debug(
+        "[trench][latency] phase=background-host route=%s clientRequestId=%s batch=%s reason=%s host_ms=%s",
+        routeKey,
+        options.body?.clientRequestId || payload?.clientRequestId || "",
+        payload?.batchId || options.body?.batchId || "",
+        options.latencyReason || "",
+        Date.now() - requestStartedAt
+      );
+    }
     return payload;
   } catch (error) {
     if (error instanceof HostRequestError) {
@@ -333,8 +344,27 @@ export function serializeHostError(error) {
   };
 }
 
-export function fetchHealth() {
-  return requestJson("health", "/api/extension/health");
+export function fetchHealth(options = {}) {
+  return requestJson("health", "/api/extension/health", options);
+}
+
+export async function primeTradeRuntime(options = {}) {
+  const startedAt = Date.now();
+  const reason = String(options.reason || "manual").trim() || "manual";
+  const surface = String(options.surface || "").trim();
+  await getCachedHostBase();
+  const health = await fetchHealth({
+    logLatency: true,
+    latencyReason: reason
+  });
+  return {
+    ok: true,
+    reason,
+    surface,
+    status: health?.status || "",
+    bootstrapRevision: health?.bootstrapRevision || "",
+    primeMs: Date.now() - startedAt
+  };
 }
 
 export function postActiveMints(entries) {

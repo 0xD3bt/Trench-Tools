@@ -88,6 +88,9 @@ fn stream_event_to_sse(event: StreamEvent) -> Option<(&'static str, String)> {
         StreamEvent::Balance(payload) => Some(("balance", serde_json::to_string(&payload).ok()?)),
         StreamEvent::TokenBalanceCache(_) => None,
         StreamEvent::Trade(payload) => Some(("trade", serde_json::to_string(&payload).ok()?)),
+        StreamEvent::BatchStatus(payload) => {
+            Some(("batchStatus", serde_json::to_string(&payload).ok()?))
+        }
         StreamEvent::Mark(payload) => Some(("mark", serde_json::to_string(&payload).ok()?)),
         StreamEvent::MarketAccount(_) => None,
         StreamEvent::Diagnostic(payload) => {
@@ -172,7 +175,8 @@ struct ConnectionStatePayload {
 mod tests {
     use super::*;
     use shared_extension_runtime::balance_stream::{
-        MarkEventPayload, MarketAccountEventPayload, TokenBalanceCacheEventPayload,
+        BatchStatusEventPayload, MarkEventPayload, MarketAccountEventPayload,
+        TokenBalanceCacheEventPayload,
     };
 
     #[test]
@@ -228,5 +232,28 @@ mod tests {
         });
 
         assert!(stream_event_to_sse(event).is_none());
+    }
+
+    #[test]
+    fn stream_event_maps_batch_status_to_sse_batch_status() {
+        let event = StreamEvent::BatchStatus(BatchStatusEventPayload {
+            batch_id: "batch1".to_string(),
+            client_request_id: "client1".to_string(),
+            revision: 1,
+            snapshot: serde_json::json!({
+                "batchId": "batch1",
+                "clientRequestId": "client1",
+                "status": "queued",
+                "wallets": []
+            }),
+            reason: "test".to_string(),
+            at_ms: 2,
+        });
+
+        let (name, data) = stream_event_to_sse(event).expect("batch status event maps");
+
+        assert_eq!(name, "batchStatus");
+        assert!(data.contains("\"batchId\":\"batch1\""));
+        assert!(data.contains("\"revision\":1"));
     }
 }

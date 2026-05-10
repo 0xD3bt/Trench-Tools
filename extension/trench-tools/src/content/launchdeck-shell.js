@@ -9,6 +9,7 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
   const CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE = "trench-tools-launchdeck";
   const CREATE_OVERLAY_RESIZE_MESSAGE_TYPE = "resize-create-overlay";
   const POST_DEPLOY_MESSAGE_TYPE = "post-deploy-success";
+  const EXTENSION_ORIGIN = new URL(chrome.runtime.getURL("")).origin;
   const CREATE_OVERLAY_VIEWPORT_GAP = createOverlayTokens.viewportGap || 64;
   const CREATE_OVERLAY_DEFAULT_WIDTH = createOverlayTokens.width || 532;
   const CREATE_OVERLAY_DEFAULT_HEIGHT = createOverlayTokens.height || 717;
@@ -50,6 +51,7 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
       const iframe = document.getElementById(OVERLAY_FRAME_ID);
       if (!(iframe instanceof HTMLIFrameElement)) return;
       if (event.source !== iframe.contentWindow) return;
+      if (event.origin !== EXTENSION_ORIGIN) return;
       const data = event.data;
       if (!data || typeof data !== "object") return;
       if (data.source !== CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE) return;
@@ -122,6 +124,9 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
     const url = new URL(chrome.runtime.getURL("launchdeck/index.html"));
     url.searchParams.set("shell", shell || "overlay");
     url.searchParams.set("mode", mode || "webapp");
+    if ((shell || "overlay") === "overlay") {
+      url.searchParams.set("parentOrigin", window.location.origin);
+    }
     if (contractAddress) {
       url.searchParams.set("contractAddress", String(contractAddress).trim());
     }

@@ -189,6 +189,17 @@ pub struct TradeEventPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BatchStatusEventPayload {
+    pub batch_id: String,
+    pub client_request_id: String,
+    pub revision: u64,
+    pub snapshot: Value,
+    pub reason: String,
+    pub at_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MarkEventPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface_id: Option<String>,
@@ -256,6 +267,7 @@ pub enum StreamEvent {
     Balance(BalanceEventPayload),
     TokenBalanceCache(TokenBalanceCacheEventPayload),
     Trade(TradeEventPayload),
+    BatchStatus(BatchStatusEventPayload),
     Mark(MarkEventPayload),
     MarketAccount(MarketAccountEventPayload),
     Diagnostic(DiagnosticEventPayload),
@@ -400,6 +412,10 @@ impl BalanceStreamHandle {
 
     pub fn publish_trade_event(&self, payload: TradeEventPayload) {
         let _ = self.inner.event_tx.send(StreamEvent::Trade(payload));
+    }
+
+    pub fn publish_batch_status_event(&self, payload: BatchStatusEventPayload) {
+        let _ = self.inner.event_tx.send(StreamEvent::BatchStatus(payload));
     }
 
     pub fn publish_balance_event(&self, payload: BalanceEventPayload) {

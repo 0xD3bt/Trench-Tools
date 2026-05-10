@@ -28,7 +28,7 @@ use crate::{
     provider_tip::pick_tip_account_for_provider,
     rpc_client::{
         CompiledTransaction, configured_rpc_url, fetch_account_owner_and_data,
-        fetch_token_balance_via_ata, rpc_request_with_client, shared_rpc_http_client,
+        fetch_token_balance_via_ata_immediate, rpc_request_with_client, shared_rpc_http_client,
     },
     trade_dispatch::{CompiledAdapterTrade, TransactionDependencyMode},
     trade_planner::{
@@ -326,7 +326,7 @@ pub async fn compile_trusted_stable_trade(
                     parse_decimal_u64(value, route.buy_input_decimals, "stable buy amount")
                 })?;
             if route.buy_input_mint != WSOL_MINT {
-                let balance = fetch_token_balance_via_ata(
+                let balance = fetch_token_balance_via_ata_immediate(
                     &owner.to_string(),
                     route.buy_input_mint,
                     route.buy_input_decimals,
@@ -362,16 +362,34 @@ pub async fn compile_trusted_stable_trade(
             if balance.amount_raw == 0 {
                 return Err("You have 0 tokens.".to_string());
             }
-            let percent = request
-                .sell_intent
-                .as_ref()
-                .map(|intent| match intent {
-                    crate::trade_runtime::RuntimeSellIntent::Percent(value) => value.as_str(),
-                    crate::trade_runtime::RuntimeSellIntent::SolOutput(_) => "",
-                })
-                .filter(|value| !value.is_empty())
-                .unwrap_or("100");
-            let amount = percent_of_amount(balance.amount_raw, percent)?;
+            let amount = match request.sell_intent.as_ref() {
+                Some(crate::trade_runtime::RuntimeSellIntent::Percent(percent)) => {
+                    percent_of_amount(balance.amount_raw, percent)?
+                }
+                Some(crate::trade_runtime::RuntimeSellIntent::SolOutput(value)) => {
+                    let target_lamports =
+                        crate::wrapper_payload::parse_sol_amount_to_lamports(value);
+                    if target_lamports == 0 {
+                        return Err("sellOutputSol must be greater than zero.".to_string());
+                    }
+                    if route.sell_output_mint != WSOL_MINT {
+                        return Err(
+                            "Trusted stable sellOutputSol requires a SOL-output stable route."
+                                .to_string(),
+                        );
+                    }
+                    choose_trusted_stable_target_sized_amount(
+                        &rpc_url,
+                        &request.policy.commitment,
+                        route,
+                        &owner,
+                        balance.amount_raw,
+                        target_lamports,
+                    )
+                    .await?
+                }
+                None => percent_of_amount(balance.amount_raw, "100")?,
+            };
             (
                 parse_pubkey(route.sell_input_mint, "stable sell input mint")?,
                 parse_pubkey(route.sell_output_mint, "stable sell output mint")?,
@@ -521,6 +539,135 @@ pub async fn compile_trusted_stable_trade(
         dependency_mode: TransactionDependencyMode::Independent,
         entry_preference_asset,
     })
+}
+
+async fn choose_trusted_stable_target_sized_amount(
+    rpc_url: &str,
+    commitment: &str,
+    route: &TrustedStableRoute,
+    owner: &Pubkey,
+    available_raw: u64,
+    target_lamports: u64,
+) -> Result<u64, String> {
+    if available_raw == 0 {
+        return Err("You have 0 tokens.".to_string());
+    }
+    let full_quote =
+        quote_trusted_stable_sell_output_lamports(rpc_url, commitment, route, owner, available_raw)
+            .await?;
+    if full_quote == 0 {
+        return Err("Trusted stable sell quote resolved to zero SOL.".to_string());
+    }
+    if full_quote < target_lamports {
+        return Err(crate::sell_target_sizing::unreachable_target_message(
+            target_lamports,
+            full_quote,
+        ));
+    }
+    let mut best = Some((available_raw, full_quote));
+    let mut low = 1u64;
+    let mut high = available_raw.saturating_sub(1);
+    let estimate = crate::sell_target_sizing::target_amount_estimate(
+        available_raw,
+        target_lamports,
+        full_quote,
+    );
+    if estimate < available_raw {
+        let quoted =
+            quote_trusted_stable_sell_output_lamports(rpc_url, commitment, route, owner, estimate)
+                .await?;
+        if quoted == 0 {
+            low = estimate.saturating_add(1);
+        } else {
+            best = Some(crate::sell_target_sizing::prefer_better_target_amount(
+                best,
+                estimate,
+                quoted,
+                target_lamports,
+            ));
+            if quoted < target_lamports {
+                low = estimate.saturating_add(1);
+            } else {
+                high = estimate.saturating_sub(1);
+            }
+        }
+    }
+    for _ in 0..crate::sell_target_sizing::RPC_TARGET_SIZING_MAX_REFINEMENT_PROBES {
+        if low > high {
+            break;
+        }
+        let amount = low + (high - low) / 2;
+        let quoted =
+            quote_trusted_stable_sell_output_lamports(rpc_url, commitment, route, owner, amount)
+                .await?;
+        if quoted == 0 {
+            low = amount.saturating_add(1);
+            continue;
+        }
+        best = Some(crate::sell_target_sizing::prefer_better_target_amount(
+            best,
+            amount,
+            quoted,
+            target_lamports,
+        ));
+        if quoted < target_lamports {
+            low = amount.saturating_add(1);
+        } else {
+            high = amount - 1;
+        }
+    }
+    best.map(|(amount, _)| amount)
+        .ok_or_else(|| "Trusted stable sell quote resolved to zero SOL.".to_string())
+}
+
+async fn quote_trusted_stable_sell_output_lamports(
+    rpc_url: &str,
+    commitment: &str,
+    route: &TrustedStableRoute,
+    owner: &Pubkey,
+    amount_in: u64,
+) -> Result<u64, String> {
+    let input_mint = parse_pubkey(route.sell_input_mint, "stable sell input mint")?;
+    let output_mint = parse_pubkey(route.sell_output_mint, "stable sell output mint")?;
+    let dummy_input = Pubkey::new_unique();
+    let dummy_output = Pubkey::new_unique();
+    let gross_sol_lamports = match route.venue {
+        TrustedStableVenue::RaydiumClmm => {
+            build_trusted_raydium_clmm_swap_exact_in(
+                rpc_url,
+                route.pool,
+                commitment,
+                owner,
+                &dummy_input,
+                &dummy_output,
+                &input_mint,
+                &output_mint,
+                amount_in,
+                0,
+            )
+            .await?
+            .expected_out
+        }
+        TrustedStableVenue::OrcaWhirlpool => {
+            build_orca_whirlpool_swap_exact_in(
+                rpc_url,
+                route,
+                commitment,
+                owner,
+                &dummy_input,
+                &dummy_output,
+                &input_mint,
+                &output_mint,
+                route.sell_input_decimals,
+                route.sell_output_decimals,
+                amount_in,
+                0,
+            )
+            .await?
+            .min_out
+        }
+    };
+    crate::sell_target_sizing::net_sol_after_wrapper_fee(gross_sol_lamports)
 }
 
 pub fn trusted_stable_effective_slippage_bps(user_slippage_percent: &str) -> Result<u64, String> {

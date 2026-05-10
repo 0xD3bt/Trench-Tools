@@ -3344,6 +3344,33 @@ async fn fetch_bags_token_account_amount(
         .map_err(|error| format!("Invalid Bags token account balance amount: {error}"))
 }
 
+async fn resolve_bags_sell_raw_amount(
+    rpc_url: &str,
+    token_account: &Pubkey,
+    commitment: &str,
+    token_amount_override: Option<u64>,
+) -> Result<Option<u64>, String> {
+    match token_amount_override {
+        Some(value) => {
+            let fresh_balance = fetch_bags_token_account_amount(rpc_url, token_account, commitment)
+                .await
+                .map_err(|error| {
+                    format!("Failed to verify target-sized Meteora balance: {error}")
+                })?;
+            if value > fresh_balance {
+                return Err(format!(
+                    "Meteora target-sized sell exceeds current wallet balance. Need {value}, have {fresh_balance}."
+                ));
+            }
+            Ok(Some(value))
+        }
+        None => match fetch_bags_token_account_amount(rpc_url, token_account, commitment).await {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Ok(None),
+        },
+    }
+}
+
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4167,6 +4194,113 @@ pub async fn quote_bags_holding_value_sol_fresh(
         false,
     )
     .await
+}
+
+pub async fn quote_bags_target_sell_value_sol(
+    rpc_url: &str,
+    mint: &str,
+    token_amount_raw: u64,
+    commitment: &str,
+    bags_launch: Option<&BagsLaunchMetadata>,
+    direct_protocol_target: &str,
+    quote_asset: &str,
+) -> Result<u64, String> {
+    if token_amount_raw == 0 {
+        return Ok(0);
+    }
+    let quote = quote_asset.trim().to_ascii_uppercase();
+    if quote != "USDC" && quote != "USD1" && quote != "USDT" {
+        return quote_bags_holding_value_sol(
+            rpc_url,
+            mint,
+            token_amount_raw,
+            commitment,
+            bags_launch,
+        )
+        .await;
+    }
+    if quote != "USDC" {
+        return Err(format!(
+            "Bags/Meteora {quote} sellOutputSol routes are not supported; stable Meteora sell routing is currently USDC-only."
+        ));
+    }
+
+    let mint_pubkey =
+        Pubkey::from_str(mint).map_err(|error| format!("Invalid Bags quote mint: {error}"))?;
+    let target = direct_protocol_target.trim().to_ascii_lowercase();
+    let stable_out = if target.contains("dbc") {
+        let Some((_, pool, config)) =
+            load_canonical_dbc_market(rpc_url, &mint_pubkey, commitment, bags_launch).await?
+        else {
+            return Err(format!(
+                "No Bags/Meteora DBC stable market was found for mint {mint}."
+            ));
+        };
+        if pool.is_migrated
+            || is_completed_dbc_pool(&pool, &config)
+            || config.quote_mint != usdc_mint_pubkey()?
+        {
+            return Err(format!(
+                "Bags/Meteora DBC route is not an active stable sell market for mint {mint}."
+            ));
+        }
+        let current_point = current_point_for_dbc_config(rpc_url, &config, commitment).await?;
+        let (expected_out, _) =
+            bags_dbc_swap_quote_exact_in(&pool, &config, true, token_amount_raw, 0, current_point)?;
+        expected_out
+    } else if target.contains("damm") {
+        let Some((_, pool, _)) =
+            load_local_damm_market(rpc_url, &mint_pubkey, commitment, bags_launch).await?
+        else {
+            return Err(format!(
+                "No Bags/Meteora DAMM stable market was found for mint {mint}."
+            ));
+        };
+        if damm_quote_mint_for_base(&pool, &mint_pubkey) != Some(usdc_mint_pubkey()?) {
+            return Err(format!(
+                "Bags/Meteora DAMM route is not a stable sell market for mint {mint}."
+            ));
+        }
+        let (current_slot, current_time) = current_time_for_damm(rpc_url, commitment).await?;
+        let current_point = if pool.activation_type == 0 {
+            current_slot
+        } else {
+            current_time
+        };
+        cpamm_swap_amount_out(
+            &BigUint::from(token_amount_raw),
+            &mint_pubkey,
+            &pool,
+            current_point,
+        )?
+        .to_u64()
+        .ok_or_else(|| "Meteora stable sell quote overflowed u64.".to_string())?
+    } else {
+        return Err(format!(
+            "Unsupported Bags/Meteora sell target {direct_protocol_target}."
+        ));
+    };
+    if stable_out == 0 {
+        return Ok(0);
+    }
+
+    let owner = Pubkey::new_unique();
+    let input_account = Pubkey::new_unique();
+    let output_account = Pubkey::new_unique();
+    let conversion_quote = build_trusted_raydium_clmm_swap_exact_in(
+        rpc_url,
+        raydium_sol_usdc_route()?.pool,
+        commitment,
+        &owner,
+        &input_account,
+        &output_account,
+        &usdc_mint_pubkey()?,
+        &bags_native_mint_pubkey()?,
+        stable_out,
+        0,
+    )
+    .await?;
+    Ok(conversion_quote.expected_out)
 }
 
 async fn quote_bags_holding_value_sol_with_cache(
@@ -6524,6 +6658,7 @@ async fn native_try_build_local_dbc_follow_sell(
     owner: &Keypair,
     mint: &Pubkey,
     sell_percent: u8,
+    token_amount_override: Option<u64>,
     slippage_bps: u64,
     tx_config: &NativeFollowTxConfig,
     bags_launch: Option<&BagsLaunchMetadata>,
@@ -6543,11 +6678,17 @@ async fn native_try_build_local_dbc_follow_sell(
     let input_token_program = token_program_for_flag(pool.pool_type)?;
     let owner_token_account =
         get_associated_token_address_with_program_id(&owner_pubkey, mint, &input_token_program);
-    let raw_amount =
-        match fetch_bags_token_account_amount(rpc_url, &owner_token_account, commitment).await {
-            Ok(value) => value,
-            Err(_) => return Ok(Some(None)),
-        };
+    let raw_amount = match resolve_bags_sell_raw_amount(
+        rpc_url,
+        &owner_token_account,
+        commitment,
+        token_amount_override,
+    )
+    .await?
+    {
+        Some(value) => value,
+        None => return Ok(Some(None)),
+    };
     if raw_amount == 0 {
         return Ok(Some(None));
     }
@@ -6768,6 +6909,7 @@ async fn native_try_build_usdc_dbc_follow_sell(
     owner: &Keypair,
     mint: &Pubkey,
     sell_percent: u8,
+    token_amount_override: Option<u64>,
     slippage_bps: u64,
     tx_config: &NativeFollowTxConfig,
     bags_launch: Option<&BagsLaunchMetadata>,
@@ -6788,11 +6930,17 @@ async fn native_try_build_usdc_dbc_follow_sell(
     let input_token_program = token_program_for_flag(pool.pool_type)?;
     let input_token_account =
         get_associated_token_address_with_program_id(&owner_pubkey, mint, &input_token_program);
-    let raw_amount =
-        match fetch_bags_token_account_amount(rpc_url, &input_token_account, commitment).await {
-            Ok(value) => value,
-            Err(_) => return Ok(Some(None)),
-        };
+    let raw_amount = match resolve_bags_sell_raw_amount(
+        rpc_url,
+        &input_token_account,
+        commitment,
+        token_amount_override,
+    )
+    .await?
+    {
+        Some(value) => value,
+        None => return Ok(Some(None)),
+    };
     if raw_amount == 0 {
         return Ok(Some(None));
     }
@@ -7024,6 +7172,7 @@ async fn native_try_build_local_damm_follow_sell(
     owner: &Keypair,
     mint: &Pubkey,
     sell_percent: u8,
+    token_amount_override: Option<u64>,
     slippage_bps: u64,
     tx_config: &NativeFollowTxConfig,
     bags_launch: Option<&BagsLaunchMetadata>,
@@ -7044,11 +7193,17 @@ async fn native_try_build_local_damm_follow_sell(
     };
     let owner_token_account =
         get_associated_token_address_with_program_id(&owner_pubkey, mint, &input_token_program);
-    let raw_amount =
-        match fetch_bags_token_account_amount(rpc_url, &owner_token_account, commitment).await {
-            Ok(value) => value,
-            Err(_) => return Ok(Some(None)),
-        };
+    let raw_amount = match resolve_bags_sell_raw_amount(
+        rpc_url,
+        &owner_token_account,
+        commitment,
+        token_amount_override,
+    )
+    .await?
+    {
+        Some(value) => value,
+        None => return Ok(Some(None)),
+    };
     if raw_amount == 0 {
         return Ok(Some(None));
     }
@@ -7276,6 +7431,7 @@ async fn native_try_build_usdc_damm_follow_sell(
     owner: &Keypair,
     mint: &Pubkey,
     sell_percent: u8,
+    token_amount_override: Option<u64>,
     slippage_bps: u64,
     tx_config: &NativeFollowTxConfig,
     bags_launch: Option<&BagsLaunchMetadata>,
@@ -7297,11 +7453,17 @@ async fn native_try_build_usdc_damm_follow_sell(
     };
     let input_token_account =
         get_associated_token_address_with_program_id(&owner_pubkey, mint, &input_token_program);
-    let raw_amount =
-        match fetch_bags_token_account_amount(rpc_url, &input_token_account, commitment).await {
-            Ok(value) => value,
-            Err(_) => return Ok(Some(None)),
-        };
+    let raw_amount = match resolve_bags_sell_raw_amount(
+        rpc_url,
+        &input_token_account,
+        commitment,
+        token_amount_override,
+    )
+    .await?
+    {
+        Some(value) => value,
+        None => return Ok(Some(None)),
+    };
     if raw_amount == 0 {
         return Ok(Some(None));
     }
@@ -7605,6 +7767,7 @@ pub async fn compile_follow_sell_transaction_for_meteora_target(
     wallet_secret: &[u8],
     mint: &str,
     sell_percent: u8,
+    token_amount_override: Option<u64>,
     bags_launch: Option<&BagsLaunchMetadata>,
     direct_protocol_target: &str,
     quote_asset: &str,
@@ -7616,6 +7779,11 @@ pub async fn compile_follow_sell_transaction_for_meteora_target(
     let tx_config = build_follow_sell_tx_config(execution, jito_tip_account)?;
     let target = direct_protocol_target.trim().to_ascii_lowercase();
     let quote = quote_asset.trim().to_ascii_uppercase();
+    if token_amount_override.is_some() && (quote == "USD1" || quote == "USDT") {
+        return Err(format!(
+            "Bags/Meteora {quote} sell routes are not supported; stable Meteora sell routing is currently USDC-only."
+        ));
+    }
     let use_usdc = quote == "USDC" || quote == "USD1" || quote == "USDT";
     let compiled = if target.contains("dbc") {
         if use_usdc {
@@ -7625,6 +7793,7 @@ pub async fn compile_follow_sell_transaction_for_meteora_target(
                 &owner,
                 &mint_pubkey,
                 sell_percent,
+                token_amount_override,
                 slippage_bps,
                 &tx_config,
                 bags_launch,
@@ -7637,6 +7806,7 @@ pub async fn compile_follow_sell_transaction_for_meteora_target(
                 &owner,
                 &mint_pubkey,
                 sell_percent,
+                token_amount_override,
                 slippage_bps,
                 &tx_config,
                 bags_launch,
@@ -7651,6 +7821,7 @@ pub async fn compile_follow_sell_transaction_for_meteora_target(
                 &owner,
                 &mint_pubkey,
                 sell_percent,
+                token_amount_override,
                 slippage_bps,
                 &tx_config,
                 bags_launch,
@@ -7663,6 +7834,7 @@ pub async fn compile_follow_sell_transaction_for_meteora_target(
                 &owner,
                 &mint_pubkey,
                 sell_percent,
+                token_amount_override,
                 slippage_bps,
                 &tx_config,
                 bags_launch,
@@ -7730,6 +7902,7 @@ pub async fn compile_follow_sell_transaction(
         &owner,
         &mint_pubkey,
         sell_percent,
+        None,
         slippage_bps,
         &tx_config,
         bags_launch,
@@ -7744,6 +7917,7 @@ pub async fn compile_follow_sell_transaction(
         &owner,
         &mint_pubkey,
         sell_percent,
+        None,
         slippage_bps,
         &tx_config,
         bags_launch,
@@ -7758,6 +7932,7 @@ pub async fn compile_follow_sell_transaction(
         &owner,
         &mint_pubkey,
         sell_percent,
+        None,
         slippage_bps,
         &tx_config,
         bags_launch,
@@ -7772,6 +7947,7 @@ pub async fn compile_follow_sell_transaction(
         &owner,
         &mint_pubkey,
         sell_percent,
+        None,
         slippage_bps,
         &tx_config,
         bags_launch,

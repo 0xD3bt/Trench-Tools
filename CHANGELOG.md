@@ -7,6 +7,37 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-05-10
+
+### Added
+
+- Documentation for current extension popup, Axiom surfaces, token split/consolidate, live PnL controls, and route prewarm behavior.
+- Documentation for current execution route coverage, including Raydium CPMM, Raydium LaunchLab, Meteora DBC/DAMM v2, wrapper v3 notes, and route metrics.
+- Execution engine: `sellOutputSol` across supported venue families by resolving a target-sized token input, then building swaps with the existing venue compilers (Pump, Raydium AMM v4, Raydium CPMM, Raydium LaunchLab, Bonk, Meteora/Bags paths, trusted stable swaps).
+- Shared `sell_target_sizing` logic with estimate-first narrowing, bounded refinement for RPC-heavy quotes, and clearer user-facing errors when the requested SOL output is not reachable from the current balance.
+- Wrapper route metadata sets a hard `min_net_output` floor for SOL-output sells so execution cannot settle below the requested SOL target while keeping normal slippage behavior on the quoted instruction path.
+- Stronger balance verification when applying target-sized overrides to reduce stale-cache oversell risk on Bonk and Meteora/Bags compilation paths.
+- Infer minimum SOL output from Orca Whirlpool venue swap instructions during wrapper compilation where applicable.
+- Browser extension: instant-trade preset controls stay in sync after the host page edits and saves preset amounts without a full reload.
+- Browser extension: compact TT-only instant-trade mode keeps TT preset controls visible and editable during host preset edit flows, with edits written back to the underlying host inputs.
+- Browser extension: manual hardplaced trade panel exposes a matching TT execute control that reads the shared amount field and respects SOL vs percentage sell selection.
+- Browser extension: token split and consolidate actions use the same pending and completion toast styling as trade confirmations.
+- Balance-gated execution checks for extension trades and token split/consolidate actions before submission.
+
+### Changed
+
+- Refreshed LaunchDeck, environment, and configuration docs for native metadata defaults, Pump/Bonk vanity queues, Bonk USD1 behavior, Bags prepare flow, follow daemon capacity/offset behavior, and newer route-family safety switches.
+- Stricter API validation for `sellOutputSol` on routes that require SOL-denominated output or USDC-only stable quoting for certain Meteora stable targets.
+- Improved extension trade readiness and prewarm handling before inline trade execution.
+- Improved execution latency, event streaming, and live balance cache updates across the extension and execution engine.
+- Hardened extension message boundaries between content scripts, background services, and LaunchDeck shell surfaces.
+
+### Fixed
+
+- Meteora/Bags: USD1/USDT restrictions for target SOL-output sizing no longer block ordinary percentage sells; stable sell-output quoting follows the real token-to-stable-to-SOL path.
+- Target sizing rejects unreachable SOL output targets instead of submitting a full-balance sell below the request, and prefers the smallest feasible token input when quotes plateau at the target.
+- Balance reflection after batch token split/consolidate actions is more reliable.
+
 ## [1.1.0] - 2026-05-09
 
 ### Added

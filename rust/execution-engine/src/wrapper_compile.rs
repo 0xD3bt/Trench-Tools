@@ -45,8 +45,10 @@ const BONK_LAUNCHPAD_PROGRAM_ID: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADdu
 const PUMP_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const BAGS_DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
 const BAGS_DAMM_V2_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+const ORCA_WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const RAYDIUM_CLMM_SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
 const RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
+const ORCA_WHIRLPOOL_SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
 const PUMP_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 const BONK_BUY_EXACT_IN_DISCRIMINATOR: [u8; 8] = [250, 234, 13, 123, 213, 156, 19, 236];
 const BONK_SELL_EXACT_IN_DISCRIMINATOR: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
@@ -987,6 +989,8 @@ fn infer_sol_out_min_lamports_from_venue_instruction(instruction: &Instruction) 
         && discriminator == RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR)
         || (program_id == raydium_clmm_program_id()
             && discriminator == RAYDIUM_CLMM_SWAP_V2_DISCRIMINATOR)
+        || (program_id == orca_whirlpool_program_id()
+            && discriminator == ORCA_WHIRLPOOL_SWAP_DISCRIMINATOR)
         || ((program_id == bags_dbc_program_id() || program_id == bags_damm_v2_program_id())
             && discriminator == BAGS_SWAP_DISCRIMINATOR)
     {
@@ -1306,6 +1310,10 @@ fn bonk_launchpad_program_id() -> Pubkey {
 
 fn pump_amm_program_id() -> Pubkey {
     Pubkey::from_str(PUMP_AMM_PROGRAM_ID).expect("Pump AMM program id must be valid")
+}
+
+fn orca_whirlpool_program_id() -> Pubkey {
+    Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID).expect("Orca Whirlpool program id must be valid")
 }
 
 fn bags_dbc_program_id() -> Pubkey {
@@ -1837,6 +1845,22 @@ mod tests {
         assert_eq!(
             infer_sol_out_min_lamports_from_venue_instruction(&raydium_v4_sell),
             Some(3_000_000)
+        );
+
+        let mut orca_sell_data = ORCA_WHIRLPOOL_SWAP_DISCRIMINATOR.to_vec();
+        orca_sell_data.extend_from_slice(&500_000u64.to_le_bytes());
+        orca_sell_data.extend_from_slice(&4_000_000u64.to_le_bytes());
+        orca_sell_data.extend_from_slice(&1u128.to_le_bytes());
+        orca_sell_data.push(1);
+        orca_sell_data.push(0);
+        let orca_sell = Instruction {
+            program_id: orca_whirlpool_program_id(),
+            accounts: vec![],
+            data: orca_sell_data,
+        };
+        assert_eq!(
+            infer_sol_out_min_lamports_from_venue_instruction(&orca_sell),
+            Some(4_000_000)
         );
     }
 

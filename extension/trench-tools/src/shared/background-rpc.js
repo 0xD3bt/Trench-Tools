@@ -16,6 +16,7 @@ function buildExtensionReloadError() {
 
 export async function callBackground(type, payload) {
   let response;
+  const startedAt = Date.now();
   try {
     response = await chrome.runtime.sendMessage({ type, payload });
   } catch (error) {
@@ -23,6 +24,16 @@ export async function callBackground(type, payload) {
       throw buildExtensionReloadError();
     }
     throw error;
+  }
+
+  if (["trench:buy", "trench:sell", "trench:prime-trade-runtime"].includes(type)) {
+    console.debug(
+      "[trench][latency] phase=background-message type=%s clientRequestId=%s reason=%s roundtrip_ms=%s",
+      type,
+      payload?.clientRequestId || "",
+      payload?.reason || "",
+      Date.now() - startedAt
+    );
   }
 
   if (!response?.ok) {

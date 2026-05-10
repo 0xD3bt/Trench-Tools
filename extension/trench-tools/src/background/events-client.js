@@ -10,6 +10,7 @@ import {
   applyServerBalanceEvent,
   applyServerMarkEvent,
   applyServerConnectionState,
+  handleBatchStatusEvent,
   handleTradeEvent,
 } from "./balances-store.js";
 import { applyServerDiagnosticEvent } from "./diagnostics-store.js";
@@ -191,6 +192,9 @@ function dispatchEvent({ event, data }) {
       break;
     case "trade":
       handleTradeEvent(data);
+      break;
+    case "batchStatus":
+      handleBatchStatusEvent(data);
       break;
     case "mark":
       applyServerMarkEvent(data);

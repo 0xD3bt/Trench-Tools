@@ -301,6 +301,13 @@ const hasLegacyPopoutQuery = pageSearchParams.get("popout") === "1";
 const isPopoutMode = window.name === POPOUT_WINDOW_NAME || hasLegacyPopoutQuery;
 const extensionShellConfig = window.__launchdeckExtensionShell || null;
 const isOverlayMode = Boolean(extensionShellConfig && extensionShellConfig.shell === "overlay");
+const TRUSTED_OVERLAY_PARENT_ORIGINS = new Set([
+  "https://axiom.trade",
+  "https://j7tracker.io",
+]);
+const overlayParentOrigin = isOverlayMode
+  ? trustedOverlayParentOrigin(pageSearchParams.get("parentOrigin"))
+  : "";
 const isCreateOverlayMode = Boolean(
   isOverlayMode
   && extensionShellConfig
@@ -351,6 +358,15 @@ const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
   symbolMaxLength: 10,
 });
 const STANDARD_RPC_SLIPPAGE_DEFAULT = "20";
+
+function trustedOverlayParentOrigin(value) {
+  try {
+    const parsed = new URL(String(value || ""));
+    return TRUSTED_OVERLAY_PARENT_ORIGINS.has(parsed.origin) ? parsed.origin : "";
+  } catch (_error) {
+    return "";
+  }
+}
 
 function readEarlyLiveSyncSnapshot() {
   return typeof LiveSyncModule.readEarlyLiveSyncSnapshot === "function"
@@ -5625,11 +5641,12 @@ function openPostDeployUrlWithWindow(url, mode) {
 
 function postPostDeploySuccessToHost(payload) {
   if (!isOverlayMode || window.parent === window) return false;
+  if (!overlayParentOrigin) return false;
   window.parent.postMessage({
     source: CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE,
     type: POST_DEPLOY_MESSAGE_TYPE,
     ...payload,
-  }, "*");
+  }, overlayParentOrigin);
   return true;
 }
 
@@ -6580,12 +6597,15 @@ function postCreateOverlayResize() {
   }
   lastCreateOverlayPostedWidth = size.width;
   lastCreateOverlayPostedHeight = size.height;
+  if (!overlayParentOrigin) {
+    return;
+  }
   window.parent.postMessage({
     source: CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE,
     type: CREATE_OVERLAY_RESIZE_MESSAGE_TYPE,
     width: size.width,
     height: size.height,
-  }, "*");
+  }, overlayParentOrigin);
 }
 
 function getPreferredPopoutLayoutMetrics() {
