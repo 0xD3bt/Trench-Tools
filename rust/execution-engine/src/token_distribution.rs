@@ -26,8 +26,9 @@ use spl_token_2022_interface::{
 use crate::{
     provider_tip::{pick_tip_account_for_provider, provider_required_tip_lamports},
     rpc_client::{
-        CompiledTransaction, configured_rpc_url, confirm_submitted_transactions_for_transport,
-        fetch_account_owner_and_data, fetch_latest_blockhash,
+        CompiledTransaction, SentResult, configured_rpc_url,
+        confirm_submitted_transactions_for_transport, fetch_account_owner_and_data,
+        fetch_latest_blockhash, reconcile_submitted_transaction_statuses_once,
         submit_independent_transactions_for_transport,
     },
     transport::{ExecutionTransportConfig, build_transport_plan},
@@ -497,8 +498,9 @@ async fn execute_planned_transfers(
     let mut warnings = config.warnings.clone();
     let provider = supported_distribution_provider(&config.provider)?;
     let compute_unit_price_micro_lamports = priority_fee_sol_to_micro_lamports(&config.fee_sol)?;
+    let mut compiled_entries = Vec::with_capacity(planned.len());
+    let (blockhash, _) = fetch_latest_blockhash(&rpc_url, &config.commitment).await?;
     for (index, transfer) in planned.into_iter().enumerate() {
-        let (blockhash, _) = fetch_latest_blockhash(&rpc_url, &config.commitment).await?;
         let compiled_transaction = compile_transfer_transaction(
             index,
             &metadata,
@@ -509,81 +511,111 @@ async fn execute_planned_transfers(
             &config.tip_sol,
             compute_unit_price_micro_lamports,
         )?;
-        let transport_plan = build_transport_plan(
-            &ExecutionTransportConfig {
-                provider: provider.clone(),
-                endpoint_profile: config.endpoint_profile.clone(),
-                commitment: config.commitment.clone(),
-                skip_preflight: config.skip_preflight,
-                track_send_block_height: config.track_send_block_height,
-                mev_mode: config.mev_mode.clone(),
-                mev_protect: !config.mev_mode.trim().eq_ignore_ascii_case("off"),
-            },
-            1,
-        );
-        let submit_result = submit_independent_transactions_for_transport(
-            &rpc_url,
-            &transport_plan,
-            std::slice::from_ref(&compiled_transaction),
-        )
-        .await;
-        let (signature, error) = match submit_result {
-            Ok((mut submitted, submit_warnings, submit_ms)) => {
-                warnings.extend(submit_warnings);
-                let confirm_result = confirm_submitted_transactions_for_transport(
-                    &rpc_url,
-                    &transport_plan,
-                    &mut submitted,
-                )
-                .await;
-                match confirm_result {
-                    Ok((confirm_warnings, confirm_ms)) => {
-                        warnings.extend(confirm_warnings);
-                        eprintln!(
-                            "[execution-engine][token-distribution] action={action} source={} destination={} submit_ms={submit_ms} confirm_ms={confirm_ms}",
-                            transfer.source_wallet_key, transfer.destination_wallet_key
-                        );
-                        let result = submitted.into_iter().next();
-                        let signature = result.as_ref().and_then(|entry| entry.signature.clone());
-                        let error = result.and_then(|entry| {
-                            if entry.confirmation_status.as_deref() == Some("failed") {
-                                entry.error.or_else(|| {
-                                    Some("Token transfer failed during confirmation.".to_string())
-                                })
-                            } else if entry.signature.is_none() {
-                                Some("Transport did not return a transfer signature.".to_string())
-                            } else {
-                                entry.error
-                            }
-                        });
-                        (signature, error)
-                    }
-                    Err(error) => {
-                        let signature = submitted
-                            .first()
-                            .and_then(|entry| entry.signature.clone())
-                            .or_else(|| compiled_transaction.signature.clone());
-                        (signature, Some(error))
+        compiled_entries.push((transfer, compiled_transaction));
+    }
+
+    let transport_plan = build_transport_plan(
+        &ExecutionTransportConfig {
+            provider: provider.clone(),
+            endpoint_profile: config.endpoint_profile.clone(),
+            commitment: config.commitment.clone(),
+            skip_preflight: config.skip_preflight,
+            track_send_block_height: config.track_send_block_height,
+            mev_mode: config.mev_mode.clone(),
+            mev_protect: !config.mev_mode.trim().eq_ignore_ascii_case("off"),
+        },
+        compiled_entries.len(),
+    );
+    let compiled_transactions = compiled_entries
+        .iter()
+        .map(|(_, transaction)| transaction.clone())
+        .collect::<Vec<_>>();
+    let submit_result = submit_independent_transactions_for_transport(
+        &rpc_url,
+        &transport_plan,
+        &compiled_transactions,
+    )
+    .await;
+    let submitted_results = match submit_result {
+        Ok((mut submitted, submit_warnings, submit_ms)) => {
+            warnings.extend(submit_warnings);
+            let confirm_result = confirm_submitted_transactions_for_transport(
+                &rpc_url,
+                &transport_plan,
+                &mut submitted,
+            )
+            .await;
+            match confirm_result {
+                Ok((confirm_warnings, confirm_ms)) => {
+                    warnings.extend(confirm_warnings);
+                    eprintln!(
+                        "[execution-engine][token-distribution] action={action} transfers={} submit_ms={submit_ms} confirm_ms={confirm_ms}",
+                        submitted.len()
+                    );
+                    submitted
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "Token distribution batch confirmation returned an error; reconciling submitted signatures with RPC: {error}"
+                    ));
+                    match reconcile_submitted_transaction_statuses_once(
+                        &rpc_url,
+                        &mut submitted,
+                        &config.commitment,
+                    )
+                    .await
+                    {
+                        Ok((reconcile_warnings, reconcile_ms)) => {
+                            warnings.extend(reconcile_warnings);
+                            eprintln!(
+                                "[execution-engine][token-distribution] action={action} transfers={} submit_ms={submit_ms} reconcile_ms={reconcile_ms}",
+                                submitted.len()
+                            );
+                            submitted
+                        }
+                        Err(reconcile_error) => {
+                            return Err(format!(
+                                "Token distribution batch confirmation failed: {error}; reconciliation failed: {reconcile_error}"
+                            ));
+                        }
                     }
                 }
             }
-            Err(error) => (compiled_transaction.signature.clone(), Some(error)),
-        };
-        let failed = error.is_some() || signature.is_none();
-        if failed {
-            failed_count += 1;
-        } else {
-            confirmed_count += 1;
         }
-        results.push(TokenDistributionTransferResult {
-            source_wallet_key: transfer.source_wallet_key,
-            destination_wallet_key: transfer.destination_wallet_key,
-            amount_raw: transfer.amount_raw,
-            amount_ui: transfer.amount_raw as f64 / scale,
+        Err(error) => compiled_transactions
+            .iter()
+            .map(|transaction| crate::rpc_client::SentResult {
+                label: transaction.label.clone(),
+                format: transaction.format.clone(),
+                signature: transaction.signature.clone(),
+                transport_type: transport_plan.transport_type.clone(),
+                endpoint: None,
+                attempted_endpoints: Vec::new(),
+                skip_preflight: config.skip_preflight,
+                max_retries: 0,
+                confirmation_status: None,
+                error: Some(error.clone()),
+                bundle_id: None,
+                attempted_bundle_ids: Vec::new(),
+                transaction_subscribe_account_required: Vec::new(),
+            })
+            .collect(),
+    };
+
+    for (index, (transfer, compiled_transaction)) in compiled_entries.into_iter().enumerate() {
+        let submitted = submitted_results.get(index);
+        let (signature, error) =
+            submitted_transfer_outcome(submitted, compiled_transaction.signature.clone());
+        let amount_ui = transfer.amount_raw as f64 / scale;
+        push_transfer_result(
+            &mut results,
+            &mut confirmed_count,
+            &mut failed_count,
+            transfer,
+            amount_ui,
             signature,
-            status: if failed { "failed" } else { "confirmed" }.to_string(),
             error,
-        });
+        );
     }
 
     Ok(TokenDistributionResponse {
@@ -597,6 +629,60 @@ async fn execute_planned_transfers(
         transfers: results,
         warnings,
     })
+}
+
+fn submitted_transfer_outcome(
+    submitted: Option<&SentResult>,
+    fallback_signature: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let signature = submitted
+        .and_then(|entry| entry.signature.clone())
+        .or(fallback_signature);
+    let error = submitted
+        .cloned()
+        .and_then(|entry| {
+            if entry.confirmation_status.as_deref() == Some("failed") {
+                entry
+                    .error
+                    .or_else(|| Some("Token transfer failed during confirmation.".to_string()))
+            } else if entry.signature.is_none() {
+                Some("Transport did not return a transfer signature.".to_string())
+            } else {
+                entry.error
+            }
+        })
+        .or_else(|| {
+            submitted
+                .is_none()
+                .then(|| "Transport did not return a result for this token transfer.".to_string())
+        });
+    (signature, error)
+}
+
+fn push_transfer_result(
+    results: &mut Vec<TokenDistributionTransferResult>,
+    confirmed_count: &mut usize,
+    failed_count: &mut usize,
+    transfer: PlannedTokenTransfer,
+    amount_ui: f64,
+    signature: Option<String>,
+    error: Option<String>,
+) {
+    let failed = error.is_some() || signature.is_none();
+    if failed {
+        *failed_count += 1;
+    } else {
+        *confirmed_count += 1;
+    }
+    results.push(TokenDistributionTransferResult {
+        source_wallet_key: transfer.source_wallet_key,
+        destination_wallet_key: transfer.destination_wallet_key,
+        amount_raw: transfer.amount_raw,
+        amount_ui,
+        signature,
+        status: if failed { "failed" } else { "confirmed" }.to_string(),
+        error,
+    });
 }
 
 fn compile_transfer_transaction(

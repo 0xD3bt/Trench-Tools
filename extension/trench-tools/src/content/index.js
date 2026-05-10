@@ -63,12 +63,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     LOWERED: "50"
   };
   const AXIOM_PANEL_LAYER_OVERLAY_SELECTOR = [
-    '[class*="fixed"][class*="z-[100]"]',
-    '[class*="fixed"][class*="z-[199]"]',
-    '[class*="fixed"][class*="z-[200]"]',
     '[class*="fixed"][class*="z-[9999]"]',
-    ".fixed.z-\\[100\\]",
-    ".fixed.z-\\[200\\]",
     ".fixed.z-\\[9999\\]",
     '[class*="z-[9999]"][style*="position: fixed"]',
     '[data-popper-placement]:not([style*="visibility: hidden"])',
@@ -1159,6 +1154,44 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     return isZeroTokenBalanceMessage(normalizeErrorMessageForDisplay(errorOrMessage));
   }
 
+  function balanceGateFailureReason(errorOrMessage) {
+    const message = normalizeErrorMessageForDisplay(errorOrMessage);
+    if (/^Insufficient SOL balance for buy amount\.?$/i.test(message)) {
+      return "Insufficient SOL balance for buy amount";
+    }
+    if (/^Insufficient token balance for sell amount\.?$/i.test(message)) {
+      return "Insufficient token balance for sell amount";
+    }
+    return "";
+  }
+
+  function balanceGateFailureToastTitle(reason, count) {
+    const walletLabel = count === 1 ? "wallet" : "wallets";
+    return `Transactions failed to send: ${reason} (${count} ${walletLabel})`;
+  }
+
+  function balanceGateFailureSummary(wallets) {
+    const failedWallets = (Array.isArray(wallets) ? wallets : []).filter((walletState) => {
+      return String(walletState?.status || "").trim().toLowerCase() === "failed";
+    });
+    const balanceFailures = failedWallets
+      .map((walletState) => balanceGateFailureReason(walletState?.error))
+      .filter(Boolean);
+    if (balanceFailures.length === 0) {
+      return null;
+    }
+    const reason = balanceFailures[0];
+    const allSameReason = balanceFailures.every((value) => value === reason);
+    if (!allSameReason || balanceFailures.length !== failedWallets.length) {
+      return null;
+    }
+    return {
+      reason,
+      count: balanceFailures.length,
+      title: balanceGateFailureToastTitle(reason, balanceFailures.length),
+    };
+  }
+
   function buildErrorToastCopy(errorOrMessage, options = {}) {
     const normalizedSide = String(options.side || "").trim().toLowerCase();
     const fallbackTitle = normalizedSide ? `${capitalize(normalizedSide)} failed` : "Request failed";
@@ -2160,8 +2193,11 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     let applicable = false;
     let changed = false;
     const wallets = walletStatus.wallets.map((wallet) => {
-      const walletKey = String(wallet?.key || wallet?.envKey || "").trim();
-      const entry = entryByWalletKey.get(walletKey);
+      const walletKeys = Array.from(new Set([
+        String(wallet?.key || "").trim(),
+        String(wallet?.envKey || "").trim()
+      ].filter(Boolean)));
+      const entry = walletKeys.map((key) => entryByWalletKey.get(key)).find(Boolean);
       if (!entry) {
         return wallet;
       }
@@ -2224,6 +2260,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       usd1Balance,
     };
     pushPanelState();
+    notifyPlatformWalletStatusChange();
     syncActiveMarkSubscription();
     return true;
   }
@@ -2246,44 +2283,86 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const tokenBalanceEntries = Array.isArray(diff?.tokenBalanceEntries)
       ? diff.tokenBalanceEntries
       : [];
+    const numberFieldOrNull = (value) => (
+      typeof value === "number" && Number.isFinite(value) ? value : null
+    );
     const entriesForMint = tokenBalanceEntries
       .map((entry) => ({
         envKey: String(entry?.envKey || "").trim(),
         mint: String(entry?.mint || "").trim(),
-        tokenBalance: Number(entry?.tokenBalance),
+        tokenBalance: numberFieldOrNull(entry?.tokenBalance),
+        tokenBalanceRaw: numberFieldOrNull(entry?.tokenBalanceRaw),
+        tokenDecimals: Number.isInteger(entry?.tokenDecimals) && entry.tokenDecimals >= 0
+          ? entry.tokenDecimals
+          : null,
       }))
-      .filter((entry) => entry.envKey && entry.mint === currentMint && Number.isFinite(entry.tokenBalance));
+      .filter((entry) => (
+        entry.envKey &&
+        entry.mint === currentMint &&
+        (
+          entry.tokenBalance != null ||
+          entry.tokenBalanceRaw != null ||
+          entry.tokenDecimals != null
+        )
+      ));
     if (entriesForMint.length === 0) {
       return false;
     }
-    const balanceByWalletKey = new Map(entriesForMint.map((entry) => [entry.envKey, entry.tokenBalance]));
+    const balanceByWalletKey = new Map(entriesForMint.map((entry) => [entry.envKey, entry]));
     let changed = false;
     const wallets = walletStatus.wallets.map((wallet) => {
-      const walletKey = String(wallet?.key || wallet?.envKey || "").trim();
-      if (!balanceByWalletKey.has(walletKey)) {
+      const walletKeys = Array.from(new Set([
+        String(wallet?.key || "").trim(),
+        String(wallet?.envKey || "").trim()
+      ].filter(Boolean)));
+      const entry = walletKeys.map((key) => balanceByWalletKey.get(key)).find(Boolean);
+      if (!entry) {
         return wallet;
       }
-      const nextTokenBalance = balanceByWalletKey.get(walletKey);
+      const nextTokenBalance = entry.tokenBalance;
+      const nextTokenBalanceRaw = entry.tokenBalanceRaw;
+      const nextTokenDecimals = entry.tokenDecimals;
       const prevComparable = Number(
         wallet?.mintBalanceUi ??
         wallet?.mintBalance ??
         wallet?.tokenBalance ??
         wallet?.holdingAmount
       );
-      if (Number.isFinite(prevComparable) && prevComparable === nextTokenBalance) {
+      const prevRaw = Number(wallet?.mintBalanceRaw ?? wallet?.tokenBalanceRaw);
+      const prevDecimals = Number(wallet?.tokenDecimals ?? wallet?.mintDecimals);
+      const uiUnchanged = nextTokenBalance == null ||
+        (Number.isFinite(prevComparable) && prevComparable === nextTokenBalance);
+      const rawUnchanged = nextTokenBalanceRaw == null ||
+        (Number.isFinite(prevRaw) && prevRaw === nextTokenBalanceRaw);
+      const decimalsUnchanged = nextTokenDecimals == null ||
+        (Number.isInteger(prevDecimals) && prevDecimals === nextTokenDecimals);
+      if (uiUnchanged && rawUnchanged && decimalsUnchanged) {
         return wallet;
       }
       changed = true;
-      return {
+      const nextWallet = {
         ...wallet,
         mint: currentMint,
-        mintBalanceRaw: nextTokenBalance > 0 ? null : 0,
-        mintBalance: nextTokenBalance,
-        mintBalanceUi: nextTokenBalance,
-        tokenBalanceRaw: nextTokenBalance > 0 ? null : 0,
-        tokenBalance: nextTokenBalance,
-        holdingAmount: nextTokenBalance,
       };
+      if (nextTokenBalance != null) {
+        nextWallet.mintBalance = nextTokenBalance;
+        nextWallet.mintBalanceUi = nextTokenBalance;
+        nextWallet.tokenBalance = nextTokenBalance;
+        nextWallet.holdingAmount = nextTokenBalance;
+        if (nextTokenBalance === 0 && nextTokenBalanceRaw == null) {
+          nextWallet.mintBalanceRaw = 0;
+          nextWallet.tokenBalanceRaw = 0;
+        }
+      }
+      if (nextTokenBalanceRaw != null) {
+        nextWallet.mintBalanceRaw = nextTokenBalanceRaw;
+        nextWallet.tokenBalanceRaw = nextTokenBalanceRaw;
+      }
+      if (nextTokenDecimals != null) {
+        nextWallet.mintDecimals = nextTokenDecimals;
+        nextWallet.tokenDecimals = nextTokenDecimals;
+      }
+      return nextWallet;
     });
     if (!changed) {
       return true;
@@ -2306,18 +2385,42 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       );
       return sum + (Number.isFinite(tokenBalance) ? tokenBalance : 0);
     }, 0);
+    const selectedMintUiKnown = selectedWallets.some((wallet) => {
+      const tokenBalance = Number(
+        wallet?.mintBalanceUi ??
+        wallet?.mintBalance ??
+        wallet?.tokenBalance ??
+        wallet?.holdingAmount
+      );
+      return Number.isFinite(tokenBalance);
+    });
+    const aggregateMintRaw = selectedWallets.reduce((sum, wallet) => {
+      const raw = Number(wallet?.mintBalanceRaw ?? wallet?.tokenBalanceRaw);
+      return sum + (Number.isFinite(raw) ? raw : 0);
+    }, 0);
+    const selectedMintRawKnown = selectedWallets.some((wallet) => {
+      const raw = Number(wallet?.mintBalanceRaw ?? wallet?.tokenBalanceRaw);
+      return Number.isFinite(raw);
+    });
+    const aggregateMintDecimals = selectedWallets
+      .map((wallet) => Number(wallet?.tokenDecimals ?? wallet?.mintDecimals))
+      .find((decimals) => Number.isInteger(decimals) && decimals >= 0);
     const previousAmount = Number(walletStatus.holdingAmount ?? walletStatus.tokenBalance ?? walletStatus.mintBalanceUi);
     const previousHoldingValueSol = Number(walletStatus.holdingValueSol);
-    const holdingValueSol = aggregateMintUi === 0
-      ? 0
-      : (
-        Number.isFinite(previousAmount) &&
-        previousAmount === aggregateMintUi &&
-        Number.isFinite(previousHoldingValueSol)
-          ? previousHoldingValueSol
-          : null
-      );
-    const shouldRefreshQuote = aggregateMintUi > 0 && holdingValueSol == null;
+    const holdingValueSol = selectedMintUiKnown
+      ? (
+        aggregateMintUi === 0
+          ? 0
+          : (
+            Number.isFinite(previousAmount) &&
+            previousAmount === aggregateMintUi &&
+            Number.isFinite(previousHoldingValueSol)
+              ? previousHoldingValueSol
+              : null
+          )
+      )
+      : walletStatus.holdingValueSol;
+    const shouldRefreshQuote = selectedMintUiKnown && aggregateMintUi > 0 && holdingValueSol == null;
     const trackedBoughtSol = Number(walletStatus.trackedBoughtSol);
     const remainingCostBasisSol = Number(walletStatus.remainingCostBasisSol);
     const explicitFeeTotalSol = Number(walletStatus.explicitFeeTotalSol);
@@ -2350,12 +2453,14 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       ...walletStatus,
       mint: currentMint,
       wallets,
-      mintBalance: aggregateMintUi,
-      mintBalanceUi: aggregateMintUi,
-      mintBalanceRaw: aggregateMintUi > 0 ? null : 0,
-      tokenBalance: aggregateMintUi,
-      tokenBalanceRaw: aggregateMintUi > 0 ? null : 0,
-      holdingAmount: aggregateMintUi,
+      mintBalance: selectedMintUiKnown ? aggregateMintUi : walletStatus.mintBalance,
+      mintBalanceUi: selectedMintUiKnown ? aggregateMintUi : walletStatus.mintBalanceUi,
+      mintBalanceRaw: selectedMintRawKnown ? aggregateMintRaw : walletStatus.mintBalanceRaw,
+      tokenBalance: selectedMintUiKnown ? aggregateMintUi : walletStatus.tokenBalance,
+      tokenBalanceRaw: selectedMintRawKnown ? aggregateMintRaw : walletStatus.tokenBalanceRaw,
+      tokenDecimals: Number.isInteger(aggregateMintDecimals) ? aggregateMintDecimals : walletStatus.tokenDecimals,
+      mintDecimals: Number.isInteger(aggregateMintDecimals) ? aggregateMintDecimals : walletStatus.mintDecimals,
+      holdingAmount: selectedMintUiKnown ? aggregateMintUi : walletStatus.holdingAmount,
       holdingValueSol,
       holding: holdingValueSol,
       unrealizedPnlGrossSol: nextUnrealizedPnlGrossSol,
@@ -2365,9 +2470,12 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       pnlPercentGross: nextPnlPercentGross,
       pnlPercentNet: nextPnlPercentNet,
       pnlRequiresQuote:
-        aggregateMintUi > 0 && (shouldRefreshQuote || walletStatus.pnlRequiresQuote === true),
+        selectedMintUiKnown
+          ? aggregateMintUi > 0 && (shouldRefreshQuote || walletStatus.pnlRequiresQuote === true)
+          : walletStatus.pnlRequiresQuote,
     };
     pushPanelState();
+    notifyPlatformWalletStatusChange();
     syncActiveMarkSubscription();
     syncWalletStatusQuoteRefresh();
     if (shouldRefreshQuote) {
@@ -2449,6 +2557,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       pnlRequiresQuote: false,
     };
     pushPanelState();
+    notifyPlatformWalletStatusChange();
     return true;
   }
 
@@ -2532,6 +2641,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       state.walletStatus = nextWalletStatus;
       state.hostError = "";
       pushPanelState();
+      notifyPlatformWalletStatusChange();
       syncActiveMarkSubscription();
       syncWalletStatusQuoteRefresh();
       return state.walletStatus;
@@ -3972,18 +4082,12 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         normalizedAction === "split" ? "trench:token-split" : "trench:token-consolidate",
         request
       );
-      const confirmedCount = Number(result?.confirmedCount || 0);
-      if (Number.isFinite(confirmedCount) && confirmedCount > 0) {
-        scheduleWalletStatusRefresh({ force: true, tokenContext, delayMs: 250 });
-      }
+      await refreshPanelWalletStatus({ tokenContext, force: true }).catch(() => null);
       const failedCount = Number(result?.failedCount || 0);
       if (Number.isFinite(failedCount) && failedCount > 0) {
         throw new Error(summarizeTokenDistributionFailure(result, failureMessage));
       }
       showToast(completeToast, "info");
-      if (!Number.isFinite(confirmedCount) || confirmedCount <= 0) {
-        scheduleWalletStatusRefresh({ force: true, tokenContext, delayMs: 250 });
-      }
     } catch (error) {
       state.hostError = isHostAvailabilityError(error) ? userFacingErrorMessage(error) : "";
       surfaceUserFacingError(error, { pushToPanel: true });
@@ -4420,6 +4524,16 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
 
     if (normalizedStatus === "failed") {
+      const balanceGateReason = balanceGateFailureReason(error);
+      if (balanceGateReason) {
+        return {
+          id: `execution-balance-gate-${batchStatus?.batchId || fallback.id}-${walletState?.walletKey || "wallet"}`,
+          title: balanceGateFailureToastTitle(balanceGateReason, 1),
+          detail: "",
+          kind: "error",
+          ttlMs: 3500
+        };
+      }
       const toastCopy = buildErrorToastCopy(error, { side: normalizedSide });
       return {
         id: `execution-${batchStatus?.batchId || fallback.id}-${walletState?.walletKey || "wallet"}`,
@@ -4462,6 +4576,16 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       toastIdOverride || `execution-batch-${batchStatus?.batchId || fallback.id || "batch"}`
     ).trim();
     const zeroBalanceFailures = zeroTokenBalanceFailureCount(wallets);
+    const balanceGateFailures = balanceGateFailureSummary(wallets);
+
+    if (balanceGateFailures && failedWallets === totalWallets && pendingWallets === 0) {
+      return {
+        id: toastId,
+        title: balanceGateFailures.title,
+        kind: "error",
+        ttlMs: 3500
+      };
+    }
 
     if (normalizedSide === "sell" && zeroBalanceFailures > 1 && pendingWallets === 0) {
       return {
@@ -4518,6 +4642,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     );
     if (totalWallets > 1) {
       const zeroBalanceFailures = zeroTokenBalanceFailureCount(wallets);
+      const balanceGateFailures = balanceGateFailureSummary(wallets);
       renderToast(
         batchExecutionToastPayload(
           batchStatus,
@@ -4525,13 +4650,28 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           batchToastIdForBatch(batchId, localPending)
         )
       );
+      if (
+        balanceGateFailures &&
+        !(Number(batchStatus?.summary?.failedWallets || 0) === totalWallets && pendingWallets === 0)
+      ) {
+        renderToast({
+          id: `execution-balance-gate-${batchId || fallback?.id || "batch"}`,
+          title: balanceGateFailures.title,
+          kind: "error",
+          ttlMs: 3500
+        });
+      }
       if (pendingWallets === 0 && localPending) {
         releaseLocalExecutionPendingTracking({ clientRequestId: localPending.clientRequestId });
       }
       wallets
         .filter((walletState) => {
           const isFailed = String(walletState?.status || "").trim().toLowerCase() === "failed";
-          return isFailed && (zeroBalanceFailures <= 1 || !isZeroTokenBalanceError(walletState?.error));
+          const isGroupedBalanceGateFailure =
+            balanceGateFailures && balanceGateFailureReason(walletState?.error) === balanceGateFailures.reason;
+          return isFailed &&
+            !isGroupedBalanceGateFailure &&
+            (zeroBalanceFailures <= 1 || !isZeroTokenBalanceError(walletState?.error));
         })
         .forEach((walletState) => {
           renderToast(executionToastPayloadForWallet(batchStatus, walletState, fallback));
@@ -5981,6 +6121,18 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         PANEL_ORIGIN
       );
     });
+  }
+
+  function notifyPlatformWalletStatusChange() {
+    try {
+      getPlatformAdapter()?.handleWalletStatusChange?.();
+    } catch (error) {
+      if (isExtensionReloadedError(error)) {
+        scheduleExtensionReloadFallbackToast();
+        return;
+      }
+      console.error("Trench Tools wallet-status platform refresh failed", error);
+    }
   }
 
   function pushPanelPreview() {

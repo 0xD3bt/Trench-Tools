@@ -17,6 +17,8 @@ const LAST_TRADE_EVENT_KEY = "trenchTools.lastTradeEvent";
 const STORE = {
   balances: new Map(),
   tokenBalances: new Map(),
+  tokenBalanceRaws: new Map(),
+  tokenDecimals: new Map(),
   balanceSlots: new Map(),
   tokenSlots: new Map(),
   markRevisions: new Map(),
@@ -108,6 +110,15 @@ function tokenBalanceFromRow(row) {
   );
 }
 
+function tokenBalanceRawFromRow(row) {
+  return numberOrNull(row?.tokenBalanceRaw ?? row?.mintBalanceRaw);
+}
+
+function tokenDecimalsFromRow(row) {
+  const decimals = row?.tokenDecimals ?? row?.mintDecimals;
+  return Number.isInteger(decimals) && decimals >= 0 ? decimals : null;
+}
+
 function walletBalanceDiffEntry(envKey, entry) {
   const diff = { envKey };
   if (entry?.balanceSol != null) diff.balanceSol = entry.balanceSol;
@@ -183,6 +194,8 @@ export function applyServerSnapshot(snapshot) {
   }
   STORE.balances = nextMap;
   STORE.tokenBalances.clear();
+  STORE.tokenBalanceRaws.clear();
+  STORE.tokenDecimals.clear();
   STORE.balanceSlots.clear();
   STORE.tokenSlots.clear();
   STORE.markRevisions.clear();
@@ -207,6 +220,8 @@ export function applyServerBalanceEvent(event) {
   if (!envKey) return;
   const tokenMint = typeof event.tokenMint === "string" ? event.tokenMint.trim() : "";
   const tokenBalance = numberOrNull(event.tokenBalance);
+  const tokenBalanceRaw = numberOrNull(event.tokenBalanceRaw);
+  const tokenDecimals = tokenDecimalsFromRow(event);
   const eventSlot = slotOrNull(event.slot);
   const eventCommitment = typeof event.commitment === "string" ? event.commitment : null;
   const eventSource = typeof event.source === "string" ? event.source : null;
@@ -223,14 +238,29 @@ export function applyServerBalanceEvent(event) {
     shouldApplySlot(STORE.balanceSlots, balanceSlotKey(envKey, "usd1"), eventSlot);
   const tokenSlotOk =
     !tokenMint ||
-    tokenBalance == null ||
+    (tokenBalance == null && tokenBalanceRaw == null && tokenDecimals == null) ||
     shouldApplySlot(STORE.tokenSlots, tokenBalanceKey(envKey, tokenMint), eventSlot);
+  const balanceKey = tokenBalanceKey(envKey, tokenMint);
   const previousTokenBalance =
     tokenMint && tokenBalance != null && tokenSlotOk
-      ? STORE.tokenBalances.get(tokenBalanceKey(envKey, tokenMint))
+      ? STORE.tokenBalances.get(balanceKey)
+      : undefined;
+  const previousTokenBalanceRaw =
+    tokenMint && tokenBalanceRaw != null && tokenSlotOk
+      ? STORE.tokenBalanceRaws.get(balanceKey)
+      : undefined;
+  const previousTokenDecimals =
+    tokenMint && tokenDecimals != null && tokenSlotOk
+      ? STORE.tokenDecimals.get(balanceKey)
       : undefined;
   const tokenChanged =
-    tokenMint && tokenBalance != null && tokenSlotOk && previousTokenBalance !== tokenBalance;
+    tokenMint &&
+    tokenSlotOk &&
+    (
+      (tokenBalance != null && previousTokenBalance !== tokenBalance) ||
+      (tokenBalanceRaw != null && previousTokenBalanceRaw !== tokenBalanceRaw) ||
+      (tokenDecimals != null && previousTokenDecimals !== tokenDecimals)
+    );
   const hasAppliedBalanceField =
     (solSlotOk && hasSolUpdate) || (usd1SlotOk && usd1Balance != null);
   const partial = {
@@ -259,7 +289,13 @@ export function applyServerBalanceEvent(event) {
     return;
   }
   if (tokenMint && tokenBalance != null && tokenSlotOk) {
-    STORE.tokenBalances.set(tokenBalanceKey(envKey, tokenMint), tokenBalance);
+    STORE.tokenBalances.set(balanceKey, tokenBalance);
+  }
+  if (tokenMint && tokenBalanceRaw != null && tokenSlotOk) {
+    STORE.tokenBalanceRaws.set(balanceKey, tokenBalanceRaw);
+  }
+  if (tokenMint && tokenDecimals != null && tokenSlotOk) {
+    STORE.tokenDecimals.set(balanceKey, tokenDecimals);
   }
   STORE.balances.set(envKey, next);
   broadcastUpdated({
@@ -271,6 +307,8 @@ export function applyServerBalanceEvent(event) {
             envKey,
             mint: tokenMint,
             tokenBalance,
+            tokenBalanceRaw,
+            tokenDecimals,
             commitment: eventCommitment,
             source: eventSource,
             slot: eventSlot,
@@ -393,12 +431,20 @@ export function hydrateFromWalletStatus(response) {
     }
     const mint = typeof wallet?.mint === "string" ? wallet.mint.trim() : "";
     const tokenBalance = tokenBalanceFromRow(wallet);
-    if (mint && tokenBalance != null) {
+    const tokenBalanceRaw = tokenBalanceRawFromRow(wallet);
+    const tokenDecimals = tokenDecimalsFromRow(wallet);
+    if (mint && (tokenBalance != null || tokenBalanceRaw != null || tokenDecimals != null)) {
       const balanceKey = tokenBalanceKey(key, mint);
-      if (STORE.tokenBalances.get(balanceKey) !== tokenBalance) {
-        STORE.tokenBalances.set(balanceKey, tokenBalance);
+      const changed =
+        (tokenBalance != null && STORE.tokenBalances.get(balanceKey) !== tokenBalance) ||
+        (tokenBalanceRaw != null && STORE.tokenBalanceRaws.get(balanceKey) !== tokenBalanceRaw) ||
+        (tokenDecimals != null && STORE.tokenDecimals.get(balanceKey) !== tokenDecimals);
+      if (changed) {
+        if (tokenBalance != null) STORE.tokenBalances.set(balanceKey, tokenBalance);
+        if (tokenBalanceRaw != null) STORE.tokenBalanceRaws.set(balanceKey, tokenBalanceRaw);
+        if (tokenDecimals != null) STORE.tokenDecimals.set(balanceKey, tokenDecimals);
         changedMints.add(mint);
-        tokenBalanceEntries.push({ envKey: key, mint, tokenBalance });
+        tokenBalanceEntries.push({ envKey: key, mint, tokenBalance, tokenBalanceRaw, tokenDecimals });
         if (!changedKeys.includes(key)) {
           changedKeys.push(key);
         }
@@ -439,12 +485,20 @@ async function runFetch({ force }) {
       }
       const mint = typeof wallet?.mint === "string" ? wallet.mint.trim() : "";
       const tokenBalance = tokenBalanceFromRow(wallet);
-      if (mint && tokenBalance != null) {
+      const tokenBalanceRaw = tokenBalanceRawFromRow(wallet);
+      const tokenDecimals = tokenDecimalsFromRow(wallet);
+      if (mint && (tokenBalance != null || tokenBalanceRaw != null || tokenDecimals != null)) {
         const balanceKey = tokenBalanceKey(key, mint);
-        if (STORE.tokenBalances.get(balanceKey) !== tokenBalance) {
-          STORE.tokenBalances.set(balanceKey, tokenBalance);
+        const changed =
+          (tokenBalance != null && STORE.tokenBalances.get(balanceKey) !== tokenBalance) ||
+          (tokenBalanceRaw != null && STORE.tokenBalanceRaws.get(balanceKey) !== tokenBalanceRaw) ||
+          (tokenDecimals != null && STORE.tokenDecimals.get(balanceKey) !== tokenDecimals);
+        if (changed) {
+          if (tokenBalance != null) STORE.tokenBalances.set(balanceKey, tokenBalance);
+          if (tokenBalanceRaw != null) STORE.tokenBalanceRaws.set(balanceKey, tokenBalanceRaw);
+          if (tokenDecimals != null) STORE.tokenDecimals.set(balanceKey, tokenDecimals);
           changedMints.add(mint);
-          tokenBalanceEntries.push({ envKey: key, mint, tokenBalance });
+          tokenBalanceEntries.push({ envKey: key, mint, tokenBalance, tokenBalanceRaw, tokenDecimals });
           if (!changedKeys.includes(key)) {
             changedKeys.push(key);
           }

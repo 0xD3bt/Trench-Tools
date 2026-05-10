@@ -145,6 +145,10 @@ pub struct BalanceEventPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_balance: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_balance_raw: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_decimals: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub commitment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -396,6 +400,10 @@ impl BalanceStreamHandle {
 
     pub fn publish_trade_event(&self, payload: TradeEventPayload) {
         let _ = self.inner.event_tx.send(StreamEvent::Trade(payload));
+    }
+
+    pub fn publish_balance_event(&self, payload: BalanceEventPayload) {
+        let _ = self.inner.event_tx.send(StreamEvent::Balance(payload));
     }
 
     pub fn publish_mark_event(&self, payload: MarkEventPayload) {
@@ -1228,6 +1236,8 @@ async fn seed_initial_snapshot(
             usd1_balance: status.usd1Balance,
             token_mint: None,
             token_balance: None,
+            token_balance_raw: None,
+            token_decimals: None,
             commitment: Some(ACCOUNTING_COMMITMENT.to_string()),
             source: Some("walletStatusSnapshot".to_string()),
             slot: None,
@@ -1915,6 +1925,8 @@ async fn handle_account_notification(
                 usd1_balance: None,
                 token_mint: None,
                 token_balance: None,
+                token_balance_raw: None,
+                token_decimals: None,
                 commitment: Some(state.account_commitment.clone()),
                 source: Some("accountSubscribe".to_string()),
                 slot,
@@ -1935,6 +1947,8 @@ async fn handle_account_notification(
                     usd1_balance: Some(amount),
                     token_mint: None,
                     token_balance: None,
+                    token_balance_raw: None,
+                    token_decimals: None,
                     commitment: Some(state.account_commitment.clone()),
                     source: Some("accountSubscribe".to_string()),
                     slot,
@@ -1955,6 +1969,8 @@ async fn handle_account_notification(
                     usd1_balance: None,
                     token_mint: Some(mint),
                     token_balance: Some(amount),
+                    token_balance_raw: None,
+                    token_decimals: None,
                     commitment: Some(state.account_commitment.clone()),
                     source: Some("accountSubscribe".to_string()),
                     slot,
@@ -2398,6 +2414,8 @@ mod tests {
             usd1_balance: None,
             token_mint: None,
             token_balance: None,
+            token_balance_raw: None,
+            token_decimals: None,
             commitment: Some("processed".to_string()),
             source: Some("accountSubscribe".to_string()),
             slot: Some(123),

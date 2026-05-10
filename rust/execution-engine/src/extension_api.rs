@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use shared_extension_runtime::{
     balance_stream::{
-        BalanceStreamHandle, DiagnosticEventPayload, MarkEventPayload,
+        BalanceEventPayload, BalanceStreamHandle, DiagnosticEventPayload, MarkEventPayload,
         StreamConfig as BalanceStreamConfig, StreamEvent, TradeEventPayload,
         spawn as spawn_balance_stream,
     },
@@ -127,7 +127,13 @@ const CANONICAL_CONFIG_VERSION: &str = "v1";
 const MAX_TRANSACTION_DELAY_MS: u64 = 2_000;
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLCsAEpksdQSJNy2C";
 const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
+const TRADE_BALANCE_GATE_TIMEOUT_MS: u64 = 100;
+const TRADE_BALANCE_GATE_FRONTEND_REFRESH_WALLET_LIMIT: usize = 50;
+const TRADE_BALANCE_GATE_SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
+const TRADE_BALANCE_GATE_FIXED_BUY_BUFFER_LAMPORTS: u64 = 10_000;
+const TRADE_BALANCE_GATE_FIRST_BUY_RENT_BUFFER_LAMPORTS: u64 = 2_100_000;
 
 const RPC_RESYNC_PAGE_SIZE: usize = 1000;
 const HELIUS_RESYNC_PAGE_SIZE: usize = 100;
@@ -5443,6 +5449,8 @@ async fn execute_batch_runtime(
     let batch_uses_hellomoon = execution_plan
         .iter()
         .any(|entry| is_hellomoon_provider(&entry.wallet_request.policy.provider));
+    let balance_gate = TradeBalanceGate::new(&execution_plan);
+    balance_gate.start_buy_refresh(state.clone(), execution_plan.clone());
     let hellomoon_deadline_unix_ms = batch_uses_hellomoon
         .then(|| worker_started_at.saturating_add(HELLOMOON_BATCH_WALLET_TIMEOUT_MS));
     let planning_started_at = now_unix_ms();
@@ -5482,6 +5490,7 @@ async fn execute_batch_runtime(
         .execution_backend
         .clone()
         .unwrap_or(execution_backend);
+    balance_gate.start_sell_refresh(state.clone(), planned_batch.execution_plan.clone());
     normalize_direct_stable_batch_policy_amounts(
         resolved_planned_execution.as_ref(),
         &planned_batch.execution_plan,
@@ -5544,6 +5553,7 @@ async fn execute_batch_runtime(
         )
         .await
     };
+    balance_gate.refresh_plan_summaries(&execution_plan);
     sync_batch_wallet_plan_summaries(
         &state,
         &batch_id,
@@ -5570,6 +5580,7 @@ async fn execute_batch_runtime(
         let wallet_key = entry.wallet_key.clone();
         let planned_summary = entry.planned_summary.clone();
         let hellomoon_deadline_for_execution = hellomoon_deadline_unix_ms;
+        let balance_gate = Arc::clone(&balance_gate);
         executions.spawn(async move {
             let request_for_result = request.clone();
             let provider = request.policy.provider.clone();
@@ -5598,10 +5609,14 @@ async fn execute_batch_runtime(
                 Err(error)
             } else if uses_hellomoon {
                 match hellomoon_remaining_timeout(hellomoon_deadline_for_execution, "transaction") {
-                    Ok(timeout) => match tokio::time::timeout(
-                        timeout,
-                        executor.execute_wallet_trade(request, wallet_key),
-                    )
+                    Ok(timeout) => match tokio::time::timeout(timeout, {
+                        let gate = Arc::clone(&balance_gate);
+                        executor.execute_wallet_trade_checked(
+                            request,
+                            wallet_key,
+                            move |wallet_key, compiled| gate.check_compiled(wallet_key, compiled),
+                        )
+                    })
                     .await
                     {
                         Ok(result) => result,
@@ -5610,7 +5625,14 @@ async fn execute_batch_runtime(
                     Err(error) => Err(error),
                 }
             } else {
-                executor.execute_wallet_trade(request, wallet_key).await
+                let gate = Arc::clone(&balance_gate);
+                executor
+                    .execute_wallet_trade_checked(
+                        request,
+                        wallet_key,
+                        move |wallet_key, compiled| gate.check_compiled(wallet_key, compiled),
+                    )
+                    .await
             };
             match execution_result {
                 Ok(ExecutedTrade {
@@ -5752,6 +5774,534 @@ fn hellomoon_remaining_timeout(
 
 fn hellomoon_transaction_timeout_error() -> String {
     "Hello Moon transaction timed out after 10s and may not have landed.".to_string()
+}
+
+#[derive(Debug, Clone)]
+enum TradeBalanceGateSnapshot {
+    BuySol(HashMap<String, u64>),
+    SellToken {
+        mint: String,
+        balances: HashMap<String, u64>,
+        token_decimals: Option<u8>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum TradeBalanceGateState {
+    Pending,
+    Ready(TradeBalanceGateSnapshot),
+    Unavailable,
+}
+
+#[derive(Debug)]
+struct TradeBalanceGate {
+    side: Option<TradeSide>,
+    state: Mutex<TradeBalanceGateState>,
+    plan_summaries: Mutex<HashMap<String, WalletExecutionPlanSummary>>,
+}
+
+impl TradeBalanceGate {
+    fn new(execution_plan: &[PlannedWalletExecution]) -> Arc<Self> {
+        let side = execution_plan
+            .first()
+            .map(|entry| entry.wallet_request.side.clone());
+        let plan_summaries = execution_plan
+            .iter()
+            .map(|entry| (entry.wallet_key.clone(), entry.planned_summary.clone()))
+            .collect::<HashMap<_, _>>();
+        Arc::new(Self {
+            side,
+            state: Mutex::new(TradeBalanceGateState::Pending),
+            plan_summaries: Mutex::new(plan_summaries),
+        })
+    }
+
+    fn refresh_plan_summaries(&self, execution_plan: &[PlannedWalletExecution]) {
+        if let Ok(mut summaries) = self.plan_summaries.lock() {
+            *summaries = execution_plan
+                .iter()
+                .map(|entry| (entry.wallet_key.clone(), entry.planned_summary.clone()))
+                .collect();
+        }
+    }
+
+    fn start_buy_refresh(
+        self: &Arc<Self>,
+        state: AppState,
+        execution_plan: Vec<PlannedWalletExecution>,
+    ) {
+        if !matches!(self.side.as_ref(), Some(TradeSide::Buy)) {
+            return;
+        }
+        let gate = Arc::clone(self);
+        tokio::spawn(async move {
+            let stream = state.balance_stream();
+            let result = tokio::time::timeout(
+                Duration::from_millis(TRADE_BALANCE_GATE_TIMEOUT_MS),
+                fetch_buy_balance_gate_snapshot(state, execution_plan),
+            )
+            .await
+            .map_err(|_| "buy balance refresh timed out".to_string())
+            .and_then(|result| result);
+            let publish_snapshot = result.as_ref().ok().cloned();
+            gate.finish_refresh(result);
+            if let Some(snapshot) = publish_snapshot.as_ref() {
+                publish_balance_gate_snapshot(&stream, snapshot);
+            }
+        });
+    }
+
+    fn start_sell_refresh(
+        self: &Arc<Self>,
+        state: AppState,
+        execution_plan: Vec<PlannedWalletExecution>,
+    ) {
+        if !matches!(self.side.as_ref(), Some(TradeSide::Sell)) {
+            return;
+        }
+        let gate = Arc::clone(self);
+        tokio::spawn(async move {
+            let stream = state.balance_stream();
+            let result = tokio::time::timeout(
+                Duration::from_millis(TRADE_BALANCE_GATE_TIMEOUT_MS),
+                fetch_sell_balance_gate_snapshot(state, execution_plan),
+            )
+            .await
+            .map_err(|_| "sell token balance refresh timed out".to_string())
+            .and_then(|result| result);
+            let publish_snapshot = result.as_ref().ok().cloned();
+            gate.finish_refresh(result);
+            if let Some(snapshot) = publish_snapshot.as_ref() {
+                publish_balance_gate_snapshot(&stream, snapshot);
+            }
+        });
+    }
+
+    fn finish_refresh(&self, result: Result<TradeBalanceGateSnapshot, String>) {
+        let next = match result {
+            Ok(snapshot) => TradeBalanceGateState::Ready(snapshot),
+            Err(error) => {
+                eprintln!("[execution-engine][balance-gate] skipped: {error}");
+                TradeBalanceGateState::Unavailable
+            }
+        };
+        if let Ok(mut state) = self.state.lock() {
+            *state = next;
+        }
+    }
+
+    fn check_compiled(
+        &self,
+        wallet_key: &str,
+        compiled: &crate::trade_runtime::CompiledTradePlan,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or(TradeBalanceGateState::Unavailable);
+        match state {
+            TradeBalanceGateState::Pending | TradeBalanceGateState::Unavailable => Ok(()),
+            TradeBalanceGateState::Ready(TradeBalanceGateSnapshot::BuySol(balances)) => {
+                let Some(available_lamports) = balances.get(wallet_key).copied() else {
+                    return Ok(());
+                };
+                let Some(required_lamports) =
+                    required_buy_balance_lamports(wallet_key, compiled, self)
+                else {
+                    return Ok(());
+                };
+                if available_lamports < required_lamports {
+                    return Err(insufficient_sol_balance_message(
+                        wallet_key,
+                        required_lamports,
+                        available_lamports,
+                    ));
+                }
+                Ok(())
+            }
+            TradeBalanceGateState::Ready(TradeBalanceGateSnapshot::SellToken {
+                mint,
+                balances,
+                token_decimals: _,
+            }) => {
+                if compiled.normalized_request.mint.trim() != mint {
+                    return Ok(());
+                }
+                let Some(available_raw) = balances.get(wallet_key).copied() else {
+                    return Ok(());
+                };
+                let Some(required_raw) =
+                    required_sell_token_balance_raw(&compiled.normalized_request, available_raw)
+                else {
+                    return Ok(());
+                };
+                if available_raw < required_raw {
+                    return Err(insufficient_token_balance_message(
+                        wallet_key,
+                        &mint,
+                        required_raw,
+                        available_raw,
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn fetch_buy_balance_gate_snapshot(
+    state: AppState,
+    execution_plan: Vec<PlannedWalletExecution>,
+) -> Result<TradeBalanceGateSnapshot, String> {
+    let wallet_keys = execution_plan
+        .iter()
+        .map(|entry| entry.wallet_key.clone())
+        .collect::<Vec<_>>();
+    let wallet_public_keys = wallet_public_keys_for_balance_gate(&state, &wallet_keys).await;
+    let balances =
+        fetch_wallet_sol_balances_once(&configured_rpc_url(), &wallet_public_keys).await?;
+    Ok(TradeBalanceGateSnapshot::BuySol(balances))
+}
+
+async fn fetch_sell_balance_gate_snapshot(
+    state: AppState,
+    execution_plan: Vec<PlannedWalletExecution>,
+) -> Result<TradeBalanceGateSnapshot, String> {
+    let mint = execution_plan
+        .iter()
+        .find_map(|entry| {
+            let mint = entry.wallet_request.mint.trim();
+            (!mint.is_empty()).then(|| mint.to_string())
+        })
+        .ok_or_else(|| "sell token balance refresh had no mint".to_string())?;
+    let wallet_keys = execution_plan
+        .iter()
+        .map(|entry| entry.wallet_key.clone())
+        .collect::<Vec<_>>();
+    let token_decimals = token_decimals_for_balance_gate(&state, &mint).await;
+    let wallet_public_keys = wallet_public_keys_for_balance_gate(&state, &wallet_keys).await;
+    let balances =
+        fetch_wallet_token_balances_once(&configured_rpc_url(), &wallet_public_keys, &mint).await?;
+    Ok(TradeBalanceGateSnapshot::SellToken {
+        mint,
+        balances,
+        token_decimals,
+    })
+}
+
+async fn wallet_public_keys_for_balance_gate(
+    state: &AppState,
+    wallet_keys: &[String],
+) -> Vec<(String, String)> {
+    let requested = wallet_keys.iter().cloned().collect::<HashSet<_>>();
+    let engine = state.engine.read().await.clone();
+    let enabled_wallets = build_effective_wallets(&engine)
+        .into_iter()
+        .filter(|wallet| wallet.enabled)
+        .collect::<Vec<_>>();
+    let use_all_enabled =
+        enabled_wallets.len() <= TRADE_BALANCE_GATE_FRONTEND_REFRESH_WALLET_LIMIT;
+    enabled_wallets
+        .into_iter()
+        .filter(|wallet| use_all_enabled || requested.contains(&wallet.key))
+        .map(|wallet| (wallet.key, wallet.public_key))
+        .collect()
+}
+
+async fn token_decimals_for_balance_gate(state: &AppState, mint: &str) -> Option<u8> {
+    let targets = state.live_mark_targets.read().await;
+    targets
+        .values()
+        .find(|target| target.mint.trim() == mint)
+        .and_then(|target| target.token_decimals)
+}
+
+fn publish_balance_gate_snapshot(stream: &BalanceStreamHandle, snapshot: &TradeBalanceGateSnapshot) {
+    let at_ms = u128::from(now_unix_ms());
+    match snapshot {
+        TradeBalanceGateSnapshot::BuySol(balances) => {
+            for (env_key, lamports) in balances {
+                stream.publish_balance_event(BalanceEventPayload {
+                    env_key: env_key.clone(),
+                    balance_sol: Some(*lamports as f64 / 1_000_000_000.0),
+                    balance_lamports: Some(*lamports),
+                    usd1_balance: None,
+                    token_mint: None,
+                    token_balance: None,
+                    token_balance_raw: None,
+                    token_decimals: None,
+                    commitment: Some("confirmed".to_string()),
+                    source: Some("balanceGate".to_string()),
+                    slot: None,
+                    at_ms,
+                });
+            }
+        }
+        TradeBalanceGateSnapshot::SellToken {
+            mint,
+            balances,
+            token_decimals,
+        } => {
+            for (env_key, raw) in balances {
+                let token_balance = token_decimals
+                    .map(|decimals| *raw as f64 / 10_f64.powi(i32::from(decimals)));
+                stream.publish_balance_event(BalanceEventPayload {
+                    env_key: env_key.clone(),
+                    balance_sol: None,
+                    balance_lamports: None,
+                    usd1_balance: None,
+                    token_mint: Some(mint.clone()),
+                    token_balance,
+                    token_balance_raw: Some(*raw),
+                    token_decimals: *token_decimals,
+                    commitment: Some("confirmed".to_string()),
+                    source: Some("balanceGate".to_string()),
+                    slot: None,
+                    at_ms,
+                });
+            }
+        }
+    }
+}
+
+async fn fetch_wallet_sol_balances_once(
+    rpc_url: &str,
+    wallet_public_keys: &[(String, String)],
+) -> Result<HashMap<String, u64>, String> {
+    if wallet_public_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if wallet_public_keys.len() > MAX_MULTIPLE_ACCOUNTS_BATCH_SIZE {
+        return Err(format!(
+            "buy balance refresh requires {} accounts, above one-call limit {}",
+            wallet_public_keys.len(),
+            MAX_MULTIPLE_ACCOUNTS_BATCH_SIZE
+        ));
+    }
+    let accounts = wallet_public_keys
+        .iter()
+        .map(|(_, public_key)| public_key.clone())
+        .collect::<Vec<_>>();
+    let client = extension_wallet_rpc_client()?;
+    let result = crate::rpc_client::rpc_request_with_client(
+        &client,
+        rpc_url,
+        "getMultipleAccounts",
+        json!([
+            accounts,
+            {
+                "encoding": "base64",
+                "commitment": "confirmed",
+                "dataSlice": {
+                    "offset": 0,
+                    "length": 0
+                }
+            }
+        ]),
+    )
+    .await?;
+    let values = result
+        .get("value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "RPC getMultipleAccounts did not return a value array.".to_string())?;
+    if values.len() != wallet_public_keys.len() {
+        return Err("SOL balance results did not match the wallet count.".to_string());
+    }
+    let mut balances = HashMap::new();
+    for (index, (wallet_key, _)) in wallet_public_keys.iter().enumerate() {
+        if values[index].is_null() {
+            balances.insert(wallet_key.clone(), 0);
+        } else if let Some(lamports) = values[index].get("lamports").and_then(Value::as_u64) {
+            balances.insert(wallet_key.clone(), lamports);
+        }
+    }
+    Ok(balances)
+}
+
+async fn fetch_wallet_token_balances_once(
+    rpc_url: &str,
+    wallet_public_keys: &[(String, String)],
+    mint: &str,
+) -> Result<HashMap<String, u64>, String> {
+    if wallet_public_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mint_pubkey =
+        Pubkey::from_str(mint).map_err(|error| format!("Invalid mint {mint}: {error}"))?;
+    let token_2022 = token_2022_program_id()?;
+    let mut account_pairs = Vec::with_capacity(wallet_public_keys.len());
+    let mut accounts = Vec::with_capacity(wallet_public_keys.len().saturating_mul(2));
+    for (wallet_key, public_key) in wallet_public_keys {
+        let owner = Pubkey::from_str(public_key)
+            .map_err(|error| format!("Invalid wallet public key {public_key}: {error}"))?;
+        let spl_ata =
+            get_associated_token_address_with_program_id(&owner, &mint_pubkey, &spl_token::id())
+                .to_string();
+        let token_2022_ata =
+            get_associated_token_address_with_program_id(&owner, &mint_pubkey, &token_2022)
+                .to_string();
+        let start = accounts.len();
+        accounts.push(spl_ata);
+        accounts.push(token_2022_ata);
+        account_pairs.push((wallet_key.clone(), start));
+    }
+    if accounts.len() > MAX_MULTIPLE_ACCOUNTS_BATCH_SIZE {
+        return Err(format!(
+            "sell token balance refresh requires {} accounts, above one-call limit {}",
+            accounts.len(),
+            MAX_MULTIPLE_ACCOUNTS_BATCH_SIZE
+        ));
+    }
+    let client = extension_wallet_rpc_client()?;
+    let account_data =
+        fetch_multiple_account_data_with_client(&client, rpc_url, &accounts, "confirmed").await?;
+    if account_data.len() != accounts.len() {
+        return Err("Token balance results did not match the account count.".to_string());
+    }
+    let mut balances = HashMap::new();
+    for (wallet_key, start) in account_pairs {
+        let mut total = 0u64;
+        for offset in 0..2 {
+            if let Some(data) = account_data
+                .get(start + offset)
+                .and_then(|data| data.as_ref())
+            {
+                total = total.saturating_add(parse_token_account_raw_balance(data)?);
+            }
+        }
+        balances.insert(wallet_key, total);
+    }
+    Ok(balances)
+}
+
+fn token_2022_program_id() -> Result<Pubkey, String> {
+    Pubkey::from_str(TOKEN_2022_PROGRAM_ID)
+        .map_err(|error| format!("Invalid Token-2022 program id: {error}"))
+}
+
+fn required_buy_balance_lamports(
+    wallet_key: &str,
+    compiled: &crate::trade_runtime::CompiledTradePlan,
+    gate: &TradeBalanceGate,
+) -> Option<u64> {
+    if !matches!(&compiled.normalized_request.side, TradeSide::Buy) {
+        return None;
+    }
+    let buy_input = if compiled.wrapper_route.touches_sol() {
+        compiled
+            .wrapper_payload
+            .as_ref()
+            .map(|payload| payload.route_metadata.gross_sol_in_lamports)
+            .filter(|amount| *amount > 0)
+            .or_else(|| {
+                compiled
+                    .normalized_request
+                    .buy_amount_sol
+                    .as_deref()
+                    .and_then(parse_sol_to_lamports)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let compiled_cost = compiled_transaction_sol_cost_lamports(compiled);
+    let rent_buffer = gate
+        .plan_summaries
+        .lock()
+        .ok()
+        .and_then(|summaries| summaries.get(wallet_key).cloned())
+        .and_then(|summary| summary.first_buy)
+        .filter(|first_buy| *first_buy)
+        .map(|_| TRADE_BALANCE_GATE_FIRST_BUY_RENT_BUFFER_LAMPORTS)
+        .unwrap_or(0);
+    Some(required_buy_balance_lamports_from_parts(
+        buy_input,
+        compiled_cost,
+        rent_buffer,
+    ))
+}
+
+fn required_buy_balance_lamports_from_parts(
+    buy_input_lamports: u64,
+    compiled_cost_lamports: u64,
+    rent_buffer_lamports: u64,
+) -> u64 {
+    buy_input_lamports
+        .saturating_add(compiled_cost_lamports)
+        .saturating_add(rent_buffer_lamports)
+        .saturating_add(TRADE_BALANCE_GATE_FIXED_BUY_BUFFER_LAMPORTS)
+}
+
+fn compiled_transaction_sol_cost_lamports(
+    compiled: &crate::trade_runtime::CompiledTradePlan,
+) -> u64 {
+    compiled.transactions.iter().fold(0u64, |sum, transaction| {
+        sum.saturating_add(TRADE_BALANCE_GATE_SIGNATURE_FEE_LAMPORTS)
+            .saturating_add(transaction.inline_tip_lamports.unwrap_or(0))
+            .saturating_add(
+                priority_fee_lamports(
+                    transaction.compute_unit_limit,
+                    transaction.compute_unit_price_micro_lamports,
+                )
+                .unwrap_or(0),
+            )
+    })
+}
+
+fn priority_fee_lamports(
+    compute_unit_limit: Option<u64>,
+    micro_lamports: Option<u64>,
+) -> Option<u64> {
+    let limit = compute_unit_limit?;
+    let price = micro_lamports?;
+    let product = u128::from(limit).checked_mul(u128::from(price))?;
+    u64::try_from(product.saturating_add(999_999) / 1_000_000).ok()
+}
+
+fn required_sell_token_balance_raw(
+    request: &TradeRuntimeRequest,
+    available_raw: u64,
+) -> Option<u64> {
+    if !matches!(&request.side, TradeSide::Sell) {
+        return None;
+    }
+    match request.sell_intent.as_ref()? {
+        RuntimeSellIntent::Percent(percent) => {
+            let percent_units = parse_decimal_units(percent, 4)?;
+            if percent_units == 0 {
+                return None;
+            }
+            if available_raw == 0 {
+                return Some(1);
+            }
+            let required = (u128::from(available_raw) * u128::from(percent_units))
+                .saturating_add(999_999)
+                / 1_000_000;
+            u64::try_from(required.max(1)).ok()
+        }
+        RuntimeSellIntent::SolOutput(output_sol) => {
+            parse_sol_to_lamports(output_sol)?;
+            Some(1)
+        }
+    }
+}
+
+fn insufficient_sol_balance_message(
+    _wallet_key: &str,
+    _required_lamports: u64,
+    _available_lamports: u64,
+) -> String {
+    "Insufficient SOL balance for buy amount".to_string()
+}
+
+fn insufficient_token_balance_message(
+    _wallet_key: &str,
+    _mint: &str,
+    _required_raw: u64,
+    _available_raw: u64,
+) -> String {
+    "Insufficient token balance for sell amount".to_string()
 }
 
 fn wallet_request_to_runtime_request(
@@ -14004,6 +14554,88 @@ mod tests {
         assert!(is_hellomoon_provider("hellomoon"));
         assert!(is_hellomoon_provider(" HelloMoon "));
         assert!(!is_hellomoon_provider("helius-sender"));
+    }
+
+    fn sell_balance_gate_request(intent: Option<RuntimeSellIntent>) -> TradeRuntimeRequest {
+        TradeRuntimeRequest {
+            side: TradeSide::Sell,
+            mint: "Mint111".to_string(),
+            buy_amount_sol: None,
+            sell_intent: intent,
+            policy: RuntimeExecutionPolicy {
+                slippage_percent: "10".to_string(),
+                mev_mode: MevMode::Off,
+                auto_tip_enabled: false,
+                fee_sol: "0.0001".to_string(),
+                tip_sol: "0.0002".to_string(),
+                provider: "standard-rpc".to_string(),
+                endpoint_profile: "global".to_string(),
+                commitment: "confirmed".to_string(),
+                skip_preflight: true,
+                track_send_block_height: false,
+                buy_funding_policy: BuyFundingPolicy::SolOnly,
+                sell_settlement_policy: SellSettlementPolicy::AlwaysToSol,
+                sell_settlement_asset: TradeSettlementAsset::Sol,
+            },
+            platform_label: None,
+            planned_route: None,
+            planned_trade: None,
+            pinned_pool: None,
+            warm_key: None,
+        }
+    }
+
+    #[test]
+    fn buy_balance_gate_requirement_includes_costs_and_buffers() {
+        let required = required_buy_balance_lamports_from_parts(
+            50_000_000,
+            1_005_000,
+            TRADE_BALANCE_GATE_FIRST_BUY_RENT_BUFFER_LAMPORTS,
+        );
+        assert_eq!(
+            required,
+            50_000_000
+                + 1_005_000
+                + TRADE_BALANCE_GATE_FIRST_BUY_RENT_BUFFER_LAMPORTS
+                + TRADE_BALANCE_GATE_FIXED_BUY_BUFFER_LAMPORTS
+        );
+    }
+
+    #[test]
+    fn priority_fee_lamports_rounds_up_micro_lamports() {
+        assert_eq!(priority_fee_lamports(Some(1_400_000), Some(2)), Some(3));
+        assert_eq!(priority_fee_lamports(None, Some(2)), None);
+        assert_eq!(priority_fee_lamports(Some(1_400_000), None), None);
+    }
+
+    #[test]
+    fn sell_balance_gate_percent_requires_available_tokens() {
+        let full = sell_balance_gate_request(Some(RuntimeSellIntent::Percent("100".to_string())));
+        assert_eq!(required_sell_token_balance_raw(&full, 1_000), Some(1_000));
+        assert_eq!(required_sell_token_balance_raw(&full, 0), Some(1));
+
+        let partial = sell_balance_gate_request(Some(RuntimeSellIntent::Percent("25".to_string())));
+        assert_eq!(required_sell_token_balance_raw(&partial, 1_000), Some(250));
+
+        let over = sell_balance_gate_request(Some(RuntimeSellIntent::Percent("125".to_string())));
+        assert_eq!(required_sell_token_balance_raw(&over, 1_000), Some(1_250));
+    }
+
+    #[test]
+    fn sell_balance_gate_sol_output_requires_nonzero_token_balance() {
+        let request =
+            sell_balance_gate_request(Some(RuntimeSellIntent::SolOutput("0.1".to_string())));
+        assert_eq!(required_sell_token_balance_raw(&request, 0), Some(1));
+        assert_eq!(required_sell_token_balance_raw(&request, 500), Some(1));
+    }
+
+    #[test]
+    fn sell_balance_gate_missing_or_zero_intent_is_inconclusive() {
+        let missing = sell_balance_gate_request(None);
+        assert_eq!(required_sell_token_balance_raw(&missing, 1_000), None);
+
+        let zero = sell_balance_gate_request(Some(RuntimeSellIntent::Percent("0".to_string())));
+        assert_eq!(required_sell_token_balance_raw(&zero, 1_000), None);
     }
 
     #[test]

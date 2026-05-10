@@ -495,12 +495,12 @@ async function handleMessage(message) {
     }
     case "trench:token-split": {
       const result = await splitTokens(message.payload);
-      invalidateBalances({ reason: "token-split" });
+      invalidateBalancesAfterTrade();
       return result;
     }
     case "trench:token-consolidate": {
       const result = await consolidateTokens(message.payload);
-      invalidateBalances({ reason: "token-consolidate" });
+      invalidateBalancesAfterTrade();
       return result;
     }
     case "trench:get-rewards-summary":

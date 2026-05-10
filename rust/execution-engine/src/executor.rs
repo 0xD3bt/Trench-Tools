@@ -3,8 +3,9 @@ use crate::{
     trade_dispatch::TradeDispatchPlan,
     trade_planner::LifecycleAndCanonicalMarket,
     trade_runtime::{
-        RuntimeExecutionPolicy, RuntimeSellIntent, TradeRuntimeRequest,
+        CompiledTradePlan, RuntimeExecutionPolicy, RuntimeSellIntent, TradeRuntimeRequest,
         execute_wallet_trade as execute_wallet_trade_with_adapter,
+        execute_wallet_trade_with_pre_submit_check,
     },
 };
 
@@ -70,6 +71,36 @@ impl ExecutionExecutor {
         request: WalletTradeRequest,
         wallet_key: String,
     ) -> Result<ExecutedTrade, String> {
+        self.execute_wallet_trade_inner(
+            request,
+            wallet_key,
+            Option::<fn(&str, &CompiledTradePlan) -> Result<(), String>>::None,
+        )
+        .await
+    }
+
+    pub async fn execute_wallet_trade_checked<F>(
+        &self,
+        request: WalletTradeRequest,
+        wallet_key: String,
+        pre_submit_check: F,
+    ) -> Result<ExecutedTrade, String>
+    where
+        F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
+    {
+        self.execute_wallet_trade_inner(request, wallet_key, Some(pre_submit_check))
+            .await
+    }
+
+    async fn execute_wallet_trade_inner<F>(
+        &self,
+        request: WalletTradeRequest,
+        wallet_key: String,
+        pre_submit_check: Option<F>,
+    ) -> Result<ExecutedTrade, String>
+    where
+        F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
+    {
         let runtime_request = TradeRuntimeRequest {
             side: request.side,
             mint: request.mint,
@@ -99,7 +130,13 @@ impl ExecutionExecutor {
             pinned_pool: request.pinned_pool,
             warm_key: request.warm_key,
         };
-        let result = execute_wallet_trade_with_adapter(runtime_request, wallet_key).await?;
+        let result = match pre_submit_check {
+            Some(check) => {
+                execute_wallet_trade_with_pre_submit_check(runtime_request, wallet_key, check)
+                    .await?
+            }
+            None => execute_wallet_trade_with_adapter(runtime_request, wallet_key).await?,
+        };
         Ok(ExecutedTrade {
             tx_signature: result.tx_signature,
             entry_preference_asset: result.entry_preference_asset,

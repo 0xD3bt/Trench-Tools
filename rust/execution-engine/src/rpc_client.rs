@@ -1147,6 +1147,104 @@ pub async fn confirm_submitted_transactions_for_transport(
     Ok((warnings, started.elapsed().as_millis()))
 }
 
+pub async fn reconcile_submitted_transaction_statuses_once(
+    rpc_url: &str,
+    submitted: &mut [SentResult],
+    commitment: &str,
+) -> Result<(Vec<String>, u128), String> {
+    let client = shared_rpc_http_client();
+    let started = std::time::Instant::now();
+    let mut warnings = Vec::new();
+    let signatures = submitted
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result
+                .signature
+                .clone()
+                .map(|signature| (index, signature))
+                .ok_or_else(|| {
+                    format!(
+                        "Submitted transaction {} is missing a signature.",
+                        result.label
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if signatures.is_empty() {
+        return Ok((warnings, started.elapsed().as_millis()));
+    }
+
+    let signature_batch = signatures
+        .iter()
+        .map(|(_, signature)| Value::String(signature.clone()))
+        .collect::<Vec<_>>();
+    let status_result = rpc_request_with_client(
+        client,
+        rpc_url,
+        "getSignatureStatuses",
+        json!([
+            signature_batch,
+            {
+                "searchTransactionHistory": true
+            }
+        ]),
+    )
+    .await?;
+    let statuses = status_result
+        .get("value")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for (position, (index, signature)) in signatures.into_iter().enumerate() {
+        let status = statuses.get(position).cloned().unwrap_or(Value::Null);
+        if status.is_null() {
+            submitted[index].error = Some(format!(
+                "Transaction {signature} was submitted but was not observed during confirmation reconciliation."
+            ));
+            warnings.push(format!(
+                "RPC reconciliation did not observe {}.",
+                submitted[index].label
+            ));
+            continue;
+        }
+        if status.get("err").is_some() && !status.get("err").unwrap_or(&Value::Null).is_null() {
+            submitted[index].error = Some(format!(
+                "Transaction {signature} failed on-chain: {}",
+                status.get("err").cloned().unwrap_or(Value::Null)
+            ));
+            submitted[index].confirmation_status = Some("failed".to_string());
+            continue;
+        }
+
+        let confirmation = status
+            .get("confirmationStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("processed");
+        submitted[index].confirmation_status = Some(confirmation.to_string());
+        if !commitment_satisfied_for_reconciliation(confirmation, commitment) {
+            submitted[index].error = Some(format!(
+                "Transaction {signature} reached {confirmation}, below requested {commitment}."
+            ));
+        }
+    }
+
+    Ok((warnings, started.elapsed().as_millis()))
+}
+
+fn commitment_satisfied_for_reconciliation(actual: &str, required: &str) -> bool {
+    fn rank(commitment: &str) -> u8 {
+        match commitment.trim().to_ascii_lowercase().as_str() {
+            "finalized" => 2,
+            "confirmed" => 1,
+            "processed" => 0,
+            _ => 1,
+        }
+    }
+    rank(actual) >= rank(required)
+}
+
 pub async fn fetch_token_balance(owner: &str, mint: &str) -> Result<TokenBalance, String> {
     let rpc_url = configured_rpc_url();
     let result = rpc_request_with_client(

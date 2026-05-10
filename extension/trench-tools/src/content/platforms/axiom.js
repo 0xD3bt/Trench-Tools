@@ -3333,9 +3333,13 @@
         if (!groupRow.hasAttribute("data-trench-tools-token-detail-group-row-original-width")) {
           groupRow.setAttribute("data-trench-tools-token-detail-group-row-original-width", groupRow.style.width || "");
         }
+        if (!groupRow.hasAttribute("data-trench-tools-token-detail-group-row-original-max-width")) {
+          groupRow.setAttribute("data-trench-tools-token-detail-group-row-original-max-width", groupRow.style.maxWidth || "");
+        }
         groupRow.setAttribute("data-trench-tools-token-detail-group-row", "true");
         if (width > 0) {
-          groupRow.style.width = `${width}px`;
+          groupRow.style.width = "fit-content";
+          groupRow.style.maxWidth = `${width}px`;
         }
       }
 
@@ -3345,13 +3349,20 @@
             return;
           }
           const originalWidth = element.getAttribute("data-trench-tools-token-detail-group-row-original-width") || "";
+          const originalMaxWidth = element.getAttribute("data-trench-tools-token-detail-group-row-original-max-width") || "";
           if (originalWidth) {
             element.style.width = originalWidth;
           } else {
             element.style.removeProperty("width");
           }
+          if (originalMaxWidth) {
+            element.style.maxWidth = originalMaxWidth;
+          } else {
+            element.style.removeProperty("max-width");
+          }
           element.removeAttribute("data-trench-tools-token-detail-group-row");
           element.removeAttribute("data-trench-tools-token-detail-group-row-original-width");
+          element.removeAttribute("data-trench-tools-token-detail-group-row-original-max-width");
         });
       }
 
@@ -4135,6 +4146,19 @@
         mountAxiomTokenDetailStandaloneWalletMenu(nativeWalletControl);
       }
 
+      function refreshAxiomTokenDetailOpenWalletMenu() {
+        const menu = document.querySelector("[data-trench-tools-token-detail-wallet-menu]");
+        const nativeWalletControl = axiomTokenDetailWalletControl;
+        if (!(menu instanceof HTMLElement) || !(nativeWalletControl instanceof HTMLElement) || !document.contains(nativeWalletControl)) {
+          return;
+        }
+        if (isAxiomTokenDetailTrenchOnlyMode()) {
+          mountAxiomTokenDetailStandaloneWalletMenu(nativeWalletControl);
+        } else {
+          mountAxiomTokenDetailWalletSidecar(nativeWalletControl);
+        }
+      }
+
       function mountAxiomTokenDetailStandaloneWalletMenu(nativeWalletControl) {
         if (!(nativeWalletControl instanceof HTMLElement) || !document.contains(nativeWalletControl)) {
           cleanupAxiomTokenDetailWalletSelector();
@@ -4165,6 +4189,7 @@
           .filter((element) => {
             if (
               element.hasAttribute("data-trench-tools-token-detail-wallet-menu") ||
+              element.closest("[data-trench-tools-token-detail-wallet-menu]") ||
               element.hasAttribute("data-trench-tools-token-detail-wallet-trigger") ||
               element.contains(nativeWalletControl) ||
               nativeWalletControl.contains(element)
@@ -4172,11 +4197,15 @@
               return false;
             }
             const rect = element.getBoundingClientRect();
-            if (rect.width < 80 || rect.height < 28 || rect.width > 420 || rect.height > 520) {
+            const maxMenuHeight = Math.max(520, window.innerHeight - 16);
+            if (rect.width < 80 || rect.height < 28 || rect.width > 420 || rect.height > maxMenuHeight) {
               return false;
             }
             const className = String(element.className || "");
             const text = String(element.textContent || "").replace(/\s+/g, " ").trim();
+            if (className.includes("primary-wallet")) {
+              return false;
+            }
             if (
               !/(wallet|SOLANA_PRIVATE_KEY|#\d+|Select All|Select All with Balance)/i.test(text) &&
               !/(wallet|shadow-dropdown|popover|dropdown|menu|select|radix)/i.test(className)
@@ -4217,9 +4246,11 @@
           const childRect = child.getBoundingClientRect();
           return childRect.width > 0 && childRect.height > 0;
         }).length;
+        const walletRows = element.querySelectorAll?.(".primary-wallet").length || 0;
         let score = 0;
         if (/(popover|dropdown|wallet|menu|select|radix)/i.test(className)) score += 30;
         if (/(absolute|fixed)/.test(String(computed?.position || ""))) score += 20;
+        score += Math.min(walletRows * 12, 36);
         if (/SOLANA_PRIVATE_KEY|#\d+/i.test(text)) score += 20;
         if (/wallet/i.test(text)) score += 10;
         score += Math.min(visibleChildren * 8, 40);
@@ -4256,7 +4287,9 @@
           overflow: "hidden",
           padding: "0",
           position: "fixed",
+          transition: "none",
           transform: "none",
+          animation: "none",
           zIndex: computed.zIndex === "auto" ? "2147483647" : computed.zIndex
         });
       }
@@ -4328,12 +4361,12 @@
             mountAxiomTokenDetailWalletSidecar(nativeWalletControl);
           }),
           buildAxiomTokenDetailWalletActionButtonWithIcon("Consolidate", false, () => {
-            runAxiomTokenDetailWalletDistribution("consolidate");
+            runAxiomTokenDetailWalletDistribution("consolidate", {}, nativeWalletControl);
           }, "ri-node-tree"),
           buildAxiomTokenDetailWalletActionButtonWithIcon("Split Tokens", false, () => {
             runAxiomTokenDetailWalletDistribution("split", {
               sourceWalletKeys: Array.from(selectedKeys).filter((key) => holderKeys.includes(key))
-            });
+            }, nativeWalletControl);
           }, "ri-node-tree")
         );
         return header;
@@ -4421,7 +4454,7 @@
         return outer;
       }
 
-      function runAxiomTokenDetailWalletDistribution(action, extraPayload = {}) {
+      function runAxiomTokenDetailWalletDistribution(action, extraPayload = {}, nativeWalletControl = axiomTokenDetailWalletControl) {
         if (typeof helpers.handleTokenDistributionRequest !== "function") {
           helpers.showToast?.("Token distribution is unavailable here.", "error");
           return;
@@ -4477,7 +4510,7 @@
         name.textContent = option.label;
         const meta = document.createElement("div");
         meta.className = "flex flex-row gap-[6px]";
-        meta.appendChild(buildAxiomTokenDetailWalletAddressButton(option.addressLabel || option.id));
+        meta.appendChild(buildAxiomTokenDetailWalletAddressButton(option.addressLabel || option.id, option.addressValue || option.id));
         identity.append(name, meta);
 
         const balanceColumn = document.createElement("div");
@@ -4509,17 +4542,67 @@
         return item;
       }
 
-      function buildAxiomTokenDetailWalletAddressButton(label) {
+      function buildAxiomTokenDetailWalletAddressButton(label, address) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "flex cursor-pointer flex-row gap-[4px] text-textTertiary transition-colors duration-[125ms] ease-in-out hover:text-textSecondary";
+        button.setAttribute("aria-label", "Copy wallet address");
         const text = document.createElement("span");
         text.className = "text-[12px] font-medium leading-[16px]";
         text.textContent = label;
         const icon = document.createElement("i");
         icon.className = "ri-file-copy-line text-[12px] font-medium leading-[16px]";
         button.append(text, icon);
+        button.addEventListener("mousedown", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void copyAxiomTokenDetailWalletAddress(address);
+        });
         return button;
+      }
+
+      async function copyAxiomTokenDetailWalletAddress(address) {
+        const value = String(address || "").trim();
+        if (!value) {
+          helpers.showToast?.("Wallet address unavailable.", "error");
+          return;
+        }
+        try {
+          await writeAxiomTokenDetailClipboardText(value);
+          helpers.showToast?.("Address copied.", "info");
+        } catch (_error) {
+          helpers.showToast?.("Failed to copy address.", "error");
+        }
+      }
+
+      async function writeAxiomTokenDetailClipboardText(value) {
+        if (navigator.clipboard?.writeText) {
+          try {
+            await navigator.clipboard.writeText(value);
+            return;
+          } catch (_error) {
+          }
+        }
+        const textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.setAttribute("readonly", "true");
+        Object.assign(textarea.style, {
+          left: "-9999px",
+          opacity: "0",
+          position: "fixed",
+          top: "0"
+        });
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand?.("copy");
+        textarea.remove();
+        if (!copied) {
+          throw new Error("Clipboard copy failed.");
+        }
       }
 
       function buildAxiomTokenDetailWalletBalancePill(label) {
@@ -4674,10 +4757,14 @@
         const wallets = Array.isArray(helpers.state.bootstrap?.wallets)
           ? helpers.state.bootstrap.wallets
           : [];
-        const walletStatusByKey = new Map(
-          (Array.isArray(helpers.state.walletStatus?.wallets) ? helpers.state.walletStatus.wallets : [])
-            .map((wallet) => [String(wallet?.key || wallet?.envKey || "").trim(), wallet])
-        );
+        const walletStatusByKey = new Map();
+        (Array.isArray(helpers.state.walletStatus?.wallets) ? helpers.state.walletStatus.wallets : [])
+          .forEach((wallet) => {
+            [wallet?.key, wallet?.envKey]
+              .map((key) => String(key || "").trim())
+              .filter(Boolean)
+              .forEach((key) => walletStatusByKey.set(key, wallet));
+          });
         return wallets
           .filter((wallet) => wallet?.enabled !== false)
           .map((wallet, index) => {
@@ -4699,6 +4786,7 @@
               id,
               label: formatAxiomTokenDetailWalletLabel(wallet?.label || wallet?.key || `Wallet ${index + 1}`),
               addressLabel: axiomTokenDetailWalletAddressLabel(wallet, status, wallet?.key),
+              addressValue: axiomTokenDetailWalletAddressValue(wallet, status),
               balanceLabel: formatAxiomTokenDetailWalletBalance(balanceValue),
               balanceValue: Number.isFinite(balanceValue) ? balanceValue : 0,
               tokenBalanceLabel: formatAxiomTokenDetailTokenBalance(tokenBalanceValue),
@@ -4790,16 +4878,19 @@
       }
 
       function axiomTokenDetailWalletAddressLabel(wallet, walletStatus, fallback = "") {
-        const value = String(
+        const address = axiomTokenDetailWalletAddressValue(wallet, walletStatus);
+        return truncateAxiomTokenDetailWalletValue(address || fallback, 4, 4);
+      }
+
+      function axiomTokenDetailWalletAddressValue(wallet, walletStatus) {
+        return String(
           wallet?.publicKey ||
           wallet?.address ||
           walletStatus?.publicKey ||
           walletStatus?.address ||
           walletStatus?.walletAddress ||
-          fallback ||
           ""
         ).trim();
-        return truncateAxiomTokenDetailWalletValue(value, 4, 4);
       }
 
       function truncateAxiomTokenDetailWalletValue(value, start = 4, end = 4) {
@@ -6445,6 +6536,7 @@
 
         getQuotedPriceHint,
         handleMutations,
+        handleWalletStatusChange: refreshAxiomTokenDetailOpenWalletMenu,
         getObserverOptions,
         getCurrentTokenCandidate,
         mount

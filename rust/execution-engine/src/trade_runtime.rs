@@ -135,6 +135,17 @@ pub async fn compile_wallet_trade(
     compile_wallet_trade_with_route_mode(request, wallet_key, false).await
 }
 
+pub async fn execute_wallet_trade_with_pre_submit_check<F>(
+    request: TradeRuntimeRequest,
+    wallet_key: String,
+    pre_submit_check: F,
+) -> Result<ExecutedRuntimeTrade, String>
+where
+    F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
+{
+    execute_wallet_trade_inner(request, wallet_key, Some(pre_submit_check)).await
+}
+
 fn request_with_net_wrapper_buy_input(
     selector: &LifecycleAndCanonicalMarket,
     request: &TradeRuntimeRequest,
@@ -1381,6 +1392,22 @@ pub async fn execute_wallet_trade(
     request: TradeRuntimeRequest,
     wallet_key: String,
 ) -> Result<ExecutedRuntimeTrade, String> {
+    execute_wallet_trade_inner(
+        request,
+        wallet_key,
+        Option::<fn(&str, &CompiledTradePlan) -> Result<(), String>>::None,
+    )
+    .await
+}
+
+async fn execute_wallet_trade_inner<F>(
+    request: TradeRuntimeRequest,
+    wallet_key: String,
+    pre_submit_check: Option<F>,
+) -> Result<ExecutedRuntimeTrade, String>
+where
+    F: Fn(&str, &CompiledTradePlan) -> Result<(), String> + Send + Sync,
+{
     let timeout_wallet_label = crate::shared_config::wallet_display_label(&wallet_key);
     let timeout_side = side_label(&request.side).to_string();
     let trade_execution_timeout = trade_execution_hard_timeout(&request.policy.provider);
@@ -1439,6 +1466,9 @@ pub async fn execute_wallet_trade(
             let normalized_request = compiled.normalized_request.clone();
             let warm_invalidation_fingerprints = compiled.warm_invalidation_fingerprints.clone();
             let selector_family = compiled.selector.family.clone();
+            if let Some(check) = pre_submit_check.as_ref() {
+                check(&wallet_key, &compiled)?;
+            }
             let execute_started_at = now_unix_ms();
             match execute_compiled_trade(compiled).await {
                 Ok(signature) => {
