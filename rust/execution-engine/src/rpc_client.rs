@@ -371,21 +371,14 @@ pub async fn fetch_account_exists(
     Ok(result.get("value").is_some_and(|value| !value.is_null()))
 }
 
-/// Fetch both the owning program and the raw account data for an arbitrary
-/// Solana account, in a single RPC call. Used by the warm classifier to
-/// distinguish an SPL Token mint / Token-2022 mint / Pump AMM pool / other
-/// program-owned account from a pasted pair / pool address.
-///
-/// Returns `Ok(None)` when the account does not exist.
-pub async fn fetch_account_owner_and_data(
+/// Inner getAccountInfo that bypasses the per-request memo. Callers either
+/// front this with `fetch_account_owner_and_data` (cache-aware single shot)
+/// or `fetch_account_owner_and_data_with_null_retry` (retry the null case).
+async fn fetch_account_owner_and_data_uncached(
     rpc_url: &str,
     address: &str,
     commitment: &str,
 ) -> Result<Option<(Pubkey, Vec<u8>)>, String> {
-    let commitment = normalized_commitment(commitment);
-    if let Some(cached) = crate::route_metrics::cached_account_owner_data(address, &commitment) {
-        return Ok(cached);
-    }
     let result = rpc_request(
         rpc_url,
         "getAccountInfo",
@@ -403,7 +396,6 @@ pub async fn fetch_account_owner_and_data(
         .get("value")
         .ok_or_else(|| format!("RPC getAccountInfo did not return account data for {address}."))?;
     if value.is_null() {
-        crate::route_metrics::cache_account_owner_data(address, &commitment, None);
         return Ok(None);
     }
     let owner_str = value
@@ -426,9 +418,61 @@ pub async fn fetch_account_owner_and_data(
             .decode(data_str)
             .map_err(|error| format!("Failed to decode account data for {address}: {error}"))?
     };
-    let decoded = Some((owner, data));
+    Ok(Some((owner, data)))
+}
+
+/// Fetch both the owning program and the raw account data for an arbitrary
+/// Solana account, in a single RPC call. Used by the warm classifier to
+/// distinguish an SPL Token mint / Token-2022 mint / Pump AMM pool / other
+/// program-owned account from a pasted pair / pool address.
+///
+/// Returns `Ok(None)` when the account does not exist.
+pub async fn fetch_account_owner_and_data(
+    rpc_url: &str,
+    address: &str,
+    commitment: &str,
+) -> Result<Option<(Pubkey, Vec<u8>)>, String> {
+    let commitment = normalized_commitment(commitment);
+    if let Some(cached) = crate::route_metrics::cached_account_owner_data(address, &commitment) {
+        return Ok(cached);
+    }
+    let decoded = fetch_account_owner_and_data_uncached(rpc_url, address, &commitment).await?;
     crate::route_metrics::cache_account_owner_data(address, &commitment, decoded.clone());
     Ok(decoded)
+}
+
+/// Like `fetch_account_owner_and_data`, but on `Ok(None)` re-issues the
+/// uncached RPC up to `extra_attempts` more times with `backoff_ms` sleep
+/// between attempts. A `Some` hit short-circuits immediately and is cached.
+/// A terminal `None` (after retries) is also cached so downstream classifier
+/// hops within the same resolve scope don't re-RPC a confirmed-dead address.
+///
+/// We bypass the per-request memo only on the retry path; if a positive cache
+/// entry already exists we still win immediately. This prevents the in-request
+/// cache from sealing the result as null after a single attempt and forcing
+/// the retry loop into a no-op.
+pub async fn fetch_account_owner_and_data_with_null_retry(
+    rpc_url: &str,
+    address: &str,
+    commitment: &str,
+    extra_attempts: u32,
+    backoff_ms: u64,
+) -> Result<Option<(Pubkey, Vec<u8>)>, String> {
+    let commitment = normalized_commitment(commitment);
+    if let Some(cached) = crate::route_metrics::cached_account_owner_data(address, &commitment)
+        && cached.is_some()
+    {
+        return Ok(cached);
+    }
+    let mut last = fetch_account_owner_and_data_uncached(rpc_url, address, &commitment).await?;
+    let mut remaining = extra_attempts;
+    while last.is_none() && remaining > 0 {
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        last = fetch_account_owner_and_data_uncached(rpc_url, address, &commitment).await?;
+        remaining -= 1;
+    }
+    crate::route_metrics::cache_account_owner_data(address, &commitment, last.clone());
+    Ok(last)
 }
 
 pub async fn fetch_multiple_account_owner_and_data(

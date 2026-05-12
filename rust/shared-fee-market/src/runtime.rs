@@ -17,16 +17,23 @@ use std::{
     hash::{Hash, Hasher},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const DEFAULT_HELIUS_PRIORITY_REFRESH_INTERVAL_MS: u64 = 30_000;
-pub const DEFAULT_HELIUS_PRIORITY_STALE_MS: u64 = 45_000;
+pub const DEFAULT_HELIUS_PRIORITY_REFRESH_INTERVAL_MS: u64 = 15_000;
+pub const DEFAULT_HELIUS_PRIORITY_STALE_MS: u64 = 60_000;
 pub const DEFAULT_JITO_TIP_REFRESH_INTERVAL_MS: u64 = 2_000;
 pub const DEFAULT_JITO_TIP_STALE_MS: u64 = 45_000;
 pub const DEFAULT_AUTO_FEE_BUFFER_PERCENT: f64 = 10.0;
 pub const DEFAULT_AUTO_FEE_FALLBACK_LAMPORTS: u64 = 1_000_000;
+/// How long the worker should back off after a failed refresh before
+/// retrying. Short enough to recover quickly from transient Helius
+/// hiccups without hammering the endpoint.
+pub const HELIUS_REFRESH_RETRY_BACKOFF_MS: u64 = 3_000;
 
 const CACHE_SCHEMA_VERSION: u64 = 1;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
@@ -73,6 +80,20 @@ pub struct SharedFeeMarketSnapshotStatus {
     pub jito_lease: SharedFeeMarketLeaseStatus,
 }
 
+/// Outcome of a single refresh attempt by the background worker. Lets
+/// the loop pick a retry cadence: tight after [`RefreshOutcome::Failed`],
+/// normal after [`RefreshOutcome::Refreshed`] or
+/// [`RefreshOutcome::Skipped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// We owned the lease and successfully wrote a fresh snapshot.
+    Refreshed,
+    /// Another process owns the lease, so we deferred to it.
+    Skipped,
+    /// We owned the lease but the upstream call returned an error.
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 struct CachedFeeMarketSnapshot {
     snapshot: FeeMarketSnapshot,
@@ -82,6 +103,21 @@ struct CachedFeeMarketSnapshot {
 fn memory_cache() -> &'static Mutex<HashMap<String, CachedFeeMarketSnapshot>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedFeeMarketSnapshot>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-`cache_key` guard that prevents N concurrent trade requests from
+/// each spawning their own background refresh when the snapshot is
+/// stale. The first caller flips the flag, performs the refresh, then
+/// resets the flag.
+fn opportunistic_refresh_guard(cache_key: &str) -> Arc<AtomicBool> {
+    static GUARDS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+    let guards = GUARDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(cache_key.to_string())
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone()
 }
 
 #[derive(Clone, Debug)]
@@ -764,38 +800,96 @@ impl SharedFeeMarketRuntime {
     }
 
     fn record_helius_error(&self, error: String) {
+        // Surface to stderr so operators can see why auto-fee is degraded;
+        // previously this was only persisted to `heliusLastError` in the
+        // cache file and was effectively invisible during incidents.
+        eprintln!(
+            "[shared-fee-market][helius] priority refresh failed owner={} error={}",
+            self.config.owner, error
+        );
         let _ = update_shared_cache(&self.config, |cache, _now| {
             cache.heliusLastError = Some(error);
         });
     }
 
     fn record_jito_error(&self, error: String) {
+        eprintln!(
+            "[shared-fee-market][jito] tip refresh failed owner={} error={}",
+            self.config.owner, error
+        );
         let _ = update_shared_cache(&self.config, |cache, _now| {
             cache.jitoLastError = Some(error);
         });
     }
 
-    pub async fn refresh_helius_if_leased(&self) {
+    /// Attempt a Helius priority refresh if this process owns the lease.
+    /// Returns the resulting [`RefreshOutcome`] so the driving loop can
+    /// schedule a tighter retry on transient failures.
+    pub async fn refresh_helius_if_leased(&self) -> RefreshOutcome {
         if !try_acquire_lease(&self.config, "helius") {
-            return;
+            return RefreshOutcome::Skipped;
         }
         match self.fetch_helius_priority_snapshot_live().await {
             Ok(snapshot) => {
                 let _ = self.update_helius_snapshot(&snapshot);
+                RefreshOutcome::Refreshed
             }
-            Err(error) => self.record_helius_error(error),
+            Err(error) => {
+                self.record_helius_error(error);
+                RefreshOutcome::Failed
+            }
         }
     }
 
-    pub async fn refresh_jito_if_leased(&self) {
+    /// Attempt a Jito tip refresh if this process owns the lease. Returns
+    /// the same [`RefreshOutcome`] semantics as the Helius variant.
+    pub async fn refresh_jito_if_leased(&self) -> RefreshOutcome {
         if !try_acquire_lease(&self.config, "jito") {
-            return;
+            return RefreshOutcome::Skipped;
         }
         self.refresh_jito_http_fallback_if_stale().await;
-        if let Err(error) = self.consume_jito_tip_stream_updates().await {
-            self.record_jito_error(error);
-            self.refresh_jito_http_fallback_if_stale().await;
+        match self.consume_jito_tip_stream_updates().await {
+            Ok(()) => RefreshOutcome::Refreshed,
+            Err(error) => {
+                self.record_jito_error(error);
+                self.refresh_jito_http_fallback_if_stale().await;
+                RefreshOutcome::Failed
+            }
         }
+    }
+
+    /// If the shared snapshot's Helius half is stale, spawn a single
+    /// best-effort background refresh and return immediately. Multiple
+    /// callers racing this method per snapshot collapse into one in-flight
+    /// fetch via a per-cache `AtomicBool` guard, so trade hot paths can
+    /// call it freely without amplifying Helius load. The current trade
+    /// will not see the new value, but the next one (within ~1s) will.
+    /// Silently no-ops when invoked outside a Tokio runtime so non-async
+    /// unit tests can exercise the resolver path.
+    pub fn maybe_spawn_helius_refresh_if_stale(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let needs_refresh = self
+            .read_snapshot_status()
+            .map(|status| !status.helius_fresh)
+            .unwrap_or(true);
+        if !needs_refresh {
+            return;
+        }
+        let guard = opportunistic_refresh_guard(&self.config.cache_key());
+        if guard
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            let runtime = SharedFeeMarketRuntime::new(config);
+            let _ = runtime.refresh_helius_if_leased().await;
+            opportunistic_refresh_guard(&runtime.config.cache_key()).store(false, Ordering::Release);
+        });
     }
 
     async fn refresh_jito_http_fallback_if_stale(&self) {
@@ -1270,11 +1364,11 @@ mod tests {
             || {
                 assert_eq!(
                     duration_ms_u64(configured_helius_priority_refresh_interval()),
-                    30_000
+                    15_000
                 );
                 assert_eq!(
                     duration_ms_u64(configured_helius_priority_stale_duration()),
-                    45_000
+                    60_000
                 );
                 assert_eq!(
                     duration_ms_u64(configured_jito_tip_refresh_interval()),

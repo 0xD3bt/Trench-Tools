@@ -34,9 +34,9 @@ use crate::{
         plan_raydium_launchlab_trade, raydium_launchlab_program_id,
     },
     rollout::{TradeExecutionBackend, family_warm_enabled, preferred_execution_backend},
-    route_index::{RouteIndexEntry, RouteIndexKey, RouteIndexLookup, shared_route_index},
+    route_index::{RouteIndexEntry, RouteIndexKey, shared_route_index},
     rpc_client::{
-        CompiledTransaction, configured_rpc_url, fetch_account_owner_and_data,
+        CompiledTransaction, configured_rpc_url, fetch_account_owner_and_data_with_null_retry,
         fetch_multiple_account_owner_and_data,
     },
     stable_native::{
@@ -49,6 +49,15 @@ use crate::{
     warm_metrics::{FamilyBucket, shared_warm_metrics},
     warming_service::shared_warming_service,
 };
+
+/// Extra retry attempts the route classifier issues when `getAccountInfo`
+/// returns `null` for the submitted route input. The first attempt is always
+/// made; this counts retries on top of it. Targets the very-fast-click case
+/// where the pair has been announced over the venue WS faster than our read
+/// RPC slot has surfaced it.
+const CLASSIFIER_NULL_RETRY_EXTRA_ATTEMPTS: u32 = 2;
+/// Backoff between classifier null-retry attempts.
+const CLASSIFIER_NULL_RETRY_BACKOFF_MS: u64 = 50;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TradeAdapter {
@@ -204,13 +213,31 @@ fn route_input_kind(raw_address: &str, resolved_pair: Option<&str>) -> TradeInpu
 async fn try_classify_route_descriptor(
     rpc_url: &str,
     input: &str,
+    fallback_mint: Option<&str>,
     commitment: &str,
 ) -> Result<Option<RouteDescriptor>, String> {
     if trusted_stable_route_for_pool(input).is_some() {
         return Ok(None);
     }
-    let classify = fetch_account_owner_and_data(rpc_url, input, commitment).await?;
+    let classify = fetch_account_owner_and_data_with_null_retry(
+        rpc_url,
+        input,
+        commitment,
+        CLASSIFIER_NULL_RETRY_EXTRA_ATTEMPTS,
+        CLASSIFIER_NULL_RETRY_BACKOFF_MS,
+    )
+    .await?;
     let Some((owner, data)) = classify else {
+        if let Some(mint_hint) = fallback_mint
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != input.trim())
+            && let Ok(Some(descriptor)) = Box::pin(try_classify_route_descriptor(
+                rpc_url, mint_hint, None, commitment,
+            ))
+            .await
+        {
+            return Ok(Some(descriptor));
+        }
         return Err(route_error(
             "unsupported_address",
             format!(
@@ -436,7 +463,8 @@ async fn try_classify_companion_pair_descriptor(
     if pair == mint.trim() {
         return Ok(None);
     }
-    let Some(mut descriptor) = try_classify_route_descriptor(rpc_url, pair, commitment).await?
+    let Some(mut descriptor) =
+        try_classify_route_descriptor(rpc_url, pair, None, commitment).await?
     else {
         return Ok(None);
     };
@@ -471,7 +499,7 @@ pub async fn classify_route_input(
     input: &str,
     commitment: &str,
 ) -> Result<Option<RouteDescriptor>, String> {
-    try_classify_route_descriptor(rpc_url, input, commitment).await
+    try_classify_route_descriptor(rpc_url, input, None, commitment).await
 }
 
 fn route_error(code: &str, message: impl Into<String>) -> String {
@@ -968,51 +996,32 @@ async fn resolve_trade_plan_with_route_index(
 ) -> Result<TradeDispatchPlan, String> {
     let rpc_url = configured_rpc_url();
     let key = route_index_key_for_request(request, &rpc_url);
-    if let Some(lookup) = shared_route_index().current(&key).await {
-        match lookup {
-            RouteIndexLookup::Hit(entry) if family_warm_enabled(&entry.selector.family) => {
-                shared_warm_metrics()
-                    .record_mint_warm_hit(FamilyBucket::from_venue_family(&entry.selector.family));
-                return build_dispatch_plan_from_route_index_entry(request, entry);
-            }
-            RouteIndexLookup::Hit(_) => {}
-            RouteIndexLookup::Negative(entry) => {
-                return Err(route_error(entry.error_code.as_str(), entry.message));
-            }
-        }
+    if let Some(entry) = shared_route_index().current(&key).await
+        && family_warm_enabled(&entry.selector.family)
+    {
+        shared_warm_metrics()
+            .record_mint_warm_hit(FamilyBucket::from_venue_family(&entry.selector.family));
+        return build_dispatch_plan_from_route_index_entry(request, entry);
     }
 
     let flight_lock = shared_route_index().flight_lock(&key).await;
     let result = {
         let _guard = flight_lock.lock().await;
-        match shared_route_index().current(&key).await {
-            Some(RouteIndexLookup::Hit(entry)) if family_warm_enabled(&entry.selector.family) => {
-                shared_warm_metrics()
-                    .record_mint_warm_hit(FamilyBucket::from_venue_family(&entry.selector.family));
-                build_dispatch_plan_from_route_index_entry(request, entry)
-            }
-            Some(RouteIndexLookup::Negative(entry)) => {
-                Err(route_error(entry.error_code.as_str(), entry.message))
-            }
-            _ => {
-                match resolve_trade_plan_with_cache_mode(request, RouteCacheMode::AllowCached).await
-                {
-                    Ok(plan) => {
-                        shared_route_index()
-                            .insert_plan(key.clone(), &plan, "click_cold_resolve")
-                            .await;
-                        Ok(plan)
-                    }
-                    Err(error) => {
-                        if should_negative_cache_route_error(&error) {
-                            let code = route_error_code(&error).unwrap_or("unsupported_mint");
-                            shared_route_index()
-                                .insert_negative(key.clone(), code, route_error_message(&error))
-                                .await;
-                        }
-                        Err(error)
-                    }
+        if let Some(entry) = shared_route_index().current(&key).await
+            && family_warm_enabled(&entry.selector.family)
+        {
+            shared_warm_metrics()
+                .record_mint_warm_hit(FamilyBucket::from_venue_family(&entry.selector.family));
+            build_dispatch_plan_from_route_index_entry(request, entry)
+        } else {
+            match resolve_trade_plan_with_cache_mode(request, RouteCacheMode::AllowCached).await {
+                Ok(plan) => {
+                    shared_route_index()
+                        .insert_plan(key.clone(), &plan, "click_cold_resolve")
+                        .await;
+                    Ok(plan)
                 }
+                Err(error) => Err(error),
             }
         }
     };
@@ -1056,35 +1065,9 @@ fn build_dispatch_plan_from_route_index_entry(
     )
 }
 
-fn should_negative_cache_route_error(error: &str) -> bool {
-    let normalized = error.to_ascii_lowercase();
-    if normalized.contains("429")
-        || normalized.contains("too many requests")
-        || normalized.contains("timeout")
-        || normalized.contains("timed out")
-        || normalized.contains("error decoding response body")
-        || normalized.contains("failed to parse")
-        || normalized.contains("body preview")
-        || normalized.contains("rpc returned status")
-    {
-        return false;
-    }
-    matches!(
-        route_error_code(error),
-        Some("unsupported_mint" | "unsupported_address" | "route_resolution_failed")
-    )
-}
-
 fn route_error_code(error: &str) -> Option<&str> {
     let rest = error.strip_prefix('[')?;
     rest.split_once(']').map(|(code, _)| code)
-}
-
-fn route_error_message(error: &str) -> &str {
-    error
-        .split_once("] ")
-        .map(|(_, message)| message)
-        .unwrap_or(error)
 }
 
 async fn prefetch_classifier_accounts(
@@ -1208,7 +1191,12 @@ async fn resolve_trade_plan_with_cache_mode(
             )
             .await;
             let (primary, companion) = tokio::join!(
-                try_classify_route_descriptor(&rpc_url, &request.mint, &request.policy.commitment),
+                try_classify_route_descriptor(
+                    &rpc_url,
+                    &request.mint,
+                    request.fallback_mint_hint.as_deref(),
+                    &request.policy.commitment,
+                ),
                 try_classify_companion_pair_descriptor(
                     &rpc_url,
                     &request.mint,
@@ -1219,8 +1207,13 @@ async fn resolve_trade_plan_with_cache_mode(
             (primary?, companion)
         } else {
             (
-                try_classify_route_descriptor(&rpc_url, &request.mint, &request.policy.commitment)
-                    .await?,
+                try_classify_route_descriptor(
+                    &rpc_url,
+                    &request.mint,
+                    request.fallback_mint_hint.as_deref(),
+                    &request.policy.commitment,
+                )
+                .await?,
                 Ok(None),
             )
         };
@@ -1795,6 +1788,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: Some("Pool222".to_string()),
             warm_key: None,
+            fallback_mint_hint: None,
         }
     }
 
@@ -2122,6 +2116,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: Some("Pool222".to_string()),
             warm_key: Some("warm".to_string()),
+            fallback_mint_hint: None,
         };
         let entry = PrewarmedMint {
             mint: "Mint111".to_string(),
@@ -2184,6 +2179,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: Some("Pool222".to_string()),
             warm_key: Some("warm".to_string()),
+            fallback_mint_hint: None,
         };
         let entry = PrewarmedMint {
             mint: "Mint111".to_string(),
@@ -2359,6 +2355,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: Some("Pool222".to_string()),
             warm_key: Some("warm".to_string()),
+            fallback_mint_hint: None,
         };
         let entry = PrewarmedMint {
             mint: "Mint111".to_string(),
@@ -2425,6 +2422,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: Some("Pool222".to_string()),
             warm_key: Some("warm".to_string()),
+            fallback_mint_hint: None,
         };
         let entry = PrewarmedMint {
             mint: "Mint111".to_string(),
@@ -2512,6 +2510,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: Some("Pool222".to_string()),
             warm_key: Some("warm".to_string()),
+            fallback_mint_hint: None,
         };
         let entry = PrewarmedMint {
             mint: "Mint111".to_string(),

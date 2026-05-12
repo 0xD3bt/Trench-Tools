@@ -29,11 +29,17 @@
       const AXIOM_TOKEN_DETAIL_COMPACT_STORAGE_KEY = "trenchToolsAxiomTokenDetailCompactButtons";
       const AXIOM_TOKEN_DETAIL_PANEL_SIZE_STORAGE_KEY = "trenchToolsAxiomTokenDetailPanelSizes";
       const AXIOM_TOKEN_DETAIL_INITIAL_SIZE_STYLE_ID = "trench-tools-axiom-token-detail-initial-size";
-      const AXIOM_INSTANT_TRADE_MODAL_POSITION_KEY = "instantTradeModalPosition";
-      const AXIOM_INSTANT_TRADE_MODAL_SIZE_KEY = "instantTradeModalSize";
-      const AXIOM_TOKEN_DETAIL_WALLET_SELECTION_KEY = "trenchToolsAxiomTokenDetailWalletSelection";
+      const AXIOM_TOKEN_DETAIL_COMPACT_POSITION_STORAGE_KEY = "trenchToolsAxiomInstantTradeCompactPosition";
+      const AXIOM_NATIVE_INSTANT_TRADE_MODAL_SIZE_KEY = "instantTradeModalSize";
       const AXIOM_TOKEN_DETAIL_DEFAULT_WIDTH = 312;
       const AXIOM_TOKEN_DETAIL_DEFAULT_HEIGHT = 372;
+      const AXIOM_TOKEN_DETAIL_WALLET_MENU_WIDTH = 350;
+      const AXIOM_TOKEN_DETAIL_WALLET_MENU_CONTENT_WIDTH = 348;
+      const AXIOM_TOKEN_DETAIL_WALLET_MENU_ROW_HEIGHT = 56;
+      const AXIOM_TOKEN_DETAIL_WALLET_MENU_HEADER_HEIGHT = 40;
+      const AXIOM_TOKEN_DETAIL_WALLET_MENU_LIST_MAX_HEIGHT = 252;
+      const AXIOM_TOKEN_DETAIL_WALLET_MENU_MIN_HEIGHT = 220;
+      const AXIOM_TOKEN_DETAIL_WALLET_MENU_MAX_HEIGHT = 520;
       const PULSE_PANEL_OWNER_CLASS = "trench-tools-pulse-panel-owner";
       let queuedDomOperationTimer = 0;
       const queuedDomOperations = new Map();
@@ -54,6 +60,9 @@
       let axiomTokenDetailCompactDragState = null;
       let axiomTokenDetailWalletControl = null;
       let axiomTokenDetailWalletControlCleanup = null;
+      let axiomTokenDetailSellHoverState = null;
+      let axiomTokenDetailNativeSellHoverControl = null;
+      let axiomTokenDetailSellHoverMonitorInstalled = false;
       let axiomTokenDetailFloatingPresetRefreshRoot = null;
       let axiomTokenDetailFloatingPresetRefreshObserver = null;
       let axiomTokenDetailFloatingPresetRefreshRoute = null;
@@ -462,6 +471,9 @@
           if (!route?.address || typeof helpers.prewarmForMint !== "function") {
             return;
           }
+          if (surface === "pulse" && !shouldPrewarmPulseRoute(route)) {
+            return;
+          }
           helpers.prewarmForMint(route, {
             surface,
             sourceUrl: route.url || options.url || window.location.href,
@@ -560,6 +572,8 @@
         ensureAxiomPageOverrides();
         if (!isPulseUrl(window.location.href) && instantTradeEnabled) {
           ensureAxiomTokenDetailInitialSizeStyle();
+        } else {
+          removeAxiomTokenDetailInitialSizeStyle();
         }
         if (!instantTradeEnabled) {
           cleanupAxiomTokenDetailManualBuyButtons();
@@ -593,7 +607,7 @@
             mountAxiomTokenDetailQuickButton(tokenDetailRoute);
           }
         } else if (!surfaceState.tokenDetail) {
-          cleanupAxiomTokenDetailManualBuyButtons();
+          cleanupAxiomTokenDetailManualBuyButtons({ restoreTransforms: false });
           helpers.removeInjectedControls("[data-trench-tools-token-detail-action-inline]");
         }
 
@@ -1254,19 +1268,65 @@
             return route;
           }
         }
-        const routeLink = findPulseRouteLink(card);
-        if (routeLink instanceof HTMLAnchorElement) {
-          return buildAxiomPairRouteReferenceFromElement(routeLink.href, "pulse", card);
-        }
         return null;
+      }
+
+      async function readAxiomPulseCopyButtonAddress(copyButton, parts) {
+        if (!(copyButton instanceof HTMLElement) || !parts) {
+          return "";
+        }
+        try {
+          copyButton.click();
+          const clipboardText = String(await navigator.clipboard?.readText?.() || "").trim();
+          return clipboardText &&
+            clipboardText.startsWith(parts.prefix) &&
+            clipboardText.endsWith(parts.suffix)
+            ? clipboardText
+            : "";
+        } catch {
+          return "";
+        }
       }
 
       async function resolvePulseTradeRouteWithFallback(card, control, tokenUrl = window.location.href) {
         const primaryRoute =
           normalizePulseRoute(resolvePulseTradeRouteForCard(card)) ||
           routePayloadFromPulseControl(control, { url: tokenUrl });
-        if (primaryRoute?.address) {
-          return primaryRoute;
+        const acceptedPrimaryRoute = rejectGuessedPulseRoute(primaryRoute);
+        if (acceptedPrimaryRoute?.address) {
+          return acceptedPrimaryRoute;
+        }
+        const copyButton = card instanceof HTMLElement ? card.querySelector("button.group\\/copy") : null;
+        const parts = pulseCopyParts(copyButton);
+        const copiedAddress = await readAxiomPulseCopyButtonAddress(copyButton, parts);
+        if (!copiedAddress) {
+          return null;
+        }
+        return {
+          address: copiedAddress,
+          routeKey: copiedAddress,
+          mint: copiedAddress,
+          pair: null,
+          source: "copy",
+          surface: "pulse",
+          url: tokenUrl || window.location.href
+        };
+      }
+
+      function isAuthoritativePulseRoute(route) {
+        return Boolean(route?.address && route?.mint);
+      }
+
+      function shouldPrewarmPulseRoute(route) {
+        return isAuthoritativePulseRoute(route);
+      }
+
+      function rejectGuessedPulseRoute(route) {
+        if (!route?.address) {
+          return null;
+        }
+        if (route.mint || route.source === "copy") {
+          return route;
         }
         return null;
       }
@@ -1369,7 +1429,7 @@
         }
 
         bindPulseRouteToControl(inlineButton, currentRoute, currentTokenUrl);
-        if (currentRoute?.address) {
+        if (shouldPrewarmPulseRoute(currentRoute)) {
           helpers.prewarmForMint?.(currentRoute, {
             surface: "pulse",
             sourceUrl: currentTokenUrl,
@@ -1431,7 +1491,7 @@
         }
 
         bindPulseRouteToControl(panelButton, currentRoute, currentTokenUrl);
-        if (currentRoute?.address) {
+        if (shouldPrewarmPulseRoute(currentRoute)) {
           helpers.prewarmForMint?.(currentRoute, {
             surface: "pulse",
             sourceUrl: currentTokenUrl,
@@ -2708,18 +2768,21 @@
         mountAxiomTokenDetailHardpanelManualActions(mountRoute);
       }
 
-      function cleanupAxiomTokenDetailManualBuyButtons() {
-        cleanupAxiomTokenDetailFloatingPresetButtons();
+      function cleanupAxiomTokenDetailManualBuyButtons(options = {}) {
+        cleanupAxiomTokenDetailFloatingPresetButtons(options);
         cleanupAxiomTokenDetailHardpanelManualActions();
       }
 
-      function cleanupAxiomTokenDetailFloatingPresetButtons() {
+      function cleanupAxiomTokenDetailFloatingPresetButtons(options = {}) {
         disconnectAxiomTokenDetailFloatingPresetRefreshBridge();
+        clearAxiomTokenDetailSellHoverState();
         removeAxiomTokenDetailInitialSizeStyle();
         disconnectAxiomTokenDetailPanelSizeMemory();
         disconnectAxiomTokenDetailGroupRowSizeSync();
         disconnectAxiomTokenDetailCompactDrag();
-        restoreAxiomTokenDetailManagedTransforms();
+        if (options.restoreTransforms !== false) {
+          restoreAxiomTokenDetailManagedTransforms();
+        }
         restoreAxiomTokenDetailNativeControls();
         clearAxiomTokenDetailPanelMarkers();
         document.querySelectorAll(
@@ -2731,12 +2794,15 @@
             "[data-trench-tools-token-detail-setting-tooltip]",
             "[data-trench-tools-token-detail-compact-toggle]",
             "[data-trench-tools-token-detail-wallet-selector]",
-            "[data-trench-tools-token-detail-wallet-menu]"
+            "[data-trench-tools-token-detail-wallet-menu]",
+            "[data-trench-tools-token-detail-wallet-summary]"
           ].join(", ")
         ).forEach((element) => {
           helpers.teardownInlineSizeSync(element);
           element._trenchInlineCleanup?.();
           element._trenchAxiomHoverBridgeCleanup?.();
+          element._trenchAxiomPresetClickCleanup?.();
+          element._trenchAxiomSellHoverEstimateCleanup?.();
           element._trenchAxiomEditableBridgeCleanup?.();
           element.remove();
         });
@@ -2773,6 +2839,9 @@
               action: readAxiomTokenDetailAction(nativeControl, row, rowSide)
             }))
             .filter((entry) => entry.action);
+          actions.forEach((entry) => {
+            installAxiomTokenDetailNativeSellHoverSummaryBridge(entry.nativeControl, entry.action);
+          });
           const existingButtons = Array.from(row.querySelectorAll(":scope > [data-trench-tools-token-detail-inline]"))
             .filter((element) => element instanceof HTMLElement);
           if (areAxiomTokenDetailPresetButtonsCurrent(row, existingButtons, actions, route)) {
@@ -2783,11 +2852,23 @@
               const actionEntry = Number.isFinite(controlIndex)
                 ? actions.find((entry) => entry.index === controlIndex)
                 : actions[existingButtons.indexOf(button)];
-              if (actionEntry?.action?.editable) {
-                installAxiomTokenDetailEditablePresetBridge(button, actionEntry.nativeControl, actionEntry.action);
+              const action = actionEntry?.action
+                ? {
+                  ...actionEntry.action,
+                  index: actionEntry.index,
+                  rowIndex: actionEntry.rowIndex,
+                  routeKey: route.routeKey || button.getAttribute("data-route-key"),
+                  tokenMint: route.tokenMint || button.getAttribute("data-mint"),
+                  companionPair: route.companionPair || button.getAttribute("data-pair")
+                }
+                : null;
+              if (action?.editable) {
+                installAxiomTokenDetailEditablePresetBridge(button, actionEntry.nativeControl, action);
               } else {
-                installAxiomTokenDetailNativeHoverBridge(button, actionEntry?.nativeControl);
+                button._trenchAxiomHoverBridgeCleanup?.();
               }
+              installAxiomTokenDetailPresetClickBridge(button, action);
+              installAxiomTokenDetailSellHoverEstimateBridge(button, actionEntry?.nativeControl, action);
               mountedButtons.add(button);
             });
             return;
@@ -2796,6 +2877,8 @@
             helpers.teardownInlineSizeSync(element);
             element._trenchInlineCleanup?.();
             element._trenchAxiomHoverBridgeCleanup?.();
+            element._trenchAxiomPresetClickCleanup?.();
+            element._trenchAxiomSellHoverEstimateCleanup?.();
             element._trenchAxiomEditableBridgeCleanup?.();
             element.remove();
           });
@@ -2827,6 +2910,8 @@
             helpers.teardownInlineSizeSync(element);
             element._trenchInlineCleanup?.();
             element._trenchAxiomHoverBridgeCleanup?.();
+            element._trenchAxiomPresetClickCleanup?.();
+            element._trenchAxiomSellHoverEstimateCleanup?.();
             element._trenchAxiomEditableBridgeCleanup?.();
             element.remove();
           }
@@ -2848,6 +2933,7 @@
           if (!(element instanceof HTMLElement)) {
             return;
           }
+          element._trenchAxiomNativeSellHoverCleanup?.();
           const originalMinWidth =
             element.getAttribute("data-trench-tools-token-detail-native-original-min-width") || "";
           if (originalMinWidth) {
@@ -2896,8 +2982,10 @@
 
       function setAxiomTokenDetailButtonMode(mode) {
         const instantTrade = document.querySelector("div#instant-trade");
+        clearAxiomTokenDetailSellHoverState(instantTrade);
         if (instantTrade instanceof HTMLElement) {
           rememberAxiomTokenDetailPanelSize(instantTrade, axiomTokenDetailPanelModeKey());
+          rememberAxiomTokenDetailCurrentPanelPosition(instantTrade);
         }
         axiomTokenDetailButtonMode = constrainAxiomTokenDetailButtonMode(mode);
         saveAxiomTokenDetailButtonModePreference(axiomTokenDetailButtonMode);
@@ -2963,9 +3051,6 @@
         const trenchOnly = isAxiomTokenDetailTrenchOnlyMode();
         const axiomOnly = isAxiomTokenDetailAxiomOnlyMode();
         const singleButtonMode = isAxiomTokenDetailSingleButtonMode();
-        if (!singleButtonMode) {
-          restoreAxiomTokenDetailManagedTransforms();
-        }
         instantTrade.toggleAttribute("data-trench-tools-token-detail-compact", singleButtonMode);
         instantTrade.setAttribute("data-trench-tools-token-detail-button-mode", axiomTokenDetailButtonMode);
         instantTrade.querySelectorAll("[data-trench-tools-token-detail-native-control]").forEach((element) => {
@@ -2992,6 +3077,7 @@
         applyAxiomTokenDetailRememberedPanelSize(instantTrade, options);
         ensureAxiomTokenDetailCompactDrag(instantTrade);
         updateAxiomTokenDetailCompactToggle();
+        ensureAxiomTokenDetailWalletSummaryBadges(instantTrade, axiomTokenDetailWalletControl);
       }
 
       function clearAxiomTokenDetailPanelMarkers(instantTrade = document.querySelector("div#instant-trade")) {
@@ -3005,6 +3091,7 @@
         instantTrade.removeAttribute("data-trench-tools-token-detail-managed-height");
         instantTrade.removeAttribute("data-trench-tools-token-detail-original-width");
         instantTrade.removeAttribute("data-trench-tools-token-detail-original-height");
+        clearAxiomTokenDetailManagedTransition(instantTrade);
         instantTrade.querySelectorAll("[data-trench-tools-token-detail-buy-currency-hidden]").forEach((element) => {
           element.removeAttribute("data-trench-tools-token-detail-buy-currency-hidden");
         });
@@ -3026,6 +3113,7 @@
         }
         const size = getAxiomTokenDetailRememberedPanelSize(modeKey);
         axiomTokenDetailPanelApplyingLayout = true;
+        markAxiomTokenDetailManagedTransition(instantTrade, "panel");
         instantTrade.style.width = `${size.width}px`;
         instantTrade.style.height = `${size.height}px`;
         instantTrade.setAttribute("data-trench-tools-token-detail-size-mode", modeKey);
@@ -3034,7 +3122,7 @@
         removeAxiomTokenDetailInitialSizeStyle();
         ensureAxiomTokenDetailPanelSizeMemory(instantTrade);
         syncAxiomTokenDetailGroupRowWidth(instantTrade);
-        applyAxiomInstantTradeModalPositionPreference(instantTrade, size);
+        applyAxiomTokenDetailCompactPositionPreference(instantTrade, size);
         window.requestAnimationFrame(() => {
           axiomTokenDetailPanelApplyingLayout = false;
         });
@@ -3127,7 +3215,7 @@
           return null;
         }
         try {
-          const parsed = JSON.parse(window.localStorage?.getItem(AXIOM_INSTANT_TRADE_MODAL_SIZE_KEY) || "{}");
+          const parsed = JSON.parse(window.localStorage?.getItem(AXIOM_NATIVE_INSTANT_TRADE_MODAL_SIZE_KEY) || "{}");
           const width = parseAxiomInstantTradeMetric(parsed?.width);
           const height = parseAxiomInstantTradeMetric(parsed?.height);
           if (!Number.isFinite(width) || !Number.isFinite(height)) {
@@ -3148,10 +3236,10 @@
         }
       }
 
-      function readAxiomInstantTradeModalPositionPreference(size = null) {
+      function readAxiomTokenDetailCompactPositionPreference(size = null) {
         try {
           const parsed = JSON.parse(
-            window.localStorage?.getItem(AXIOM_INSTANT_TRADE_MODAL_POSITION_KEY) || "{}"
+            window.localStorage?.getItem(AXIOM_TOKEN_DETAIL_COMPACT_POSITION_STORAGE_KEY) || "{}"
           );
           const rawX = parseAxiomInstantTradeMetric(parsed?.x ?? parsed?.left);
           const rawY = parseAxiomInstantTradeMetric(parsed?.y ?? parsed?.top);
@@ -3162,8 +3250,21 @@
           const height = Number(size?.height);
           const maxX = Number.isFinite(width) && width > 0 ? Math.max(0, window.innerWidth - width) : window.innerWidth;
           const maxY = Number.isFinite(height) && height > 0 ? Math.max(0, window.innerHeight - height) : window.innerHeight;
+          const edgeThresholdPx = 24;
+          const edgeX = String(parsed?.edgeX || "").trim().toLowerCase();
+          const offsetX = parseAxiomInstantTradeMetric(parsed?.offsetX);
+          const resolvedX =
+            edgeX === "right" && Number.isFinite(offsetX) && Number.isFinite(width) && width > 0
+              ? window.innerWidth - width - (offsetX <= edgeThresholdPx ? 0 : offsetX)
+              : edgeX === "left" && Number.isFinite(offsetX)
+                ? (offsetX <= edgeThresholdPx ? 0 : offsetX)
+                : Number.isFinite(width) && width > 0 && maxX - rawX <= edgeThresholdPx
+                  ? maxX
+                  : rawX <= edgeThresholdPx
+                    ? 0
+                    : rawX;
           return {
-            x: Math.round(clampAxiomTokenDetailDragPosition(rawX, 0, maxX)),
+            x: Math.round(clampAxiomTokenDetailDragPosition(resolvedX, 0, maxX)),
             y: Math.round(clampAxiomTokenDetailDragPosition(rawY, 0, maxY))
           };
         } catch (_error) {
@@ -3181,18 +3282,23 @@
         return Number.NaN;
       }
 
-      function applyAxiomInstantTradeModalPositionPreference(instantTrade, size = null) {
+      function applyAxiomTokenDetailCompactPositionPreference(instantTrade, size = null) {
         const container = findAxiomTokenDetailDragContainer(instantTrade);
         if (!(container instanceof HTMLElement) || axiomTokenDetailCompactDragState) {
           return;
         }
         const rect = container.getBoundingClientRect();
-        const position = readAxiomInstantTradeModalPositionPreference(size || rect);
+        const measuredSize = Number.isFinite(rect.width) && rect.width > 0 && Number.isFinite(rect.height) && rect.height > 0
+          ? rect
+          : size;
+        const position = readAxiomTokenDetailCompactPositionPreference(measuredSize);
         if (!position) {
           return;
         }
+        const managedTransform = isAxiomTokenDetailSingleButtonMode();
         setAxiomTokenDetailDragContainerTransform(container, position.x, position.y, {
-          managed: isAxiomTokenDetailSingleButtonMode()
+          managed: managedTransform,
+          disableTransition: true
         });
       }
 
@@ -3346,9 +3452,6 @@
           [modeKey]: size
         };
         saveAxiomTokenDetailPanelSizePreference();
-        if (modeKey === "expanded") {
-          rememberAxiomInstantTradeModalSize(size.width, size.height);
-        }
       }
 
       function ensureAxiomTokenDetailGroupRowSizeSync(
@@ -3404,6 +3507,7 @@
         }
         groupRow.setAttribute("data-trench-tools-token-detail-group-row", "true");
         if (width > 0) {
+          markAxiomTokenDetailManagedTransition(groupRow, "row");
           groupRow.style.width = "fit-content";
           groupRow.style.maxWidth = `${width}px`;
         }
@@ -3429,6 +3533,7 @@
           element.removeAttribute("data-trench-tools-token-detail-group-row");
           element.removeAttribute("data-trench-tools-token-detail-group-row-original-width");
           element.removeAttribute("data-trench-tools-token-detail-group-row-original-max-width");
+          clearAxiomTokenDetailManagedTransition(element);
         });
       }
 
@@ -3449,6 +3554,7 @@
             );
           }
           container.setAttribute("data-trench-tools-token-detail-container", "true");
+          markAxiomTokenDetailManagedTransition(container, "container");
           container.style.width = `${width}px`;
           container.style.minWidth = `${width}px`;
           container.style.maxWidth = `${width}px`;
@@ -3484,7 +3590,41 @@
           element.removeAttribute("data-trench-tools-token-detail-container-original-width");
           element.removeAttribute("data-trench-tools-token-detail-container-original-min-width");
           element.removeAttribute("data-trench-tools-token-detail-container-original-max-width");
+          clearAxiomTokenDetailManagedTransition(element);
         });
+      }
+
+      function markAxiomTokenDetailManagedTransition(element, kind = "") {
+        if (!(element instanceof HTMLElement)) {
+          return;
+        }
+        if (!element.hasAttribute("data-trench-tools-token-detail-managed-transition")) {
+          element.setAttribute("data-trench-tools-token-detail-layout-original-transition", element.style.transition || "");
+          element.setAttribute(
+            "data-trench-tools-token-detail-layout-original-transition-priority",
+            element.style.getPropertyPriority("transition") || ""
+          );
+        }
+        element.setAttribute("data-trench-tools-token-detail-managed-transition", kind || "true");
+      }
+
+      function clearAxiomTokenDetailManagedTransition(element) {
+        if (!(element instanceof HTMLElement) ||
+          !element.hasAttribute("data-trench-tools-token-detail-managed-transition")
+        ) {
+          return;
+        }
+        const originalTransition = element.getAttribute("data-trench-tools-token-detail-layout-original-transition") || "";
+        const transitionPriority =
+          element.getAttribute("data-trench-tools-token-detail-layout-original-transition-priority") || "";
+        if (originalTransition) {
+          element.style.setProperty("transition", originalTransition, transitionPriority);
+        } else {
+          element.style.removeProperty("transition");
+        }
+        element.removeAttribute("data-trench-tools-token-detail-managed-transition");
+        element.removeAttribute("data-trench-tools-token-detail-layout-original-transition");
+        element.removeAttribute("data-trench-tools-token-detail-layout-original-transition-priority");
       }
 
       function findAxiomTokenDetailPanelContainers(instantTrade, width) {
@@ -3574,17 +3714,49 @@
           rect.height <= panelRect.height + 220;
       }
 
-      function rememberAxiomInstantTradeModalPosition(x, y) {
+      function rememberAxiomTokenDetailCompactPosition(x, y, size = null) {
         if (!Number.isFinite(x) || !Number.isFinite(y)) {
           return;
         }
         try {
-          const value = JSON.stringify({ x: Math.round(x), y: Math.round(y) });
+          const roundedX = Math.round(x);
+          const roundedY = Math.round(y);
+          const value = {
+            x: roundedX,
+            y: roundedY
+          };
+          const width = Number(size?.width);
+          if (Number.isFinite(width) && width > 0) {
+            const edgeThresholdPx = 24;
+            const leftOffset = Math.max(0, x);
+            const rightOffset = Math.max(0, window.innerWidth - (x + width));
+            if (leftOffset <= edgeThresholdPx || rightOffset <= edgeThresholdPx) {
+              if (rightOffset < leftOffset) {
+                value.edgeX = "right";
+                value.offsetX = 0;
+              } else {
+                value.edgeX = "left";
+                value.offsetX = 0;
+              }
+            }
+          }
           window.localStorage?.setItem(
-            AXIOM_INSTANT_TRADE_MODAL_POSITION_KEY,
-            value
+            AXIOM_TOKEN_DETAIL_COMPACT_POSITION_STORAGE_KEY,
+            JSON.stringify(value)
           );
         } catch (_error) {}
+      }
+
+      function rememberAxiomTokenDetailCurrentPanelPosition(instantTrade) {
+        const container = findAxiomTokenDetailDragContainer(instantTrade);
+        if (!(container instanceof HTMLElement)) {
+          return;
+        }
+        const rect = container.getBoundingClientRect();
+        if (!Number.isFinite(rect.x) || !Number.isFinite(rect.y)) {
+          return;
+        }
+        rememberAxiomTokenDetailCompactPosition(rect.x, rect.y, rect);
       }
 
       function setAxiomTokenDetailDragContainerTransform(container, x, y, options = {}) {
@@ -3610,7 +3782,43 @@
           container.style.setProperty("transform", value, "important");
           return;
         }
+        if (options.disableTransition === true) {
+          const hasSavedTransition = container.hasAttribute("data-trench-tools-token-detail-original-transition");
+          const originalTransition = hasSavedTransition
+            ? container.getAttribute("data-trench-tools-token-detail-original-transition") || ""
+            : container.style.transition || "";
+          const originalTransitionPriority = hasSavedTransition
+            ? container.getAttribute("data-trench-tools-token-detail-original-transition-priority") || ""
+            : container.style.getPropertyPriority("transition") || "";
+          clearAxiomTokenDetailManagedTransformMarkers(container);
+          container.style.setProperty("transition", "none", "important");
+          container.style.transform = value;
+          window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+              if (!(container instanceof HTMLElement) || !container.isConnected) {
+                return;
+              }
+              if (originalTransition) {
+                container.style.setProperty("transition", originalTransition, originalTransitionPriority);
+              } else {
+                container.style.removeProperty("transition");
+              }
+            });
+          });
+          return;
+        }
         container.style.transform = value;
+      }
+
+      function clearAxiomTokenDetailManagedTransformMarkers(element) {
+        if (!(element instanceof HTMLElement)) {
+          return;
+        }
+        element.removeAttribute("data-trench-tools-token-detail-managed-transform");
+        element.removeAttribute("data-trench-tools-token-detail-original-transform");
+        element.removeAttribute("data-trench-tools-token-detail-original-transform-priority");
+        element.removeAttribute("data-trench-tools-token-detail-original-transition");
+        element.removeAttribute("data-trench-tools-token-detail-original-transition-priority");
       }
 
       function restoreAxiomTokenDetailManagedTransforms() {
@@ -3639,18 +3847,6 @@
           element.removeAttribute("data-trench-tools-token-detail-original-transition");
           element.removeAttribute("data-trench-tools-token-detail-original-transition-priority");
         });
-      }
-
-      function rememberAxiomInstantTradeModalSize(width, height) {
-        if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
-          return;
-        }
-        try {
-          window.localStorage?.setItem(
-            AXIOM_INSTANT_TRADE_MODAL_SIZE_KEY,
-            JSON.stringify({ width: Math.round(width), height: Math.round(height) })
-          );
-        } catch (_error) {}
       }
 
       function ensureAxiomTokenDetailCompactDrag(instantTrade = document.querySelector("div#instant-trade")) {
@@ -3722,7 +3918,7 @@
             if (Math.abs(rect.x - startRect.x) < 2 && Math.abs(rect.y - startRect.y) < 2) {
               return;
             }
-            rememberAxiomInstantTradeModalPosition(rect.x, rect.y);
+            rememberAxiomTokenDetailCompactPosition(rect.x, rect.y, rect);
           }, 0);
         };
         document.addEventListener("pointerup", remember, true);
@@ -3831,7 +4027,7 @@
           if (state.container instanceof HTMLElement && state.container.isConnected) {
             applyAxiomTokenDetailCompactDragFrame(state);
             setAxiomTokenDetailDragContainerTransform(state.container, state.nextX, state.nextY, { managed: true });
-            rememberAxiomInstantTradeModalPosition(state.nextX, state.nextY);
+            rememberAxiomTokenDetailCompactPosition(state.nextX, state.nextY, state.container.getBoundingClientRect());
           }
         }
         stopAxiomTokenDetailCompactDrag();
@@ -4050,6 +4246,7 @@
           return;
         }
         document.querySelectorAll("[data-trench-tools-token-detail-wallet-selector]").forEach((element) => element.remove());
+        ensureAxiomTokenDetailWalletSummaryBadges(instantTrade, nativeWalletControl);
         if (axiomTokenDetailWalletControl === nativeWalletControl) {
           return;
         }
@@ -4089,9 +4286,21 @@
       }
 
       function cleanupAxiomTokenDetailWalletSelector() {
+        clearAxiomTokenDetailSellHoverState();
         document.querySelectorAll(
-          "[data-trench-tools-token-detail-wallet-selector], [data-trench-tools-token-detail-wallet-menu]"
+          "[data-trench-tools-token-detail-wallet-selector], [data-trench-tools-token-detail-wallet-menu], [data-trench-tools-token-detail-wallet-summary]"
         ).forEach((element) => element.remove());
+        document.querySelectorAll("[data-trench-tools-token-detail-summary-hide-native]").forEach((element) => {
+          if (element instanceof HTMLElement) {
+            element.removeAttribute("data-trench-tools-token-detail-summary-hide-native");
+          }
+        });
+        document.querySelectorAll("[data-trench-tools-token-detail-native-wallet-count-hidden]").forEach((element) => {
+          if (element instanceof HTMLElement) {
+            element.style.removeProperty("display");
+            element.removeAttribute("data-trench-tools-token-detail-native-wallet-count-hidden");
+          }
+        });
         document.removeEventListener("mousedown", handleAxiomTokenDetailWalletMenuOutsideClick, true);
         axiomTokenDetailWalletControlCleanup?.();
         axiomTokenDetailWalletControlCleanup = null;
@@ -4138,6 +4347,862 @@
         if (/wallet/i.test(text)) score += 10;
         if (/SOLANA_PRIVATE_KEY|^#\d+$/i.test(text)) score += 8;
         return score;
+      }
+
+      function ensureAxiomTokenDetailWalletSummaryBadges(
+        instantTrade = findAxiomTokenDetailInstantTradePanel(),
+        nativeWalletControl = axiomTokenDetailWalletControl
+      ) {
+        if (!(instantTrade instanceof HTMLElement) || !(nativeWalletControl instanceof HTMLElement)) {
+          return;
+        }
+        resetAxiomTokenDetailWalletSummaryRender(instantTrade);
+        const data = getAxiomTokenDetailWalletSummaryData();
+        const slots = resolveAxiomTokenDetailBalanceSlots(instantTrade, nativeWalletControl);
+        renderAxiomTokenDetailWalletSummary(slots, data, axiomTokenDetailButtonMode);
+      }
+
+      function refreshAxiomTokenDetailWalletSummaryBadges(
+        instantTrade = findAxiomTokenDetailInstantTradePanel(),
+        nativeWalletControl = axiomTokenDetailWalletControl
+      ) {
+        if (!(instantTrade instanceof HTMLElement) || !(nativeWalletControl instanceof HTMLElement)) {
+          return;
+        }
+        const data = getAxiomTokenDetailWalletSummaryData();
+        const slots = resolveAxiomTokenDetailBalanceSlots(instantTrade, nativeWalletControl);
+        syncAxiomTokenDetailWalletCountSummary(slots.walletCountSlot, data.count, axiomTokenDetailButtonMode);
+        renderAxiomTokenDetailBuySolSummary(slots, data, axiomTokenDetailButtonMode);
+        renderAxiomTokenDetailSellDisplay(slots, data, axiomTokenDetailButtonMode);
+      }
+
+      function getAxiomTokenDetailWalletSummaryData() {
+        const options = axiomTokenDetailWalletOptions();
+        const optionById = new Map(options.map((option) => [option.id, option]));
+        const selection = resolveAxiomTokenDetailWalletSelection();
+        const selectedKeys = Array.from(new Set(
+          (selection?.manualWalletKeys || [])
+            .map((key) => String(key || "").trim())
+            .filter((key) => key && optionById.has(key))
+        ));
+        const selectedOptions = selectedKeys.map((key) => optionById.get(key)).filter(Boolean);
+        const solBalance = selectedOptions.reduce((sum, option) => sum + (Number(option.balanceValue) || 0), 0);
+        const tokenBalance = selectedOptions.reduce((sum, option) => sum + (Number(option.tokenBalanceValue) || 0), 0);
+        const selectedTokenValueSol = selectedOptions.reduce((sum, option) => {
+          const value = axiomTokenDetailFiniteValueOrNull(option.tokenValueSol);
+          return Number.isFinite(value) ? sum + value : sum;
+        }, 0);
+        const selectedTokenValueKnown = selectedOptions.some((option) =>
+          axiomTokenDetailFiniteValueOrNull(option.tokenValueSol) != null
+        );
+        const aggregateTokenBalance = Number(
+          helpers.state.walletStatus?.holdingAmount ??
+          helpers.state.walletStatus?.mintBalanceUi ??
+          helpers.state.walletStatus?.tokenBalance
+        );
+        const aggregateHoldingValueSol = Number(
+          helpers.state.walletStatus?.holdingValueSol ??
+          helpers.state.walletStatus?.holding
+        );
+        const tokenValueSol =
+          selectedTokenValueKnown
+            ? selectedTokenValueSol
+            :
+          Number.isFinite(aggregateTokenBalance) &&
+          aggregateTokenBalance > 0 &&
+          Number.isFinite(aggregateHoldingValueSol)
+            ? (tokenBalance / aggregateTokenBalance) * aggregateHoldingValueSol
+            : null;
+        return {
+          count: selectedOptions.length,
+          solBalance,
+          tokenBalance,
+          tokenValueSol,
+          tokenValueKnown: selectedTokenValueKnown || Number.isFinite(tokenValueSol),
+          ticker: axiomTokenDetailSellTokenTicker(),
+          quoteConfidence: selectedTokenValueKnown ? "wallet" : Number.isFinite(tokenValueSol) ? "panel" : "unknown"
+        };
+      }
+
+      function axiomTokenDetailSelectedWalletSummary() {
+        return getAxiomTokenDetailWalletSummaryData();
+      }
+
+      function resolveAxiomTokenDetailBalanceSlots(instantTrade, nativeWalletControl = axiomTokenDetailWalletControl) {
+        const walletCountSlot = findAxiomTokenDetailWalletControlCountSlot(nativeWalletControl);
+        const buyHeader = findAxiomTokenDetailTradeBalanceHeader(instantTrade, "buy");
+        const sellHeader = findAxiomTokenDetailTradeBalanceHeader(instantTrade, "sell");
+        const buyValueRoot = findAxiomTokenDetailTradeBalanceValueRootFromHeader(buyHeader);
+        const sellValueRoot = findAxiomTokenDetailTradeBalanceValueRootFromHeader(sellHeader);
+        return {
+          instantTrade,
+          nativeWalletControl,
+          walletCountSlot,
+          buyHeader,
+          buySolSlot: findAxiomTokenDetailBuySolBalanceSlotFromHeader(buyHeader),
+          buyValueRoot,
+          sellHeader,
+          sellSlot: findAxiomTokenDetailSellBalanceSlotFromHeader(sellHeader),
+          sellValueRoot
+        };
+      }
+
+      function renderAxiomTokenDetailWalletSummary(slots, data, mode) {
+        const normalizedMode = normalizeAxiomTokenDetailButtonMode(mode) || "dual";
+        syncAxiomTokenDetailWalletCountSummary(slots?.walletCountSlot, data?.count || 0, normalizedMode);
+        renderAxiomTokenDetailBuySolSummary(slots, data, normalizedMode);
+        renderAxiomTokenDetailSellDisplay(slots, data, normalizedMode);
+      }
+
+      function resetAxiomTokenDetailWalletSummaryRender(instantTrade = findAxiomTokenDetailInstantTradePanel()) {
+        const root = instantTrade instanceof HTMLElement ? instantTrade : document;
+        root.querySelectorAll("[data-trench-tools-token-detail-wallet-summary]").forEach((element) => element.remove());
+        root.querySelectorAll("[data-trench-tools-token-detail-balance-tt-column]").forEach((element) => element.remove());
+        root.querySelectorAll("[data-trench-tools-token-detail-balance-header]").forEach((element) => {
+          if (element instanceof HTMLElement) {
+            element.removeAttribute("data-trench-tools-token-detail-balance-header");
+          }
+        });
+        root.querySelectorAll("[data-trench-tools-token-detail-balance-native-column]").forEach((element) => {
+          if (element instanceof HTMLElement) {
+            element.removeAttribute("data-trench-tools-token-detail-balance-native-column");
+          }
+        });
+        root.querySelectorAll("[data-trench-tools-token-detail-summary-hide-native]").forEach((element) => {
+          if (element instanceof HTMLElement) {
+            element.removeAttribute("data-trench-tools-token-detail-summary-hide-native");
+          }
+        });
+        root.querySelectorAll("[data-trench-tools-token-detail-native-wallet-count-hidden]").forEach((element) => {
+          if (element instanceof HTMLElement) {
+            element.style.removeProperty("display");
+            element.removeAttribute("data-trench-tools-token-detail-native-wallet-count-hidden");
+          }
+        });
+      }
+
+      function renderAxiomTokenDetailBuySolSummary(slots, summary, mode) {
+        const normalizedMode = normalizeAxiomTokenDetailButtonMode(mode) || "dual";
+        if (normalizedMode === "dual") {
+          clearAxiomTokenDetailInlineSummaryNodes(slots?.buySolSlot, slots?.buyValueRoot);
+          renderAxiomTokenDetailBalanceTtColumn(slots?.buyHeader, slots?.buyValueRoot, "buy", () =>
+            buildAxiomTokenDetailSolInlineSummary(slots?.buySolSlot, formatAxiomTokenDetailWalletBalance(summary.solBalance), "trench-tools-axiom-token-detail-wallet-sol")
+          );
+          return;
+        }
+        clearAxiomTokenDetailBalanceTtColumn(slots?.buyHeader, slots?.buyValueRoot);
+        syncAxiomTokenDetailInlineValue(slots?.buySolSlot, {
+          value: formatAxiomTokenDetailWalletBalance(summary.solBalance),
+          className: "trench-tools-axiom-token-detail-wallet-sol",
+          mode: normalizedMode,
+          buildValue: (slot) => buildAxiomTokenDetailSolInlineSummary(slot, formatAxiomTokenDetailWalletBalance(summary.solBalance), "trench-tools-axiom-token-detail-wallet-sol")
+        });
+      }
+
+      function renderAxiomTokenDetailSellSummary(slots, summary, mode) {
+        const normalizedMode = normalizeAxiomTokenDetailButtonMode(mode) || "dual";
+        if (normalizedMode === "dual") {
+          clearAxiomTokenDetailSellSummaryNodes(slots);
+          renderAxiomTokenDetailBalanceTtColumn(slots?.sellHeader, slots?.sellValueRoot, "sell", () =>
+            buildAxiomTokenDetailSellInlineSummary(slots?.sellSlot, summary, { strictValue: true })
+          );
+          return;
+        }
+        clearAxiomTokenDetailBalanceTtColumn(slots?.sellHeader, slots?.sellValueRoot);
+        syncAxiomTokenDetailInlineValue(slots?.sellSlot, {
+          value: formatAxiomTokenDetailSellSummaryValue(summary, slots?.sellSlot),
+          className: "trench-tools-axiom-token-detail-wallet-value",
+          mode: normalizedMode,
+          hideSlot: slots?.sellValueRoot,
+          buildValue: (slot) => buildAxiomTokenDetailSellInlineSummary(slot, summary)
+        });
+      }
+
+      function renderAxiomTokenDetailSellDisplay(slots, summary, mode) {
+        if (shouldDeferAxiomTokenDetailSellSummaryToNative(mode)) {
+          renderAxiomTokenDetailNativeSellHoverPassthrough(slots, summary, mode);
+          return;
+        }
+        if (axiomTokenDetailSellHoverState) {
+          if (axiomTokenDetailSellHoverState.type === "trench") {
+            renderAxiomTokenDetailTrenchSellHover(slots, summary, axiomTokenDetailSellHoverState, mode);
+            return;
+          }
+        }
+        renderAxiomTokenDetailSellSummary(slots, summary, mode);
+      }
+
+      function shouldDeferAxiomTokenDetailSellSummaryToNative(mode) {
+        const normalizedMode = normalizeAxiomTokenDetailButtonMode(mode) || "dual";
+        return (normalizedMode === "axiom" || normalizedMode === "dual") &&
+          axiomTokenDetailNativeSellHoverControl instanceof HTMLElement &&
+          axiomTokenDetailNativeSellHoverControl.isConnected;
+      }
+
+      function renderAxiomTokenDetailNativeSellHoverPassthrough(slots, summary, mode) {
+        const normalizedMode = normalizeAxiomTokenDetailButtonMode(mode) || "dual";
+        if (normalizedMode === "dual") {
+          slots?.sellHeader?.querySelectorAll?.(":scope > [data-trench-tools-token-detail-balance-tt-column]")
+            .forEach((element) => element.remove());
+          renderAxiomTokenDetailBalanceTtColumn(slots?.sellHeader, slots?.sellValueRoot, "sell", () =>
+            buildAxiomTokenDetailSellInlineSummary(slots?.sellSlot, summary, { strictValue: true })
+          );
+          return;
+        }
+        clearAxiomTokenDetailBalanceTtColumn(slots?.sellHeader, slots?.sellValueRoot);
+        clearAxiomTokenDetailInlineSummaryNodes(slots?.sellSlot, slots?.sellValueRoot);
+      }
+
+      function syncAxiomTokenDetailWalletControlSummary(nativeWalletControl, summary) {
+        const instantTrade = nativeWalletControl?.closest?.("div#instant-trade") || findAxiomTokenDetailInstantTradePanel();
+        const slots = resolveAxiomTokenDetailBalanceSlots(instantTrade, nativeWalletControl);
+        syncAxiomTokenDetailWalletCountSummary(slots.walletCountSlot, summary.count, axiomTokenDetailButtonMode);
+        renderAxiomTokenDetailBuySolSummary(slots, summary, axiomTokenDetailButtonMode);
+      }
+
+      function findAxiomTokenDetailWalletControlCountSlot(nativeWalletControl) {
+        const children = Array.from(nativeWalletControl?.children || [])
+          .filter((element) => element instanceof HTMLElement);
+        return children.find((element) => /wallet|^\d+$/i.test(String(element.textContent || "").replace(/\s+/g, "").trim())) ||
+          children[0] ||
+          null;
+      }
+
+      function syncAxiomTokenDetailWalletCountSummary(slot, count, mode) {
+        if (!(slot instanceof HTMLElement)) {
+          return;
+        }
+        const normalizedMode = normalizeAxiomTokenDetailButtonMode(mode) || "dual";
+        slot.querySelectorAll(":scope > [data-trench-tools-token-detail-wallet-summary]").forEach((element) => element.remove());
+        slot.querySelectorAll("[data-trench-tools-token-detail-native-wallet-count-hidden]").forEach((element) => {
+          if (element instanceof HTMLElement) {
+            element.style.removeProperty("display");
+            element.removeAttribute("data-trench-tools-token-detail-native-wallet-count-hidden");
+          }
+        });
+        if (normalizedMode === "axiom") {
+          return;
+        }
+        const nativeCount = findAxiomTokenDetailWalletNativeCountText(slot);
+        if (normalizedMode === "trench" && nativeCount instanceof HTMLElement) {
+          nativeCount.setAttribute("data-trench-tools-token-detail-native-wallet-count-hidden", "true");
+          nativeCount.style.display = "none";
+        }
+        if (normalizedMode === "dual" && nativeCount instanceof HTMLElement) {
+          slot.appendChild(buildAxiomTokenDetailWalletCountSeparator(nativeCount));
+        }
+        slot.appendChild(buildAxiomTokenDetailWalletCountText(String(count), nativeCount));
+      }
+
+      function findAxiomTokenDetailWalletNativeCountText(slot) {
+        if (!(slot instanceof HTMLElement)) {
+          return null;
+        }
+        return Array.from(slot.children).find((element) =>
+          element instanceof HTMLElement &&
+          !element.hasAttribute("data-trench-tools-token-detail-wallet-summary") &&
+          !element.matches("i, svg, img") &&
+          /\d/.test(String(element.textContent || ""))
+        ) || null;
+      }
+
+      function buildAxiomTokenDetailWalletCountText(value, nativeCount) {
+        const text = document.createElement("span");
+        text.setAttribute("data-trench-tools-token-detail-wallet-summary", "true");
+        text.className = nativeCount instanceof HTMLElement
+          ? `${nativeCount.className} trench-tools-axiom-token-detail-wallet-count`
+          : "trench-tools-axiom-token-detail-wallet-count";
+        text.textContent = value;
+        return text;
+      }
+
+      function buildAxiomTokenDetailWalletCountSeparator(nativeCount) {
+        const text = document.createElement("span");
+        text.setAttribute("data-trench-tools-token-detail-wallet-summary", "true");
+        text.className = nativeCount instanceof HTMLElement
+          ? `${nativeCount.className} trench-tools-axiom-token-detail-wallet-separator`
+          : "trench-tools-axiom-token-detail-wallet-separator";
+        text.textContent = "|";
+        return text;
+      }
+
+      function findAxiomTokenDetailBuySolBalanceSlot(instantTrade) {
+        const header = findAxiomTokenDetailTradeBalanceHeader(instantTrade, "buy");
+        return findAxiomTokenDetailBuySolBalanceSlotFromHeader(header);
+      }
+
+      function findAxiomTokenDetailBuySolBalanceSlotFromHeader(header) {
+        if (!(header instanceof HTMLElement)) {
+          return null;
+        }
+        return findAxiomTokenDetailTradeBalanceValueSlot(header, (element) =>
+          element.querySelector("img[src*='sol-fill'], img[alt='SOL'], svg") &&
+          /\d/.test(String(element.textContent || ""))
+        );
+      }
+
+      function findAxiomTokenDetailTradeBalanceHeader(instantTrade, side) {
+        const container = instantTrade?.querySelector?.(".buy-click-container");
+        if (!(container instanceof HTMLElement)) {
+          return null;
+        }
+        const sidePattern = side === "sell" ? /^Sell/i : /^Buy/i;
+        return Array.from(container.querySelectorAll("div.flex.items-center.justify-between"))
+          .filter((element) => element instanceof HTMLElement)
+          .find((element) => {
+            const children = Array.from(element.children).filter((child) => child instanceof HTMLElement);
+            const labelText = String(children[0]?.textContent || "").replace(/\s+/g, " ").trim();
+            const valueText = String(children[1]?.textContent || "").replace(/\s+/g, " ").trim();
+            return sidePattern.test(labelText) && /\d/.test(valueText) && isVisibleAxiomNode(element);
+          }) || null;
+      }
+
+      function findAxiomTokenDetailTradeBalanceValueSlot(header, predicate) {
+        const children = Array.from(header?.children || []).filter((child) => child instanceof HTMLElement);
+        const valueRoot = children[1] instanceof HTMLElement ? children[1] : null;
+        if (!(valueRoot instanceof HTMLElement)) {
+          return null;
+        }
+        const candidates = Array.from(valueRoot.querySelectorAll("span"))
+          .filter((element) =>
+            element instanceof HTMLElement &&
+            axiomTokenDetailElementText(element) &&
+            !element.hasAttribute("data-trench-tools-token-detail-wallet-summary") &&
+            !element.closest("[data-trench-tools-token-detail-wallet-summary]") &&
+            (!predicate || predicate(element))
+          );
+        return candidates
+          .sort((left, right) => {
+            const leftScore = axiomTokenDetailTradeBalanceValueSlotScore(left);
+            const rightScore = axiomTokenDetailTradeBalanceValueSlotScore(right);
+            if (leftScore !== rightScore) {
+              return rightScore - leftScore;
+            }
+            const leftRect = left.getBoundingClientRect();
+            const rightRect = right.getBoundingClientRect();
+            return (leftRect.top - rightRect.top) || (rightRect.left - leftRect.left);
+          })[0] || null;
+      }
+
+      function axiomTokenDetailTradeBalanceValueSlotScore(element) {
+        if (!(element instanceof HTMLElement)) {
+          return 0;
+        }
+        const ownText = axiomTokenDetailInlineValueOwnText(element);
+        const className = String(element.className || "");
+        let score = 0;
+        if (element.matches("span")) score += 30;
+        if (/\bflex\b/.test(className)) score += 40;
+        if (/text-textSecondary/.test(className)) score += 10;
+        if (element.parentElement instanceof HTMLElement && /text-textSecondary/.test(String(element.parentElement.className || ""))) score += 20;
+        if (element.children.length <= 2) score += 10;
+        if (element.querySelector("img[src*='sol-fill'], img[alt='SOL'], svg")) score += 10;
+        if (/^\d/.test(ownText)) score += 10;
+        if (element.closest(".flex.items-center.justify-between")) score += 8;
+        score -= Math.max(0, element.getBoundingClientRect().width - 120) / 4;
+        return score;
+      }
+
+      function syncAxiomTokenDetailInlineValue(slot, { value, className, mode, hideSlot = null, buildValue = null }) {
+        if (!(slot instanceof HTMLElement)) {
+          return;
+        }
+        const normalizedMode = normalizeAxiomTokenDetailButtonMode(mode) || "dual";
+        const hideTarget = hideSlot instanceof HTMLElement ? hideSlot : slot;
+        clearAxiomTokenDetailInlineSummaryNodes(slot, hideTarget);
+        if (normalizedMode === "axiom") {
+          return;
+        }
+        hideTarget.toggleAttribute("data-trench-tools-token-detail-summary-hide-native", normalizedMode === "trench");
+        const appendTarget = normalizedMode === "trench" ? hideTarget : slot;
+        if (normalizedMode === "dual" && axiomTokenDetailElementText(slot)) {
+          appendTarget.appendChild(buildAxiomTokenDetailWalletSummaryText(" | ", "trench-tools-axiom-token-detail-wallet-separator"));
+        }
+        appendTarget.appendChild(typeof buildValue === "function"
+          ? buildValue(slot)
+          : buildAxiomTokenDetailWalletSummaryText(value, className));
+      }
+
+      function clearAxiomTokenDetailInlineSummaryNodes(slot, hideTarget = null) {
+        if (slot instanceof HTMLElement) {
+          slot.querySelectorAll(":scope > [data-trench-tools-token-detail-wallet-summary]").forEach((element) => element.remove());
+        }
+        if (hideTarget instanceof HTMLElement) {
+          hideTarget.removeAttribute("data-trench-tools-token-detail-summary-hide-native");
+          if (hideTarget !== slot) {
+            hideTarget.querySelectorAll(":scope > [data-trench-tools-token-detail-wallet-summary]").forEach((element) => element.remove());
+          }
+        }
+      }
+
+      function clearAxiomTokenDetailSellSummaryNodes(slots) {
+        const sellSlot = slots?.sellSlot;
+        const sellRoot = slots?.sellValueRoot;
+        clearAxiomTokenDetailInlineSummaryNodes(sellSlot, sellRoot);
+        clearAxiomTokenDetailBalanceTtColumn(slots?.sellHeader, sellRoot);
+      }
+
+      function clearAxiomTokenDetailBalanceTtColumn(header, valueRoot = null) {
+        if (header instanceof HTMLElement) {
+          header.querySelectorAll(":scope > [data-trench-tools-token-detail-balance-tt-column]").forEach((element) => element.remove());
+          header.removeAttribute("data-trench-tools-token-detail-balance-header");
+        }
+        if (valueRoot instanceof HTMLElement) {
+          valueRoot.removeAttribute("data-trench-tools-token-detail-balance-native-column");
+        }
+      }
+
+      function renderAxiomTokenDetailBalanceTtColumn(header, valueRoot, side, buildValue) {
+        if (!(header instanceof HTMLElement) || !(valueRoot instanceof HTMLElement) || typeof buildValue !== "function") {
+          return;
+        }
+        clearAxiomTokenDetailBalanceTtColumn(header, valueRoot);
+        header.setAttribute("data-trench-tools-token-detail-balance-header", side);
+        valueRoot.setAttribute("data-trench-tools-token-detail-balance-native-column", side);
+        const summary = document.createElement("span");
+        summary.setAttribute("data-trench-tools-token-detail-balance-tt-column", "true");
+        summary.setAttribute("data-trench-tools-token-detail-balance-tt-column-side", side);
+        summary.appendChild(buildValue());
+        header.appendChild(summary);
+      }
+
+      function renderAxiomTokenDetailTrenchSellHover(slots, summary, hoverState, mode) {
+        const estimate = buildAxiomTokenDetailTrenchSellHoverEstimate(summary, hoverState);
+        const normalizedMode = normalizeAxiomTokenDetailButtonMode(mode) || "dual";
+        if (normalizedMode === "axiom") {
+          renderAxiomTokenDetailSellSummary(slots, summary, normalizedMode);
+          return;
+        }
+        if (!estimate) {
+          renderAxiomTokenDetailSellSummary(slots, summary, normalizedMode);
+          return;
+        }
+        if (normalizedMode === "dual") {
+          clearAxiomTokenDetailSellSummaryNodes(slots);
+          renderAxiomTokenDetailBalanceTtColumn(slots?.sellHeader, slots?.sellValueRoot, "sell", () =>
+            buildAxiomTokenDetailSellInlineSummary(slots?.sellSlot, estimate, {
+              hover: true,
+              strictValue: true,
+              ticker: estimate.ticker
+            })
+          );
+          return;
+        }
+        const sellSlot = slots?.sellSlot;
+        const sellRoot = slots?.sellValueRoot instanceof HTMLElement ? slots.sellValueRoot : sellSlot;
+        clearAxiomTokenDetailSellSummaryNodes(slots);
+        if (!(sellSlot instanceof HTMLElement) || !(sellRoot instanceof HTMLElement)) {
+          return;
+        }
+        const appendTarget = normalizedMode === "trench" ? sellRoot : sellSlot;
+        sellRoot.toggleAttribute("data-trench-tools-token-detail-summary-hide-native", normalizedMode === "trench");
+        appendTarget.appendChild(buildAxiomTokenDetailSellInlineSummary(sellSlot, estimate, {
+          hover: true,
+          strictValue: true,
+          ticker: estimate.ticker
+        }));
+      }
+
+      function buildAxiomTokenDetailTrenchSellHoverEstimate(summary, hoverState) {
+        const tokenBalance = Number(summary?.tokenBalance);
+        const amount = Number(hoverState?.amount);
+        const sellUnit = String(hoverState?.sellUnit || "").trim().toLowerCase();
+        if (!Number.isFinite(tokenBalance) || tokenBalance <= 0 || !Number.isFinite(amount) || amount <= 0) {
+          return null;
+        }
+        const totalValueSol = axiomTokenDetailKnownSellValueSol(summary);
+        let estimatedTokenBalance = null;
+        let estimatedValueSol = null;
+        if (sellUnit === "percent") {
+          estimatedTokenBalance = tokenBalance * amount / 100;
+          estimatedValueSol = Number.isFinite(totalValueSol) && totalValueSol > 0
+            ? totalValueSol * amount / 100
+            : null;
+        } else if (sellUnit === "sol") {
+          if (!Number.isFinite(totalValueSol) || totalValueSol <= 0) {
+            return null;
+          }
+          estimatedValueSol = Math.min(amount, totalValueSol);
+          estimatedTokenBalance = tokenBalance * (estimatedValueSol / totalValueSol);
+        } else {
+          return null;
+        }
+        if (!Number.isFinite(estimatedTokenBalance) || estimatedTokenBalance <= 0) {
+          return null;
+        }
+        return {
+          tokenBalance: estimatedTokenBalance,
+          tokenValueSol: Number.isFinite(estimatedValueSol) && estimatedValueSol > 0 ? estimatedValueSol : null,
+          ticker: summary?.ticker || axiomTokenDetailSellTokenTicker()
+        };
+      }
+
+      function setAxiomTokenDetailSellHoverState(state) {
+        axiomTokenDetailNativeSellHoverControl = null;
+        if (isAxiomTokenDetailSellHoverStateEqual(axiomTokenDetailSellHoverState, state)) {
+          return;
+        }
+        axiomTokenDetailSellHoverState = state;
+        ensureAxiomTokenDetailSellHoverMonitor();
+        refreshAxiomTokenDetailWalletSummaryBadges();
+      }
+
+      function isAxiomTokenDetailSellHoverStateEqual(left, right) {
+        if (!left || !right || left.type !== right.type) {
+          return false;
+        }
+        return String(left.amount || "") === String(right.amount || "") &&
+          String(left.sellUnit || "") === String(right.sellUnit || "") &&
+          left.sourceElement === right.sourceElement;
+      }
+
+      function clearAxiomTokenDetailSellHoverState(instantTrade = findAxiomTokenDetailInstantTradePanel()) {
+        if (!axiomTokenDetailSellHoverState) {
+          disconnectAxiomTokenDetailSellHoverMonitor();
+          if (axiomTokenDetailNativeSellHoverControl) {
+            axiomTokenDetailNativeSellHoverControl = null;
+            refreshAxiomTokenDetailWalletSummaryBadges(instantTrade);
+          }
+          return;
+        }
+        axiomTokenDetailSellHoverState = null;
+        axiomTokenDetailNativeSellHoverControl = null;
+        disconnectAxiomTokenDetailSellHoverMonitor();
+        refreshAxiomTokenDetailWalletSummaryBadges(instantTrade);
+      }
+
+      function setAxiomTokenDetailNativeSellHoverControl(nativeControl) {
+        if (axiomTokenDetailButtonMode === "trench" || axiomTokenDetailNativeSellHoverControl === nativeControl) {
+          return;
+        }
+        axiomTokenDetailNativeSellHoverControl = nativeControl;
+        refreshAxiomTokenDetailWalletSummaryBadges(nativeControl?.closest?.("div#instant-trade"));
+      }
+
+      function clearAxiomTokenDetailNativeSellHoverControl(nativeControl = axiomTokenDetailNativeSellHoverControl, event = null) {
+        if (axiomTokenDetailNativeSellHoverControl !== nativeControl) {
+          return;
+        }
+        const relatedTarget = event?.relatedTarget;
+        if (relatedTarget instanceof Node && nativeControl?.contains?.(relatedTarget)) {
+          return;
+        }
+        window.setTimeout(() => {
+          if (axiomTokenDetailNativeSellHoverControl !== nativeControl) {
+            return;
+          }
+          if (nativeControl?.matches?.(":hover")) {
+            return;
+          }
+          const instantTrade = nativeControl?.closest?.("div#instant-trade");
+          axiomTokenDetailNativeSellHoverControl = null;
+          refreshAxiomTokenDetailWalletSummaryBadges(instantTrade);
+        }, 0);
+      }
+
+      function ensureAxiomTokenDetailSellHoverMonitor() {
+        if (axiomTokenDetailSellHoverMonitorInstalled) {
+          return;
+        }
+        axiomTokenDetailSellHoverMonitorInstalled = true;
+        document.addEventListener("pointermove", handleAxiomTokenDetailSellHoverMonitor, true);
+        document.addEventListener("mousemove", handleAxiomTokenDetailSellHoverMonitor, true);
+        document.addEventListener("scroll", handleAxiomTokenDetailSellHoverMonitor, true);
+        window.addEventListener("blur", handleAxiomTokenDetailSellHoverForceClear, true);
+      }
+
+      function disconnectAxiomTokenDetailSellHoverMonitor() {
+        if (!axiomTokenDetailSellHoverMonitorInstalled) {
+          return;
+        }
+        axiomTokenDetailSellHoverMonitorInstalled = false;
+        document.removeEventListener("pointermove", handleAxiomTokenDetailSellHoverMonitor, true);
+        document.removeEventListener("mousemove", handleAxiomTokenDetailSellHoverMonitor, true);
+        document.removeEventListener("scroll", handleAxiomTokenDetailSellHoverMonitor, true);
+        window.removeEventListener("blur", handleAxiomTokenDetailSellHoverForceClear, true);
+      }
+
+      function handleAxiomTokenDetailSellHoverForceClear() {
+        clearAxiomTokenDetailSellHoverState();
+      }
+
+      function handleAxiomTokenDetailSellHoverMonitor(event) {
+        if (!axiomTokenDetailSellHoverState) {
+          disconnectAxiomTokenDetailSellHoverMonitor();
+          return;
+        }
+        const source = axiomTokenDetailSellHoverState.sourceElement;
+        if (!(source instanceof HTMLElement) || !source.isConnected) {
+          clearAxiomTokenDetailSellHoverState();
+          return;
+        }
+        const point = axiomTokenDetailPointerPoint(event);
+        if (!point) {
+          return;
+        }
+        const element = document.elementFromPoint(point.x, point.y);
+        if (element instanceof Node && source.contains(element)) {
+          return;
+        }
+        clearAxiomTokenDetailSellHoverState(source.closest("div#instant-trade"));
+      }
+
+      function axiomTokenDetailPointerPoint(event) {
+        if (Number.isFinite(event?.clientX) && Number.isFinite(event?.clientY)) {
+          return { x: event.clientX, y: event.clientY };
+        }
+        return null;
+      }
+
+      function axiomTokenDetailInlineValueOwnText(element) {
+        if (!(element instanceof HTMLElement)) {
+          return "";
+        }
+        return Array.from(element.childNodes)
+          .filter((node) => node.nodeType === Node.TEXT_NODE)
+          .map((node) => String(node.nodeValue || "").trim())
+          .filter(Boolean)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+
+      function axiomTokenDetailElementText(element) {
+        if (!(element instanceof HTMLElement)) {
+          return "";
+        }
+        return String(element.textContent || "").replace(/\s+/g, " ").trim();
+      }
+
+      function axiomTokenDetailFiniteValueOrNull(value) {
+        if (value == null || value === "") {
+          return null;
+        }
+        const number = Number(value);
+        return Number.isFinite(number) ? number : null;
+      }
+
+      function buildAxiomTokenDetailWalletSummaryText(value, className) {
+        const text = document.createElement("span");
+        text.setAttribute("data-trench-tools-token-detail-wallet-summary", "true");
+        text.className = className;
+        text.textContent = value;
+        return text;
+      }
+
+      function buildAxiomTokenDetailSolInlineSummary(nativeSlot, value, className) {
+        const summary = document.createElement("span");
+        summary.setAttribute("data-trench-tools-token-detail-wallet-summary", "true");
+        summary.className = className;
+        summary.style.display = "inline-flex";
+        summary.style.alignItems = "center";
+        summary.style.gap = "4px";
+        const icon = cloneAxiomTokenDetailSolIcon(nativeSlot);
+        if (icon) {
+          summary.appendChild(icon);
+        }
+        summary.appendChild(document.createTextNode(value));
+        return summary;
+      }
+
+      function cloneAxiomTokenDetailSolIcon(root) {
+        const icon = root?.querySelector?.("img[src*='sol-fill'], img[alt='SOL'], svg");
+        if (icon instanceof HTMLElement || icon instanceof SVGElement) {
+          return icon.cloneNode(true);
+        }
+        return buildAxiomTokenDetailSolIcon();
+      }
+
+      function syncAxiomTokenDetailSellSummary(instantTrade, summary) {
+        if (!(instantTrade instanceof HTMLElement)) {
+          return;
+        }
+        renderAxiomTokenDetailSellSummary(
+          resolveAxiomTokenDetailBalanceSlots(instantTrade),
+          summary,
+          axiomTokenDetailButtonMode
+        );
+      }
+
+      function findAxiomTokenDetailTradeBalanceValueRoot(instantTrade, side) {
+        const header = findAxiomTokenDetailTradeBalanceHeader(instantTrade, side);
+        return findAxiomTokenDetailTradeBalanceValueRootFromHeader(header);
+      }
+
+      function findAxiomTokenDetailTradeBalanceValueRootFromHeader(header) {
+        const children = Array.from(header?.children || []).filter((child) => child instanceof HTMLElement);
+        return children[1] instanceof HTMLElement ? children[1] : null;
+      }
+
+      function findAxiomTokenDetailSellBalanceSlot(instantTrade) {
+        const header = findAxiomTokenDetailTradeBalanceHeader(instantTrade, "sell");
+        return findAxiomTokenDetailSellBalanceSlotFromHeader(header);
+      }
+
+      function findAxiomTokenDetailSellBalanceSlotFromHeader(header) {
+        if (!(header instanceof HTMLElement)) {
+          return null;
+        }
+        return findAxiomTokenDetailTradeBalanceValueSlot(header, (element) =>
+          /•/.test(String(element.textContent || "")) ||
+          element.querySelector("img[src*='sol-fill'], img[alt='SOL'], svg")
+        );
+      }
+
+      function formatAxiomTokenDetailSellSummaryValue(summary, nativeSlot = null) {
+        const tokenText = formatAxiomTokenDetailTokenBalance(summary?.tokenBalance);
+        const valueText = formatAxiomTokenDetailSellValueSol(axiomTokenDetailEffectiveSellValueSol(summary, nativeSlot));
+        const tokenSuffix = axiomTokenDetailSellTokenTicker(nativeSlot);
+        const tokenWithSuffix = tokenSuffix && tokenText !== "0" ? `${tokenText}${tokenSuffix}` : tokenText;
+        return valueText ? `${tokenWithSuffix} • ${valueText}` : tokenWithSuffix;
+      }
+
+      function buildAxiomTokenDetailSellInlineSummary(nativeSlot, summary, options = {}) {
+        const root = nativeSlot instanceof HTMLElement ? nativeSlot : null;
+        const tokenText = formatAxiomTokenDetailTokenBalance(summary?.tokenBalance);
+        const ticker = String(options.ticker || summary?.ticker || axiomTokenDetailSellTokenTicker(root) || "");
+        const valueSource = options.strictValue
+          ? axiomTokenDetailKnownSellValueSol(summary)
+          : axiomTokenDetailEffectiveSellValueSol(summary, root);
+        const valueText = formatAxiomTokenDetailSellValueSol(valueSource);
+        const wrapper = document.createElement("span");
+        wrapper.setAttribute("data-trench-tools-token-detail-wallet-summary", "true");
+        if (options.hover) {
+          wrapper.setAttribute("data-trench-tools-hover-estimate", "true");
+        }
+        wrapper.className = "trench-tools-axiom-token-detail-wallet-value";
+        wrapper.style.display = "inline-flex";
+        wrapper.style.alignItems = "center";
+        wrapper.style.gap = "4px";
+        const tokenAmount = document.createElement("span");
+        tokenAmount.textContent = tokenText;
+        wrapper.appendChild(tokenAmount);
+        if (ticker) {
+          const tickerSpan = document.createElement("span");
+          tickerSpan.textContent = ticker;
+          wrapper.appendChild(tickerSpan);
+        }
+        if (valueText) {
+          const separator = document.createElement("span");
+          separator.textContent = "•";
+          wrapper.appendChild(separator);
+          const sol = document.createElement("span");
+          sol.style.display = "inline-flex";
+          sol.style.alignItems = "center";
+          sol.style.gap = "4px";
+          const icon = cloneAxiomTokenDetailSolIcon(root);
+          if (icon) {
+            sol.appendChild(icon);
+          }
+          sol.appendChild(document.createTextNode(valueText));
+          wrapper.appendChild(sol);
+        }
+        return wrapper;
+      }
+
+      function axiomTokenDetailSellTokenTicker(nativeSlot = null) {
+        const slot = nativeSlot instanceof HTMLElement
+          ? nativeSlot
+          : findAxiomTokenDetailSellBalanceSlot(findAxiomTokenDetailInstantTradePanel());
+        return axiomTokenDetailTickerFromText(axiomTokenDetailNativeSlotText(slot)) ||
+          axiomTokenDetailTickerFromText(
+            axiomTokenDetailNativeSlotText(findAxiomTokenDetailTradeBalanceValueRoot(findAxiomTokenDetailInstantTradePanel(), "sell"))
+          );
+      }
+
+      function axiomTokenDetailTickerFromText(text) {
+        const match = String(text || "").match(/^\s*[\d.,]+[KMB]?\s*([^\s•$]+)\s*•/i);
+        return match?.[1] ? match[1] : "";
+      }
+
+      function axiomTokenDetailEffectiveSellValueSol(summary, nativeSlot = null) {
+        const direct = Number(summary?.tokenValueSol);
+        if (Number.isFinite(direct) && direct > 0) {
+          return direct;
+        }
+        const known = axiomTokenDetailKnownSellValueSol(summary);
+        if (Number.isFinite(known) && known > 0) {
+          return known;
+        }
+        const tokenBalance = Number(summary?.tokenBalance);
+        const native = parseAxiomTokenDetailSellNativeBalance(nativeSlot);
+        if (
+          Number.isFinite(tokenBalance) &&
+          tokenBalance > 0 &&
+          native.tokenBalance > 0 &&
+          native.valueSol > 0
+        ) {
+          return (tokenBalance / native.tokenBalance) * native.valueSol;
+        }
+        return Number.isFinite(direct) ? direct : null;
+      }
+
+      function axiomTokenDetailKnownSellValueSol(summary) {
+        const direct = Number(summary?.tokenValueSol);
+        if (Number.isFinite(direct) && direct > 0) {
+          return direct;
+        }
+        const panelHoldingValue = Number(
+          helpers.state.walletStatus?.holdingValueSol ??
+          helpers.state.walletStatus?.holding
+        );
+        const panelTokenBalance = Number(
+          helpers.state.walletStatus?.holdingAmount ??
+          helpers.state.walletStatus?.mintBalanceUi ??
+          helpers.state.walletStatus?.tokenBalance
+        );
+        const tokenBalance = Number(summary?.tokenBalance);
+        if (
+          Number.isFinite(panelHoldingValue) &&
+          panelHoldingValue > 0 &&
+          Number.isFinite(panelTokenBalance) &&
+          panelTokenBalance > 0 &&
+          Number.isFinite(tokenBalance) &&
+          tokenBalance > 0
+        ) {
+          return (tokenBalance / panelTokenBalance) * panelHoldingValue;
+        }
+        return null;
+      }
+
+      function parseAxiomTokenDetailSellNativeBalance(nativeSlot) {
+        const text = axiomTokenDetailNativeSlotText(nativeSlot);
+        const parts = text.split("•").map((part) => part.trim()).filter(Boolean);
+        return {
+          tokenBalance: parseAxiomTokenDetailCompactNumber(parts[0]),
+          valueSol: parseAxiomTokenDetailCompactNumber(parts[parts.length - 1])
+        };
+      }
+
+      function axiomTokenDetailNativeSlotText(slot) {
+        if (!(slot instanceof HTMLElement)) {
+          return "";
+        }
+        const clone = slot.cloneNode(true);
+        if (clone instanceof HTMLElement) {
+          clone.querySelectorAll("[data-trench-tools-token-detail-wallet-summary]").forEach((element) => element.remove());
+          return String(clone.textContent || "").replace(/\s+/g, " ").trim();
+        }
+        return String(slot.textContent || "").replace(/\s+/g, " ").trim();
+      }
+
+      function parseAxiomTokenDetailCompactNumber(value) {
+        const match = String(value || "").replace(/,/g, "").match(/([0-9]*\.?[0-9]+)\s*([KMB])?/i);
+        if (!match) {
+          return 0;
+        }
+        const amount = Number(match[1]);
+        const suffix = String(match[2] || "").toUpperCase();
+        const multiplier = suffix === "B" ? 1_000_000_000 : suffix === "M" ? 1_000_000 : suffix === "K" ? 1_000 : 1;
+        return Number.isFinite(amount) ? amount * multiplier : 0;
+      }
+
+      function formatAxiomTokenDetailSellValueSol(value) {
+        const amount = Number(value);
+        if (!Number.isFinite(amount) || amount < 0) {
+          return "";
+        }
+        return formatAxiomTokenDetailWalletBalance(amount);
       }
 
       function scheduleAxiomTokenDetailWalletSidecar(nativeWalletControl) {
@@ -4213,6 +5278,10 @@
       }
 
       function refreshAxiomTokenDetailOpenWalletMenu() {
+        ensureAxiomTokenDetailWalletSummaryBadges(
+          findAxiomTokenDetailInstantTradePanel(),
+          axiomTokenDetailWalletControl
+        );
         const menu = document.querySelector("[data-trench-tools-token-detail-wallet-menu]");
         const nativeWalletControl = axiomTokenDetailWalletControl;
         if (!(menu instanceof HTMLElement) || !(nativeWalletControl instanceof HTMLElement) || !document.contains(nativeWalletControl)) {
@@ -4331,7 +5400,16 @@
         menu.classList.add("trench-tools-axiom-token-detail-wallet-menu");
         const computed = window.getComputedStyle?.(nativeMenu);
         const rect = nativeMenu.getBoundingClientRect();
-        const maxHeight = Math.max(220, Math.min(Math.round(rect.height || 320), window.innerHeight - 16));
+        const options = axiomTokenDetailWalletOptions();
+        const requiredHeight = axiomTokenDetailWalletMenuRequiredHeight(options);
+        const maxAllowedHeight = Math.min(AXIOM_TOKEN_DETAIL_WALLET_MENU_MAX_HEIGHT, window.innerHeight - 16);
+        const maxHeight = Math.max(
+          AXIOM_TOKEN_DETAIL_WALLET_MENU_MIN_HEIGHT,
+          Math.min(
+            Math.max(Math.round(rect.height || 0), requiredHeight),
+            maxAllowedHeight
+          )
+        );
         if (!computed) {
           return;
         }
@@ -4350,7 +5428,8 @@
           maxHeight: `${maxHeight}px`,
           minHeight: "0",
           opacity: "1",
-          overflow: "hidden",
+          overflowX: "hidden",
+          overflowY: requiredHeight > maxHeight ? "auto" : "hidden",
           padding: "0",
           position: "fixed",
           transition: "none",
@@ -4363,7 +5442,15 @@
       function syncAxiomTokenDetailStandaloneWalletMenuStyle(menu, nativeWalletControl) {
         menu.className = "trench-tools-axiom-token-detail-wallet-menu shadow-dropdown";
         const computed = window.getComputedStyle?.(nativeWalletControl);
-        const maxHeight = Math.max(260, Math.min(520, window.innerHeight - 16));
+        const requiredHeight = axiomTokenDetailWalletMenuRequiredHeight(axiomTokenDetailWalletOptions());
+        const maxAllowedHeight = Math.min(AXIOM_TOKEN_DETAIL_WALLET_MENU_MAX_HEIGHT, window.innerHeight - 16);
+        const maxHeight = Math.max(
+          260,
+          Math.min(
+            requiredHeight,
+            maxAllowedHeight
+          )
+        );
         Object.assign(menu.style, {
           background: "linear-gradient(0deg, rgba(238, 167, 237, 0.06), rgba(238, 167, 237, 0.06)), rgb(33, 33, 33)",
           backgroundColor: "rgb(33, 33, 33)",
@@ -4377,7 +5464,8 @@
           maxHeight: `${maxHeight}px`,
           minHeight: "0",
           opacity: "1",
-          overflow: "hidden",
+          overflowX: "hidden",
+          overflowY: requiredHeight > maxHeight ? "auto" : "hidden",
           padding: "0",
           position: "fixed",
           transform: "none",
@@ -4385,10 +5473,31 @@
         });
       }
 
+      function axiomTokenDetailWalletMenuRequiredHeight(options) {
+        const walletOptions = Array.isArray(options) ? options : [];
+        const holderCount = walletOptions.filter((option) => Number(option.tokenBalanceValue || 0) > 0).length;
+        const nonHolderCount = walletOptions.length - holderCount;
+        const sectionHeights = [];
+        if (holderCount) {
+          sectionHeights.push(
+            AXIOM_TOKEN_DETAIL_WALLET_MENU_HEADER_HEIGHT +
+              Math.min(holderCount * AXIOM_TOKEN_DETAIL_WALLET_MENU_ROW_HEIGHT, AXIOM_TOKEN_DETAIL_WALLET_MENU_LIST_MAX_HEIGHT)
+          );
+        }
+        if (nonHolderCount || !holderCount) {
+          sectionHeights.push(
+            AXIOM_TOKEN_DETAIL_WALLET_MENU_HEADER_HEIGHT +
+              Math.min(nonHolderCount * AXIOM_TOKEN_DETAIL_WALLET_MENU_ROW_HEIGHT, AXIOM_TOKEN_DETAIL_WALLET_MENU_LIST_MAX_HEIGHT)
+          );
+        }
+        return Math.max(AXIOM_TOKEN_DETAIL_WALLET_MENU_MIN_HEIGHT, sectionHeights.reduce((sum, height) => sum + height, 0));
+      }
+
       function buildAxiomTokenDetailWalletMenuContent(options, active, nativeWalletControl) {
         const selectedKeys = new Set(active?.manualWalletKeys || []);
         const wrapper = document.createElement("div");
-        wrapper.className = "flex flex-col gap-[16px] w-[348px]";
+        wrapper.className = "flex flex-col gap-[16px]";
+        wrapper.style.width = `${AXIOM_TOKEN_DETAIL_WALLET_MENU_CONTENT_WIDTH}px`;
 
         const outer = document.createElement("div");
         outer.className = "flex flex-col  gap-[16px] ";
@@ -4535,7 +5644,8 @@
 
       function buildAxiomTokenDetailWalletMenuList(options, selectedKeys, nativeWalletControl) {
         const list = document.createElement("div");
-        list.className = "flex flex-col border-t border-secondaryStroke  max-h-[252px] overflow-y-auto";
+        list.className = "flex flex-col border-t border-secondaryStroke overflow-y-auto";
+        list.style.maxHeight = `${AXIOM_TOKEN_DETAIL_WALLET_MENU_LIST_MAX_HEIGHT}px`;
         options.forEach((option) => {
           list.appendChild(buildAxiomTokenDetailWalletMenuItem(option, selectedKeys, nativeWalletControl));
         });
@@ -4847,6 +5957,16 @@
               wallet?.mintBalance ??
               wallet?.holdingAmount
             );
+            const tokenValueSol = Number(
+              status?.holdingValueSol ??
+              status?.holding ??
+              status?.tokenValueSol ??
+              status?.valueSol ??
+              wallet?.holdingValueSol ??
+              wallet?.holding ??
+              wallet?.tokenValueSol ??
+              wallet?.valueSol
+            );
             return {
               type: "wallet",
               id,
@@ -4856,7 +5976,8 @@
               balanceLabel: formatAxiomTokenDetailWalletBalance(balanceValue),
               balanceValue: Number.isFinite(balanceValue) ? balanceValue : 0,
               tokenBalanceLabel: formatAxiomTokenDetailTokenBalance(tokenBalanceValue),
-              tokenBalanceValue: Number.isFinite(tokenBalanceValue) ? tokenBalanceValue : 0
+              tokenBalanceValue: Number.isFinite(tokenBalanceValue) ? tokenBalanceValue : 0,
+              tokenValueSol: Number.isFinite(tokenValueSol) ? tokenValueSol : null
             };
           })
           .filter((option) => option.id && option.label)
@@ -4872,46 +5993,19 @@
           return null;
         }
         const optionKeys = new Set(options.map((option) => option.id));
-        const storedSelectionValue = readAxiomTokenDetailWalletSelectionValue();
-        if (storedSelectionValue.startsWith("manual:")) {
-          const manualWalletKeys = axiomTokenDetailWalletKeysFromStoredValue(storedSelectionValue, optionKeys);
-          return {
-            type: "manual",
-            manualWalletKeys,
-            value: `manual:${manualWalletKeys.join(",")}`
-          };
-        }
-        const manualWalletKeys = axiomTokenDetailWalletKeysFromStoredValue(storedSelectionValue, optionKeys);
-        if (manualWalletKeys.length) {
-          return {
-            type: "manual",
-            manualWalletKeys,
-            value: `manual:${manualWalletKeys.join(",")}`
-          };
-        }
         const preferenceKeys = axiomTokenDetailWalletKeysFromPreferences(optionKeys);
-        const fallbackKeys = preferenceKeys.length ? preferenceKeys : [options[0].id];
+        // A manual selection is the user's explicit choice, including an empty
+        // list (deselect-all). Only fall back to the first wallet when nothing
+        // resolves AND the source isn't an explicit manual pick.
+        const selectionSource = String(helpers.state.preferences?.selectionSource || "").trim().toLowerCase();
+        const resolvedKeys = preferenceKeys.length || selectionSource === "manual"
+          ? preferenceKeys
+          : [options[0].id];
         return {
           type: "manual",
-          manualWalletKeys: fallbackKeys,
-          value: `manual:${fallbackKeys.join(",")}`
+          manualWalletKeys: resolvedKeys,
+          value: `manual:${resolvedKeys.join(",")}`
         };
-      }
-
-      function axiomTokenDetailWalletKeysFromStoredValue(value, knownWalletKeys) {
-        const stored = String(value || "").trim();
-        if (stored.startsWith("manual:")) {
-          return stored
-            .slice("manual:".length)
-            .split(",")
-            .map((key) => String(key || "").trim())
-            .filter((key) => key && knownWalletKeys.has(key));
-        }
-        if (stored.startsWith("wallet:")) {
-          const key = stored.slice("wallet:".length).trim();
-          return key && knownWalletKeys.has(key) ? [key] : [];
-        }
-        return [];
       }
 
       function axiomTokenDetailWalletKeysFromPreferences(knownWalletKeys) {
@@ -5001,27 +6095,27 @@
         return amount.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
       }
 
-      function readAxiomTokenDetailWalletSelectionValue() {
-        try {
-          return String(window.localStorage?.getItem(AXIOM_TOKEN_DETAIL_WALLET_SELECTION_KEY) || "").trim();
-        } catch (_error) {
-          return "";
-        }
-      }
-
-      function saveAxiomTokenDetailWalletSelectionValue(value) {
-        try {
-          window.localStorage?.setItem(AXIOM_TOKEN_DETAIL_WALLET_SELECTION_KEY, String(value || ""));
-        } catch (_error) {}
-      }
-
       function saveAxiomTokenDetailWalletKeys(walletKeys) {
         const normalized = Array.from(new Set(
           (Array.isArray(walletKeys) ? walletKeys : [])
             .map((key) => String(key || "").trim())
             .filter(Boolean)
         ));
-        saveAxiomTokenDetailWalletSelectionValue(`manual:${normalized.join(",")}`);
+        // The Axiom in-page wallet selector is just another surface for editing
+        // the same selection used by the Trench Tools panel. Routing the write
+        // through panel preferences keeps both surfaces in sync (and trades
+        // fired from the panel use the wallets the user just picked here).
+        if (typeof helpers.savePreferences === "function") {
+          const nextRevision =
+            Math.max(0, Number(helpers.state.preferences?.selectionRevision || 0) || 0) + 1;
+          void helpers.savePreferences({
+            selectionSource: "manual",
+            activeWalletGroupId: helpers.state.preferences?.activeWalletGroupId || "",
+            manualWalletKeys: normalized,
+            selectionRevision: nextRevision
+          });
+        }
+        refreshAxiomTokenDetailOpenWalletMenu();
       }
 
       function positionAxiomTokenDetailWalletMenu(menu, nativeMenu) {
@@ -5029,7 +6123,10 @@
           return;
         }
         const rect = nativeMenu.getBoundingClientRect();
-        const width = Math.max(300, Math.min(360, Math.round(rect.width || 350)));
+        const width = Math.max(
+          AXIOM_TOKEN_DETAIL_WALLET_MENU_WIDTH,
+          Math.min(360, Math.round(rect.width || AXIOM_TOKEN_DETAIL_WALLET_MENU_WIDTH))
+        );
         const gap = 6;
         const rightSideLeft = rect.right + gap;
         const leftSideLeft = rect.left - width - gap;
@@ -5047,7 +6144,7 @@
           return;
         }
         const rect = nativeWalletControl.getBoundingClientRect();
-        const width = 350;
+        const width = AXIOM_TOKEN_DETAIL_WALLET_MENU_WIDTH;
         const gap = 6;
         const maxHeight = Number.parseFloat(menu.style.maxHeight || "") || 320;
         const left = Math.max(gap, Math.min(Math.round(rect.right - width), window.innerWidth - width - gap));
@@ -5155,6 +6252,20 @@
           [data-trench-tools-token-detail-buy-currency-hidden="true"] {
             display: none !important;
           }
+          div#instant-trade[data-trench-tools-token-detail-managed-transition],
+          [data-trench-tools-token-detail-container][data-trench-tools-token-detail-managed-transition],
+          [data-trench-tools-token-detail-group-row][data-trench-tools-token-detail-managed-transition] {
+            transition:
+              width 180ms cubic-bezier(0.22, 1, 0.36, 1),
+              min-width 180ms cubic-bezier(0.22, 1, 0.36, 1),
+              max-width 180ms cubic-bezier(0.22, 1, 0.36, 1),
+              height 180ms cubic-bezier(0.22, 1, 0.36, 1),
+              max-height 180ms cubic-bezier(0.22, 1, 0.36, 1),
+              opacity 120ms ease-out !important;
+          }
+          div#instant-trade[data-trench-tools-token-detail-managed-transition] {
+            will-change: width, height;
+          }
           [data-trench-tools-token-detail-option-row] {
             display: flex !important;
             align-items: stretch !important;
@@ -5219,6 +6330,50 @@
             margin: 0 2px;
             width: 1px;
           }
+          [data-trench-tools-token-detail-balance-header] {
+            display: grid !important;
+            grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
+            gap: 4px;
+          }
+          [data-trench-tools-token-detail-balance-header] > :first-child {
+            grid-column: 1;
+          }
+          [data-trench-tools-token-detail-balance-native-column] {
+            grid-column: 2;
+            min-width: 0;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            width: 100%;
+          }
+          [data-trench-tools-token-detail-balance-native-column="sell"] {
+            max-width: calc(100% - 42px);
+            justify-self: start;
+          }
+          [data-trench-tools-token-detail-balance-native-column] * {
+            min-width: 0 !important;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+          [data-trench-tools-token-detail-balance-tt-column] {
+            align-items: center;
+            color: #EEA7ED;
+            display: inline-flex;
+            font: inherit;
+            justify-content: flex-end;
+            line-height: inherit;
+            grid-column: 3;
+            min-width: 0;
+            overflow: hidden;
+            pointer-events: none;
+            white-space: nowrap;
+          }
+          [data-trench-tools-token-detail-balance-tt-column] > [data-trench-tools-token-detail-wallet-summary] {
+            min-width: 0;
+          }
           div#instant-trade[data-trench-tools-token-detail-button-mode="dual"] [data-trench-tools-token-detail-option-native] {
             flex: 0 1 calc(50% - 52px) !important;
           }
@@ -5238,6 +6393,8 @@
           .trench-tools-axiom-token-detail-bloom-clone {
             border: 1px solid #EEA7ED;
             color: #EEA7ED;
+            pointer-events: auto !important;
+            position: relative;
             z-index: 1000;
           }
           .trench-tools-axiom-token-detail-bloom-clone:hover {
@@ -5297,6 +6454,45 @@
             position: fixed;
             z-index: 2147483647;
           }
+          [data-trench-tools-token-detail-wallet-summary] {
+            color: #EEA7ED;
+            display: inline;
+            font: inherit;
+            font-weight: inherit;
+            line-height: inherit;
+            pointer-events: none;
+            white-space: nowrap;
+          }
+          [data-trench-tools-token-detail-summary-hide-native] {
+            color: inherit !important;
+          }
+          [data-trench-tools-token-detail-summary-hide-native] > :not([data-trench-tools-token-detail-wallet-summary]) {
+            display: none !important;
+          }
+          [data-trench-tools-token-detail-summary-hide-native] [data-trench-tools-token-detail-wallet-summary] {
+            color: #EEA7ED !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+            display: inline-flex !important;
+          }
+          [data-trench-tools-token-detail-summary-hide-native] [data-trench-tools-token-detail-wallet-summary] img,
+          [data-trench-tools-token-detail-summary-hide-native] [data-trench-tools-token-detail-wallet-summary] svg {
+            opacity: 1 !important;
+            visibility: visible !important;
+          }
+          .trench-tools-axiom-token-detail-wallet-separator {
+            color: hsl(var(--twc-textTertiary) / var(--twc-textTertiary-opacity, 1));
+            margin: 0 4px;
+          }
+          .group\\/wallets .trench-tools-axiom-token-detail-wallet-separator,
+          .group\\/wallets .trench-tools-axiom-token-detail-wallet-count {
+            font-size: 12px !important;
+            font-weight: 500 !important;
+            line-height: 16px !important;
+          }
+          .group\\/wallets .trench-tools-axiom-token-detail-wallet-separator {
+            margin: 0 !important;
+          }
         `;
         document.head.appendChild(style);
       }
@@ -5355,11 +6551,18 @@
         row.setAttribute("data-trench-tools-token-detail-option-row", "true");
         row.setAttribute("data-trench-tools-token-detail-option-side", side);
         const existingSettingRow = row.querySelector(":scope > [data-trench-tools-token-detail-setting-row]");
-        const nativeChildren = Array.from(row.children)
-          .filter((element) =>
-            element instanceof HTMLElement &&
-            !element.hasAttribute("data-trench-tools-token-detail-setting-row")
-          );
+        const rowChildren = Array.from(row.children).filter((element) => element instanceof HTMLElement);
+        const nativeChildren = rowChildren.filter((element) =>
+          !element.hasAttribute("data-trench-tools-token-detail-setting-row") &&
+          !element.hasAttribute("data-trench-tools-token-detail-inline") &&
+          !element.hasAttribute("data-trench-tools-token-detail-preload-inline")
+        );
+        rowChildren
+          .filter((element) => !nativeChildren.includes(element))
+          .forEach((element) => {
+            element.removeAttribute("data-trench-tools-token-detail-option-native");
+            element.removeAttribute("data-trench-tools-token-detail-option-action");
+          });
         nativeChildren.forEach((element, index) => {
           element.toggleAttribute("data-trench-tools-token-detail-option-native", index === 0);
           element.toggleAttribute("data-trench-tools-token-detail-option-action", index > 0);
@@ -5375,7 +6578,18 @@
         }
         settingRow.setAttribute("data-trench-tools-token-detail-setting-row", "true");
         settingRow.setAttribute("data-trench-tools-token-detail-setting-side", side);
-        if (settingRow.parentElement !== row) {
+        const firstInlineButton = Array.from(row.children).find((element) =>
+          element instanceof HTMLElement &&
+          (
+            element.hasAttribute("data-trench-tools-token-detail-inline") ||
+            element.hasAttribute("data-trench-tools-token-detail-preload-inline")
+          )
+        );
+        if (firstInlineButton instanceof HTMLElement) {
+          if (settingRow.parentElement !== row || settingRow.nextElementSibling !== firstInlineButton) {
+            row.insertBefore(settingRow, firstInlineButton);
+          }
+        } else if (settingRow.parentElement !== row) {
           row.appendChild(settingRow);
         }
       }
@@ -5404,27 +6618,41 @@
         const slippage = side === "sell" ? getAxiomTokenDetailSellSlippagePercent(preset) : getAxiomTokenDetailBuySlippagePercent(preset);
         const fee = side === "sell" ? preset?.sellFeeSol : preset?.buyFeeSol;
         const tip = side === "sell" ? preset?.sellTipSol : preset?.buyTipSol;
-        const autoFee = side === "sell" ? preset?.sellAutoTipEnabled : preset?.buyAutoTipEnabled;
+        const maxFee = side === "sell" ? preset?.sellMaxFeeSol : preset?.buyMaxFeeSol;
+        const autoFeeEnabled = Boolean(side === "sell" ? preset?.sellAutoTipEnabled : preset?.buyAutoTipEnabled);
         const feeValue = fee ? String(fee) : "";
         const tipValue = tip ? String(tip) : "";
+        const maxFeeValue = maxFee ? String(maxFee) : "";
+        const feeItems = autoFeeEnabled
+          ? [
+              {
+                icon: safeRuntimeGetUrl("assets/lighting-icon.png"),
+                label: "Auto fee",
+                value: "On"
+              },
+              {
+                icon: safeRuntimeGetUrl("assets/tip-icon.png"),
+                label: "Max Fee",
+                value: maxFeeValue ? formatAxiomTokenDetailCompactDecimalValue(maxFeeValue) : "Preset",
+                rawValue: maxFeeValue || "Preset"
+              }
+            ]
+          : [
+              {
+                icon: safeRuntimeGetUrl("assets/fuel-icon.png"),
+                label: "Priority Fee",
+                value: feeValue ? formatAxiomTokenDetailCompactDecimalValue(feeValue) : "Preset",
+                rawValue: feeValue || "Preset"
+              },
+              {
+                icon: safeRuntimeGetUrl("assets/tip-icon.png"),
+                label: "Tip",
+                value: tipValue ? formatAxiomTokenDetailCompactDecimalValue(tipValue) : "Preset",
+                rawValue: tipValue || "Preset"
+              }
+            ];
         return [
-          {
-            icon: safeRuntimeGetUrl("assets/lighting-icon.png"),
-            label: "Auto fee",
-            value: autoFee ? "On" : "Off"
-          },
-          {
-            icon: safeRuntimeGetUrl("assets/fuel-icon.png"),
-            label: "Priority Fee",
-            value: feeValue ? formatAxiomTokenDetailCompactDecimalValue(feeValue) : "Preset",
-            rawValue: feeValue || "Preset"
-          },
-          {
-            icon: safeRuntimeGetUrl("assets/tip-icon.png"),
-            label: "Tip",
-            value: tipValue ? formatAxiomTokenDetailCompactDecimalValue(tipValue) : "Preset",
-            rawValue: tipValue || "Preset"
-          },
+          ...feeItems,
           {
             icon: safeRuntimeGetUrl("assets/slippage-icon.png"),
             label: "Slippage",
@@ -5886,20 +7114,33 @@
         nativeControl.style.minWidth = "40px";
         Object.assign(button.style, {
           minWidth: "40px",
+          pointerEvents: "auto",
           zIndex: "1000"
         });
         if (action.editable) {
           installAxiomTokenDetailEditablePresetBridge(button, nativeControl, action);
         } else {
-          installAxiomTokenDetailNativeHoverBridge(button, nativeControl);
+          button._trenchAxiomHoverBridgeCleanup?.();
         }
-        button.addEventListener("click", (event) => {
+        installAxiomTokenDetailPresetClickBridge(button, action);
+        installAxiomTokenDetailSellHoverEstimateBridge(button, nativeControl, action);
+        return button;
+      }
+
+      function installAxiomTokenDetailPresetClickBridge(button, action) {
+        if (!(button instanceof HTMLElement) || !action?.side) {
+          return;
+        }
+        button._trenchAxiomPresetClickCleanup?.();
+        const handleClick = (event) => {
           if (action.editable) {
+            if (isAxiomTokenDetailEditableEventTarget(event.target)) {
+              event.stopPropagation();
+              return;
+            }
             event.preventDefault();
             event.stopPropagation();
-            if (!isAxiomTokenDetailEditableEventTarget(event.target)) {
-              findAxiomTokenDetailEditablePresetInput(button)?.focus();
-            }
+            findAxiomTokenDetailEditablePresetInput(button)?.focus();
             return;
           }
           if (isAxiomTokenDetailEditableEventTarget(event.target)) {
@@ -5908,9 +7149,9 @@
           event.preventDefault();
           event.stopPropagation();
           const liveRoute = routePayloadFromButton(button, {
-            address: action.routeKey,
-            mint: action.tokenMint,
-            pair: action.companionPair,
+            address: action.routeKey || button.getAttribute("data-route-key"),
+            mint: action.tokenMint || button.getAttribute("data-mint"),
+            pair: action.companionPair || button.getAttribute("data-pair"),
             surface: "token_detail",
             url: window.location.href
           });
@@ -5918,22 +7159,28 @@
             helpers.showToast?.("Token not found.", "error");
             return;
           }
-          if (!Number.isFinite(Number(action.amount)) || Number(action.amount) <= 0) {
+          const amount = String(action.amount || button.getAttribute("data-amount") || "").trim();
+          if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
             helpers.showToast?.("Invalid amount.", "error");
             return;
           }
+          const sellUnit = action.sellUnit || button.getAttribute("data-sell-unit") || "";
           const payload = {
             ...axiomTokenDetailWalletSelectionPreferences(),
             ...(action.side === "buy"
-              ? { buyAmountSol: action.amount }
-              : action.sellUnit === "sol"
-                ? { sellOutputSol: action.amount }
-                : { sellPercent: action.amount })
+              ? { buyAmountSol: amount }
+              : sellUnit === "sol"
+                ? { sellOutputSol: amount }
+                : { sellPercent: amount })
           };
           void helpers.handleInlineTradeRequest(action.side, liveRoute, "token_detail", payload, window.location.href)
             .catch((error) => helpers.showToast?.(error?.message || "Trade failed.", "error"));
-        });
-        return button;
+        };
+        button.addEventListener("click", handleClick);
+        button._trenchAxiomPresetClickCleanup = () => {
+          button.removeEventListener("click", handleClick);
+          delete button._trenchAxiomPresetClickCleanup;
+        };
       }
 
       function installAxiomTokenDetailEditablePresetBridge(button, nativeControl, action) {
@@ -5941,6 +7188,7 @@
           return;
         }
         button._trenchAxiomHoverBridgeCleanup?.();
+        button._trenchAxiomSellHoverEstimateCleanup?.();
         button._trenchAxiomEditableBridgeCleanup?.();
         const nativeInput = findAxiomTokenDetailEditablePresetInput(nativeControl);
         const cloneInput = findAxiomTokenDetailEditablePresetInput(button);
@@ -5993,6 +7241,65 @@
           nativeInput.removeEventListener("input", syncCloneFromNative);
           nativeInput.removeEventListener("change", syncCloneFromNative);
           delete button._trenchAxiomEditableBridgeCleanup;
+        };
+      }
+
+      function installAxiomTokenDetailSellHoverEstimateBridge(button, nativeControl, action) {
+        if (!(button instanceof HTMLElement) || action?.side !== "sell") {
+          return;
+        }
+        button._trenchAxiomSellHoverEstimateCleanup?.();
+        if (action.editable) {
+          return;
+        }
+        const enterTrench = () => setAxiomTokenDetailSellHoverState({
+          type: "trench",
+          amount: action.amount,
+          sellUnit: action.sellUnit || button.getAttribute("data-sell-unit") || "",
+          sourceElement: button
+        });
+        const clearHover = () => clearAxiomTokenDetailSellHoverState(button.closest("div#instant-trade"));
+        const forceClearHover = () => clearAxiomTokenDetailSellHoverState(button.closest("div#instant-trade"));
+        button.addEventListener("mouseenter", enterTrench);
+        button.addEventListener("mousemove", enterTrench);
+        button.addEventListener("mouseleave", clearHover);
+        button.addEventListener("pointerout", clearHover);
+        button.addEventListener("pointercancel", forceClearHover);
+        button.addEventListener("blur", forceClearHover, true);
+        button._trenchAxiomSellHoverEstimateCleanup = () => {
+          button.removeEventListener("mouseenter", enterTrench);
+          button.removeEventListener("mousemove", enterTrench);
+          button.removeEventListener("mouseleave", clearHover);
+          button.removeEventListener("pointerout", clearHover);
+          button.removeEventListener("pointercancel", forceClearHover);
+          button.removeEventListener("blur", forceClearHover, true);
+          delete button._trenchAxiomSellHoverEstimateCleanup;
+        };
+      }
+
+      function installAxiomTokenDetailNativeSellHoverSummaryBridge(nativeControl, action) {
+        if (!(nativeControl instanceof HTMLElement) || action?.side !== "sell" || action.editable) {
+          nativeControl?._trenchAxiomNativeSellHoverCleanup?.();
+          return;
+        }
+        nativeControl._trenchAxiomNativeSellHoverCleanup?.();
+        const enterNative = () => setAxiomTokenDetailNativeSellHoverControl(nativeControl);
+        const clearNative = (event) => clearAxiomTokenDetailNativeSellHoverControl(nativeControl, event);
+        const forceClearNative = () => clearAxiomTokenDetailNativeSellHoverControl(nativeControl);
+        nativeControl.addEventListener("mouseenter", enterNative);
+        nativeControl.addEventListener("mousemove", enterNative);
+        nativeControl.addEventListener("mouseleave", clearNative);
+        nativeControl.addEventListener("pointerout", clearNative);
+        nativeControl.addEventListener("pointercancel", forceClearNative);
+        nativeControl.addEventListener("blur", forceClearNative, true);
+        nativeControl._trenchAxiomNativeSellHoverCleanup = () => {
+          nativeControl.removeEventListener("mouseenter", enterNative);
+          nativeControl.removeEventListener("mousemove", enterNative);
+          nativeControl.removeEventListener("mouseleave", clearNative);
+          nativeControl.removeEventListener("pointerout", clearNative);
+          nativeControl.removeEventListener("pointercancel", forceClearNative);
+          nativeControl.removeEventListener("blur", forceClearNative, true);
+          delete nativeControl._trenchAxiomNativeSellHoverCleanup;
         };
       }
 
@@ -6074,17 +7381,34 @@
           if (!(target instanceof HTMLElement) || !target.closest("div#instant-trade")) {
             return false;
           }
-          if (target.closest("[data-trench-tools-token-detail-inline]")) {
+          if (isAxiomTokenDetailOwnedMutationElement(target)) {
             return false;
           }
           const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes]
             .map(axiomElementFromMutationNode)
             .filter((element) => element instanceof HTMLElement);
-          return !changedNodes.length ||
-            !changedNodes.every((element) =>
-              element.closest("[data-trench-tools-token-detail-inline]")
-            );
+          if (!changedNodes.length) {
+            return true;
+          }
+          return changedNodes.some((element) => !isAxiomTokenDetailOwnedMutationElement(element));
         });
+      }
+
+      function isAxiomTokenDetailOwnedMutationElement(element) {
+        if (!(element instanceof Element)) {
+          return false;
+        }
+        return Boolean(element.closest([
+          "[data-trench-tools-token-detail-inline]",
+          "[data-trench-tools-token-detail-preload-inline]",
+          "[data-trench-tools-token-detail-setting-row]",
+          "[data-trench-tools-token-detail-setting-tooltip]",
+          "[data-trench-tools-token-detail-compact-toggle]",
+          "[data-trench-tools-token-detail-wallet-selector]",
+          "[data-trench-tools-token-detail-wallet-menu]",
+          "[data-trench-tools-token-detail-wallet-summary]",
+          "[data-trench-tools-token-detail-balance-tt-column]"
+        ].join(", ")));
       }
 
       function axiomElementFromMutationNode(node) {
@@ -6463,137 +7787,6 @@
         };
         void helpers.handleInlineTradeRequest(state.side, liveRoute, "token_detail", payload, window.location.href)
           .catch((error) => helpers.showToast?.(error?.message || "Trade failed.", "error"));
-      }
-
-      function installAxiomTokenDetailNativeHoverBridge(button, nativeControl) {
-        if (!(button instanceof HTMLElement) || !(nativeControl instanceof HTMLElement)) {
-          return;
-        }
-        button._trenchAxiomHoverBridgeCleanup?.();
-        button._trenchAxiomEditableBridgeCleanup?.();
-        const forward = (sourceEvent, eventTypes) => {
-          if (!(nativeControl instanceof HTMLElement) || !nativeControl.isConnected) {
-            return;
-          }
-          const handledByAxiom = eventTypes.includes("mouseenter")
-            ? requestAxiomTokenDetailNativeHover(nativeControl, "enter", sourceEvent) ||
-              invokeAxiomTokenDetailNativeReactHandler(nativeControl, "onMouseEnter", sourceEvent)
-            : eventTypes.includes("mouseleave")
-              ? requestAxiomTokenDetailNativeHover(nativeControl, "leave", sourceEvent) ||
-                invokeAxiomTokenDetailNativeReactHandler(nativeControl, "onMouseLeave", sourceEvent)
-              : false;
-          if (handledByAxiom) {
-            return;
-          }
-          eventTypes.forEach((eventType) => {
-            dispatchAxiomTokenDetailNativeHoverEvent(nativeControl, sourceEvent, eventType);
-          });
-        };
-        const handleEnter = (event) => forward(event, ["pointerover", "pointerenter", "mouseover", "mouseenter"]);
-        const handleMove = (event) => forward(event, ["pointermove", "mousemove"]);
-        const handleLeave = (event) => forward(event, ["pointerout", "pointerleave", "mouseout", "mouseleave"]);
-        button.addEventListener("mouseenter", handleEnter);
-        button.addEventListener("mousemove", handleMove);
-        button.addEventListener("mouseleave", handleLeave);
-        button._trenchAxiomHoverBridgeCleanup = () => {
-          button.removeEventListener("mouseenter", handleEnter);
-          button.removeEventListener("mousemove", handleMove);
-          button.removeEventListener("mouseleave", handleLeave);
-          delete button._trenchAxiomHoverBridgeCleanup;
-        };
-      }
-
-      function requestAxiomTokenDetailNativeHover(nativeControl, action, sourceEvent) {
-        if (!(nativeControl instanceof HTMLElement)) {
-          return false;
-        }
-        const bridgeEvent = new CustomEvent("trench-tools:axiom-token-detail-native-hover", {
-          bubbles: true,
-          cancelable: true,
-          composed: true,
-          detail: { action }
-        });
-        try {
-          nativeControl.dispatchEvent(bridgeEvent);
-          return bridgeEvent.defaultPrevented;
-        } catch (_error) {
-          return false;
-        }
-      }
-
-      function invokeAxiomTokenDetailNativeReactHandler(nativeControl, handlerName, sourceEvent) {
-        if (!(nativeControl instanceof HTMLElement)) {
-          return false;
-        }
-        const reactProps = axiomTokenDetailNativeReactProps(nativeControl);
-        const handler = reactProps?.[handlerName];
-        if (typeof handler !== "function") {
-          return false;
-        }
-        try {
-          handler({
-            currentTarget: nativeControl,
-            target: nativeControl,
-            relatedTarget: sourceEvent?.target instanceof EventTarget ? sourceEvent.target : null,
-            type: handlerName === "onMouseLeave" ? "mouseleave" : "mouseenter",
-            nativeEvent: sourceEvent || null,
-            preventDefault() {},
-            stopPropagation() {},
-            isDefaultPrevented: () => false,
-            isPropagationStopped: () => false,
-            persist() {}
-          });
-          return true;
-        } catch (_error) {
-          return false;
-        }
-      }
-
-      function axiomTokenDetailNativeReactProps(nativeControl) {
-        if (!(nativeControl instanceof HTMLElement)) {
-          return null;
-        }
-        const propsKey = Object.keys(nativeControl).find((key) => key.startsWith("__reactProps$"));
-        return propsKey ? nativeControl[propsKey] : null;
-      }
-
-      function dispatchAxiomTokenDetailNativeHoverEvent(target, sourceEvent, eventType) {
-        if (!(target instanceof HTMLElement)) {
-          return;
-        }
-        const pointerLike = eventType.startsWith("pointer");
-        const init = {
-          bubbles: true,
-          cancelable: true,
-          composed: true,
-          view: window,
-          detail: sourceEvent?.detail || 0,
-          screenX: sourceEvent?.screenX || 0,
-          screenY: sourceEvent?.screenY || 0,
-          clientX: sourceEvent?.clientX || 0,
-          clientY: sourceEvent?.clientY || 0,
-          ctrlKey: Boolean(sourceEvent?.ctrlKey),
-          shiftKey: Boolean(sourceEvent?.shiftKey),
-          altKey: Boolean(sourceEvent?.altKey),
-          metaKey: Boolean(sourceEvent?.metaKey),
-          button: 0,
-          buttons: 0,
-          relatedTarget: sourceEvent?.target instanceof EventTarget ? sourceEvent.target : null
-        };
-        try {
-          const event = pointerLike && typeof PointerEvent === "function"
-            ? new PointerEvent(eventType, {
-              ...init,
-              pointerId: sourceEvent?.pointerId || 1,
-              pointerType: sourceEvent?.pointerType || "mouse",
-              isPrimary: sourceEvent?.isPrimary ?? true,
-              width: sourceEvent?.width || 1,
-              height: sourceEvent?.height || 1,
-              pressure: sourceEvent?.pressure || 0
-            })
-            : new MouseEvent(eventType, init);
-          target.dispatchEvent(event);
-        } catch (_error) {}
       }
 
       function handleMutations(mutations) {

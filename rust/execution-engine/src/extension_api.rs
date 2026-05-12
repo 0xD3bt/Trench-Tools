@@ -327,15 +327,29 @@ fn spawn_shared_fee_market_refresh_task() {
     tokio::spawn(async move {
         loop {
             let runtime = shared_fee_market_runtime();
-            runtime.refresh_helius_if_leased().await;
-            tokio::time::sleep(runtime.config().helius_refresh_interval).await;
+            // On a transient failure, back off briefly instead of waiting
+            // the full refresh interval — that's what was inflating the
+            // stale window from ~15s to ~60s and producing the wave of
+            // "Auto Fee unavailable" warnings on the FE.
+            let sleep_for = match runtime.refresh_helius_if_leased().await {
+                shared_fee_market::RefreshOutcome::Failed => Duration::from_millis(
+                    shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS,
+                ),
+                _ => runtime.config().helius_refresh_interval,
+            };
+            tokio::time::sleep(sleep_for).await;
         }
     });
     tokio::spawn(async move {
         loop {
             let runtime = shared_fee_market_runtime();
-            runtime.refresh_jito_if_leased().await;
-            tokio::time::sleep(runtime.config().jito_reconnect_delay).await;
+            let sleep_for = match runtime.refresh_jito_if_leased().await {
+                shared_fee_market::RefreshOutcome::Failed => Duration::from_millis(
+                    shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS,
+                ),
+                _ => runtime.config().jito_reconnect_delay,
+            };
+            tokio::time::sleep(sleep_for).await;
         }
     });
 }
@@ -1985,6 +1999,12 @@ pub struct WalletExecutionState {
     pub status: BatchLifecycleStatus,
     pub tx_signature: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_confirmed_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_recorded_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_error: Option<String>,
     #[serde(default)]
     pub buy_amount_sol: Option<String>,
     #[serde(default)]
@@ -3343,6 +3363,144 @@ fn publish_confirmed_trade_balance_stream_event(
     });
 }
 
+fn ledger_warning_message(
+    wallet_key: &str,
+    tx_signature: &str,
+    outcome: &Result<ConfirmedTradeLedgerRecordOutcome, ConfirmedTradeLedgerRecordError>,
+) -> Option<String> {
+    ledger_warning_message_for_state(
+        wallet_key,
+        tx_signature,
+        outcome.as_ref().map(|value| value.state),
+    )
+}
+
+fn ledger_warning_message_for_state(
+    wallet_key: &str,
+    tx_signature: &str,
+    outcome: Result<ConfirmedTradeLedgerRecordState, &ConfirmedTradeLedgerRecordError>,
+) -> Option<String> {
+    match outcome {
+        Ok(state) => match state {
+            ConfirmedTradeLedgerRecordState::Recorded => None,
+            ConfirmedTradeLedgerRecordState::Duplicate => Some(format!(
+                "Ledger already recorded confirmed trade signature {tx_signature}; execution remains confirmed for wallet {wallet_key}."
+            )),
+            ConfirmedTradeLedgerRecordState::Ignored => Some(format!(
+                "Confirmed transaction {tx_signature} did not produce a ledger-applicable trade for wallet {wallet_key}; execution remains confirmed."
+            )),
+        },
+        Err(ConfirmedTradeLedgerRecordError::Validation(error)) => Some(format!(
+            "Ledger validation failed for confirmed transaction {tx_signature} wallet {wallet_key}: {error}"
+        )),
+        Err(ConfirmedTradeLedgerRecordError::Persist(error)) => Some(format!(
+            "Ledger persistence failed for confirmed transaction {tx_signature} wallet {wallet_key}: {error}"
+        )),
+    }
+}
+
+async fn update_wallet_ledger_recording_state(
+    state: &AppState,
+    batch_id: &str,
+    wallet_key: &str,
+    tx_signature: &str,
+    ledger_recorded_at_unix_ms: Option<u64>,
+    ledger_error: Option<String>,
+) {
+    let mut guard = state.batches.write().await;
+    let Some(batch) = guard.get_mut(batch_id) else {
+        return;
+    };
+    let Some(wallet) = batch
+        .wallets
+        .iter_mut()
+        .find(|wallet| wallet.wallet_key == wallet_key)
+    else {
+        return;
+    };
+    if wallet.tx_signature.as_deref().map(str::trim) != Some(tx_signature.trim()) {
+        return;
+    }
+    wallet.ledger_recorded_at_unix_ms = ledger_recorded_at_unix_ms;
+    wallet.ledger_error = ledger_error;
+    let batch_snapshot = batch.clone();
+    if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
+        eprintln!("[execution-engine][persist] batch history write failed: {error}");
+        state.persist_failures.record_batch_history_failure(&error);
+    }
+    drop(guard);
+    publish_batch_status_snapshot(state, &batch_snapshot, "ledger_recording");
+}
+
+fn spawn_confirmed_trade_ledger_recording(
+    state: AppState,
+    batch_id: String,
+    batch_client_request_id: String,
+    wallet_request: WalletTradeRequest,
+    wallet_key: String,
+    tx_signature: String,
+    entry_preference_asset: Option<TradeSettlementAsset>,
+) {
+    tokio::spawn(async move {
+        let outcome = record_confirmed_trade_ledger_entry(
+            &state,
+            &wallet_request,
+            &wallet_key,
+            &tx_signature,
+            entry_preference_asset,
+            &batch_client_request_id,
+            &batch_id,
+        )
+        .await;
+
+        if let Some(message) = ledger_warning_message(&wallet_key, &tx_signature, &outcome) {
+            eprintln!("[execution-engine][ledger] {message}");
+            if matches!(outcome, Err(ConfirmedTradeLedgerRecordError::Persist(_))) {
+                state.persist_failures.record_trade_ledger_failure(&message);
+            }
+        }
+
+        let outcome_state = outcome.as_ref().map(|record_outcome| record_outcome.state);
+        match outcome_state {
+            Ok(ConfirmedTradeLedgerRecordState::Recorded) => {
+                let slot = outcome
+                    .as_ref()
+                    .ok()
+                    .and_then(|record_outcome| record_outcome.slot);
+                update_wallet_ledger_recording_state(
+                    &state,
+                    &batch_id,
+                    &wallet_key,
+                    &tx_signature,
+                    Some(now_unix_ms()),
+                    None,
+                )
+                .await;
+                publish_confirmed_trade_balance_stream_event(
+                    &state,
+                    Some(&batch_client_request_id),
+                    Some(&batch_id),
+                    &tx_signature,
+                    slot,
+                );
+            }
+            other => {
+                let ledger_error =
+                    ledger_warning_message_for_state(&wallet_key, &tx_signature, other);
+                update_wallet_ledger_recording_state(
+                    &state,
+                    &batch_id,
+                    &wallet_key,
+                    &tx_signature,
+                    None,
+                    ledger_error,
+                )
+                .await;
+            }
+        }
+    });
+}
+
 async fn create_auth_token(
     State(state): State<AppState>,
     Json(request): Json<CreateAuthTokenRequest>,
@@ -3895,6 +4053,12 @@ async fn prewarm_mint(
         sell_settlement_policy,
         sell_settlement_asset: resolve_sell_settlement_asset(sell_settlement_policy, None),
     };
+    let prewarm_fallback_mint_hint = request
+        .mint
+        .as_deref()
+        .and_then(trimmed_option)
+        .filter(|value| *value != preferred_input.as_str())
+        .map(str::to_string);
     let runtime_request = TradeRuntimeRequest {
         side: TradeSide::Buy,
         mint: preferred_input.clone(),
@@ -3906,6 +4070,7 @@ async fn prewarm_mint(
         planned_trade: None,
         pinned_pool: companion_pair.clone(),
         warm_key: None,
+        fallback_mint_hint: prewarm_fallback_mint_hint.clone(),
     };
     let (runtime_request, _) = normalize_runtime_request_for_wrapper_trade(&runtime_request);
     let prewarm_route_policy = runtime_route_policy_label(&TradeSide::Buy, &runtime_request.policy);
@@ -4120,6 +4285,7 @@ async fn prewarm_mint(
                 planned_trade: None,
                 pinned_pool: companion_pair.clone(),
                 warm_key: None,
+                fallback_mint_hint: prewarm_fallback_mint_hint.clone(),
             };
             let (sell_runtime_request, _) =
                 normalize_runtime_request_for_wrapper_trade(&sell_runtime_request);
@@ -4269,6 +4435,9 @@ async fn preview_batch(
         .buy_amount_sol
         .clone()
         .or(policy.buy_amount_sol.clone());
+    let preview_fallback_mint_hint = trimmed_option(&request.mint)
+        .filter(|value| *value != preview_address.as_str())
+        .map(str::to_string);
     let preview_request = TradeRuntimeRequest {
         side: preview_side.clone(),
         mint: preview_address.clone(),
@@ -4297,6 +4466,7 @@ async fn preview_batch(
         planned_trade: None,
         pinned_pool: preview_pinned_pool.clone(),
         warm_key: request.warm_key.clone(),
+        fallback_mint_hint: preview_fallback_mint_hint.clone(),
     };
     let (preview_wrapper_request, preview_route_conversion) =
         normalize_preview_request_for_wrapper_trade(&preview_request);
@@ -4361,6 +4531,7 @@ async fn preview_batch(
             .and_then(|plan| plan.resolved_pinned_pool.clone())
             .or_else(|| preview_pinned_pool.clone()),
         warm_key: request.warm_key.clone(),
+        fallback_mint_hint: preview_fallback_mint_hint.clone(),
     };
     let execution_plan = if matches!(preview_side, TradeSide::Buy) {
         build_buy_batch_execution_plan(
@@ -4526,6 +4697,9 @@ async fn buy(
     let companion_pair =
         route_companion_pair(request.pair.as_deref(), request.pinned_pool.as_deref())?;
     let batch_planning_mint = trimmed_option(&request.mint).unwrap_or(&address_input);
+    let buy_fallback_mint_hint = trimmed_option(&request.mint)
+        .filter(|value| *value != address_input.as_str())
+        .map(str::to_string);
     let execution_backend = "runtime".to_string();
     let wallet_request = WalletTradeRequest {
         side: TradeSide::Buy,
@@ -4554,6 +4728,7 @@ async fn buy(
         planned_trade: None,
         pinned_pool: companion_pair,
         warm_key: request.warm_key.clone(),
+        fallback_mint_hint: buy_fallback_mint_hint,
     };
     let (route_wallet_request, _) = normalize_wallet_request_for_wrapper_trade(&wallet_request);
     let execution_plan = build_buy_batch_execution_plan(
@@ -4658,6 +4833,9 @@ async fn sell(
         request.sell_output_sol.as_deref(),
         policy.sell_percent.as_deref(),
     )?;
+    let sell_fallback_mint_hint = trimmed_option(&request.mint)
+        .filter(|value| *value != address_input.as_str())
+        .map(str::to_string);
     let execution_backend = "runtime".to_string();
     let wallet_request = WalletTradeRequest {
         side: TradeSide::Sell,
@@ -4684,6 +4862,7 @@ async fn sell(
         planned_trade: None,
         pinned_pool: companion_pair,
         warm_key: request.warm_key.clone(),
+        fallback_mint_hint: sell_fallback_mint_hint,
     };
     let (route_wallet_request, _) = normalize_wallet_request_for_wrapper_trade(&wallet_request);
     let execution_plan =
@@ -5319,6 +5498,9 @@ async fn enqueue_batch(
                 status: BatchLifecycleStatus::Queued,
                 tx_signature: None,
                 error: None,
+                execution_confirmed_at_unix_ms: None,
+                ledger_recorded_at_unix_ms: None,
+                ledger_error: None,
                 buy_amount_sol: entry.planned_summary.buy_amount_sol.clone(),
                 scheduled_delay_ms: entry.planned_summary.scheduled_delay_ms,
                 delay_applied: entry.planned_summary.delay_applied,
@@ -5688,17 +5870,23 @@ async fn execute_batch_runtime(
                     tx_signature,
                     entry_preference_asset,
                 }) => (
-                    WalletExecutionState {
-                        wallet_key: wallet_id,
-                        status: BatchLifecycleStatus::Confirmed,
-                        tx_signature: Some(tx_signature),
-                        error: None,
-                        buy_amount_sol: planned_summary.buy_amount_sol.clone(),
-                        scheduled_delay_ms: planned_summary.scheduled_delay_ms,
-                        delay_applied: planned_summary.delay_applied,
-                        first_buy: planned_summary.first_buy,
-                        applied_variance_percent: planned_summary.applied_variance_percent,
-                        entry_preference_asset,
+                    {
+                        let confirmed_at = now_unix_ms();
+                        WalletExecutionState {
+                            wallet_key: wallet_id,
+                            status: BatchLifecycleStatus::Confirmed,
+                            tx_signature: Some(tx_signature),
+                            error: None,
+                            execution_confirmed_at_unix_ms: Some(confirmed_at),
+                            ledger_recorded_at_unix_ms: None,
+                            ledger_error: None,
+                            buy_amount_sol: planned_summary.buy_amount_sol.clone(),
+                            scheduled_delay_ms: planned_summary.scheduled_delay_ms,
+                            delay_applied: planned_summary.delay_applied,
+                            first_buy: planned_summary.first_buy,
+                            applied_variance_percent: planned_summary.applied_variance_percent,
+                            entry_preference_asset,
+                        }
                     },
                     request_for_result,
                 ),
@@ -5711,6 +5899,9 @@ async fn execute_batch_runtime(
                             status: BatchLifecycleStatus::Failed,
                             tx_signature: submitted_signature,
                             error: Some(error),
+                            execution_confirmed_at_unix_ms: None,
+                            ledger_recorded_at_unix_ms: None,
+                            ledger_error: None,
                             buy_amount_sol: planned_summary.buy_amount_sol.clone(),
                             scheduled_delay_ms: planned_summary.scheduled_delay_ms,
                             delay_applied: planned_summary.delay_applied,
@@ -5734,6 +5925,9 @@ async fn execute_batch_runtime(
                     status: BatchLifecycleStatus::Failed,
                     tx_signature: None,
                     error: Some(format!("Wallet task join failed: {error}")),
+                    execution_confirmed_at_unix_ms: None,
+                    ledger_recorded_at_unix_ms: None,
+                    ledger_error: None,
                     buy_amount_sol: None,
                     scheduled_delay_ms: 0,
                     delay_applied: false,
@@ -5747,6 +5941,7 @@ async fn execute_batch_runtime(
                     platform_label: None,
                     buy_amount_sol: None,
                     sell_intent: None,
+                    fallback_mint_hint: None,
                     policy: ExecutionPolicy {
                         slippage_percent: String::new(),
                         mev_mode: MevMode::Off,
@@ -6510,6 +6705,7 @@ fn wallet_request_to_runtime_request(
         planned_trade,
         pinned_pool: resolved_pinned_pool,
         warm_key: request.warm_key.clone(),
+        fallback_mint_hint: request.fallback_mint_hint.clone(),
     }
 }
 
@@ -6978,6 +7174,9 @@ async fn plan_batch_wallet_trades(
                                 status: BatchLifecycleStatus::Failed,
                                 tx_signature: None,
                                 error: Some(error.clone()),
+                                execution_confirmed_at_unix_ms: None,
+                                ledger_recorded_at_unix_ms: None,
+                                ledger_error: None,
                                 buy_amount_sol: entry.planned_summary.buy_amount_sol.clone(),
                                 scheduled_delay_ms: entry.planned_summary.scheduled_delay_ms,
                                 delay_applied: entry.planned_summary.delay_applied,
@@ -6996,6 +7195,9 @@ async fn plan_batch_wallet_trades(
                                 status: BatchLifecycleStatus::Failed,
                                 tx_signature: None,
                                 error: Some(error.clone()),
+                                execution_confirmed_at_unix_ms: None,
+                                ledger_recorded_at_unix_ms: None,
+                                ledger_error: None,
                                 buy_amount_sol: request.buy_amount_sol.clone(),
                                 scheduled_delay_ms: 0,
                                 delay_applied: false,
@@ -7018,6 +7220,9 @@ async fn plan_batch_wallet_trades(
                                 status: BatchLifecycleStatus::Failed,
                                 tx_signature: None,
                                 error: Some(error.clone()),
+                                execution_confirmed_at_unix_ms: None,
+                                ledger_recorded_at_unix_ms: None,
+                                ledger_error: None,
                                 buy_amount_sol: entry.planned_summary.buy_amount_sol.clone(),
                                 scheduled_delay_ms: entry.planned_summary.scheduled_delay_ms,
                                 delay_applied: entry.planned_summary.delay_applied,
@@ -7036,6 +7241,9 @@ async fn plan_batch_wallet_trades(
                                 status: BatchLifecycleStatus::Failed,
                                 tx_signature: None,
                                 error: Some(error.clone()),
+                                execution_confirmed_at_unix_ms: None,
+                                ledger_recorded_at_unix_ms: None,
+                                ledger_error: None,
                                 buy_amount_sol: request.buy_amount_sol.clone(),
                                 scheduled_delay_ms: 0,
                                 delay_applied: false,
@@ -7072,20 +7280,13 @@ async fn apply_wallet_execution_outcome(
     state: &AppState,
     batch_id: &str,
     wallet_request: &WalletTradeRequest,
-    mut outcome: WalletExecutionState,
+    outcome: WalletExecutionState,
 ) {
     let now = now_unix_ms();
-    let (batch_client_request_id, duplicate_owner, already_registered_signature) = {
+    let (batch_client_request_id, already_registered_signature) = {
         let guard = state.batches.read().await;
         let Some(batch) = guard.get(batch_id) else {
             return;
-        };
-        let duplicate_owner = if matches!(outcome.status, BatchLifecycleStatus::Confirmed) {
-            outcome.tx_signature.as_deref().and_then(|signature| {
-                duplicate_signature_owner(&guard, batch_id, &outcome.wallet_key, signature)
-            })
-        } else {
-            None
         };
         let already_registered_signature = outcome
             .tx_signature
@@ -7101,76 +7302,25 @@ async fn apply_wallet_execution_outcome(
             .unwrap_or(false);
         (
             batch.client_request_id.clone(),
-            duplicate_owner,
             already_registered_signature,
         )
     };
 
-    let mut register_trade_signature = if already_registered_signature {
-        None
+    let register_trade_signature = (!already_registered_signature)
+        .then(|| outcome.tx_signature.clone())
+        .flatten();
+    let ledger_recording = if matches!(outcome.status, BatchLifecycleStatus::Confirmed) {
+        outcome.tx_signature.clone().map(|tx_signature| {
+            (
+                wallet_request.clone(),
+                outcome.wallet_key.clone(),
+                tx_signature,
+                outcome.entry_preference_asset,
+            )
+        })
     } else {
-        outcome.tx_signature.clone()
+        None
     };
-    let mut confirmed_trade_event: Option<(String, Option<u64>)> = None;
-
-    if let Some((owner_batch_id, owner_wallet_key)) = duplicate_owner {
-        let signature = outcome.tx_signature.clone().unwrap_or_default();
-        outcome.status = BatchLifecycleStatus::Failed;
-        outcome.error = Some(duplicate_signature_error(
-            &signature,
-            &owner_batch_id,
-            &owner_wallet_key,
-        ));
-        register_trade_signature = None;
-    }
-
-    if matches!(outcome.status, BatchLifecycleStatus::Confirmed)
-        && let Some(tx_signature) = outcome.tx_signature.clone()
-    {
-        match record_confirmed_trade_ledger_entry(
-            state,
-            wallet_request,
-            &outcome.wallet_key,
-            &tx_signature,
-            outcome.entry_preference_asset,
-            &batch_client_request_id,
-            batch_id,
-        )
-        .await
-        {
-            Ok(record_outcome) => match record_outcome.state {
-                ConfirmedTradeLedgerRecordState::Recorded => {
-                    confirmed_trade_event = Some((tx_signature.clone(), record_outcome.slot));
-                }
-                ConfirmedTradeLedgerRecordState::Duplicate => {
-                    outcome.status = BatchLifecycleStatus::Failed;
-                    outcome.error = Some(format!(
-                        "Duplicate confirmed trade signature {tx_signature}; this request did not submit a distinct transaction."
-                    ));
-                    register_trade_signature = None;
-                }
-                ConfirmedTradeLedgerRecordState::Ignored => {
-                    outcome.status = BatchLifecycleStatus::Failed;
-                    outcome.error = Some(format!(
-                        "Confirmed transaction {tx_signature} did not produce a ledger-applicable trade."
-                    ));
-                    register_trade_signature = None;
-                }
-            },
-            Err(ConfirmedTradeLedgerRecordError::Validation(error)) => {
-                outcome.status = BatchLifecycleStatus::Failed;
-                outcome.error = Some(error);
-                register_trade_signature = None;
-            }
-            Err(ConfirmedTradeLedgerRecordError::Persist(error)) => {
-                eprintln!(
-                    "failed to record confirmed trade ledger entry for {} {}: {}",
-                    outcome.wallet_key, tx_signature, error
-                );
-                state.persist_failures.record_trade_ledger_failure(&error);
-            }
-        }
-    }
 
     let mut guard = state.batches.write().await;
     let Some(batch) = guard.get_mut(batch_id) else {
@@ -7185,6 +7335,9 @@ async fn apply_wallet_execution_outcome(
         wallet.status = outcome.status;
         wallet.tx_signature = outcome.tx_signature;
         wallet.error = outcome.error;
+        wallet.execution_confirmed_at_unix_ms = outcome.execution_confirmed_at_unix_ms;
+        wallet.ledger_recorded_at_unix_ms = outcome.ledger_recorded_at_unix_ms;
+        wallet.ledger_error = outcome.ledger_error;
         wallet.entry_preference_asset = outcome.entry_preference_asset;
     } else {
         return;
@@ -7211,13 +7364,17 @@ async fn apply_wallet_execution_outcome(
         );
     }
 
-    if let Some((tx_signature, slot)) = confirmed_trade_event {
-        publish_confirmed_trade_balance_stream_event(
-            state,
-            Some(&batch_client_request_id),
-            Some(batch_id),
-            &tx_signature,
-            slot,
+    if let Some((wallet_request, wallet_key, tx_signature, entry_preference_asset)) =
+        ledger_recording
+    {
+        spawn_confirmed_trade_ledger_recording(
+            state.clone(),
+            batch_id.to_string(),
+            batch_client_request_id,
+            wallet_request,
+            wallet_key,
+            tx_signature,
+            entry_preference_asset,
         );
     }
 }
@@ -10787,24 +10944,48 @@ async fn reconcile_batch_with_trade_event(
     state: &AppState,
     payload: &TradeEventPayload,
 ) -> Result<(), String> {
-    let normalized_status = payload.status.trim().to_ascii_lowercase();
-    if !matches!(normalized_status.as_str(), "confirmed" | "failed") {
+    if trade_event_is_accounting_only(payload) {
         return Ok(());
     }
     let mut guard = state.batches.write().await;
-    let Some(wallet_index) = guard
-        .get(&payload.batch_id)
-        .and_then(|batch| resolve_trade_event_wallet_index(batch, &payload.signature))
+    let Some(batch_snapshot) = reconcile_batch_with_trade_event_in_memory(&mut guard, payload)?
     else {
         return Ok(());
     };
+    if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
+        eprintln!("[execution-engine][persist] batch history write failed: {error}");
+        state.persist_failures.record_batch_history_failure(&error);
+    }
+    drop(guard);
+    publish_batch_status_snapshot(state, &batch_snapshot, "trade_reconcile");
+    Ok(())
+}
+
+fn trade_event_is_accounting_only(payload: &TradeEventPayload) -> bool {
+    payload.ledger_applied == Some(true)
+}
+
+fn reconcile_batch_with_trade_event_in_memory(
+    batches: &mut HashMap<String, BatchStatusResponse>,
+    payload: &TradeEventPayload,
+) -> Result<Option<BatchStatusResponse>, String> {
+    let normalized_status = payload.status.trim().to_ascii_lowercase();
+    if !matches!(normalized_status.as_str(), "confirmed" | "failed") {
+        return Ok(None);
+    }
+    let Some(wallet_index) = batches
+        .get(&payload.batch_id)
+        .and_then(|batch| resolve_trade_event_wallet_index(batch, &payload.signature))
+    else {
+        return Ok(None);
+    };
     let duplicate_owner = if normalized_status == "confirmed" {
-        guard
+        batches
             .get(&payload.batch_id)
             .and_then(|batch| batch.wallets.get(wallet_index))
             .and_then(|wallet| {
                 duplicate_signature_owner(
-                    &guard,
+                    batches,
                     &payload.batch_id,
                     &wallet.wallet_key,
                     &payload.signature,
@@ -10813,8 +10994,8 @@ async fn reconcile_batch_with_trade_event(
     } else {
         None
     };
-    let Some(batch) = guard.get_mut(&payload.batch_id) else {
-        return Ok(());
+    let Some(batch) = batches.get_mut(&payload.batch_id) else {
+        return Ok(None);
     };
     let wallet = batch.wallets.get_mut(wallet_index).ok_or_else(|| {
         format!(
@@ -10824,15 +11005,26 @@ async fn reconcile_batch_with_trade_event(
     })?;
     wallet.tx_signature = Some(payload.signature.clone());
     if let Some((owner_batch_id, owner_wallet_key)) = duplicate_owner {
-        wallet.status = BatchLifecycleStatus::Failed;
-        wallet.error = Some(duplicate_signature_error(
-            &payload.signature,
-            &owner_batch_id,
-            &owner_wallet_key,
-        ));
+        if matches!(wallet.status, BatchLifecycleStatus::Confirmed) {
+            wallet.ledger_error = Some(duplicate_signature_error(
+                &payload.signature,
+                &owner_batch_id,
+                &owner_wallet_key,
+            ));
+        } else {
+            wallet.status = BatchLifecycleStatus::Failed;
+            wallet.error = Some(duplicate_signature_error(
+                &payload.signature,
+                &owner_batch_id,
+                &owner_wallet_key,
+            ));
+        }
     } else if normalized_status == "confirmed" {
         wallet.status = BatchLifecycleStatus::Confirmed;
         wallet.error = None;
+        wallet
+            .execution_confirmed_at_unix_ms
+            .get_or_insert_with(now_unix_ms);
     } else {
         wallet.status = BatchLifecycleStatus::Failed;
         wallet.error = payload
@@ -10843,14 +11035,7 @@ async fn reconcile_batch_with_trade_event(
     }
     batch.updated_at_unix_ms = now_unix_ms();
     recompute_batch_summary(batch);
-    let batch_snapshot = batch.clone();
-    if let Err((_, error)) = persist_batch_history(&state.batch_history_path, &guard) {
-        eprintln!("[execution-engine][persist] batch history write failed: {error}");
-        state.persist_failures.record_batch_history_failure(&error);
-    }
-    drop(guard);
-    publish_batch_status_snapshot(state, &batch_snapshot, "trade_reconcile");
-    Ok(())
+    Ok(Some(batch.clone()))
 }
 
 fn active_batch_count(batches: &HashMap<String, BatchStatusResponse>) -> usize {
@@ -11205,6 +11390,7 @@ fn build_route_probe_request(
         planned_trade: None,
         pinned_pool,
         warm_key: None,
+        fallback_mint_hint: None,
     }
 }
 
@@ -11278,6 +11464,17 @@ fn resolve_capped_auto_fee_fields(
 ) -> (String, String, Vec<String>) {
     let runtime = shared_fee_market_runtime();
     let snapshot_status = read_shared_fee_market_snapshot(runtime.config());
+    // If the cached Helius snapshot is stale by the time a trade lands,
+    // kick off a best-effort background refresh so the *next* trade in
+    // this same window doesn't have to fall back too. Deduped per-cache
+    // so a burst of trades produces at most one in-flight fetch.
+    if snapshot_status
+        .as_ref()
+        .map(|status| !status.helius_fresh)
+        .unwrap_or(true)
+    {
+        runtime.maybe_spawn_helius_refresh_if_stale();
+    }
     let output = resolve_buffered_auto_fee_components(AutoFeeResolutionInput {
         provider,
         execution_class: "manual",
@@ -12541,6 +12738,7 @@ async fn resolve_wallet_status_quote_selector(
         planned_trade: None,
         pinned_pool: companion_pair,
         warm_key: request.warm_key.clone(),
+        fallback_mint_hint: None,
     };
     let plan = resolve_trade_plan(&runtime_request).await?;
     if plan.resolved_mint.trim() != mint {
@@ -14782,6 +14980,9 @@ mod tests {
                 },
                 tx_signature: signature.map(str::to_string),
                 error: None,
+                execution_confirmed_at_unix_ms: signature.map(|_| 1),
+                ledger_recorded_at_unix_ms: None,
+                ledger_error: None,
                 buy_amount_sol: None,
                 scheduled_delay_ms: 0,
                 delay_applied: false,
@@ -14825,6 +15026,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: None,
             warm_key: None,
+            fallback_mint_hint: None,
         }
     }
 
@@ -15085,6 +15287,104 @@ mod tests {
             duplicate_signature_owner(&batches, "batch-a", "wallet-alpha", "sig-1"),
             None
         );
+    }
+
+    #[test]
+    fn duplicate_trade_event_does_not_demote_execution_confirmed_wallet() {
+        let mut batches = HashMap::new();
+        batches.insert(
+            "batch-a".to_string(),
+            sample_batch_with_wallet_signature("batch-a", "wallet-alpha", Some("sig-1")),
+        );
+        batches.insert(
+            "batch-b".to_string(),
+            sample_batch_with_wallet_signature("batch-b", "wallet-bravo", Some("sig-1")),
+        );
+        let payload = TradeEventPayload {
+            client_request_id: "client-batch-b".to_string(),
+            batch_id: "batch-b".to_string(),
+            signature: "sig-1".to_string(),
+            status: "confirmed".to_string(),
+            slot: Some(42),
+            err: None,
+            ledger_applied: None,
+            at_ms: u128::from(now_unix_ms()),
+        };
+
+        let snapshot = reconcile_batch_with_trade_event_in_memory(&mut batches, &payload)
+            .expect("reconcile duplicate trade event")
+            .expect("batch snapshot");
+
+        let wallet = snapshot.wallets.first().expect("batch-b wallet");
+        assert!(matches!(wallet.status, BatchLifecycleStatus::Confirmed));
+        assert_eq!(wallet.error, None);
+        assert!(
+            wallet
+                .ledger_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Duplicate transaction signature")
+        );
+    }
+
+    #[test]
+    fn ledger_applied_trade_event_is_accounting_only_for_batch_reconcile() {
+        let payload = TradeEventPayload {
+            client_request_id: "client-batch-a".to_string(),
+            batch_id: "batch-a".to_string(),
+            signature: "sig-1".to_string(),
+            status: "confirmed".to_string(),
+            slot: Some(42),
+            err: None,
+            ledger_applied: Some(true),
+            at_ms: u128::from(now_unix_ms()),
+        };
+
+        assert!(trade_event_is_accounting_only(&payload));
+    }
+
+    #[test]
+    fn ledger_warning_duplicate_keeps_execution_confirmed() {
+        let outcome = Ok(ConfirmedTradeLedgerRecordState::Duplicate);
+        let message = ledger_warning_message_for_state("wallet-alpha", "sig-1", outcome)
+            .expect("duplicate should produce accounting warning");
+
+        assert!(message.contains("already recorded"));
+        assert!(message.contains("execution remains confirmed"));
+    }
+
+    #[test]
+    fn ledger_warning_validation_keeps_execution_confirmed() {
+        let error = ConfirmedTradeLedgerRecordError::Validation("wrong token delta".to_string());
+        let message = ledger_warning_message_for_state("wallet-alpha", "sig-2", Err(&error))
+            .expect("validation failure should produce accounting warning");
+
+        assert!(message.contains("Ledger validation failed"));
+        assert!(message.contains("sig-2"));
+    }
+
+    #[test]
+    fn ledger_warning_ignored_keeps_toast_facing_state_confirmed() {
+        let outcome = Ok(ConfirmedTradeLedgerRecordState::Ignored);
+        let message = ledger_warning_message_for_state("wallet-alpha", "sig-3", outcome)
+            .expect("ignored ledger event should produce accounting warning");
+
+        assert!(message.contains("ledger-applicable"));
+        assert!(message.contains("execution remains confirmed"));
+    }
+
+    #[test]
+    fn recompute_batch_summary_uses_execution_confirmed_status() {
+        let mut batch =
+            sample_batch_with_wallet_signature("batch-confirmed", "wallet-alpha", Some("sig-1"));
+        batch.wallets[0].ledger_error = Some("ledger still pending".to_string());
+        batch.wallets[0].ledger_recorded_at_unix_ms = None;
+
+        recompute_batch_summary(&mut batch);
+
+        assert!(matches!(batch.status, BatchLifecycleStatus::Confirmed));
+        assert_eq!(batch.summary.confirmed_wallets, 1);
+        assert_eq!(batch.summary.failed_wallets, 0);
     }
 
     #[test]
@@ -15659,6 +15959,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: None,
             warm_key: None,
+            fallback_mint_hint: None,
         };
         let mut ledger = HashMap::new();
         ledger.insert(
@@ -16987,6 +17288,7 @@ mod tests {
                     planned_trade: None,
                     pinned_pool: None,
                     warm_key: None,
+                    fallback_mint_hint: None,
                 },
                 planned_summary: WalletExecutionPlanSummary {
                     wallet_key: "wallet-alpha".to_string(),
@@ -17027,6 +17329,7 @@ mod tests {
                     planned_trade: None,
                     pinned_pool: None,
                     warm_key: None,
+                    fallback_mint_hint: None,
                 },
                 planned_summary: WalletExecutionPlanSummary {
                     wallet_key: "wallet-bravo".to_string(),
@@ -17067,6 +17370,7 @@ mod tests {
                     planned_trade: None,
                     pinned_pool: None,
                     warm_key: None,
+                    fallback_mint_hint: None,
                 },
                 planned_summary: WalletExecutionPlanSummary {
                     wallet_key: "wallet-charlie".to_string(),

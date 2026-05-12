@@ -71,7 +71,12 @@ body {
   background: var(--tt-bg);
   overflow: hidden;
   position: relative;
-  border-radius: 12px;
+  border-radius: 10px;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 1px 0 rgba(0, 0, 0, 0.5),
+    0 18px 40px -16px rgba(0, 0, 0, 0.7);
 }
 
 
@@ -704,25 +709,40 @@ select:focus {
   background: var(--tt-surface-2);
 }
 
+.input-validation-error,
+.compact-input-shell:has(.input-validation-error) {
+  border-color: rgba(255, 112, 128, 0.65) !important;
+  box-shadow: 0 0 0 2px rgba(255, 112, 128, 0.18);
+  animation: input-validation-shake 0.25s ease-in-out 1;
+}
+
+@keyframes input-validation-shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-2px); }
+  75% { transform: translateX(2px); }
+}
+
 
 .primary-button,
 .secondary-button,
 .danger-button,
 .shortcut-button {
   min-height: 34px;
-  padding: 6px 10px;
-  border-radius: 8px;
+  padding: 6px 12px;
+  border-radius: 9px;
   border: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 7px;
-  /* Bold (700) keeps the value text legible on the bright green / pink
-     button fills; semibold washed out at 14px against the saturated bg. */
-  font-size: 14px;
+  font-family: "Manrope", "Plus Jakarta Sans", "Inter Display", "Inter", "SF Pro Rounded", "SF Pro Display", system-ui, -apple-system, sans-serif;
+  font-size: 13.5px;
   font-weight: 700;
   line-height: 1;
-  letter-spacing: -0.005em;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
   font-variant-numeric: tabular-nums slashed-zero;
   font-feature-settings:
     "tnum" 1,
@@ -733,9 +753,10 @@ select:focus {
   cursor: pointer;
   box-shadow: none;
   transition:
-    background-color 0.14s ease,
+    background-color 0.16s ease,
+    box-shadow 0.2s ease,
     color 0.14s ease,
-    transform 0.06s ease;
+    transform 0.12s ease;
 }
 
 .button-unit-icon {
@@ -750,36 +771,72 @@ select:focus {
 
 .primary-button,
 .buy-shortcut {
-  background: #2fe3ac;
+  background-image: linear-gradient(180deg, #3edda5 0%, #2ec88e 100%);
+  background-color: #34d399;
   color: #04140e;
+  text-shadow: none;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.45),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.18),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.05),
+    0 1px 0 rgba(0, 0, 0, 0.55),
+    0 4px 12px -6px rgba(52, 211, 153, 0.45);
 }
 
 .primary-button:hover,
 .buy-shortcut:hover:not(:disabled) {
-  background: #5eecbd;
-  color: #04140e;
+  background-image: linear-gradient(180deg, #5aeab7 0%, #36d49d 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.55),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.16),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.06),
+    0 1px 0 rgba(0, 0, 0, 0.55),
+    0 6px 18px -6px rgba(52, 211, 153, 0.6);
+  transform: translateY(-1px);
 }
 
 .buy-shortcut.active {
-  background: #20c191;
-  color: #04140e;
+  background-image: linear-gradient(180deg, #28b884 0%, #1c9b6d 100%);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.22),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.1),
+    0 1px 0 rgba(255, 255, 255, 0.04);
+  transform: translateY(0);
 }
 
 .secondary-button,
 .sell-shortcut {
-  background: #ec397a;
+  background-image: linear-gradient(180deg, #ff8794 0%, #ff6678 100%);
+  background-color: #ff7080;
   color: #1a0612;
+  text-shadow: none;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.45),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.2),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.05),
+    0 1px 0 rgba(0, 0, 0, 0.55),
+    0 4px 12px -6px rgba(255, 112, 128, 0.5);
 }
 
 .secondary-button:hover,
 .sell-shortcut:hover:not(:disabled) {
-  background: #f370a0;
-  color: #1a0612;
+  background-image: linear-gradient(180deg, #ff9ba6 0%, #ff7787 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.55),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.18),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.06),
+    0 1px 0 rgba(0, 0, 0, 0.55),
+    0 6px 18px -6px rgba(255, 112, 128, 0.65);
+  transform: translateY(-1px);
 }
 
 .sell-shortcut.active {
-  background: #c81f60;
-  color: #1a0612;
+  background-image: linear-gradient(180deg, #e85b6c 0%, #c84455 100%);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.25),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.1),
+    0 1px 0 rgba(255, 255, 255, 0.04);
+  transform: translateY(0);
 }
 
 .shortcut-button {
@@ -826,7 +883,10 @@ select:focus {
 .shortcut-button:active:not(:disabled),
 .primary-button:active,
 .secondary-button:active {
-  transform: scale(0.97);
+  transform: translateY(0);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.4),
+    0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .danger-button {
@@ -991,7 +1051,8 @@ select:focus {
   transform: translateY(0.5px);
 }
 
-.buy-shortcut .unit-icon {
+.buy-shortcut .unit-icon,
+.sell-shortcut .unit-icon {
   filter: brightness(0);
   opacity: 0.85;
 }
@@ -1048,6 +1109,11 @@ select:focus {
 
 .option-inline-icon[src$="lighting-icon.png"] {
   transform: translateX(-10px);
+}
+
+.option-inline-icon[src$="slippage-icon.png"] {
+  width: 9px;
+  height: 9px;
 }
 
 .option-inline-icon.is-enabled {
@@ -1132,6 +1198,14 @@ select:focus {
   background: rgba(255, 255, 255, 0.14);
 }
 
+.balance-stats-row > .balance-stat:first-child {
+  border-bottom-left-radius: 9px;
+}
+
+.balance-stats-row > .balance-stat:last-child {
+  border-bottom-right-radius: 9px;
+}
+
 .balance-stat-label {
   display: none;
 }
@@ -1181,41 +1255,36 @@ select:focus {
   font-size: 11px;
   font-weight: 700;
   line-height: 1.1;
-  /* No opacity reduction — over the bright green/pink PnL background the dark
-     text needs full opacity to stay legible. The chip's own `color` token
-     (#04140e or #1a0612) supplies the near-black hue. */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   font-variant-numeric: tabular-nums slashed-zero;
+  opacity: 0.78;
 }
 
 .balance-stat-buy {
   color: #04140e;
-  background: #2fe3ac;
+  background: #34d399;
 }
 
 .balance-stat-sell {
   color: #1a0612;
-  background: #ec397a;
+  background: #ff7080;
 }
 
 .balance-stat-hold {
-  /* Solid light grey-white fill matching the saturated solid fills on the
-     buy/sell/PnL chips around it — keeps the row visually consistent.
-     Dark text on top for high contrast against the bright background. */
   color: #0a0a0a;
   background: #d4d4d8;
 }
 
 .balance-stat-pnl {
   color: #04140e;
-  background: #2fe3ac;
+  background: #34d399;
 }
 
 .balance-stat-pnl.is-negative {
   color: #1a0612;
-  background: #ec397a;
+  background: #ff7080;
 }
 
 .balance-stat-pnl .balance-stat-value.is-negative,

@@ -46,11 +46,11 @@
   --bg-tint-secondary: transparent;
   --page-bg-tint-primary: rgba(255, 255, 255, 0.028);
   --page-bg-tint-secondary: rgba(255, 255, 255, 0.014);
-  --radius: 14px;
-  --radius-sm: 11px;
-  --radius-xs: 8px;
-  --radius-control: 8px;
-  --radius-control-tight: 6px;
+  --radius: 9px;
+  --radius-sm: 7px;
+  --radius-xs: 5px;
+  --radius-control: 6px;
+  --radius-control-tight: 4px;
   --radius-pill: 999px;
   --font-display: "Public Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-sans: "Public Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -535,7 +535,7 @@ h2 {
   left: 0;
   width: min(100%, 304px);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 8px;
   background: var(--surface-overlay);
   box-shadow: var(--shadow-lg);
   z-index: 25;
@@ -1000,7 +1000,7 @@ html.overlay-create-mode body {
 
 .overlay-create-mode .launch-surface,
 .overlay-create-mode .output {
-  border-radius: 20px;
+  border-radius: 12px;
 }
 
 .overlay-create-mode .launch-surface {
@@ -1026,6 +1026,10 @@ html.overlay-create-mode body {
   display: none;
 }
 
+.overlay-create-mode #open-settings-button {
+  display: none;
+}
+
 .overlay-create-mode .boot-overlay {
   min-height: 100vh;
   height: 100vh;
@@ -1040,7 +1044,7 @@ html.overlay-create-mode body {
   max-width: var(--create-overlay-stable-width);
   min-height: 100%;
   height: 100%;
-  border-radius: 20px;
+  border-radius: 12px;
   border: 1px solid var(--border);
   background: var(--surface);
   box-shadow: var(--shadow-md);
@@ -1097,17 +1101,16 @@ html.overlay-create-mode .modal {
   animation: none;
 }
 
-/*
- * Auto-sell modal has lots of collapsible sections (auto-sell rules, market
- * settings, sniper integration). Cap its height in the deploy iframe so it
- * cannot stretch beyond the visible UI, and rely on the inner
- * `.auto-sell-modal-body { overflow-y: auto }` to scroll when content
- * exceeds the cap. The outer modal keeps `overflow: hidden` (from the
- * base rule) so the scroll stays inside the body instead of bleeding to
- * the whole panel.
- */
+html.overlay-create-mode .modal.sniper-modal,
 html.overlay-create-mode .modal.auto-sell-modal {
-  max-height: min(480px, calc(100vh - 24px));
+  width: min(460px, calc(100% - 12px));
+  min-width: min(460px, calc(100% - 12px));
+  max-width: calc(100% - 12px);
+}
+
+
+html.overlay-create-mode .modal.auto-sell-modal {
+  max-height: min(540px, calc(100vh - 24px));
   height: auto;
   overflow: hidden;
   display: flex;
@@ -1635,45 +1638,61 @@ label.is-field-error {
 }
 
 .image-library-modal {
-  width: min(780px, 100%);
+  width: min(760px, calc(100vw - 16px));
+  height: min(580px, calc(100vh - 24px));
+  max-height: min(580px, calc(100vh - 24px));
+  overflow: hidden;
+}
+
+html.overlay-create-mode .image-library-modal {
+  width: calc(100vw - 16px);
+  max-width: calc(100vw - 16px);
 }
 
 .image-library-body {
-  gap: 14px;
+  flex: 1 1 auto;
+  min-height: 0;
+  gap: 8px;
+  overflow: hidden;
 }
 
 .image-library-topbar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
 }
 
 .image-library-search {
   position: relative;
   flex: 1 1 auto;
+  min-width: 0;
 }
 
 .image-library-search input {
-  padding-left: 34px;
+  width: 100%;
+  padding-left: 28px;
 }
 
 .image-library-search-icon {
   position: absolute;
-  left: 11px;
+  left: 9px;
   top: 50%;
   transform: translateY(-50%);
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 11px;
   pointer-events: none;
 }
 
-.image-library-upload-button {
+.image-library-topbar .image-library-upload-button {
   width: auto;
-  min-width: 92px;
+  min-width: 0;
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  white-space: nowrap;
 }
 
 .image-library-section-label {
-  margin-top: -2px;
+  margin-top: -1px;
   font: 600 11px/1.3 var(--font-sans);
   color: var(--text-secondary);
 }
@@ -1682,20 +1701,21 @@ label.is-field-error {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 5px;
+  flex: 0 0 auto;
 }
 
 .image-category-dynamic {
   display: inline-flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 5px;
 }
 
 .image-category-chip {
   width: auto;
   min-width: 0;
-  padding: 4px 10px;
+  padding: 3px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius-pill);
   background: var(--surface-raised);
@@ -1722,15 +1742,18 @@ label.is-field-error {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(56px, 56px));
   gap: 6px;
-  min-height: 320px;
   align-content: start;
 }
 
 .image-library-grid-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 12px;
-  min-height: 360px;
+  border-radius: 8px;
+  padding: 8px;
   background: var(--surface-soft);
 }
 
@@ -1784,7 +1807,7 @@ label.is-field-error {
 }
 
 .image-library-empty {
-  min-height: 320px;
+  min-height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2163,7 +2186,7 @@ label.is-field-error {
   transform: translateX(-50%);
   width: min(280px, calc(100vw - 36px));
   padding: 12px;
-  border-radius: 12px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--surface-overlay);
   box-shadow: var(--shadow-lg);
@@ -2703,7 +2726,7 @@ label.is-field-error {
   max-height: min(420px, 60vh);
   overflow: auto;
   padding: 12px;
-  border-radius: 12px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: rgba(11, 16, 22, 0.98);
   box-shadow: var(--shadow-lg);
@@ -2857,7 +2880,7 @@ label.is-field-error {
   right: 0;
   width: min(340px, calc(100vw - 36px));
   padding: 12px;
-  border-radius: 12px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: rgba(11, 16, 22, 0.98);
   box-shadow: var(--shadow-lg);
@@ -2987,9 +3010,9 @@ label.is-field-error {
 }
 
 .modal.auto-sell-modal {
-  width: min(400px, calc(100vw - 44px));
+  width: min(460px, calc(100vw - 24px));
   height: auto;
-  max-height: min(560px, calc(100vh - 44px));
+  max-height: min(580px, calc(100vh - 24px));
   padding-bottom: 8px;
   overflow: hidden;
   border-color: rgba(255, 255, 255, 0.08);
@@ -3995,9 +4018,9 @@ label.is-field-error {
 }
 
 .modal.sniper-modal {
-  width: min(400px, calc(100vw - 48px));
+  width: min(460px, calc(100vw - 24px));
   height: auto;
-  max-height: min(280px, calc(100vh - 48px));
+  max-height: min(420px, calc(100vh - 24px));
   padding-bottom: 8px;
   overflow: hidden;
   border-color: rgba(255, 255, 255, 0.08);
@@ -4005,31 +4028,18 @@ label.is-field-error {
   box-shadow:
     0 24px 70px rgba(0, 0, 0, 0.52),
     0 0 0 1px rgba(255, 255, 255, 0.03);
-  transition: max-height 0.18s ease;
-}
-
-.modal.sniper-modal.is-expanded {
-  max-height: min(544px, calc(100vh - 48px));
 }
 
 .sniper-modal-header {
-  align-items: flex-start;
-  padding: 8px 10px 7px;
+  align-items: center;
+  padding: 5px 10px 5px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   background: linear-gradient(180deg, var(--surface-soft), var(--surface));
 }
 
-.sniper-modal-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.sniper-header-button {
-  width: auto;
-  min-width: 0;
-  min-height: 24px;
-  padding-inline: 8px;
+.sniper-modal-header h3 {
+  font: 700 12px/1.2 var(--font-display);
+  color: #fff;
 }
 
 .sniper-modal-body {
@@ -4048,7 +4058,7 @@ label.is-field-error {
   gap: 6px;
   padding: 8px;
   border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 14px;
+  border-radius: 10px;
   background: linear-gradient(180deg, var(--surface-raised), var(--surface));
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.02),
@@ -4097,7 +4107,8 @@ label.is-field-error {
 }
 
 .sniper-wallets-section {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   gap: 6px;
@@ -4168,7 +4179,7 @@ label.is-field-error {
   justify-content: space-between;
   gap: 6px;
   margin-top: 0;
-  padding: 6px 10px 7px;
+  padding: 4px 10px;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
   color: var(--text-secondary);
   font: 600 9px/1.1 var(--font-display);
@@ -4592,14 +4603,15 @@ label.is-field-error {
 }
 
 .sniper-modal .modal-footer {
-  padding: 7px 10px 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 5px 10px 6px;
+  gap: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
   background: linear-gradient(180deg, var(--surface-soft), var(--surface));
 }
 
 .sniper-modal .modal-footer .button {
-  min-height: 28px;
-  padding: 6px 10px;
+  min-height: 24px;
+  padding: 4px 10px;
   font-size: 10px;
 }
 
@@ -4696,13 +4708,62 @@ label.is-field-error {
 }
 
 .vanity-modal {
-  width: min(540px, 100%);
+  width: min(360px, calc(100vw - 24px));
+}
+
+.vanity-modal .modal-header {
+  padding: 9px 12px 8px;
+}
+
+.vanity-modal .modal-body {
+  padding: 10px 12px 8px;
+}
+
+.vanity-modal .modal-body .stack {
+  gap: 8px;
+}
+
+.vanity-modal .modal-body label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vanity-modal .modal-body label > span {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.vanity-modal .muted.small {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
 }
 
 .vanity-modal textarea {
   width: 100%;
-  min-height: 100px;
+  min-height: 64px;
+  max-height: 120px;
+  padding: 8px 10px;
   resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.vanity-modal .field-error:empty {
+  display: none;
+}
+
+.vanity-modal .modal-footer {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 8px 12px 10px;
 }
 
 .vanity-derived-address {
@@ -5509,12 +5570,72 @@ label.is-field-error {
   border-radius: 8px;
 }
 
+#fee-split-modal .fee-split-modal.compact-fee-split-modal {
+  width: min(460px, calc(100vw - 12px));
+  min-width: min(460px, calc(100vw - 12px));
+  max-height: min(560px, calc(100vh - 12px));
+  overflow: hidden;
+}
+
 .fee-split-modal.compact-fee-split-modal .modal-header {
   padding: 9px 8px 7px;
 }
 
 .fee-split-modal.compact-fee-split-modal .modal-body {
   padding: 8px 8px 7px;
+}
+
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .fee-split-row-main {
+  grid-template-columns: minmax(0, 1fr) 62px;
+  gap: 6px;
+}
+
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .recipient-target-wrap {
+  gap: 5px;
+}
+
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .recipient-target,
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .recipient-share {
+  height: 26px;
+  min-height: 26px;
+  padding: 0 7px;
+  font-size: 10px;
+}
+
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .recipient-lock-toggle {
+  height: 26px;
+  min-width: 34px;
+  font-size: 9.5px;
+}
+
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .fee-split-actions {
+  gap: 5px;
+}
+
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .fee-split-actions .button.subtle {
+  padding: 5px 7px;
+  font-size: 9.5px;
+}
+
+#fee-split-modal .fee-split-modal.compact-fee-split-modal .fee-split-legend-list {
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+}
+
+#fee-split-modal .bags-fee-split-summary {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+#fee-split-modal .fee-split-modal .modal-footer {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .fee-split-modal.compact-fee-split-modal .modal-footer {
@@ -6105,7 +6226,7 @@ button {
   gap: 12px;
   padding: 12px;
   border: 1px solid var(--border-subtle);
-  border-radius: 12px;
+  border-radius: 8px;
   background: linear-gradient(180deg, rgba(12, 16, 22, 0.9), rgba(8, 11, 16, 0.72));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
@@ -6121,7 +6242,7 @@ button {
 .reports-launch-card-image-fallback {
   width: 52px;
   height: 52px;
-  border-radius: 12px;
+  border-radius: 8px;
 }
 
 .reports-launch-card-image {
@@ -6678,7 +6799,7 @@ button {
 .modal {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 8px;
   width: min(500px, 100%);
   max-height: calc(100vh - 48px);
   overflow-y: auto;
@@ -6949,7 +7070,7 @@ button {
   gap: 8px;
   padding: 9px 10px;
   border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
-  border-radius: 14px;
+  border-radius: 10px;
   background:
     radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 14%, transparent), transparent 45%),
     var(--surface-gradient);
@@ -7581,7 +7702,7 @@ button {
   align-items: end;
   padding: 12px;
   border: 1px solid rgba(255, 255, 255, 0.05);
-  border-radius: 12px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.02);
 }
 
@@ -8037,8 +8158,8 @@ label.is-disabled textarea {
 }
 
 .popout-mode .auto-sell-modal {
-  width: min(410px, calc(100vw - 44px));
-  max-height: min(620px, calc(100vh - 44px));
+  width: min(460px, calc(100vw - 24px));
+  max-height: min(620px, calc(100vh - 24px));
 }
 
 .theme-light .auto-sell-modal-header h3,
@@ -8701,7 +8822,7 @@ textarea:focus-visible,
   .overlay-create-mode .boot-overlay-brand {
     min-height: 0;
     padding: 12px;
-    border-radius: 20px;
+    border-radius: 12px;
   }
 
   .modal-overlay {
@@ -8712,7 +8833,7 @@ textarea:focus-visible,
   .settings-modal {
     width: min(100%, 520px);
     max-height: calc(100vh - 20px);
-    border-radius: 12px;
+    border-radius: 8px;
   }
 
   .settings-modal-header {
@@ -9337,19 +9458,19 @@ textarea:focus-visible,
 .popout-mode .sniper-modal .modal-footer {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
-  padding: 8px 12px 10px;
+  padding: 5px 12px 6px;
 }
 
 .popout-mode .sniper-modal .modal-footer .button {
-  min-height: 30px;
-  padding: 7px 10px;
+  min-height: 26px;
+  padding: 5px 10px;
   font-size: 11px;
 }
 
 .popout-mode .sniper-footer-summary {
   gap: 8px;
   margin-top: 0;
-  padding: 7px 12px 8px;
+  padding: 4px 12px;
   font-size: 10px;
   line-height: 1.15;
 }

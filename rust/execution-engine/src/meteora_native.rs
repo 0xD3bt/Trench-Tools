@@ -754,6 +754,7 @@ mod tests {
                 planned_trade: None,
                 pinned_pool: None,
                 warm_key: None,
+                fallback_mint_hint: None,
             },
             launchdeck_bags::BagsImportContext {
                 launchpad: "bagsapp".to_string(),

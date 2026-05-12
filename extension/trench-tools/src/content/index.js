@@ -251,6 +251,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       prewarmForMint,
       handleTradeRequest,
       handleTokenDistributionRequest,
+      savePreferences,
       resolveQuickBuyAmount,
       quickBuyLabel,
       openPanel,
@@ -481,6 +482,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       window.history[methodName] = function patchedHistoryMethod(...args) {
         const result = original.apply(this, args);
         scheduleRouteReconcile(`history-${methodName}`, 0);
+        scheduleDelayedRouteReconciles(`history-${methodName}`);
         scheduleMountSweeps(`history-${methodName}`);
         return result;
       };
@@ -489,10 +491,12 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     wrapHistoryMethod("replaceState");
     lifecycle.popstateListener = () => {
       scheduleRouteReconcile("popstate", 0);
+      scheduleDelayedRouteReconciles("popstate");
       scheduleMountSweeps("popstate");
     };
     lifecycle.hashchangeListener = () => {
       scheduleRouteReconcile("hashchange", 0);
+      scheduleDelayedRouteReconciles("hashchange");
       scheduleMountSweeps("hashchange");
     };
     lifecycle.visibilityChangeListener = () => {
@@ -517,6 +521,12 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     window.addEventListener("hashchange", lifecycle.hashchangeListener);
     document.addEventListener("visibilitychange", lifecycle.visibilityChangeListener);
     window.addEventListener("focus", lifecycle.focusListener);
+  }
+
+  function scheduleDelayedRouteReconciles(reason) {
+    for (const delayMs of [120, 350, 900, 1800]) {
+      scheduleRouteReconcile(`${reason}-delayed-${delayMs}`, delayMs);
+    }
   }
 
   function scheduleRouteReconcile(reason, delayMs = 0) {
@@ -654,6 +664,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       setPersistentPanelTokenContext(null);
       clearPanelTokenScopedState();
       pushPanelState();
+    } else if (routeChanged && reason !== "init") {
+      scheduleDelayedRouteReconciles(`pending-token-detail-${reason}`);
     } else if (!panelWasOpenBeforeRoute) {
       await setPanelHidden(true, false);
       destroyPersistentPanelFrame();
@@ -2003,10 +2015,15 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   async function savePreferences(nextPreferences) {
+    const previousSelection = normalizeWalletSelectionPreference(state.preferences);
     state.preferences = normalizePreferencesValue({
       ...state.preferences,
       ...nextPreferences
     });
+    const nextSelection = normalizeWalletSelectionPreference(state.preferences);
+    if (!walletSelectionsEqual(previousSelection, nextSelection)) {
+      state.preview = null;
+    }
     await safeStorageSet({ [PREFERENCES_KEY]: serializePreferencesForStorage(state.preferences) });
     pushPanelState();
   }
@@ -2791,6 +2808,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const wallets = state.bootstrap?.wallets || [];
     const walletGroups = state.bootstrap?.walletGroups || [];
 
+    const initialPresetId = String(state.preferences?.presetId || "").trim();
+    const initialSelection = normalizeWalletSelectionPreference(state.preferences);
+
     if (!state.preferences.presetId && presets[0]) {
       state.preferences.presetId = presets[0].id;
     }
@@ -2814,6 +2834,18 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
     mirrorWalletSelectionPreferenceOntoPreferences(state.preferences, selection);
     state.preferences = normalizePreferencesValue(state.preferences);
+
+    const presetChanged = String(state.preferences?.presetId || "").trim() !== initialPresetId;
+    const finalSelection = normalizeWalletSelectionPreference(state.preferences);
+    const selectionChanged = !walletSelectionsEqual(initialSelection, finalSelection);
+    if (selectionChanged) {
+      state.preferences.selectionRevision =
+        Math.max(0, Number(state.preferences.selectionRevision || 0) || 0) + 1;
+      state.preview = null;
+    }
+    if (presetChanged || selectionChanged) {
+      void safeStorageSet({ [PREFERENCES_KEY]: serializePreferencesForStorage(state.preferences) });
+    }
   }
 
   function openOptionsSection(section) {
@@ -2852,7 +2884,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     return state.bootstrap !== null && Array.isArray(state.bootstrap?.presets);
   }
 
-  function resolveExecutionPresetSelection() {
+  function resolveExecutionPresetSelection({ requestedPresetId } = {}) {
     if (!isBootstrapLoaded()) {
       return { preset: null, repaired: false, bootstrapLoaded: false };
     }
@@ -2860,26 +2892,30 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     if (!presets.length) {
       return { preset: null, repaired: false, bootstrapLoaded: true };
     }
-    const requestedPresetId = String(state.preferences?.presetId || "").trim();
-    const selectedPreset = presets.find((preset) => preset.id === requestedPresetId) || null;
+    const presetIdToCheck = typeof requestedPresetId === "string" && requestedPresetId.length > 0
+      ? requestedPresetId
+      : String(state.preferences?.presetId || "").trim();
+    const selectedPreset = presets.find((preset) => preset.id === presetIdToCheck) || null;
     if (selectedPreset) {
       return { preset: selectedPreset, repaired: false, bootstrapLoaded: true };
     }
     return {
       preset: presets[0],
-      repaired: requestedPresetId !== presets[0].id,
+      repaired: presetIdToCheck !== presets[0].id,
       bootstrapLoaded: true
     };
   }
 
   async function ensureValidExecutionPreset({
     missingMessage = "No valid preset saved. Click here to create a preset",
-    pushToPanel = false
+    pushToPanel = false,
+    requestedPresetId,
+    persistRepair = true
   } = {}) {
     if (!isBootstrapLoaded()) {
       await refreshBootstrap(true);
     }
-    const resolution = resolveExecutionPresetSelection();
+    const resolution = resolveExecutionPresetSelection({ requestedPresetId });
     if (!resolution.bootstrapLoaded) {
       const message = state.hostError || "Execution engine offline.";
       if (pushToPanel) {
@@ -2917,7 +2953,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       showMissingExecutionPresetToast(missingMessage);
       return null;
     }
-    if (resolution.repaired) {
+    if (resolution.repaired && persistRepair) {
       await savePreferences({ presetId: resolution.preset.id });
     }
     return resolution.preset;
@@ -3847,6 +3883,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       if (changes[BOOTSTRAP_REVISION_KEY]) {
         void refreshBootstrap().then(() => {
           scheduleWalletStatusRefresh({ force: true, delayMs: 40 });
+          notifyPlatformWalletStatusChange();
         });
       }
       if (changes[HOST_AUTH_TOKEN_KEY]) {
@@ -3897,10 +3934,16 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         applyStreamedBatchStatus(changes[BATCH_STATUS_EVENT_KEY].newValue);
       }
       if (changes[PREFERENCES_KEY]) {
+        const previousSelection = normalizeWalletSelectionPreference(state.preferences);
         state.preferences = normalizePreferencesValue(changes[PREFERENCES_KEY].newValue || {});
+        const nextSelection = normalizeWalletSelectionPreference(state.preferences);
+        if (!walletSelectionsEqual(previousSelection, nextSelection)) {
+          state.preview = null;
+        }
         pushPanelState();
         scheduleWalletStatusRefresh({ force: true, delayMs: 40 });
         scanAndMount();
+        notifyPlatformWalletStatusChange();
       }
     };
     chrome.storage.onChanged.addListener(lifecycle.storageChangeListener);
@@ -4184,22 +4227,26 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       const requestedBuyAmount = String(payload?.buyAmountSol || "").trim();
       const requestedSellPercent = String(payload?.sellPercent || "").trim();
       const requestedSellOutputSol = String(payload?.sellOutputSol || "").trim();
+      let effectivePreferences;
       if (options.persistPreferences === false) {
-        state.preferences = normalizePreferencesValue({
+        effectivePreferences = normalizePreferencesValue({
           ...state.preferences,
           ...payload
         });
-        pushPanelState();
       } else {
         await savePreferences(payload);
+        effectivePreferences = state.preferences;
       }
-      if (!(await ensureValidExecutionPreset({
+      const activePreset = await ensureValidExecutionPreset({
         missingMessage: "No valid preset saved. Click here to create a preset",
-        pushToPanel: true
-      }))) {
+        pushToPanel: true,
+        requestedPresetId: String(effectivePreferences?.presetId || "").trim(),
+        persistRepair: options.persistPreferences !== false
+      });
+      if (!activePreset) {
         return;
       }
-      const selection = selectionPayloadFromPreferences();
+      const selection = selectionPayloadFromPreferences(effectivePreferences);
       if (!selection.walletKey && !selection.walletGroupId && !selection.walletKeys?.length) {
         throw new Error("Select at least one wallet.");
       }
@@ -4228,7 +4275,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         mint: normalizeRouteValue(tokenContext?.mint) || undefined,
         platform: String(tokenContext?.platform || state.platform || "").trim() || undefined,
         pair: routeRequest.pair || undefined,
-        presetId: state.preferences.presetId,
+        presetId: activePreset.id,
         ...selection,
         ...warmReuseFields
       };
@@ -4429,11 +4476,13 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
     clearBatchStatusPoller(batchId);
     updatePanelBatchStatus(event);
-    syncExecutionToastsFromBatchStatus(event, {
-      side: event.side,
-      walletCount: event.summary?.totalWallets,
-      clientRequestId
-    });
+    if (event.streamReason !== "ledger_recording") {
+      syncExecutionToastsFromBatchStatus(event, {
+        side: event.side,
+        walletCount: event.summary?.totalWallets,
+        clientRequestId
+      });
+    }
     const emittedAt = Number(event.streamEmittedAtUnixMs || 0);
     if (emittedAt > 0) {
       console.debug(
@@ -5039,40 +5088,42 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const candidatePair = getCandidatePairAddress(candidate);
     const candidateMint = getCandidateMintAddress(candidate);
     const cacheKey = buildRouteRequestKey(candidate.surface, candidateAddress, candidatePair);
-    if (state.pendingMintRequests.has(cacheKey)) {
-      return state.pendingMintRequests.get(cacheKey);
+    let promise = state.pendingMintRequests.get(cacheKey);
+    if (!promise) {
+      promise = callBackground("trench:resolve-token", {
+        source: candidate.source,
+        platform,
+        surface: candidate.surface,
+        url: candidate.url || window.location.href,
+        address: candidateAddress,
+        mint: candidateMint || undefined,
+        pair: candidatePair || undefined
+      }).then((tokenContext) => enrichResolvedTokenContext(tokenContext, {
+        address: candidateAddress,
+        mint: candidateMint,
+        pair: candidatePair
+      })).finally(() => state.pendingMintRequests.delete(cacheKey));
+      state.pendingMintRequests.set(cacheKey, promise);
     }
-
-    const resolvePayload = {
-      source: candidate.source,
-      platform,
-      surface: candidate.surface,
-      url: candidate.url || window.location.href,
-      address: candidateAddress,
-      mint: candidateMint || undefined,
-      pair: candidatePair || undefined
-    };
-    const promise = callBackground("trench:resolve-token", resolvePayload)
-      .then((tokenContext) => {
-        const enriched = enrichResolvedTokenContext(tokenContext, {
-          address: candidateAddress,
-          mint: candidateMint,
-          pair: candidatePair
-        });
-        if (requestSeq !== state.tokenRequestSeq || requestUrl !== state.currentRouteUrl) {
-          return state.tokenContext;
-        }
-        setPageTokenContext(enriched);
-        // Fire a best-effort prewarm now that we know the active raw route
-        // address. The backend de-dupes concurrent warms for the same
-        // fingerprint, so calling here is cheap.
-        schedulePrewarmForTokenContext(enriched, "resolve-token");
-        return enriched;
-      })
-      .finally(() => state.pendingMintRequests.delete(cacheKey));
-
-    state.pendingMintRequests.set(cacheKey, promise);
-    return promise;
+    const enriched = await promise;
+    if (requestSeq !== state.tokenRequestSeq || requestUrl !== state.currentRouteUrl) {
+      return state.tokenContext;
+    }
+    if (enriched) {
+      setPageTokenContext(enriched);
+      // Fire a best-effort prewarm now that we know the active raw route
+      // address. The backend de-dupes concurrent warms for the same
+      // fingerprint, so calling here is cheap.
+      schedulePrewarmForTokenContext(enriched, "resolve-token");
+    }
+    if (String(enriched?.surface || "").trim() === "token_detail") {
+      scheduleWalletStatusRefresh({
+        tokenContext: currentActivePanelTokenContext() || enriched,
+        force: true,
+        delayMs: 0
+      });
+    }
+    return enriched;
   }
 
   // Trade warming is only useful when the user actually intends to
@@ -6375,8 +6426,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     windows.forEach(({ windowRef }) => windowRef.postMessage(payload, PANEL_ORIGIN));
   }
 
-  function selectionPayloadFromPreferences() {
-    const selection = normalizeWalletSelectionPreference(state.preferences);
+  function selectionPayloadFromPreferences(value = state.preferences) {
+    const selection = normalizeWalletSelectionPreference(value);
     if (selection.selectionSource === "group") {
       return { walletGroupId: selectedWalletGroupIdFromValue(selection) };
     }
@@ -6385,6 +6436,21 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       return { walletKey: manualWalletKeys[0] || "" };
     }
     return { walletKeys: manualWalletKeys };
+  }
+
+  function walletSelectionsEqual(left, right) {
+    if (left?.selectionSource !== right?.selectionSource) {
+      return false;
+    }
+    if (String(left?.activeWalletGroupId || "") !== String(right?.activeWalletGroupId || "")) {
+      return false;
+    }
+    const leftKeys = [...(left?.manualWalletKeys || [])].sort();
+    const rightKeys = [...(right?.manualWalletKeys || [])].sort();
+    if (leftKeys.length !== rightKeys.length) {
+      return false;
+    }
+    return leftKeys.every((key, index) => key === rightKeys[index]);
   }
 
   function getActivePreset() {

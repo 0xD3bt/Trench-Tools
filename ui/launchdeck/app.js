@@ -239,8 +239,6 @@ const sniperModal = document.getElementById("sniper-modal");
 const sniperClose = document.getElementById("sniper-close");
 const sniperCancel = document.getElementById("sniper-cancel");
 const sniperSave = document.getElementById("sniper-save");
-const sniperRefreshButton = document.getElementById("sniper-refresh-button");
-const sniperResetButton = document.getElementById("sniper-reset-button");
 const sniperEnabledToggle = document.getElementById("sniper-enabled-toggle");
 const sniperEnabledState = document.getElementById("sniper-enabled-state");
 const sniperHostBanner = document.getElementById("sniper-host-banner");
@@ -2155,8 +2153,6 @@ const sniperFeature = window.SniperFeature.create({
     sniperClose,
     sniperCancel,
     sniperSave,
-    sniperRefreshButton,
-    sniperResetButton,
     sniperEnabledToggle,
     sniperEnabledState,
     sniperHostBanner,
@@ -2180,7 +2176,6 @@ const sniperFeature = window.SniperFeature.create({
   getRouteCapabilities,
   getBuyProvider,
   getSellProvider,
-  refreshWalletStatus,
   metaNode,
   onStateChange: () => {
     syncDevAutoSellUI();

@@ -2741,10 +2741,20 @@ fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String)
     tokio::spawn(async move {
         loop {
             if engine_background_requests_active(&helius_state) {
-                shared_fee_market_runtime(&primary_rpc_url)
+                // Tighten retry on failure so a transient Helius hiccup
+                // doesn't leave the snapshot stale for a full refresh
+                // interval (which produced visible "Auto Fee unavailable"
+                // warnings on the FE).
+                let outcome = shared_fee_market_runtime(&primary_rpc_url)
                     .refresh_helius_if_leased()
                     .await;
-                tokio::time::sleep(configured_helius_priority_refresh_interval()).await;
+                let sleep_for = match outcome {
+                    shared_fee_market::RefreshOutcome::Failed => Duration::from_millis(
+                        shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS,
+                    ),
+                    _ => configured_helius_priority_refresh_interval(),
+                };
+                tokio::time::sleep(sleep_for).await;
             } else {
                 tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL).await;
             }
@@ -2755,8 +2765,14 @@ fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String)
         loop {
             if engine_background_requests_active(&jito_state) {
                 let runtime = shared_fee_market_runtime(&rpc_url);
-                runtime.refresh_jito_if_leased().await;
-                tokio::time::sleep(runtime.config().jito_reconnect_delay).await;
+                let outcome = runtime.refresh_jito_if_leased().await;
+                let sleep_for = match outcome {
+                    shared_fee_market::RefreshOutcome::Failed => Duration::from_millis(
+                        shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS,
+                    ),
+                    _ => runtime.config().jito_reconnect_delay,
+                };
+                tokio::time::sleep(sleep_for).await;
             } else {
                 tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL).await;
             }

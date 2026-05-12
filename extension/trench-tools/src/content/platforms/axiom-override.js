@@ -99,7 +99,12 @@
     backfillRuns: 0,
     backfillLastDelayMs: 0,
     bridgeChecks: 0,
-    bridgeLastDelayMs: 0
+    bridgeLastDelayMs: 0,
+    socketAttachCount: 0,
+    socketUpdateCount: 0,
+    socketLastUpdateAt: 0,
+    socketLastMergeCount: 0,
+    socketJoinCount: 0
   };
   window.__trenchToolsAxiomPulseMetadataDebug = debugState;
 
@@ -328,7 +333,7 @@
             nextEntries.push(token);
           });
         });
-        mergePulseEntries(nextEntries);
+        debugState.socketLastMergeCount = mergePulseEntries(nextEntries);
       } catch (error) {
         console.error("Error in batched pulse update:", error);
       }
@@ -339,68 +344,118 @@
     if (!(card instanceof HTMLElement)) {
       return null;
     }
-    const seen = new WeakSet();
-    const entry = {
-      pairAddress: "",
-      tokenAddress: ""
-    };
 
-    function captureField(name, value) {
-      if (entry[name]) {
-        return;
-      }
-      const normalized = String(value || "").trim();
-      if (BASE58_ADDRESS_RE.test(normalized)) {
-        entry[name] = normalized;
-      }
-    }
+    function findEntryInPayload(payload) {
+      const seen = new WeakSet();
+      const entry = {
+        pairAddress: "",
+        tokenAddress: ""
+      };
 
-    function walk(value, depth) {
-      if (
-        entry.pairAddress && entry.tokenAddress ||
-        value == null ||
-        depth > PULSE_ROW_SEED_MAX_DEPTH
-      ) {
-        return;
-      }
-      if (typeof value === "string") {
-        return;
-      }
-      if (typeof value !== "object" || seen.has(value)) {
-        return;
-      }
-      seen.add(value);
-
-      captureField("pairAddress", value.pairAddress);
-      captureField("tokenAddress", value.tokenAddress || value.mint);
-      if (entry.pairAddress && entry.tokenAddress) {
-        return;
-      }
-
-      const keys = Object.keys(value).slice(0, PULSE_ROW_SEED_MAX_KEYS);
-      for (const key of keys) {
-        if (key.startsWith("_") && !key.startsWith("__react")) {
-          continue;
+      function captureField(name, value) {
+        if (entry[name]) {
+          return;
         }
-        try {
-          walk(value[key], depth + 1);
-        } catch (_error) {}
+        const normalized = String(value || "").trim();
+        if (BASE58_ADDRESS_RE.test(normalized)) {
+          entry[name] = normalized;
+        }
+      }
+
+      function walk(value, depth) {
+        if (
+          entry.pairAddress && entry.tokenAddress ||
+          value == null ||
+          depth > PULSE_ROW_SEED_MAX_DEPTH
+        ) {
+          return;
+        }
+        if (typeof value === "string") {
+          return;
+        }
+        if (typeof value !== "object" || seen.has(value)) {
+          return;
+        }
+        seen.add(value);
+
+        captureField("pairAddress", value.pairAddress);
+        captureField("tokenAddress", value.tokenAddress || value.mint);
         if (entry.pairAddress && entry.tokenAddress) {
           return;
         }
+
+        const keys = Object.keys(value).slice(0, PULSE_ROW_SEED_MAX_KEYS);
+        for (const key of keys) {
+          if (
+            key === "return" ||
+            key === "sibling" ||
+            key === "alternate" ||
+            key === "_debugOwner" ||
+            key === "_owner"
+          ) {
+            continue;
+          }
+          if (key.startsWith("_") && !key.startsWith("__react")) {
+            continue;
+          }
+          try {
+            walk(value[key], depth + 1);
+          } catch (_error) {}
+          if (entry.pairAddress && entry.tokenAddress) {
+            return;
+          }
+        }
       }
+
+      walk(payload, 0);
+      return entry.pairAddress && entry.tokenAddress ? entry : null;
+    }
+
+    function findEntryInReactPayload(value) {
+      try {
+        return findEntryInPayload(value);
+      } catch (_error) {
+        return null;
+      }
+    }
+
+    function findEntryInReactStateNodeProps(fiber) {
+      const stateNode = fiber?.stateNode;
+      if (!(stateNode instanceof HTMLElement)) {
+        return null;
+      }
+      for (const key of Object.keys(stateNode)) {
+        if (key.startsWith("__reactProps$")) {
+          const entry = findEntryInReactPayload(stateNode[key]);
+          if (entry) {
+            return entry;
+          }
+        }
+      }
+      return null;
     }
 
     const nodes = [card, ...card.querySelectorAll("*")].slice(0, PULSE_ROW_SEED_MAX_NODES);
     for (const node of nodes) {
       for (const key of Object.keys(node)) {
-        if (!key.startsWith("__reactFiber$") && !key.startsWith("__reactProps$")) {
+        if (key.startsWith("__reactProps$")) {
+          const entry = findEntryInReactPayload(node[key]);
+          if (entry) {
+            return entry;
+          }
           continue;
         }
-        try {
-          walk(node[key], 0);
-        } catch (_error) {}
-        if (entry.pairAddress && entry.tokenAddress) {
+        if (
+          !key.startsWith("__reactFiber$")
+        ) {
+          continue;
+        }
+        const fiber = node[key];
+        const entry =
+          findEntryInReactStateNodeProps(fiber) ||
+          findEntryInReactPayload(fiber?.memoizedProps) ||
+          findEntryInReactPayload(fiber?.pendingProps);
+        if (entry) {
           return entry;
         }
       }
@@ -574,6 +629,7 @@
 
   function attachPulseSocketListeners(ws) {
     try {
+      debugState.socketAttachCount += 1;
       originalAddEventListener.call(ws, "message", (event) => {
         if (!event?.data || typeof event.data !== "string") {
           return;
@@ -581,6 +637,8 @@
         if (!event.data.toLowerCase().includes("update_pulse")) {
           return;
         }
+        debugState.socketUpdateCount += 1;
+        debugState.socketLastUpdateAt = Date.now();
         try {
           const parsed = JSON.parse(event.data);
           debouncedPulseUpdate(parsed);
@@ -589,6 +647,7 @@
         }
       });
       originalAddEventListener.call(ws, "open", () => {
+        debugState.socketJoinCount += 1;
         ws.send('{"action":"join","room":"update_pulse_v2"}');
       });
     } catch (error) {
@@ -597,19 +656,19 @@
   }
 
   function installWebSocketBridge() {
-    const CurrentWebSocket = window.WebSocket?.__trenchToolsWrappedWebSocket || window.WebSocket;
-    if (
-      typeof CurrentWebSocket !== "function" ||
-      window.WebSocket?.__trenchToolsPulseWebSocketVersion === OVERRIDE_VERSION
-    ) {
+    if (typeof PreviousWebSocket !== "function") {
+      return;
+    }
+    if (window.WebSocket?.__trenchToolsPulseWebSocketVersion === OVERRIDE_VERSION) {
+      window.WebSocket.__trenchToolsPulseBridgeActive = true;
       return;
     }
 
     function TrenchToolsPulseWebSocket(url, protocols) {
       const ws =
         arguments.length > 1
-          ? new CurrentWebSocket(url, protocols)
-          : new CurrentWebSocket(url);
+          ? new PreviousWebSocket(url, protocols)
+          : new PreviousWebSocket(url);
       if (shouldInterceptWebSocket(url)) {
         attachPulseSocketListeners(ws);
       }
@@ -618,10 +677,11 @@
 
     TrenchToolsPulseWebSocket.__trenchToolsPulseWebSocket = true;
     TrenchToolsPulseWebSocket.__trenchToolsPulseWebSocketVersion = OVERRIDE_VERSION;
-    TrenchToolsPulseWebSocket.__trenchToolsWrappedWebSocket = CurrentWebSocket;
-    TrenchToolsPulseWebSocket.prototype = CurrentWebSocket.prototype;
+    TrenchToolsPulseWebSocket.__trenchToolsWrappedWebSocket = PreviousWebSocket;
+    TrenchToolsPulseWebSocket.__trenchToolsPulseBridgeActive = true;
+    TrenchToolsPulseWebSocket.prototype = PreviousWebSocket.prototype;
     TrenchToolsPulseWebSocket.prototype.constructor = TrenchToolsPulseWebSocket;
-    Object.setPrototypeOf(TrenchToolsPulseWebSocket, CurrentWebSocket);
+    Object.setPrototypeOf(TrenchToolsPulseWebSocket, PreviousWebSocket);
     window.WebSocket = TrenchToolsPulseWebSocket;
   }
 

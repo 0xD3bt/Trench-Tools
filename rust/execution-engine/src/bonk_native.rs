@@ -824,6 +824,7 @@ mod tests {
                 planned_trade: None,
                 pinned_pool: None,
                 warm_key: None,
+                fallback_mint_hint: None,
             },
             launchdeck_bonk::BonkImportContext {
                 launchpad: "bonk".to_string(),
@@ -869,6 +870,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: None,
             warm_key: None,
+            fallback_mint_hint: None,
         };
         let selector = LifecycleAndCanonicalMarket {
             lifecycle: TradeLifecycle::PostMigration,

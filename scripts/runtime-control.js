@@ -5,7 +5,6 @@ const { printStartupDiagnostics } = require("./runtime-diagnostics");
 
 const action = process.argv[2];
 const validActions = new Set(["start", "stop", "restart"]);
-const defaultMode = "both";
 
 if (!validActions.has(action)) {
   console.error(`Usage: node scripts/runtime-control.js <${Array.from(validActions).join("|")}>`);
@@ -14,6 +13,61 @@ if (!validActions.has(action)) {
 
 const projectRoot = path.resolve(__dirname, "..");
 const isWindows = process.platform === "win32";
+
+function parseEnvFile() {
+  const envPath = path.join(projectRoot, ".env");
+  const values = {};
+  let contents = "";
+  try {
+    contents = fs.readFileSync(envPath, "utf8");
+  } catch {
+    return values;
+  }
+  for (const rawLine of contents.split(/\r?\n/)) {
+    let line = rawLine.replace(/\r$/, "").trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    if (line.startsWith("export ")) {
+      line = line.slice("export ".length);
+    }
+    const separatorIndex = line.indexOf("=");
+    if (separatorIndex < 1) {
+      continue;
+    }
+    const name = line.slice(0, separatorIndex).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      continue;
+    }
+    let value = line.slice(separatorIndex + 1);
+    if (value.length >= 2) {
+      const first = value.slice(0, 1);
+      const last = value.slice(-1);
+      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+        value = value.slice(1, -1);
+      }
+    }
+    values[name] = value;
+  }
+  return values;
+}
+
+function resolveMode() {
+  const env = { ...process.env, ...parseEnvFile() };
+  const candidate = String(env.TRENCH_TOOLS_MODE || "").trim() || "both";
+  const normalized = candidate.toLowerCase();
+  if (normalized === "ee" || normalized === "ld" || normalized === "both") {
+    return normalized;
+  }
+  throw new Error("mode must be ee, ld, or both.");
+}
+
+function diagnosticsOptionsForMode(mode) {
+  return {
+    includeExecution: mode !== "ld",
+    includeLaunchdeck: mode !== "ee",
+  };
+}
 
 function resolvePosixShell() {
   const candidates = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"];
@@ -37,18 +91,18 @@ function scriptPathFor(kind) {
   return path.join(projectRoot, kind === "stop" ? "trench-tools-stop.sh" : "trench-tools-start.sh");
 }
 
-function argsFor(scriptPath) {
+function argsFor(scriptPath, selectedMode) {
   if (isWindows) {
     // `-NoProfile` skips user profile scripts, which add noise/latency and
     // occasionally break on minimal/pristine Windows VPS images.
-    return ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "--mode", defaultMode];
+    return ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "--mode", selectedMode];
   }
-  return [scriptPath, "--mode", defaultMode];
+  return [scriptPath, "--mode", selectedMode];
 }
 
-function run(kind) {
+function run(kind, selectedMode) {
   const scriptPath = scriptPathFor(kind);
-  const child = spawn(command, argsFor(scriptPath), {
+  const child = spawn(command, argsFor(scriptPath, selectedMode), {
     cwd: projectRoot,
     env: { ...process.env, TRENCH_TOOLS_FINAL_DIAGNOSTICS: "1" },
     stdio: "inherit",
@@ -91,14 +145,15 @@ function run(kind) {
 }
 
 (async () => {
+  const selectedMode = resolveMode();
   if (action === "restart") {
-    await run("start");
-    await printStartupDiagnostics({ includeExecution: true, includeLaunchdeck: true });
+    await run("start", selectedMode);
+    await printStartupDiagnostics(diagnosticsOptionsForMode(selectedMode));
     return;
   }
-  await run(action);
+  await run(action, selectedMode);
   if (action === "start") {
-    await printStartupDiagnostics({ includeExecution: true, includeLaunchdeck: true });
+    await printStartupDiagnostics(diagnosticsOptionsForMode(selectedMode));
   }
 })().catch((error) => {
   if (error && error.signal) {

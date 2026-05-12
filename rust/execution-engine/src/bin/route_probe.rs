@@ -231,6 +231,7 @@ fn request_from_args(args: &[String]) -> Result<TradeRuntimeRequest, String> {
         planned_trade: None,
         pinned_pool: arg_value(args, "--pool"),
         warm_key: None,
+        fallback_mint_hint: arg_value(args, "--fallback-mint"),
     })
 }
 

@@ -15,7 +15,6 @@ const PRE_MIGRATION_ROLLING_TTL_MS: u64 = 10_000;
 const PRE_MIGRATION_ABSOLUTE_MAX_AGE_MS: u64 = 30_000;
 const POST_MIGRATION_ROLLING_TTL_MS: u64 = 60 * 60 * 1000;
 const POST_MIGRATION_ABSOLUTE_MAX_AGE_MS: u64 = 4 * 60 * 60 * 1000;
-const NEGATIVE_CACHE_TTL_MS: u64 = 10_000;
 const ROUTE_INDEX_LRU_CAP: usize = 256;
 const ROUTE_INDEX_POLICY_VERSION: &str = "verified-mint-or-pool-v2";
 
@@ -102,29 +101,9 @@ impl RouteIndexEntry {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct NegativeRouteEntry {
-    pub error_code: String,
-    pub message: String,
-    pub fetched_at_unix_ms: u64,
-}
-
-impl NegativeRouteEntry {
-    fn is_stale(&self, now: u64) -> bool {
-        now.saturating_sub(self.fetched_at_unix_ms) > NEGATIVE_CACHE_TTL_MS
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum RouteIndexLookup {
-    Hit(RouteIndexEntry),
-    Negative(NegativeRouteEntry),
-}
-
 #[derive(Default)]
 pub struct RouteIndex {
     entries: RwLock<HashMap<RouteIndexKey, RouteIndexEntry>>,
-    negative_entries: RwLock<HashMap<RouteIndexKey, NegativeRouteEntry>>,
     flight_locks: Mutex<HashMap<RouteIndexKey, Arc<Mutex<()>>>>,
 }
 
@@ -135,32 +114,19 @@ pub fn shared_route_index() -> &'static RouteIndex {
 }
 
 impl RouteIndex {
-    pub async fn current(&self, key: &RouteIndexKey) -> Option<RouteIndexLookup> {
+    pub async fn current(&self, key: &RouteIndexKey) -> Option<RouteIndexEntry> {
         let now = now_unix_ms();
-        {
-            let mut entries = self.entries.write().await;
-            if let Some(entry) = entries.get_mut(key) {
-                if entry.is_stale(now) {
-                    entries.remove(key);
-                } else {
-                    entry.last_used_at_unix_ms = now;
-                    return Some(RouteIndexLookup::Hit(entry.clone()));
-                }
-            }
+        let mut entries = self.entries.write().await;
+        let entry = entries.get_mut(key)?;
+        if entry.is_stale(now) {
+            entries.remove(key);
+            return None;
         }
-        let mut negative_entries = self.negative_entries.write().await;
-        if let Some(entry) = negative_entries.get(key) {
-            if entry.is_stale(now) {
-                negative_entries.remove(key);
-            } else {
-                return Some(RouteIndexLookup::Negative(entry.clone()));
-            }
-        }
-        None
+        entry.last_used_at_unix_ms = now;
+        Some(entry.clone())
     }
 
     pub async fn insert_plan(&self, key: RouteIndexKey, plan: &TradeDispatchPlan, source: &str) {
-        self.negative_entries.write().await.remove(&key);
         let mut entries = self.entries.write().await;
         entries.insert(key, RouteIndexEntry::from_plan(plan, source));
         if entries.len() > ROUTE_INDEX_LRU_CAP {
@@ -174,22 +140,8 @@ impl RouteIndex {
         }
     }
 
-    pub async fn insert_negative(&self, key: RouteIndexKey, error_code: &str, message: &str) {
-        self.entries.write().await.remove(&key);
-        let mut negative_entries = self.negative_entries.write().await;
-        negative_entries.insert(
-            key,
-            NegativeRouteEntry {
-                error_code: error_code.to_string(),
-                message: message.to_string(),
-                fetched_at_unix_ms: now_unix_ms(),
-            },
-        );
-    }
-
     pub async fn invalidate(&self, key: &RouteIndexKey) {
         self.entries.write().await.remove(key);
-        self.negative_entries.write().await.remove(key);
     }
 
     pub async fn flight_lock(&self, key: &RouteIndexKey) -> Arc<Mutex<()>> {

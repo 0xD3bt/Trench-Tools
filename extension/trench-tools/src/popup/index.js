@@ -152,8 +152,17 @@ function enabledWallets() {
   );
 }
 
+function compactEnvWalletLabel(value) {
+  const label = String(value || "").trim();
+  const genericMatch = label.match(/^SOLANA_PRIVATE_KEY(\d+)?$/i);
+  if (!genericMatch) {
+    return label;
+  }
+  return `#${genericMatch[1] || "1"}`;
+}
+
 function walletLabel(wallet, index) {
-  const raw = String(wallet?.label || wallet?.name || wallet?.key || `Wallet ${index + 1}`).trim();
+  const raw = compactEnvWalletLabel(wallet?.label || wallet?.name || wallet?.key || `Wallet ${index + 1}`);
   if (raw.length <= 16) {
     return raw;
   }

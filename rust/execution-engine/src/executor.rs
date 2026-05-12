@@ -45,6 +45,7 @@ pub struct WalletTradeRequest {
     pub planned_trade: Option<LifecycleAndCanonicalMarket>,
     pub pinned_pool: Option<String>,
     pub warm_key: Option<String>,
+    pub fallback_mint_hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +159,7 @@ impl ExecutionExecutor {
             planned_trade: request.planned_trade,
             pinned_pool: request.pinned_pool,
             warm_key: request.warm_key,
+            fallback_mint_hint: request.fallback_mint_hint,
         };
         let result = match pre_submit_check {
             Some(check) => match on_submitted {

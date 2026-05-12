@@ -19,6 +19,7 @@ const REDUCED_MEV_ICON_SRC = "../../assets/MEV-icon.png";
 const SECURE_MEV_ICON_SRC = "../../assets/mevsecure-icon.png";
 const NO_MEV_ICON_SRC = "../../assets/NOMEV-icon.png";
 const SOL_ICON_SRC = "../../assets/sol-icon-white.png";
+const PERCENT_ICON_SRC = "../../assets/percent-icon.png";
 const FUEL_ICON_SRC = "../../assets/fuel-icon.png";
 const SLIPPAGE_ICON_SRC = "../../assets/slippage-icon.png";
 const TIP_ICON_SRC = "../../assets/tip-icon.png";
@@ -491,24 +492,39 @@ elements.dragHandle.addEventListener("pointerdown", (event) => {
     EXPECTED_PARENT_ORIGIN || "*"
   );
 });
-bindImmediateButtonAction(elements.customBuyButton, () =>
+bindImmediateButtonAction(elements.customBuyButton, () => {
+  const value = elements.customBuyInput.value.trim();
+  if (!isPositiveNumericInput(value)) {
+    flagEmptyCustomInput(elements.customBuyInput, "Enter a SOL amount before buying.");
+    return;
+  }
   emit("request-buy", {
     ...collectPreferences(),
-    buyAmountSol: elements.customBuyInput.value.trim()
-  })
-);
-bindImmediateButtonAction(elements.customSellPercentButton, () =>
+    buyAmountSol: value
+  });
+});
+bindImmediateButtonAction(elements.customSellPercentButton, () => {
+  const value = elements.customSellPercentInput.value.trim();
+  if (!isPositiveNumericInput(value)) {
+    flagEmptyCustomInput(elements.customSellPercentInput, "Enter a sell percentage before selling.");
+    return;
+  }
   emit("request-sell", {
     ...collectPreferences(),
-    sellPercent: elements.customSellPercentInput.value.trim()
-  })
-);
-bindImmediateButtonAction(elements.customSellSolButton, () =>
+    sellPercent: value
+  });
+});
+bindImmediateButtonAction(elements.customSellSolButton, () => {
+  const value = elements.customSellSolInput.value.trim();
+  if (!isPositiveNumericInput(value)) {
+    flagEmptyCustomInput(elements.customSellSolInput, "Enter a SOL amount before selling.");
+    return;
+  }
   emit("request-sell", {
     ...collectPreferences(),
-    sellOutputSol: elements.customSellSolInput.value.trim()
-  })
-);
+    sellOutputSol: value
+  });
+});
 elements.engineStatusRetry?.addEventListener("click", () => emit("refresh-panel"));
 elements.minimizeButton.addEventListener("click", () => emit("minimize-panel"));
 
@@ -546,6 +562,41 @@ function emit(type, payload = collectPreferences()) {
     },
     EXPECTED_PARENT_ORIGIN || "*"
   );
+}
+
+function isPositiveNumericInput(value) {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0;
+}
+
+let inputValidationNoticeTimer = null;
+
+function flagEmptyCustomInput(input, message) {
+  if (input instanceof HTMLInputElement) {
+    input.focus();
+    input.classList.add("input-validation-error");
+    window.setTimeout(() => {
+      input.classList.remove("input-validation-error");
+    }, 1200);
+  }
+  applyPanelNotice({
+    source: "input-validation",
+    title: "Input required",
+    message,
+    kind: "warning"
+  });
+  render();
+  if (inputValidationNoticeTimer) {
+    clearTimeout(inputValidationNoticeTimer);
+  }
+  inputValidationNoticeTimer = window.setTimeout(() => {
+    applyPanelNotice({ source: "input-validation", message: "" });
+    render();
+    inputValidationNoticeTimer = null;
+  }, 2800);
 }
 
 function bindImmediateButtonAction(button, action) {
@@ -1007,11 +1058,11 @@ function renderShortcutRows() {
       button.innerHTML = value
         ? `
         <span class="shortcut-value-with-icon">
-          <span class="unit-glyph">%</span>
+          <img class="unit-icon" src="${PERCENT_ICON_SRC}" alt="" aria-hidden="true" />
           <span>${value}</span>
         </span>
       `
-        : `<span class="shortcut-value-with-icon"><span>--%</span></span>`;
+        : `<span class="shortcut-value-with-icon"><img class="unit-icon" src="${PERCENT_ICON_SRC}" alt="" aria-hidden="true" /><span>--</span></span>`;
       if (value) {
         bindImmediateButtonAction(button, () =>
           emit("request-sell", {

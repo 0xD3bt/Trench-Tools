@@ -239,8 +239,6 @@ const sniperModal = document.getElementById("sniper-modal");
 const sniperClose = document.getElementById("sniper-close");
 const sniperCancel = document.getElementById("sniper-cancel");
 const sniperSave = document.getElementById("sniper-save");
-const sniperRefreshButton = document.getElementById("sniper-refresh-button");
-const sniperResetButton = document.getElementById("sniper-reset-button");
 const sniperEnabledToggle = document.getElementById("sniper-enabled-toggle");
 const sniperEnabledState = document.getElementById("sniper-enabled-state");
 const sniperHostBanner = document.getElementById("sniper-host-banner");
@@ -2175,8 +2173,6 @@ const sniperFeature = window.SniperFeature.create({
     sniperClose,
     sniperCancel,
     sniperSave,
-    sniperRefreshButton,
-    sniperResetButton,
     sniperEnabledToggle,
     sniperEnabledState,
     sniperHostBanner,
@@ -2200,7 +2196,6 @@ const sniperFeature = window.SniperFeature.create({
   getRouteCapabilities,
   getBuyProvider,
   getSellProvider,
-  refreshWalletStatus,
   metaNode,
   onStateChange: () => {
     syncDevAutoSellUI();
@@ -4407,10 +4402,12 @@ function walletIndexFromEnvKey(envKey) {
 
 function walletDisplayName(wallet) {
   if (!wallet) return "No wallet";
-  if (wallet.customName && String(wallet.customName).trim()) {
-    return String(wallet.customName).trim();
+  const customName = wallet.customName ? String(wallet.customName).trim() : "";
+  const envKey = wallet.envKey ? String(wallet.envKey).trim() : "";
+  if (customName && customName !== envKey && !/^SOLANA_PRIVATE_KEY\d*$/i.test(customName)) {
+    return customName;
   }
-  const index = walletIndexFromEnvKey(wallet.envKey);
+  const index = walletIndexFromEnvKey(envKey);
   return `#${index}`;
 }
 
@@ -6560,6 +6557,19 @@ function measureVisibleModalOverlayContent() {
   return { width: 0, height: 0 };
 }
 
+function measureOpenWalletDropdownContentHeight() {
+  if (
+    !(walletDropdown instanceof HTMLElement)
+    || walletDropdown.hidden
+    || !(form instanceof HTMLElement)
+  ) {
+    return 0;
+  }
+  const dropdownRect = walletDropdown.getBoundingClientRect();
+  const formRect = form.getBoundingClientRect();
+  return Math.max(0, Math.ceil(dropdownRect.bottom - formRect.top));
+}
+
 function getPreferredCreateOverlayContentSize() {
   const stableCreateOverlaySize = typeof LaunchDeckLayout.getCreateOverlayStableSize === "function"
     ? LaunchDeckLayout.getCreateOverlayStableSize()
@@ -6624,6 +6634,7 @@ function getPreferredPopoutLayoutMetrics() {
       };
   const workspace = measureVisibleWorkspaceContent();
   const modalOverlayContent = measureVisibleModalOverlayContent();
+  const openWalletDropdownHeight = measureOpenWalletDropdownContentHeight();
   return {
     formVisible,
     reportsVisible,
@@ -6631,7 +6642,7 @@ function getPreferredPopoutLayoutMetrics() {
     baseHeight: base.height,
     modalWidth: modalOverlayContent.width,
     modalHeight: modalOverlayContent.height,
-    measuredContentHeight: Math.max(base.height, workspace.height, modalOverlayContent.height),
+    measuredContentHeight: Math.max(base.height, workspace.height, modalOverlayContent.height, openWalletDropdownHeight),
   };
 }
 

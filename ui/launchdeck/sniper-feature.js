@@ -28,7 +28,6 @@
       getRouteCapabilities,
       getBuyProvider,
       getSellProvider,
-      refreshWalletStatus,
       metaNode,
       onStateChange,
     } = config;
@@ -44,8 +43,6 @@
       sniperClose,
       sniperCancel,
       sniperSave,
-      sniperRefreshButton,
-      sniperResetButton,
       sniperEnabledToggle,
       sniperEnabledState,
       sniperHostBanner,
@@ -584,8 +581,6 @@
         }
       }
       if (sniperSave) sniperSave.disabled = hostOffline || validateState().length > 0;
-      if (sniperRefreshButton) sniperRefreshButton.disabled = hostOffline;
-      if (sniperResetButton) sniperResetButton.disabled = hostOffline;
       if (sniperModalCard) {
         sniperModalCard.classList.toggle("is-expanded", sniperState.enabled);
       }
@@ -923,22 +918,6 @@
           applyStateToForm();
           setModalError("");
           renderUI();
-        });
-      }
-      if (sniperRefreshButton) {
-        sniperRefreshButton.addEventListener("click", async () => {
-          setModalError("");
-          try {
-            await refreshWalletStatus(true);
-          } catch (error) {
-            setModalError(error.message || "Failed to refresh balances.");
-          }
-        });
-      }
-      if (sniperResetButton) {
-        sniperResetButton.addEventListener("click", () => {
-          setModalError("");
-          resetState();
         });
       }
       if (sniperSave) {

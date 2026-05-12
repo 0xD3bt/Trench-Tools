@@ -917,13 +917,9 @@
           <div>
             <h3>Sniper Configuration</h3>
           </div>
-          <div class="sniper-modal-actions">
-            <button type="button" id="sniper-refresh-button" class="button subtle sniper-header-button">Refresh</button>
-            <button type="button" id="sniper-reset-button" class="button subtle sniper-header-button">Reset</button>
-            <button type="button" id="sniper-close" class="modal-close" aria-label="Close modal">
-              <img class="modal-close-icon" src="/images/modal-close.png" alt="">
-            </button>
-          </div>
+          <button type="button" id="sniper-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/images/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body sniper-modal-body">
           <div class="sniper-card">
@@ -1061,7 +1057,7 @@
             <div class="muted small">Insert a private key to use for vanity CA generation. This is not saved to settings presets.</div>
             <label>
               <span>Private Key</span>
-              <textarea id="vanity-private-key-input" rows="4" placeholder="Paste vanity private key"></textarea>
+              <textarea id="vanity-private-key-input" rows="2" placeholder="Paste vanity private key"></textarea>
             </label>
             <div id="vanity-modal-error" class="field-error"></div>
           </div>

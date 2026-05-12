@@ -187,6 +187,7 @@ fn build_request(
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
         warm_key: None,
+        fallback_mint_hint: None,
     }
 }
 

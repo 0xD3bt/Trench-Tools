@@ -83,6 +83,7 @@ pub struct TradeRuntimeRequest {
     /// entry this trade is expected to consume. Used to match the click
     /// against the right prewarmed plan and to tighten metrics.
     pub warm_key: Option<String>,
+    pub fallback_mint_hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1666,6 +1667,7 @@ mod tests {
             planned_trade: None,
             pinned_pool: Some("Pair111".to_string()),
             warm_key: Some("warm-1".to_string()),
+            fallback_mint_hint: None,
         }
     }
 

@@ -7,6 +7,34 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-05-12
+
+### Added
+
+- Browser extension: expanded Axiom instant panel support with richer inline controls, TT-only panel behavior, wallet-aware quick actions, and percent-sell affordances.
+- Browser extension: added the percent icon asset used by updated Axiom sell controls.
+- Browser extension: added Axiom support for `backup.axiom.trade` alongside the primary `axiom.trade` host.
+- Execution engine: added fallback mint hints through preview, prewarm, buy, sell, wrapper, and probe paths so trades from pair-centric surfaces can still resolve the intended token mint.
+
+### Changed
+
+- Execution engine: moved confirmed-trade ledger writes off the confirmation hot path, with separate ledger recording status and warnings so confirmed trades are not held up by ledger persistence.
+- Shared auto-fee refresh now retries transient Helius/Jito refresh failures quickly instead of leaving a longer stale-fee window.
+- LaunchDeck and extension modal layouts were tightened for smaller embedded panels, including auto-sell, sniper, and image library height and width behavior.
+- Runtime control now honors `TRENCH_TOOLS_MODE` from the environment or `.env`, and scopes startup diagnostics to the selected `ee`, `ld`, or `both` mode.
+- LaunchDeck sniper configuration was simplified by removing stale refresh/reset header actions from the modal.
+
+### Fixed
+
+- Axiom instant panel rendering, compact panel sizing, and popout wallet dropdown styling are more reliable across host page states.
+- Axiom wallet selection is hardened so trades use the intended selected wallet, including wallet changes made through the embedded panel.
+- Extension popup wallet dropdown layout and generic `SOLANA_PRIVATE_KEY` wallet labels are more compact and readable.
+- Pulse and newly indexed pair trades can resolve the token mint when the page provides pair-oriented context first.
+- Route discovery no longer poisons caches with overly fast negative results while newly indexed routes are still becoming available.
+- Auto-fee availability recovers faster after transient provider failures, reducing spurious "Auto Fee unavailable" states.
+- Extension wallet selection payloads are validated more strictly before execution.
+- LaunchDeck auto-sell and sniper modal max-height behavior no longer overflows constrained extension views.
+
 ## [1.1.1] - 2026-05-10
 
 ### Added
