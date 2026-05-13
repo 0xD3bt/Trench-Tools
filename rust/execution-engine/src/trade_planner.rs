@@ -54,6 +54,8 @@ pub enum PlannerVerificationSource {
 pub enum WrapperAction {
     PumpBondingCurveBuy,
     PumpBondingCurveSell,
+    PumpAmmBuy,
+    PumpAmmSell,
     PumpAmmWsolBuy,
     PumpAmmWsolSell,
     RaydiumAmmV4WsolBuy,
@@ -91,6 +93,24 @@ pub struct PumpBondingCurveRuntimeBundle {
     pub associated_bonding_curve: String,
     pub global_volume_accumulator: String,
     pub fee_config: String,
+    #[serde(default)]
+    pub quote_mint: String,
+    #[serde(default)]
+    pub quote_token_program: String,
+    #[serde(default)]
+    pub buyback_fee_recipient: String,
+    #[serde(default)]
+    pub associated_quote_fee_recipient: String,
+    #[serde(default)]
+    pub associated_quote_buyback_fee_recipient: String,
+    #[serde(default)]
+    pub associated_quote_bonding_curve: String,
+    #[serde(default)]
+    pub associated_quote_user: String,
+    #[serde(default)]
+    pub associated_creator_vault: String,
+    #[serde(default)]
+    pub associated_user_volume_accumulator: String,
     pub is_mayhem_mode: bool,
     pub is_cashback_coin: bool,
 }

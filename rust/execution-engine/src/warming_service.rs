@@ -616,7 +616,7 @@ mod tests {
             canonical_market_key: "pool-1".to_string(),
             quote_asset: PlannerQuoteAsset::Wsol,
             verification_source: PlannerVerificationSource::OnchainDerived,
-            wrapper_action: WrapperAction::PumpAmmWsolBuy,
+            wrapper_action: WrapperAction::PumpAmmBuy,
             wrapper_accounts: vec![],
             market_subtype: None,
             direct_protocol_target: None,

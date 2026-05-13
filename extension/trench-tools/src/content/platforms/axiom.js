@@ -32,6 +32,7 @@
       const AXIOM_TOKEN_DETAIL_COMPACT_POSITION_STORAGE_KEY = "trenchToolsAxiomInstantTradeCompactPosition";
       const AXIOM_NATIVE_INSTANT_TRADE_MODAL_SIZE_KEY = "instantTradeModalSize";
       const AXIOM_TOKEN_DETAIL_DEFAULT_WIDTH = 312;
+      const AXIOM_TOKEN_DETAIL_COMPACT_WIDTH = 312;
       const AXIOM_TOKEN_DETAIL_DEFAULT_HEIGHT = 372;
       const AXIOM_TOKEN_DETAIL_WALLET_MENU_WIDTH = 350;
       const AXIOM_TOKEN_DETAIL_WALLET_MENU_CONTENT_WIDTH = 348;
@@ -3135,7 +3136,7 @@
       function defaultAxiomTokenDetailPanelSizes() {
         return {
           compact: {
-            width: AXIOM_TOKEN_DETAIL_DEFAULT_WIDTH,
+            width: AXIOM_TOKEN_DETAIL_COMPACT_WIDTH,
             height: AXIOM_TOKEN_DETAIL_DEFAULT_HEIGHT
           },
           expanded: {
@@ -3295,15 +3296,14 @@
         if (!position) {
           return;
         }
-        const managedTransform = isAxiomTokenDetailSingleButtonMode();
         setAxiomTokenDetailDragContainerTransform(container, position.x, position.y, {
-          managed: managedTransform,
+          managed: true,
           disableTransition: true
         });
       }
 
       function axiomTokenDetailPanelMinWidth(modeKey) {
-        return modeKey === "expanded" ? AXIOM_TOKEN_DETAIL_DEFAULT_WIDTH : 220;
+        return modeKey === "expanded" ? AXIOM_TOKEN_DETAIL_DEFAULT_WIDTH : AXIOM_TOKEN_DETAIL_COMPACT_WIDTH;
       }
 
       function axiomTokenDetailNativeExpandedMinWidth() {
@@ -3631,13 +3631,9 @@
         if (!(instantTrade instanceof HTMLElement)) {
           return [];
         }
-        const containers = [];
         const parent = instantTrade.parentElement;
         if (!(parent instanceof HTMLElement) || parent === document.body || parent === document.documentElement) {
-          return containers;
-        }
-        if (Array.from(parent.children).includes(instantTrade)) {
-          containers.push(parent);
+          return [];
         }
         let current = parent.parentElement;
         for (let depth = 0; current instanceof HTMLElement && depth < 4; depth += 1) {
@@ -3654,11 +3650,14 @@
             current.hasAttribute("data-trench-tools-token-detail-container") ||
             (positioned && isAxiomTokenDetailPanelSizedAncestor(current, instantTrade))
           ) {
-            containers.push(current);
+            return [current];
           }
           current = current.parentElement;
         }
-        return containers;
+        if (Array.from(parent.children).includes(instantTrade)) {
+          return [parent];
+        }
+        return [];
       }
 
       function isAxiomTokenDetailPanelSizedAncestor(element, instantTrade) {
@@ -3765,7 +3764,8 @@
         }
         const value = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
         if (options.managed === true) {
-          if (!container.hasAttribute("data-trench-tools-token-detail-managed-transform")) {
+          const wasManaged = container.hasAttribute("data-trench-tools-token-detail-managed-transform");
+          if (!wasManaged) {
             container.setAttribute("data-trench-tools-token-detail-original-transform", container.style.transform || "");
             container.setAttribute(
               "data-trench-tools-token-detail-original-transform-priority",
@@ -3778,7 +3778,40 @@
             );
           }
           container.setAttribute("data-trench-tools-token-detail-managed-transform", "true");
-          container.style.setProperty("transition", "none", "important");
+          const tickAttr = "data-trench-tools-token-detail-managed-tick";
+          const nextTick = String((Number(container.getAttribute(tickAttr)) || 0) + 1);
+          container.setAttribute(tickAttr, nextTick);
+          if (options.activeDrag === true) {
+            container.style.setProperty("transition", "none", "important");
+          } else {
+            const originalTransition = container.getAttribute("data-trench-tools-token-detail-original-transition") || "";
+            const originalTransitionPriority =
+              container.getAttribute("data-trench-tools-token-detail-original-transition-priority") || "";
+            const currentTransitionPriority = container.style.getPropertyPriority("transition");
+            const transitionAlreadyKilled =
+              container.style.transition === "none" && currentTransitionPriority === "important";
+            if (!wasManaged || transitionAlreadyKilled || options.disableTransition === true) {
+              container.style.setProperty("transition", "none", "important");
+              window.requestAnimationFrame(() => {
+                window.requestAnimationFrame(() => {
+                  if (!(container instanceof HTMLElement) || !container.isConnected) {
+                    return;
+                  }
+                  if (container.getAttribute("data-trench-tools-token-detail-managed-transform") !== "true") {
+                    return;
+                  }
+                  if (container.getAttribute(tickAttr) !== nextTick) {
+                    return;
+                  }
+                  if (originalTransition) {
+                    container.style.setProperty("transition", originalTransition, originalTransitionPriority);
+                  } else {
+                    container.style.removeProperty("transition");
+                  }
+                });
+              });
+            }
+          }
           container.style.setProperty("transform", value, "important");
           return;
         }
@@ -4048,7 +4081,10 @@
         if (!state?.container?.isConnected) {
           return;
         }
-        setAxiomTokenDetailDragContainerTransform(state.container, state.nextX, state.nextY, { managed: true });
+        setAxiomTokenDetailDragContainerTransform(state.container, state.nextX, state.nextY, {
+          managed: true,
+          activeDrag: true
+        });
       }
 
       function buildAxiomTokenDetailCompactDragOverlay() {
@@ -4143,13 +4179,13 @@
             setAxiomTokenDetailButtonMode(nextAxiomTokenDetailButtonMode());
           });
         }
-        const closeButton = findAxiomTokenDetailCloseControl(host);
-        if (closeButton instanceof HTMLElement) {
-          if (button.parentElement !== host || button.nextElementSibling !== closeButton) {
-            host.insertBefore(button, closeButton);
+        const insertBefore = findAxiomTokenDetailCompactToggleInsertBefore(host);
+        if (insertBefore instanceof HTMLElement) {
+          if (button.parentElement !== host || button.nextElementSibling !== insertBefore) {
+            host.insertBefore(button, insertBefore);
           }
-        } else if (button.parentElement !== host) {
-            host.appendChild(button);
+        } else if (button.parentElement !== host || button.nextElementSibling !== null) {
+          host.appendChild(button);
         }
         updateAxiomTokenDetailCompactToggle(button);
       }
@@ -4197,11 +4233,30 @@
           }
           const text = String(element.textContent || "").replace(/\s+/g, "").trim();
           const className = String(element.className || "");
+          const ariaLabel = String(element.getAttribute("aria-label") || "");
+          const title = String(element.getAttribute("title") || "");
           return text === "×" ||
             text === "X" ||
+            /close/i.test(ariaLabel) ||
+            /close/i.test(title) ||
             /ri-close|ri-close-line|close/i.test(className) ||
-            Boolean(element.querySelector("i[class*='close'], svg"));
+            Boolean(element.querySelector("i[class*='close'], svg[class*='close'], [aria-label*='close' i], [title*='close' i]"));
         }) || null;
+      }
+
+      function findAxiomTokenDetailCompactToggleInsertBefore(host) {
+        if (!(host instanceof HTMLElement)) {
+          return null;
+        }
+        const children = Array.from(host.children).filter((element) =>
+          element instanceof HTMLElement &&
+          !element.hasAttribute("data-trench-tools-token-detail-compact-toggle")
+        );
+        const closeButton = findAxiomTokenDetailCloseControl(host);
+        if (closeButton instanceof HTMLElement) {
+          return closeButton;
+        }
+        return children[children.length - 1] || null;
       }
 
       function updateAxiomTokenDetailCompactToggle(button = null) {
@@ -6401,6 +6456,27 @@
             background-color: #EEA7ED;
             color: hsl(var(--twc-grey-900) / var(--twc-grey-900-opacity, var(--tw-text-opacity)));
           }
+          div#instant-trade[data-trench-tools-token-detail-compact] div.h-\\[44px\\].border-b > div {
+            gap: 4px !important;
+            justify-content: flex-start !important;
+          }
+          div#instant-trade[data-trench-tools-token-detail-compact] div.h-\\[44px\\].border-b > div > div {
+            gap: 4px !important;
+          }
+          div#instant-trade[data-trench-tools-token-detail-compact] [data-trench-tools-token-detail-compact-toggle] {
+            margin-left: 6px !important;
+          }
+          div#instant-trade[data-trench-tools-token-detail-compact] div.h-\\[44px\\].border-b button:has(> i.ri-close-line) {
+            margin-left: 6px !important;
+          }
+          div#instant-trade[data-trench-tools-token-detail-compact] div.h-\\[44px\\].border-b div:has(> i.ri-keyboard-box-line),
+          div#instant-trade[data-trench-tools-token-detail-compact] div.h-\\[44px\\].border-b button:has(> i.ri-keyboard-box-line),
+          div#instant-trade[data-trench-tools-token-detail-compact] div.h-\\[44px\\].border-b button:has(> i.ri-close-line) {
+            padding-left: 0 !important;
+            padding-right: 0 !important;
+            width: 16px !important;
+            min-width: 16px !important;
+          }
           [data-trench-tools-token-detail-compact-toggle] {
             --trench-tools-axiom-toggle-color: #34D399;
             align-items: center;
@@ -6413,14 +6489,14 @@
             flex-shrink: 0;
             font-size: 9px;
             font-weight: 700;
-            height: 22px;
+            height: 20px;
             justify-content: center;
             letter-spacing: -0.02em;
             line-height: 1;
-            margin-left: -2px;
-            min-width: 22px;
+            margin: 0 !important;
+            min-width: 20px;
             padding: 0;
-            width: 22px;
+            width: 20px;
             transition: background-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
           }
           [data-trench-tools-token-detail-compact-toggle]:hover {
@@ -7444,7 +7520,8 @@
           existingWrapper.hasAttribute("data-trench-tools-token-detail-hardpanel-action-wrapper")
         ) {
           const existingButton = existingWrapper.querySelector("[data-trench-tools-token-detail-hardpanel-action]");
-          if (isAxiomTokenDetailHardpanelActionCurrent(existingButton, route, state)) {
+          if (existingButton instanceof HTMLElement) {
+            updateAxiomTokenDetailHardpanelActionAttributes(existingButton, route, state);
             syncAxiomTokenDetailHardpanelActionButton(existingButton, submitButton, state.side);
             ensureAxiomTokenDetailHardpanelRefreshBridge(hardpanel, route);
             return;
@@ -7544,13 +7621,23 @@
         return true;
       }
 
-      function isAxiomTokenDetailHardpanelActionCurrent(button, route, state) {
-        return button instanceof HTMLElement &&
-          button.getAttribute("data-route-key") === route.routeKey &&
-          String(button.getAttribute("data-mint") || "") === route.tokenMint &&
-          String(button.getAttribute("data-pair") || "") === route.companionPair &&
-          button.getAttribute("data-side") === state.side &&
-          String(button.getAttribute("data-sell-unit") || "") === String(state.sellUnit || "");
+      function updateAxiomTokenDetailHardpanelActionAttributes(button, route, state) {
+        if (!(button instanceof HTMLElement)) {
+          return;
+        }
+        button.setAttribute("data-route-key", route.routeKey || "");
+        button.setAttribute("data-side", state.side);
+        button.setAttribute("data-sell-unit", state.sellUnit || "");
+        if (route.tokenMint) {
+          button.setAttribute("data-mint", route.tokenMint);
+        } else {
+          button.removeAttribute("data-mint");
+        }
+        if (route.companionPair) {
+          button.setAttribute("data-pair", route.companionPair);
+        } else {
+          button.removeAttribute("data-pair");
+        }
       }
 
       function findAxiomTokenDetailHardpanelRoot() {
@@ -7708,6 +7795,7 @@
         if (!(button instanceof HTMLElement) || !(nativeSubmitButton instanceof HTMLElement)) {
           return;
         }
+        syncAxiomTokenDetailHardpanelActionNativeAttributes(button, nativeSubmitButton);
         button.textContent = "";
         nativeSubmitButton.childNodes.forEach((child) => {
           button.appendChild(child.cloneNode(true));
@@ -7732,6 +7820,44 @@
           minHeight: rect.height > 0 ? `${Math.round(rect.height)}px` : nativeSubmitButton.style.minHeight || "",
           width: "100%"
         });
+      }
+
+      function syncAxiomTokenDetailHardpanelActionNativeAttributes(button, nativeSubmitButton) {
+        const preserved = {
+          routeKey: button.getAttribute("data-route-key") || "",
+          side: button.getAttribute("data-side") || "",
+          sellUnit: button.getAttribute("data-sell-unit") || "",
+          mint: button.getAttribute("data-mint"),
+          pair: button.getAttribute("data-pair")
+        };
+        Array.from(button.attributes).forEach((attribute) => {
+          if (attribute.name === "style") {
+            return;
+          }
+          button.removeAttribute(attribute.name);
+        });
+        Array.from(nativeSubmitButton.attributes).forEach((attribute) => {
+          if (attribute.name === "style") {
+            return;
+          }
+          button.setAttribute(attribute.name, attribute.value);
+        });
+        button.type = "button";
+        button.setAttribute("data-trench-tools-token-detail-hardpanel-action", "true");
+        button.setAttribute("data-route-key", preserved.routeKey);
+        button.setAttribute("data-side", preserved.side);
+        button.setAttribute("data-sell-unit", preserved.sellUnit);
+        if (preserved.mint) {
+          button.setAttribute("data-mint", preserved.mint);
+        } else {
+          button.removeAttribute("data-mint");
+        }
+        if (preserved.pair) {
+          button.setAttribute("data-pair", preserved.pair);
+        } else {
+          button.removeAttribute("data-pair");
+        }
+        button.classList.add("trench-tools-axiom-token-detail-hardpanel-action");
       }
 
       function brandAxiomTokenDetailHardpanelActionContent(button, side) {

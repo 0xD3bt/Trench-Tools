@@ -332,9 +332,9 @@ fn spawn_shared_fee_market_refresh_task() {
             // stale window from ~15s to ~60s and producing the wave of
             // "Auto Fee unavailable" warnings on the FE.
             let sleep_for = match runtime.refresh_helius_if_leased().await {
-                shared_fee_market::RefreshOutcome::Failed => Duration::from_millis(
-                    shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS,
-                ),
+                shared_fee_market::RefreshOutcome::Failed => {
+                    Duration::from_millis(shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS)
+                }
                 _ => runtime.config().helius_refresh_interval,
             };
             tokio::time::sleep(sleep_for).await;
@@ -344,9 +344,9 @@ fn spawn_shared_fee_market_refresh_task() {
         loop {
             let runtime = shared_fee_market_runtime();
             let sleep_for = match runtime.refresh_jito_if_leased().await {
-                shared_fee_market::RefreshOutcome::Failed => Duration::from_millis(
-                    shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS,
-                ),
+                shared_fee_market::RefreshOutcome::Failed => {
+                    Duration::from_millis(shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS)
+                }
                 _ => runtime.config().jito_reconnect_delay,
             };
             tokio::time::sleep(sleep_for).await;
@@ -15995,7 +15995,7 @@ mod tests {
                 quote_asset: PlannerQuoteAsset::Sol,
                 verification_source:
                     crate::trade_planner::PlannerVerificationSource::OnchainDerived,
-                wrapper_action: crate::trade_planner::WrapperAction::PumpAmmWsolSell,
+                wrapper_action: crate::trade_planner::WrapperAction::PumpAmmSell,
                 wrapper_accounts: Vec::new(),
                 market_subtype: None,
                 direct_protocol_target: None,
@@ -17184,7 +17184,7 @@ mod tests {
             canonical_market_key: "pool-1".to_string(),
             quote_asset: crate::trade_planner::PlannerQuoteAsset::Wsol,
             verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
-            wrapper_action: crate::trade_planner::WrapperAction::PumpAmmWsolBuy,
+            wrapper_action: crate::trade_planner::WrapperAction::PumpAmmBuy,
             wrapper_accounts: vec![],
             market_subtype: None,
             direct_protocol_target: None,

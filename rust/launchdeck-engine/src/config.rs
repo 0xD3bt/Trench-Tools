@@ -557,7 +557,11 @@ pub fn launch_follow_up_label(config: &NormalizedConfig) -> Option<&'static str>
         {
             Some("follow-up")
         }
-        "agent-custom" if config.agent.splitAgentInit && !config.agent.feeRecipients.is_empty() => {
+        "agent-custom"
+            if config.agent.splitAgentInit
+                && (config.agent.buybackBps.unwrap_or(0) > 0
+                    || !config.agent.feeRecipients.is_empty()) =>
+        {
             Some("agent-setup")
         }
         "agent-locked" => Some("agent-setup"),
@@ -1075,9 +1079,9 @@ fn parse_limited_string(
     if required && normalized.is_empty() {
         return Err(ConfigError::Message(format!("{label} is required.")));
     }
-    if normalized.len() > max_length {
+    if normalized.as_bytes().len() > max_length {
         return Err(ConfigError::Message(format!(
-            "{label} must be at most {max_length} characters."
+            "{label} must be at most {max_length} UTF-8 bytes."
         )));
     }
     Ok(normalized)
@@ -2069,6 +2073,13 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
     if (mode == "regular" || mode == "cashback") && normalized.agent.splitAgentInit {
         normalized.agent.splitAgentInit = false;
     }
+    if mode == "agent-custom"
+        && normalized.agent.splitAgentInit
+        && normalized.agent.buybackBps.unwrap_or(0) == 0
+        && normalized.agent.feeRecipients.is_empty()
+    {
+        normalized.agent.splitAgentInit = false;
+    }
     if mode != "regular" && normalized.feeSharing.generateLaterSetup {
         return Err(ConfigError::Message(
             "feeSharing.generateLaterSetup is only supported in regular mode.".to_string(),
@@ -2904,12 +2915,26 @@ mod tests {
     fn pump_rejects_non_sol_quote_asset() {
         let mut raw = sample_raw_config();
         raw.launchpad = "pump".to_string();
-        raw.quoteAsset = "usd1".to_string();
-        let error = normalize_raw_config(raw).expect_err("pump should reject usd1 quote asset");
+        raw.quoteAsset = "usdc".to_string();
+        let error = normalize_raw_config(raw).expect_err("pump should reject usdc quote asset");
         assert_eq!(
             error.to_string(),
-            "quoteAsset=usd1 is only supported for bonk right now."
+            "quoteAsset=usdc is only supported for bonk right now."
         );
+    }
+
+    #[test]
+    fn agent_custom_split_without_meaningful_recipients_normalizes_to_inline_init() {
+        let mut raw = sample_raw_config();
+        raw.mode = "agent-custom".to_string();
+        raw.agent.buybackBps = Some(json!(0));
+        raw.agent.splitAgentInit = Some(json!(true));
+        raw.agent.feeRecipients = vec![];
+
+        let normalized = normalize_raw_config(raw).expect("agent-custom should normalize");
+
+        assert!(!normalized.agent.splitAgentInit);
+        assert_eq!(launch_follow_up_label(&normalized), None);
     }
 
     #[test]

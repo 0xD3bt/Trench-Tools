@@ -26,6 +26,7 @@ use crate::transport::{
 const SIGNATURE_CONFIRMATION_RPC_POLL_INTERVAL_MS: u64 = 400;
 const HELIUS_SIGNATURE_STATUS_RECONCILE_INTERVAL_MS: u64 = 550;
 const SYSTEM_PROGRAM_ID_STR: &str = "11111111111111111111111111111111";
+const SOLANA_TRANSACTION_PACKET_LIMIT: usize = 1232;
 pub const COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS: u64 = 20;
 const HELLOMOON_QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HELLOMOON_QUIC_SEND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -3959,6 +3960,24 @@ pub async fn send_transactions_sequential(
 }
 
 fn validate_helius_sender_transaction(transaction: &CompiledTransaction) -> Result<(), String> {
+    {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        let decoded_len = BASE64
+            .decode(&transaction.serializedBase64)
+            .map_err(|error| {
+                format!(
+                    "Transaction {} has invalid base64 payload: {error}",
+                    transaction.label
+                )
+            })?
+            .len();
+        if decoded_len > SOLANA_TRANSACTION_PACKET_LIMIT {
+            return Err(format!(
+                "Transaction {} is too large for Helius Sender/Solana packet size ({} bytes, max {}). Reduce token metadata length, disable launch-packed dev buy/extra setup, or split the launch into smaller transactions.",
+                transaction.label, decoded_len, SOLANA_TRANSACTION_PACKET_LIMIT
+            ));
+        }
+    }
     if transaction.inlineTipLamports.unwrap_or(0) < 200_000 {
         return Err(format!(
             "Transaction {} is missing the required inline Helius Sender tip.",
@@ -6102,6 +6121,20 @@ mod tests {
         .await
         .expect_err("sender should reject missing inline tip");
         assert!(error.contains("required inline Helius Sender tip"));
+    }
+
+    #[test]
+    fn helius_sender_rejects_oversized_transaction_payload() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+        let mut transaction = compiled_tx("launch");
+        transaction.serializedBase64 =
+            BASE64.encode(vec![0u8; SOLANA_TRANSACTION_PACKET_LIMIT + 1]);
+
+        let error = validate_helius_sender_transaction(&transaction)
+            .expect_err("sender should reject oversized transaction");
+        assert!(error.contains("too large for Helius Sender/Solana packet size"));
+        assert!(error.contains("1233 bytes"));
     }
 
     #[tokio::test]

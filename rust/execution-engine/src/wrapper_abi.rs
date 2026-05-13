@@ -32,14 +32,11 @@ pub const WSOL_MINT: Pubkey = Pubkey::new_from_array([
     235, 59, 85, 152, 160, 240, 0, 0, 0, 0, 1,
 ]);
 
-/// Discriminator prefixing the runtime `Execute` instruction.
-pub const EXECUTE_DISCRIMINATOR: u8 = 1;
-pub const EXECUTE_AMM_WSOL_DISCRIMINATOR: u8 = 7;
 pub const EXECUTE_SWAP_ROUTE_DISCRIMINATOR: u8 = 8;
+pub const EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR: u8 = 9;
 
 /// Seeds used to derive the program's singleton Config PDA.
 pub const CONFIG_SEED: &[u8] = b"config";
-pub const AMM_WSOL_SEED: &[u8] = b"amm-wsol";
 pub const ROUTE_WSOL_SEED: &[u8] = b"route-wsol";
 pub const ROUTE_WSOL_LANE_COUNT: u8 = 8;
 
@@ -63,52 +60,6 @@ pub enum WrapperRouteKind {
     SolOut = 1,
     /// Reserved for future compatibility.
     SolThrough = 2,
-}
-
-/// Byte layout of the `Execute` instruction data.
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct ExecuteRequest {
-    pub version: u8,
-    pub route_kind: WrapperRouteKind,
-    pub fee_bps: u16,
-    /// Gross SOL input in lamports. Required for `SolIn`, ignored for
-    /// `SolOut` (zero-initialized on the wire).
-    pub gross_sol_in_lamports: u64,
-    /// Net floor the user must receive. Units depend on `route_kind`:
-    /// - `SolIn` buy: minimum token base-units delivered.
-    /// - `SolOut` sell: minimum net SOL lamports delivered after fee.
-    /// - `SolThrough`: reserved.
-    pub min_net_output: u64,
-    /// Number of fixed-prefix wrapper accounts that precede the inner
-    /// CPI account list. The program uses this to split the `accounts`
-    /// slice into `[wrapper_prefix..][inner_accounts..]`.
-    pub inner_accounts_offset: u16,
-    /// Opaque instruction data forwarded verbatim to the inner venue
-    /// program. The wrapper does NOT parse this payload; the inner
-    /// program's own decoder handles it.
-    pub inner_ix_data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-#[borsh(use_discriminant = true)]
-#[repr(u8)]
-pub enum WsolAccountMode {
-    CreateOrReuse = 0,
-    ReuseOnly = 1,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct ExecuteAmmWsolRequest {
-    pub version: u8,
-    pub route_kind: WrapperRouteKind,
-    pub fee_bps: u16,
-    pub gross_sol_in_lamports: u64,
-    pub min_net_output: u64,
-    pub inner_accounts_offset: u16,
-    pub wsol_account_mode: WsolAccountMode,
-    pub pda_wsol_lamports: u64,
-    pub inner_wsol_account_index: u16,
-    pub inner_ix_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -191,6 +142,35 @@ pub struct ExecuteSwapRouteRequest {
     pub legs: Vec<SwapRouteLeg>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum PumpBondingV2Side {
+    Buy = 0,
+    Sell = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum PumpBondingV2QuoteFeeMode {
+    Wsol = 0,
+    Token = 1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ExecutePumpBondingV2Request {
+    pub version: u8,
+    pub side: PumpBondingV2Side,
+    pub quote_fee_mode: PumpBondingV2QuoteFeeMode,
+    pub fee_bps: u16,
+    pub gross_quote_in_amount: u64,
+    pub min_base_out_amount: u64,
+    pub base_amount_in: u64,
+    pub gross_min_quote_out_amount: u64,
+    pub net_min_quote_out_amount: u64,
+}
+
 /// Fixed order of the accounts that prefix every `Execute` call.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecuteAccounts<'a> {
@@ -219,11 +199,10 @@ pub struct ExecuteAccounts<'a> {
     pub token_program: &'a Pubkey,
 }
 
-pub const EXECUTE_FIXED_ACCOUNT_COUNT: u16 = 8;
-pub const EXECUTE_AMM_WSOL_FIXED_ACCOUNT_COUNT: u16 = 12;
 pub const EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT: u16 = 8;
 pub const EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT: u16 = 3;
 pub const EXECUTE_SWAP_ROUTE_TOKEN_FEE_ACCOUNT_COUNT: u16 = 1;
+pub const EXECUTE_PUMP_BONDING_V2_FIXED_ACCOUNT_COUNT: u16 = 6;
 
 impl<'a> ExecuteAccounts<'a> {
     pub fn to_account_metas(&self) -> Vec<AccountMeta> {
@@ -238,32 +217,6 @@ impl<'a> ExecuteAccounts<'a> {
             AccountMeta::new_readonly(*self.token_program, false),
         ]
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ExecuteAmmWsolAccounts<'a> {
-    pub execute: ExecuteAccounts<'a>,
-    pub amm_wsol_account: &'a Pubkey,
-    pub wsol_mint: &'a Pubkey,
-    pub system_program: &'a Pubkey,
-    pub rent_sysvar: &'a Pubkey,
-}
-
-impl<'a> ExecuteAmmWsolAccounts<'a> {
-    pub fn to_account_metas(&self) -> Vec<AccountMeta> {
-        let mut metas = self.execute.to_account_metas();
-        metas.extend([
-            AccountMeta::new(*self.amm_wsol_account, false),
-            AccountMeta::new_readonly(*self.wsol_mint, false),
-            AccountMeta::new_readonly(*self.system_program, false),
-            AccountMeta::new_readonly(*self.rent_sysvar, false),
-        ]);
-        metas
-    }
-}
-
-pub fn amm_wsol_pda(user: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[AMM_WSOL_SEED, user.as_ref()], &PROGRAM_ID)
 }
 
 pub fn route_wsol_pda(user: &Pubkey, lane: u8) -> (Pubkey, u8) {
@@ -290,6 +243,29 @@ fn swap_route_uses_token_fee(request: &ExecuteSwapRouteRequest) -> bool {
 pub struct ExecuteSwapRouteAccounts<'a> {
     pub execute: ExecuteAccounts<'a>,
     pub token_fee_vault_ata: Option<&'a Pubkey>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutePumpBondingV2Accounts<'a> {
+    pub user: &'a Pubkey,
+    pub config_pda: &'a Pubkey,
+    pub fee_vault: &'a Pubkey,
+    pub fee_vault_quote_ata: &'a Pubkey,
+    pub instructions_sysvar: &'a Pubkey,
+    pub pump_program: &'a Pubkey,
+}
+
+impl<'a> ExecutePumpBondingV2Accounts<'a> {
+    pub fn to_account_metas(&self) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new(*self.user, true),
+            AccountMeta::new_readonly(*self.config_pda, false),
+            AccountMeta::new(*self.fee_vault, false),
+            AccountMeta::new(*self.fee_vault_quote_ata, false),
+            AccountMeta::new_readonly(*self.instructions_sysvar, false),
+            AccountMeta::new_readonly(*self.pump_program, false),
+        ]
+    }
 }
 
 impl<'a> ExecuteSwapRouteAccounts<'a> {
@@ -321,47 +297,6 @@ impl<'a> ExecuteSwapRouteAccounts<'a> {
     }
 }
 
-/// Serialize an `Execute` instruction payload.
-pub fn encode_execute_data(request: &ExecuteRequest) -> Result<Vec<u8>, String> {
-    if request.version != ABI_VERSION {
-        return Err(format!(
-            "wrapper ABI version mismatch: got {}, expected {}",
-            request.version, ABI_VERSION
-        ));
-    }
-    if request.fee_bps > MAX_FEE_BPS {
-        return Err(format!(
-            "wrapper fee_bps {} exceeds hardcoded cap {}",
-            request.fee_bps, MAX_FEE_BPS
-        ));
-    }
-    let mut buf = Vec::with_capacity(64 + request.inner_ix_data.len());
-    buf.push(EXECUTE_DISCRIMINATOR);
-    borsh::to_writer(&mut buf, request)
-        .map_err(|error| format!("Failed to serialize Execute request: {error}"))?;
-    Ok(buf)
-}
-
-pub fn encode_execute_amm_wsol_data(request: &ExecuteAmmWsolRequest) -> Result<Vec<u8>, String> {
-    if request.version != ABI_VERSION {
-        return Err(format!(
-            "wrapper ABI version mismatch: got {}, expected {}",
-            request.version, ABI_VERSION
-        ));
-    }
-    if request.fee_bps > MAX_FEE_BPS {
-        return Err(format!(
-            "wrapper fee_bps {} exceeds hardcoded cap {}",
-            request.fee_bps, MAX_FEE_BPS
-        ));
-    }
-    let mut buf = Vec::with_capacity(80 + request.inner_ix_data.len());
-    buf.push(EXECUTE_AMM_WSOL_DISCRIMINATOR);
-    borsh::to_writer(&mut buf, request)
-        .map_err(|error| format!("Failed to serialize ExecuteAmmWsol request: {error}"))?;
-    Ok(buf)
-}
-
 pub fn encode_execute_swap_route_data(
     request: &ExecuteSwapRouteRequest,
 ) -> Result<Vec<u8>, String> {
@@ -390,49 +325,6 @@ pub fn encode_execute_swap_route_data(
     Ok(buf)
 }
 
-/// Build a wrapper `Execute` instruction.
-pub fn build_execute_instruction(
-    accounts: &ExecuteAccounts<'_>,
-    request: &ExecuteRequest,
-    inner_accounts: &[AccountMeta],
-) -> Result<Instruction, String> {
-    if request.inner_accounts_offset != EXECUTE_FIXED_ACCOUNT_COUNT {
-        return Err(format!(
-            "inner_accounts_offset must equal EXECUTE_FIXED_ACCOUNT_COUNT ({}), got {}",
-            EXECUTE_FIXED_ACCOUNT_COUNT, request.inner_accounts_offset
-        ));
-    }
-    let mut metas = accounts.to_account_metas();
-    metas.extend_from_slice(inner_accounts);
-    let data = encode_execute_data(request)?;
-    Ok(Instruction {
-        program_id: PROGRAM_ID,
-        accounts: metas,
-        data,
-    })
-}
-
-pub fn build_execute_amm_wsol_instruction(
-    accounts: &ExecuteAmmWsolAccounts<'_>,
-    request: &ExecuteAmmWsolRequest,
-    inner_accounts: &[AccountMeta],
-) -> Result<Instruction, String> {
-    if request.inner_accounts_offset != EXECUTE_AMM_WSOL_FIXED_ACCOUNT_COUNT {
-        return Err(format!(
-            "inner_accounts_offset must equal EXECUTE_AMM_WSOL_FIXED_ACCOUNT_COUNT ({}), got {}",
-            EXECUTE_AMM_WSOL_FIXED_ACCOUNT_COUNT, request.inner_accounts_offset
-        ));
-    }
-    let mut metas = accounts.to_account_metas();
-    metas.extend_from_slice(inner_accounts);
-    let data = encode_execute_amm_wsol_data(request)?;
-    Ok(Instruction {
-        program_id: PROGRAM_ID,
-        accounts: metas,
-        data,
-    })
-}
-
 pub fn build_execute_swap_route_instruction(
     accounts: &ExecuteSwapRouteAccounts<'_>,
     request: &ExecuteSwapRouteRequest,
@@ -458,6 +350,43 @@ pub fn build_execute_swap_route_instruction(
     let mut metas = accounts.to_account_metas(request)?;
     metas.extend_from_slice(route_accounts);
     let data = encode_execute_swap_route_data(request)?;
+    Ok(Instruction {
+        program_id: PROGRAM_ID,
+        accounts: metas,
+        data,
+    })
+}
+
+pub fn encode_execute_pump_bonding_v2_data(
+    request: &ExecutePumpBondingV2Request,
+) -> Result<Vec<u8>, String> {
+    if request.version != ABI_VERSION {
+        return Err(format!(
+            "wrapper ABI version mismatch: got {}, expected {}",
+            request.version, ABI_VERSION
+        ));
+    }
+    if request.fee_bps > MAX_FEE_BPS {
+        return Err(format!(
+            "wrapper fee_bps {} exceeds hardcoded cap {}",
+            request.fee_bps, MAX_FEE_BPS
+        ));
+    }
+    let mut buf = Vec::with_capacity(48);
+    buf.push(EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR);
+    borsh::to_writer(&mut buf, request)
+        .map_err(|error| format!("Failed to serialize ExecutePumpBondingV2 request: {error}"))?;
+    Ok(buf)
+}
+
+pub fn build_execute_pump_bonding_v2_instruction(
+    accounts: &ExecutePumpBondingV2Accounts<'_>,
+    request: &ExecutePumpBondingV2Request,
+    pump_accounts: &[AccountMeta],
+) -> Result<Instruction, String> {
+    let mut metas = accounts.to_account_metas();
+    metas.extend_from_slice(pump_accounts);
+    let data = encode_execute_pump_bonding_v2_data(request)?;
     Ok(Instruction {
         program_id: PROGRAM_ID,
         accounts: metas,
@@ -511,43 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn execute_round_trips() {
-        let request = ExecuteRequest {
-            version: ABI_VERSION,
-            route_kind: WrapperRouteKind::SolIn,
-            fee_bps: 10,
-            gross_sol_in_lamports: 500_000_000,
-            min_net_output: 1_000,
-            inner_accounts_offset: EXECUTE_FIXED_ACCOUNT_COUNT,
-            inner_ix_data: vec![1, 2, 3],
-        };
-        let bytes = encode_execute_data(&request).expect("encode");
-        assert_eq!(bytes[0], EXECUTE_DISCRIMINATOR);
-        let decoded = ExecuteRequest::try_from_slice(&bytes[1..]).expect("roundtrip");
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
-    fn execute_amm_wsol_round_trips() {
-        let request = ExecuteAmmWsolRequest {
-            version: ABI_VERSION,
-            route_kind: WrapperRouteKind::SolIn,
-            fee_bps: 10,
-            gross_sol_in_lamports: 500_000_000,
-            min_net_output: 1_000,
-            inner_accounts_offset: EXECUTE_FIXED_ACCOUNT_COUNT + 4,
-            wsol_account_mode: WsolAccountMode::CreateOrReuse,
-            pda_wsol_lamports: 499_000_000,
-            inner_wsol_account_index: 3,
-            inner_ix_data: vec![1, 2, 3],
-        };
-        let bytes = encode_execute_amm_wsol_data(&request).expect("encode");
-        assert_eq!(bytes[0], EXECUTE_AMM_WSOL_DISCRIMINATOR);
-        let decoded = ExecuteAmmWsolRequest::try_from_slice(&bytes[1..]).expect("roundtrip");
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
     fn execute_swap_route_round_trips() {
         let request = ExecuteSwapRouteRequest {
             version: ABI_VERSION,
@@ -582,79 +474,94 @@ mod tests {
     }
 
     #[test]
-    fn build_execute_amm_wsol_instruction_uses_v2_fixed_prefix() {
+    fn execute_pump_bonding_v2_round_trips() {
+        let request = ExecutePumpBondingV2Request {
+            version: ABI_VERSION,
+            side: PumpBondingV2Side::Buy,
+            quote_fee_mode: PumpBondingV2QuoteFeeMode::Wsol,
+            fee_bps: 10,
+            gross_quote_in_amount: 500_000_000,
+            min_base_out_amount: 1_000,
+            base_amount_in: 0,
+            gross_min_quote_out_amount: 0,
+            net_min_quote_out_amount: 0,
+        };
+        let bytes = encode_execute_pump_bonding_v2_data(&request).expect("encode");
+        assert_eq!(bytes[0], EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR);
+        let decoded = ExecutePumpBondingV2Request::try_from_slice(&bytes[1..]).expect("roundtrip");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn build_execute_pump_bonding_v2_instruction_uses_fixed_prefix() {
         let user = Pubkey::new_unique();
         let config = config_pda().0;
         let fee_vault = Pubkey::new_unique();
-        let zero = Pubkey::default();
+        let fee_vault_quote_ata = Pubkey::new_unique();
         let instructions = instructions_sysvar_id();
-        let inner_program = Pubkey::new_unique();
-        let token_program = TOKEN_PROGRAM_ID;
-        let (amm_wsol, _) = amm_wsol_pda(&user);
-        let system = system_program_id();
-        let rent = rent_sysvar_id();
-        let accounts = ExecuteAmmWsolAccounts {
-            execute: ExecuteAccounts {
-                user: &user,
-                config_pda: &config,
-                fee_vault: &fee_vault,
-                fee_vault_wsol_ata: &zero,
-                user_wsol_ata: &zero,
-                instructions_sysvar: &instructions,
-                inner_program: &inner_program,
-                token_program: &token_program,
-            },
-            amm_wsol_account: &amm_wsol,
-            wsol_mint: &WSOL_MINT,
-            system_program: &system,
-            rent_sysvar: &rent,
+        let pump_program = Pubkey::new_unique();
+        let accounts = ExecutePumpBondingV2Accounts {
+            user: &user,
+            config_pda: &config,
+            fee_vault: &fee_vault,
+            fee_vault_quote_ata: &fee_vault_quote_ata,
+            instructions_sysvar: &instructions,
+            pump_program: &pump_program,
         };
-        let request = ExecuteAmmWsolRequest {
+        let request = ExecutePumpBondingV2Request {
             version: ABI_VERSION,
-            route_kind: WrapperRouteKind::SolIn,
+            side: PumpBondingV2Side::Sell,
+            quote_fee_mode: PumpBondingV2QuoteFeeMode::Wsol,
             fee_bps: 10,
-            gross_sol_in_lamports: 500_000_000,
-            min_net_output: 1_000,
-            inner_accounts_offset: EXECUTE_AMM_WSOL_FIXED_ACCOUNT_COUNT,
-            wsol_account_mode: WsolAccountMode::CreateOrReuse,
-            pda_wsol_lamports: 499_000_000,
-            inner_wsol_account_index: 3,
-            inner_ix_data: vec![1, 2, 3],
+            gross_quote_in_amount: 0,
+            min_base_out_amount: 0,
+            base_amount_in: 1_000,
+            gross_min_quote_out_amount: 500_000_000,
+            net_min_quote_out_amount: 499_000_000,
         };
+        let pump_account = AccountMeta::new_readonly(pump_program, false);
         let instruction =
-            build_execute_amm_wsol_instruction(&accounts, &request, &[]).expect("build");
-        assert_eq!(instruction.accounts.len(), 12);
-        assert_eq!(instruction.accounts[8].pubkey, amm_wsol);
-        assert_eq!(instruction.data[0], EXECUTE_AMM_WSOL_DISCRIMINATOR);
+            build_execute_pump_bonding_v2_instruction(&accounts, &request, &[pump_account])
+                .expect("build");
+        assert_eq!(
+            instruction.accounts.len(),
+            usize::from(EXECUTE_PUMP_BONDING_V2_FIXED_ACCOUNT_COUNT) + 1
+        );
+        assert_eq!(instruction.accounts[5].pubkey, pump_program);
+        assert_eq!(instruction.data[0], EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR);
     }
 
     #[test]
     fn encode_rejects_fee_bps_above_cap() {
-        let request = ExecuteRequest {
+        let request = ExecutePumpBondingV2Request {
             version: ABI_VERSION,
-            route_kind: WrapperRouteKind::SolIn,
+            side: PumpBondingV2Side::Buy,
+            quote_fee_mode: PumpBondingV2QuoteFeeMode::Wsol,
             fee_bps: MAX_FEE_BPS + 1,
-            gross_sol_in_lamports: 0,
-            min_net_output: 0,
-            inner_accounts_offset: EXECUTE_FIXED_ACCOUNT_COUNT,
-            inner_ix_data: vec![],
+            gross_quote_in_amount: 0,
+            min_base_out_amount: 0,
+            base_amount_in: 0,
+            gross_min_quote_out_amount: 0,
+            net_min_quote_out_amount: 0,
         };
-        let err = encode_execute_data(&request).unwrap_err();
+        let err = encode_execute_pump_bonding_v2_data(&request).unwrap_err();
         assert!(err.contains("exceeds hardcoded cap"));
     }
 
     #[test]
     fn encode_rejects_stale_version() {
-        let request = ExecuteRequest {
+        let request = ExecutePumpBondingV2Request {
             version: ABI_VERSION.wrapping_add(1),
-            route_kind: WrapperRouteKind::SolIn,
+            side: PumpBondingV2Side::Buy,
+            quote_fee_mode: PumpBondingV2QuoteFeeMode::Wsol,
             fee_bps: 0,
-            gross_sol_in_lamports: 0,
-            min_net_output: 0,
-            inner_accounts_offset: EXECUTE_FIXED_ACCOUNT_COUNT,
-            inner_ix_data: vec![],
+            gross_quote_in_amount: 0,
+            min_base_out_amount: 0,
+            base_amount_in: 0,
+            gross_min_quote_out_amount: 0,
+            net_min_quote_out_amount: 0,
         };
-        let err = encode_execute_data(&request).unwrap_err();
+        let err = encode_execute_pump_bonding_v2_data(&request).unwrap_err();
         assert!(err.contains("version mismatch"));
     }
 
@@ -673,8 +580,8 @@ mod tests {
     }
 
     #[test]
-    fn execute_fixed_account_count_is_eight() {
-        assert_eq!(EXECUTE_FIXED_ACCOUNT_COUNT, 8);
+    fn pump_bonding_v2_fixed_account_count_is_six() {
+        assert_eq!(EXECUTE_PUMP_BONDING_V2_FIXED_ACCOUNT_COUNT, 6);
     }
 
     #[test]

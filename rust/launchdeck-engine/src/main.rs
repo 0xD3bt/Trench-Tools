@@ -2749,9 +2749,9 @@ fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String)
                     .refresh_helius_if_leased()
                     .await;
                 let sleep_for = match outcome {
-                    shared_fee_market::RefreshOutcome::Failed => Duration::from_millis(
-                        shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS,
-                    ),
+                    shared_fee_market::RefreshOutcome::Failed => {
+                        Duration::from_millis(shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS)
+                    }
                     _ => configured_helius_priority_refresh_interval(),
                 };
                 tokio::time::sleep(sleep_for).await;
@@ -2767,9 +2767,9 @@ fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String)
                 let runtime = shared_fee_market_runtime(&rpc_url);
                 let outcome = runtime.refresh_jito_if_leased().await;
                 let sleep_for = match outcome {
-                    shared_fee_market::RefreshOutcome::Failed => Duration::from_millis(
-                        shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS,
-                    ),
+                    shared_fee_market::RefreshOutcome::Failed => {
+                        Duration::from_millis(shared_fee_market::HELIUS_REFRESH_RETRY_BACKOFF_MS)
+                    }
                     _ => runtime.config().jito_reconnect_delay,
                 };
                 tokio::time::sleep(sleep_for).await;
@@ -4755,12 +4755,9 @@ async fn execute_engine_action_payload(
         let execution_class = transport_plan.executionClass.clone();
         let secure_hellomoon_bundle_transport = transport_plan.transportType == "hellomoon-bundle";
         let use_phased_follow_pipeline = matches!(normalized.launchpad.as_str(), "pump" | "bonk");
-        let (same_time_snipes, deferred_follow_launch) = if use_phased_follow_pipeline {
-            (vec![], normalized.followLaunch.clone())
-        } else {
-            split_same_time_snipes(&normalized.followLaunch)
-        };
-        let same_time_retry_enabled = same_time_snipes.iter().any(|snipe| snipe.retryOnFailure);
+        let (same_time_snipes, deferred_follow_launch) =
+            split_same_time_snipes(&normalized.followLaunch);
+        let all_same_time_retry_enabled = same_time_snipes.iter().all(|snipe| snipe.retryOnFailure);
         let follow_daemon_transport = configured_follow_daemon_transport().map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
@@ -5142,6 +5139,10 @@ async fn execute_engine_action_payload(
                 }
             }
         }
+        if use_phased_follow_pipeline && !secure_hellomoon_bundle_transport {
+            compiled_transactions = creation_transactions.clone();
+            compiled_transaction_wallet_keys = creation_transaction_wallet_keys.clone();
+        }
         if !same_time_snipes.is_empty() && !bags_same_time_compile_after_launch {
             let same_time_compile_started_ms = current_time_ms();
             let same_time_compiled = compile_same_time_snipes(
@@ -5185,10 +5186,6 @@ async fn execute_engine_action_payload(
                     .collect();
                 same_time_independent_compiled = same_time_compiled;
             }
-        }
-        if use_phased_follow_pipeline && !secure_hellomoon_bundle_transport {
-            compiled_transactions = creation_transactions.clone();
-            compiled_transaction_wallet_keys = creation_transaction_wallet_keys.clone();
         }
         if must_complete_follow_reserve_before_send {
             if let Some(task) = reserve_follow_job_task.take() {
@@ -5312,7 +5309,7 @@ async fn execute_engine_action_payload(
                     }
                 }
             }
-        } else if normalized.launchpad == "bonk" {
+        } else if matches!(normalized.launchpad.as_str(), "bonk" | "pump") {
             let (launch_sent, mut launch_warnings, _launch_submit_ms) =
                 match submit_transactions_for_transport(
                     &rpc_url,
@@ -5343,10 +5340,10 @@ async fn execute_engine_action_payload(
                         ));
                     }
                 };
-            launch_warnings.push(
-                "Bonk same-time sniper buys are submitted immediately after the launch transaction on non-bundle transports so the mint exists before buy execution."
-                    .to_string(),
-            );
+            launch_warnings.push(format!(
+                "{} same-time sniper buys are submitted immediately after the launch transaction on non-bundle transports so the mint exists before buy execution.",
+                normalized.launchpad
+            ));
             match submit_independent_transactions_for_transport(
                 &rpc_url,
                 same_time_transport_plan.as_ref().unwrap_or(&transport_plan),
@@ -5361,15 +5358,15 @@ async fn execute_engine_action_payload(
                     same_time_sent = sent;
                     launch_warnings.extend(same_time_warnings);
                 }
-                Err(error) if same_time_retry_enabled => {
+                Err(error) if all_same_time_retry_enabled => {
                     launch_warnings.push(format!(
-                        "Same-time sniper submit failed after Bonk launch submit; daemon retry is armed for one retry attempt: {error}"
+                        "Same-time sniper submit failed after launch submit; daemon retry is armed for one retry attempt: {error}"
                     ));
                 }
                 Err(error) => {
                     same_time_failure_count = same_time_failure_count.saturating_add(1);
                     launch_warnings.push(format!(
-                        "Same-time sniper submit failed after Bonk launch submit: {error}"
+                        "Same-time sniper submit failed after launch submit; at least one same-time snipe has no daemon retry fallback: {error}"
                     ));
                 }
             }
@@ -5421,7 +5418,7 @@ async fn execute_engine_action_payload(
                     same_time_sent = sent;
                     launch_warnings.extend(same_time_warnings);
                 }
-                Err(error) if same_time_retry_enabled => {
+                Err(error) if all_same_time_retry_enabled => {
                     launch_warnings.push(format!(
                         "Same-time sniper submit failed; daemon retry is armed for one retry attempt: {error}"
                     ));
@@ -5429,7 +5426,7 @@ async fn execute_engine_action_payload(
                 Err(error) => {
                     same_time_failure_count = same_time_failure_count.saturating_add(1);
                     launch_warnings.push(format!(
-                        "Same-time sniper submit failed after launch submit: {error}"
+                        "Same-time sniper submit failed; at least one same-time snipe has no daemon retry fallback: {error}"
                     ));
                 }
             }
@@ -5617,7 +5614,7 @@ async fn execute_engine_action_payload(
                                 execution["warnings"] = Value::Array(existing_warnings);
                             }
                         }
-                        Err(error) if same_time_retry_enabled => {
+                        Err(error) if all_same_time_retry_enabled => {
                             append_execution_warning(
                                 &mut report_value,
                                 &format!(
@@ -5630,7 +5627,7 @@ async fn execute_engine_action_payload(
                             append_execution_warning(
                                 &mut report_value,
                                 &format!(
-                                    "Same-time Bags sniper submit failed after launch confirmation: {error}"
+                                    "Same-time Bags sniper submit failed after launch confirmation; at least one same-time snipe has no daemon retry fallback: {error}"
                                 ),
                             );
                         }
@@ -5908,7 +5905,7 @@ async fn execute_engine_action_payload(
                     confirm_warnings.extend(same_time_confirm_warnings);
                     confirm_ms = confirm_ms.saturating_add(same_time_confirm_ms);
                 }
-                Err(error) if same_time_retry_enabled => {
+                Err(error) if all_same_time_retry_enabled => {
                     confirm_warnings.push(format!(
                         "Same-time sniper confirmation failed; daemon retry will attempt one fallback buy: {error}"
                     ));
@@ -8291,6 +8288,45 @@ mod tests {
         assert!(!launch_prefers_post_setup_creator_vault_for_follow(
             "pump", "regular", true, false
         ));
+    }
+
+    #[test]
+    fn same_time_split_preserves_launch_buy_and_retry_fallback() {
+        let follow_launch = NormalizedFollowLaunch {
+            enabled: true,
+            source: "test".to_string(),
+            schemaVersion: 1,
+            snipes: vec![crate::config::NormalizedFollowLaunchSnipe {
+                actionId: "snipe-1-buy".to_string(),
+                enabled: true,
+                walletEnvKey: "SOLANA_PRIVATE_KEY2".to_string(),
+                buyAmountSol: "0.1".to_string(),
+                submitWithLaunch: true,
+                retryOnFailure: true,
+                submitDelayMs: 0,
+                targetBlockOffset: None,
+                jitterMs: 0,
+                feeJitterBps: 0,
+                skipIfTokenBalancePositive: false,
+                postBuySell: None,
+            }],
+            devAutoSell: None,
+            constraints: crate::config::NormalizedFollowLaunchConstraints {
+                pumpOnly: true,
+                retryBudget: 0,
+                requireDaemonReadiness: true,
+                blockOnRequiredPrechecks: true,
+            },
+        };
+
+        let (same_time, deferred) = split_same_time_snipes(&follow_launch);
+
+        assert_eq!(same_time.len(), 1);
+        assert!(same_time[0].submitWithLaunch);
+        assert_eq!(deferred.snipes.len(), 1);
+        assert!(!deferred.snipes[0].submitWithLaunch);
+        assert_eq!(deferred.snipes[0].submitDelayMs, 450);
+        assert!(deferred.snipes[0].skipIfTokenBalancePositive);
     }
 
     #[test]

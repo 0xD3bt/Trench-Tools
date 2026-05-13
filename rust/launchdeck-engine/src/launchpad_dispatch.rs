@@ -44,10 +44,11 @@ use crate::{
         compile_follow_buy_transaction as compile_pump_follow_buy,
         compile_follow_sell_transaction_with_token_amount as compile_pump_follow_sell_with_token_amount,
         derive_follow_owner_token_account as derive_pump_follow_owner_token_account,
+        derive_follow_owner_token_account_with_token_program as derive_pump_follow_owner_token_account_with_token_program,
         fetch_pump_market_snapshot,
         predict_dev_buy_token_amount as predict_pump_dev_buy_token_amount,
-        quote_launch as quote_pump_launch, try_compile_native_pump, warm_default_lookup_tables,
-        warm_pump_global_state,
+        quote_launch as quote_pump_launch, resolve_pump_bonding_mint_token_program,
+        try_compile_native_pump, warm_default_lookup_tables, warm_pump_global_state,
     },
     rpc::CompiledTransaction,
     transport::TransportPlan,
@@ -546,7 +547,8 @@ async fn maybe_wrap_follow_transaction(
         }
         Err(error) => {
             if error.contains("transaction is already wrapped")
-                && bonk_allows_already_wrapped_passthrough(launchpad, &source.label)
+                && (bonk_allows_already_wrapped_passthrough(launchpad, &source.label)
+                    || pump_allows_already_wrapped_passthrough(launchpad, &source.label))
             {
                 eprintln!(
                     "[launchdeck-engine][wrapper-wrap] passthrough=already_wrapped launchpad={} label={}",
@@ -581,6 +583,10 @@ fn wrapper_alt_cache_miss_error(error: &str) -> bool {
 
 fn bonk_allows_already_wrapped_passthrough(launchpad: &str, label: &str) -> bool {
     launchpad == "bonk" && matches!(label, "follow-buy" | "follow-buy-atomic" | "follow-sell")
+}
+
+fn pump_allows_already_wrapped_passthrough(launchpad: &str, label: &str) -> bool {
+    launchpad == "pump" && matches!(label, "follow-buy" | "follow-sell")
 }
 
 fn wrapper_passthrough_reason<'a>(launchpad: &str, error: &str) -> Option<&'a str> {
@@ -927,6 +933,7 @@ pub async fn compile_follow_sell_for_launchpad(
                 request.prefer_post_setup_creator_vault,
                 request.token_amount_override,
                 request.pump_cashback_enabled_override,
+                request.wrapper_fee_bps,
             )
             .await
         }
@@ -1013,6 +1020,32 @@ pub fn derive_follow_owner_token_account_for_launchpad(
         other => Err(format!(
             "Unsupported launchpad for follow owner token account derivation: {other}"
         )),
+    }
+}
+
+pub async fn derive_follow_owner_token_account_for_launchpad_with_rpc(
+    launchpad: &str,
+    rpc_url: &str,
+    commitment: &str,
+    owner: &str,
+    mint: &str,
+) -> Result<String, String> {
+    let owner_pubkey =
+        Pubkey::from_str(owner).map_err(|error| format!("Invalid owner public key: {error}"))?;
+    let mint_pubkey =
+        Pubkey::from_str(mint).map_err(|error| format!("Invalid mint public key: {error}"))?;
+    match launchpad {
+        "pump" => {
+            let token_program =
+                resolve_pump_bonding_mint_token_program(rpc_url, &mint_pubkey, commitment).await?;
+            Ok(derive_pump_follow_owner_token_account_with_token_program(
+                &owner_pubkey,
+                &mint_pubkey,
+                &token_program,
+            )?
+            .to_string())
+        }
+        _ => derive_follow_owner_token_account_for_launchpad(launchpad, owner, mint),
     }
 }
 
@@ -1292,6 +1325,27 @@ mod tests {
             "follow-buy"
         ));
         assert!(!bonk_allows_already_wrapped_passthrough("bonk", "launch"));
+    }
+
+    #[test]
+    fn pump_already_wrapped_passthrough_accepts_usdc_follow_routes() {
+        assert!(pump_allows_already_wrapped_passthrough(
+            "pump",
+            "follow-buy"
+        ));
+        assert!(pump_allows_already_wrapped_passthrough(
+            "pump",
+            "follow-sell"
+        ));
+        assert!(!pump_allows_already_wrapped_passthrough(
+            "pump",
+            "follow-buy-atomic"
+        ));
+        assert!(!pump_allows_already_wrapped_passthrough(
+            "bonk",
+            "follow-buy"
+        ));
+        assert!(!pump_allows_already_wrapped_passthrough("pump", "launch"));
     }
 
     #[test]

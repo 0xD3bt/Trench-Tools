@@ -1247,11 +1247,10 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                     entry.triggerMode.trim().eq_ignore_ascii_case("same-time")
                 )),
                 retryOnFailure: Some(json!(entry.retryOnce)),
-                submitDelayMs: if entry
-                    .triggerMode
-                    .trim()
-                    .eq_ignore_ascii_case("submit-delay")
-                {
+                submitDelayMs: if matches!(
+                    entry.triggerMode.trim().to_ascii_lowercase().as_str(),
+                    "on-submit" | "submit-delay"
+                ) {
                     entry.submitDelayMs.map(|value| json!(value.max(0)))
                 } else {
                     Some(json!(0))
@@ -1961,7 +1960,7 @@ mod tests {
                 sniperWallets: vec![UiSniperWalletInput {
                     envKey: "SOLANA_PRIVATE_KEY2".to_string(),
                     amountSol: "0.25".to_string(),
-                    triggerMode: "submit-delay".to_string(),
+                    triggerMode: "on-submit".to_string(),
                     submitDelayMs: Some(25),
                     jitterMs: Some(5),
                     feeJitterBps: Some(200),

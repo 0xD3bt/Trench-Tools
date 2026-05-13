@@ -27,11 +27,11 @@ const SHARED_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMi
 const PACKET_LIMIT_BYTES: usize = 1232;
 const MAX_FEE_BPS: u16 = 20;
 pub const ABI_VERSION: u8 = 3;
-#[allow(dead_code)]
-const EXECUTE_FIXED_ACCOUNT_COUNT: u16 = 8;
 pub const EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT: u16 = 8;
 pub const EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT: u16 = 3;
 pub const EXECUTE_SWAP_ROUTE_TOKEN_FEE_ACCOUNT_COUNT: u16 = 1;
+#[allow(dead_code)]
+pub const EXECUTE_PUMP_BONDING_V2_FIXED_ACCOUNT_COUNT: u16 = 6;
 const BPS_DENOMINATOR: u128 = 10_000;
 const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
 const SYSTEM_CREATE_ACCOUNT_DISCRIMINATOR: u32 = 0;
@@ -56,7 +56,8 @@ const RAYDIUM_CLMM_SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30
 const RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
 const PUMP_BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const PUMP_BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
-const PUMP_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
+const PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR: [u8; 8] = [194, 171, 28, 70, 104, 77, 91, 47];
 const BONK_BUY_EXACT_IN_DISCRIMINATOR: [u8; 8] = [250, 234, 13, 123, 213, 156, 19, 236];
 const BONK_SELL_EXACT_IN_DISCRIMINATOR: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
 const PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
@@ -71,11 +72,20 @@ const BAGS_DAMM_V2_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1s
 const WRAPPED_COMPUTE_UNIT_LIMIT_FLOOR: u32 = 280_000;
 const WRAPPED_COMPUTE_UNIT_LIMIT_OVERHEAD: u32 = 60_000;
 const SHARED_LOOKUP_TABLE_CACHE_TTL: Duration = Duration::from_secs(300);
-#[allow(dead_code)]
-const EXECUTE_DISCRIMINATOR: u8 = 1;
-#[allow(dead_code)]
-const EXECUTE_AMM_WSOL_DISCRIMINATOR: u8 = 7;
+const RETIRED_EXECUTE_DISCRIMINATOR: u8 = 1;
+const RETIRED_EXECUTE_AMM_WSOL_DISCRIMINATOR: u8 = 7;
 const EXECUTE_SWAP_ROUTE_DISCRIMINATOR: u8 = 8;
+const EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR: u8 = 9;
+const PUMP_V2_BUY_ACCOUNT_COUNT: usize = 27;
+const PUMP_V2_SELL_ACCOUNT_COUNT: usize = 26;
+const PUMP_V2_BASE_MINT_INDEX: usize = 1;
+const PUMP_V2_QUOTE_MINT_INDEX: usize = 2;
+const PUMP_V2_BASE_TOKEN_PROGRAM_INDEX: usize = 3;
+const PUMP_V2_USER_INDEX: usize = 13;
+const PUMP_V2_ASSOCIATED_BASE_USER_INDEX: usize = 14;
+const PUMP_V2_ASSOCIATED_QUOTE_USER_INDEX: usize = 15;
+const PUMP_V2_BUY_PROGRAM_INDEX: usize = 26;
+const PUMP_V2_SELL_PROGRAM_INDEX: usize = 25;
 
 pub const ZEROED_WSOL_ATA_SENTINEL: Pubkey = Pubkey::new_from_array([0; 32]);
 pub const SWAP_ROUTE_NO_PATCH_OFFSET: u16 = u16::MAX;
@@ -96,42 +106,6 @@ pub enum WrapperRouteKind {
     SolIn = 0,
     SolOut = 1,
     SolThrough = 2,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct ExecuteRequest {
-    pub version: u8,
-    pub route_kind: WrapperRouteKind,
-    pub fee_bps: u16,
-    pub gross_sol_in_lamports: u64,
-    pub min_net_output: u64,
-    pub inner_accounts_offset: u16,
-    pub inner_ix_data: Vec<u8>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-#[borsh(use_discriminant = true)]
-#[repr(u8)]
-pub enum WsolAccountMode {
-    CreateOrReuse = 0,
-    ReuseOnly = 1,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct ExecuteAmmWsolRequest {
-    pub version: u8,
-    pub route_kind: WrapperRouteKind,
-    pub fee_bps: u16,
-    pub gross_sol_in_lamports: u64,
-    pub min_net_output: u64,
-    pub inner_accounts_offset: u16,
-    pub wsol_account_mode: WsolAccountMode,
-    pub pda_wsol_lamports: u64,
-    pub inner_wsol_account_index: u16,
-    pub inner_ix_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -210,6 +184,35 @@ pub struct ExecuteSwapRouteRequest {
     pub intermediate_account_index: u16,
     pub token_fee_account_index: u16,
     pub legs: Vec<SwapRouteLeg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum PumpBondingV2Side {
+    Buy = 0,
+    Sell = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
+pub enum PumpBondingV2QuoteFeeMode {
+    Wsol = 0,
+    Token = 1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ExecutePumpBondingV2Request {
+    pub version: u8,
+    pub side: PumpBondingV2Side,
+    pub quote_fee_mode: PumpBondingV2QuoteFeeMode,
+    pub fee_bps: u16,
+    pub gross_quote_in_amount: u64,
+    pub min_base_out_amount: u64,
+    pub base_amount_in: u64,
+    pub gross_min_quote_out_amount: u64,
+    pub net_min_quote_out_amount: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -415,6 +418,38 @@ pub fn estimate_sol_in_fee_lamports(gross_lamports: u64, fee_bps: u16) -> u64 {
     ((gross_lamports as u128 * fee_bps as u128) / BPS_DENOMINATOR) as u64
 }
 
+fn gross_lamports_for_net_after_wrapper_fee(
+    net_lamports: u64,
+    fee_bps: u16,
+) -> Result<u64, String> {
+    if net_lamports == 0 || fee_bps == 0 {
+        return Ok(net_lamports);
+    }
+    let denominator = 10_000u64
+        .checked_sub(u64::from(fee_bps))
+        .ok_or_else(|| "LaunchDeck wrapper fee bps exceeded denominator".to_string())?;
+    if denominator == 0 {
+        return Err("LaunchDeck wrapper fee bps leaves zero venue input".to_string());
+    }
+    let mut gross = ((u128::from(net_lamports) * 10_000u128) + u128::from(denominator - 1))
+        / u128::from(denominator);
+    loop {
+        let gross_u64 = u64::try_from(gross)
+            .map_err(|_| "LaunchDeck wrapper gross SOL input overflowed u64".to_string())?;
+        let fee = estimate_sol_in_fee_lamports(gross_u64, fee_bps);
+        let candidate_net = gross_u64
+            .checked_sub(fee)
+            .ok_or_else(|| "LaunchDeck wrapper fee exceeds gross SOL input".to_string())?;
+        if candidate_net < net_lamports {
+            gross = gross
+                .checked_add(1)
+                .ok_or_else(|| "LaunchDeck wrapper gross SOL input overflowed".to_string())?;
+            continue;
+        }
+        return Ok(gross_u64);
+    }
+}
+
 fn build_compute_unit_limit_instruction(compute_unit_limit: u32) -> Instruction {
     let mut data = vec![2];
     data.extend_from_slice(&compute_unit_limit.to_le_bytes());
@@ -566,6 +601,46 @@ pub fn build_execute_swap_route_instruction(
     })
 }
 
+pub fn build_execute_pump_bonding_v2_instruction(
+    user: &Pubkey,
+    fee_vault_quote_ata: &Pubkey,
+    pump_program: &Pubkey,
+    request: &ExecutePumpBondingV2Request,
+    pump_accounts: &[AccountMeta],
+) -> Result<Instruction, String> {
+    if request.version != ABI_VERSION {
+        return Err(format!(
+            "LaunchDeck wrapper ABI version mismatch: got {}, expected {}",
+            request.version, ABI_VERSION
+        ));
+    }
+    if request.fee_bps > MAX_FEE_BPS {
+        return Err(format!(
+            "LaunchDeck wrapper fee_bps {} exceeds cap {}",
+            request.fee_bps, MAX_FEE_BPS
+        ));
+    }
+    let mut accounts = vec![
+        AccountMeta::new(*user, true),
+        AccountMeta::new_readonly(config_pda(), false),
+        AccountMeta::new(wrapper_fee_vault(), false),
+        AccountMeta::new(*fee_vault_quote_ata, false),
+        AccountMeta::new_readonly(instructions_sysvar_id(), false),
+        AccountMeta::new_readonly(*pump_program, false),
+    ];
+    accounts.extend_from_slice(pump_accounts);
+    let mut data = Vec::with_capacity(48);
+    data.push(EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR);
+    request
+        .serialize(&mut data)
+        .map_err(|error| format!("Failed to serialize ExecutePumpBondingV2 request: {error}"))?;
+    Ok(Instruction {
+        program_id: wrapper_program_id(),
+        accounts,
+        data,
+    })
+}
+
 fn is_wrapper_swap_route_instruction(instruction: &Instruction) -> bool {
     if instruction.program_id != wrapper_program_id() {
         return false;
@@ -573,9 +648,10 @@ fn is_wrapper_swap_route_instruction(instruction: &Instruction) -> bool {
     matches!(
         instruction.data.first().copied(),
         Some(
-            EXECUTE_DISCRIMINATOR
-                | EXECUTE_AMM_WSOL_DISCRIMINATOR
+            RETIRED_EXECUTE_DISCRIMINATOR
+                | RETIRED_EXECUTE_AMM_WSOL_DISCRIMINATOR
                 | EXECUTE_SWAP_ROUTE_DISCRIMINATOR
+                | EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR
         )
     )
 }
@@ -685,12 +761,15 @@ pub fn wrap_compiled_transaction(
         &wrapper_fee_vault(),
         request.route_kind,
         &venue_ix.program_id,
+        &venue_ix.data,
         &venue_ix.accounts,
         &preamble,
         &postamble,
     )?;
     let mut inner_accounts = venue_ix.accounts.clone();
     append_system_program_inner_account(&mut inner_accounts);
+    let pump_v2_wrapper =
+        try_build_pump_bonding_v2_wrapper_instruction(&payer.pubkey(), request, &venue_ix)?;
     let v3_wsol_plan =
         try_build_amm_wsol_v2_plan(&payer.pubkey(), request, &venue_ix, &preamble, &postamble)
             .or_else(|| {
@@ -703,7 +782,23 @@ pub fn wrap_compiled_transaction(
                     user_wsol_ata,
                 )
             });
-    let (wrapper_ix, preamble, postamble, mode) = if let Some(plan) = v3_wsol_plan {
+    let (wrapper_ix, preamble, postamble, mode) = if let Some(instruction) = pump_v2_wrapper {
+        let user_pubkey = payer.pubkey();
+        let fee_vault = wrapper_fee_vault();
+        let mut preamble = preamble;
+        if matches!(request.route_kind, WrapperRouteKind::SolIn) {
+            preamble.push(build_create_pump_v2_base_ata_instruction(
+                &user_pubkey,
+                &venue_ix,
+            )?);
+        }
+        preamble.push(build_create_wsol_ata_instruction(
+            &user_pubkey,
+            &user_pubkey,
+        ));
+        preamble.push(build_create_wsol_ata_instruction(&user_pubkey, &fee_vault));
+        (instruction, preamble, postamble, "pump-v2-wrapper")
+    } else if let Some(plan) = v3_wsol_plan {
         (
             build_v3_wsol_swap_route_instruction(
                 payer,
@@ -830,13 +925,15 @@ fn apply_inferred_sol_in_amount(
     {
         return Ok(request);
     }
-    request.gross_sol_in_lamports = infer_sol_in_lamports_from_venue_instruction(venue_ix)
+    let inferred_net_input = infer_sol_in_lamports_from_venue_instruction(venue_ix)
         .ok_or_else(|| {
             format!(
                 "Could not infer SOL input from selected venue instruction {} for token-mode dev-buy",
                 venue_ix.program_id
             )
         })?;
+    request.gross_sol_in_lamports =
+        gross_lamports_for_net_after_wrapper_fee(inferred_net_input, request.fee_bps)?;
     if request.gross_sol_in_lamports == 0 {
         return Err("Inferred zero SOL input from selected venue instruction".to_string());
     }
@@ -854,6 +951,13 @@ fn infer_sol_in_lamports_from_venue_instruction(instruction: &Instruction) -> Op
     }
     if instruction.program_id == parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id").ok()?
         && data.get(0..8)? == PUMP_BUY_EXACT_SOL_IN_DISCRIMINATOR
+    {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(data.get(8..16)?);
+        return Some(u64::from_le_bytes(buf));
+    }
+    if instruction.program_id == parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id").ok()?
+        && data.get(0..8)? == PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR
     {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(data.get(8..16)?);
@@ -884,7 +988,7 @@ fn infer_sol_out_min_lamports_from_venue_instruction(instruction: &Instruction) 
     let discriminator = data.get(0..8)?;
     let program_id = instruction.program_id;
     if program_id == parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id").ok()?
-        && discriminator == PUMP_SELL_DISCRIMINATOR
+        && discriminator == PUMP_SELL_V2_DISCRIMINATOR
     {
         return read_u64_le(data, 16..24);
     }
@@ -911,6 +1015,7 @@ fn patch_amm_wsol_input_amount(
     net_input_lamports: u64,
 ) -> Vec<u8> {
     let mut patched = inner_ix_data.to_vec();
+    let pump_program = parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id").ok();
     let supports_amount_patch = (inner_program == raydium_clmm_program_id()
         && patched.get(0..8) == Some(RAYDIUM_CLMM_SWAP_V2_DISCRIMINATOR.as_slice()))
         || (inner_program == raydium_cpmm_program_id()
@@ -919,6 +1024,8 @@ fn patch_amm_wsol_input_amount(
             && patched.get(0..8) == Some(BONK_BUY_EXACT_IN_DISCRIMINATOR.as_slice()))
         || (inner_program == pump_amm_program_id()
             && patched.get(0..8) == Some(PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR.as_slice()))
+        || (pump_program == Some(inner_program)
+            && patched.get(0..8) == Some(PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.as_slice()))
         || ((inner_program == bags_dbc_program_id() || inner_program == bags_damm_v2_program_id())
             && patched.get(0..8) == Some(BAGS_SWAP_DISCRIMINATOR.as_slice()));
     if supports_amount_patch && patched.len() >= 16 {
@@ -961,6 +1068,11 @@ fn sol_in_amount_patch_offset(instruction: &Instruction) -> Option<usize> {
     }
     if instruction.program_id == parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id").ok()?
         && data.get(0..8)? == PUMP_BUY_EXACT_SOL_IN_DISCRIMINATOR
+    {
+        return Some(8);
+    }
+    if instruction.program_id == parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id").ok()?
+        && data.get(0..8)? == PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR
     {
         return Some(8);
     }
@@ -1065,6 +1177,211 @@ fn try_build_amm_wsol_v2_plan(
         preamble,
         postamble,
     })
+}
+
+fn is_pump_bonding_v2_wsol_quote_instruction(
+    inner_program: &Pubkey,
+    venue_ix_data: &[u8],
+    venue_accounts: &[AccountMeta],
+) -> bool {
+    let Ok(pump) = parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id") else {
+        return false;
+    };
+    if *inner_program != pump {
+        return false;
+    }
+    let Some(discriminator) = venue_ix_data.get(0..8) else {
+        return false;
+    };
+    if discriminator != PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR
+        && discriminator != PUMP_SELL_V2_DISCRIMINATOR
+    {
+        return false;
+    }
+    venue_accounts
+        .get(PUMP_V2_QUOTE_MINT_INDEX)
+        .map(|meta| meta.pubkey == wsol_mint())
+        .unwrap_or(false)
+}
+
+fn read_pump_bonding_v2_amounts(data: &[u8]) -> Option<([u8; 8], u64, u64)> {
+    let discriminator = data.get(0..8)?.try_into().ok()?;
+    let amount = read_u64_le(data, 8..16)?;
+    let limit = read_u64_le(data, 16..24)?;
+    Some((discriminator, amount, limit))
+}
+
+fn pump_bonding_v2_expected_account_layout(discriminator: &[u8; 8]) -> Option<(usize, usize)> {
+    match discriminator {
+        &PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR => {
+            Some((PUMP_V2_BUY_ACCOUNT_COUNT, PUMP_V2_BUY_PROGRAM_INDEX))
+        }
+        &PUMP_SELL_V2_DISCRIMINATOR => {
+            Some((PUMP_V2_SELL_ACCOUNT_COUNT, PUMP_V2_SELL_PROGRAM_INDEX))
+        }
+        _ => None,
+    }
+}
+
+fn try_build_pump_bonding_v2_wrapper_instruction(
+    payer: &Pubkey,
+    request: LaunchdeckWrapRequest,
+    venue_ix: &Instruction,
+) -> Result<Option<Instruction>, String> {
+    if !is_pump_bonding_v2_wsol_quote_instruction(
+        &venue_ix.program_id,
+        &venue_ix.data,
+        &venue_ix.accounts,
+    ) {
+        return Ok(None);
+    }
+    let (discriminator, amount, limit) = read_pump_bonding_v2_amounts(&venue_ix.data)
+        .ok_or_else(|| "Pump bonding v2 instruction data was malformed".to_string())?;
+    let (expected_account_count, program_index) =
+        pump_bonding_v2_expected_account_layout(&discriminator).ok_or_else(|| {
+            "Pump bonding v2 instruction discriminator was not supported".to_string()
+        })?;
+    if venue_ix.accounts.len() != expected_account_count {
+        return Err(format!(
+            "Pump bonding v2 wrapper expected {expected_account_count} accounts, got {}",
+            venue_ix.accounts.len()
+        ));
+    }
+    if venue_ix
+        .accounts
+        .get(PUMP_V2_USER_INDEX)
+        .map(|meta| meta.pubkey)
+        != Some(*payer)
+        || !venue_ix
+            .accounts
+            .get(PUMP_V2_USER_INDEX)
+            .map(|meta| meta.is_signer)
+            .unwrap_or(false)
+    {
+        return Err("Pump bonding v2 wrapper user account did not match payer signer".to_string());
+    }
+    if venue_ix.accounts.get(program_index).map(|meta| meta.pubkey) != Some(venue_ix.program_id) {
+        return Err(
+            "Pump bonding v2 wrapper program account did not match venue program".to_string(),
+        );
+    }
+    let quote_ata =
+        get_associated_token_address_with_program_id(payer, &wsol_mint(), &token_program_id());
+    if venue_ix
+        .accounts
+        .get(PUMP_V2_ASSOCIATED_QUOTE_USER_INDEX)
+        .map(|meta| meta.pubkey)
+        != Some(quote_ata)
+    {
+        return Err(
+            "Pump bonding v2 wrapper quote user account did not match payer WSOL ATA".to_string(),
+        );
+    }
+    let wrapper_request = match (request.route_kind, discriminator) {
+        (WrapperRouteKind::SolIn, PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR) => {
+            let expected_amount = request
+                .gross_sol_in_lamports
+                .checked_sub(estimate_sol_in_fee_lamports(
+                    request.gross_sol_in_lamports,
+                    request.fee_bps,
+                ))
+                .ok_or_else(|| {
+                    "Pump bonding v2 wrapper fee exceeds gross quote input".to_string()
+                })?;
+            if amount != expected_amount {
+                return Err(format!(
+                    "Pump bonding v2 wrapper buy amount {amount} did not match net quote input {expected_amount}"
+                ));
+            }
+            ExecutePumpBondingV2Request {
+                version: ABI_VERSION,
+                side: PumpBondingV2Side::Buy,
+                quote_fee_mode: PumpBondingV2QuoteFeeMode::Wsol,
+                fee_bps: request.fee_bps,
+                gross_quote_in_amount: request.gross_sol_in_lamports,
+                min_base_out_amount: limit,
+                base_amount_in: 0,
+                gross_min_quote_out_amount: 0,
+                net_min_quote_out_amount: 0,
+            }
+        }
+        (WrapperRouteKind::SolOut, PUMP_SELL_V2_DISCRIMINATOR) => ExecutePumpBondingV2Request {
+            version: ABI_VERSION,
+            side: PumpBondingV2Side::Sell,
+            quote_fee_mode: PumpBondingV2QuoteFeeMode::Wsol,
+            fee_bps: request.fee_bps,
+            gross_quote_in_amount: 0,
+            min_base_out_amount: 0,
+            base_amount_in: amount,
+            gross_min_quote_out_amount: limit,
+            net_min_quote_out_amount: request.min_net_output,
+        },
+        _ => {
+            return Err(
+                "Pump bonding v2 wrapper route kind did not match instruction side".to_string(),
+            );
+        }
+    };
+    let fee_vault_quote_ata = get_associated_token_address_with_program_id(
+        &wrapper_fee_vault(),
+        &wsol_mint(),
+        &token_program_id(),
+    );
+    build_execute_pump_bonding_v2_instruction(
+        payer,
+        &fee_vault_quote_ata,
+        &venue_ix.program_id,
+        &wrapper_request,
+        &venue_ix.accounts,
+    )
+    .map(Some)
+}
+
+fn build_create_wsol_ata_instruction(payer: &Pubkey, owner: &Pubkey) -> Instruction {
+    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+        payer,
+        owner,
+        &wsol_mint(),
+        &token_program_id(),
+    )
+}
+
+fn build_create_pump_v2_base_ata_instruction(
+    payer: &Pubkey,
+    venue_ix: &Instruction,
+) -> Result<Instruction, String> {
+    let base_mint = venue_ix
+        .accounts
+        .get(PUMP_V2_BASE_MINT_INDEX)
+        .map(|meta| meta.pubkey)
+        .ok_or_else(|| "Pump bonding v2 wrapper base mint account was missing".to_string())?;
+    let base_token_program = venue_ix
+        .accounts
+        .get(PUMP_V2_BASE_TOKEN_PROGRAM_INDEX)
+        .map(|meta| meta.pubkey)
+        .ok_or_else(|| {
+            "Pump bonding v2 wrapper base token program account was missing".to_string()
+        })?;
+    let expected_base_ata =
+        get_associated_token_address_with_program_id(payer, &base_mint, &base_token_program);
+    if venue_ix
+        .accounts
+        .get(PUMP_V2_ASSOCIATED_BASE_USER_INDEX)
+        .map(|meta| meta.pubkey)
+        != Some(expected_base_ata)
+    {
+        return Err(
+            "Pump bonding v2 wrapper base user account did not match payer base ATA".to_string(),
+        );
+    }
+    Ok(
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            payer,
+            payer,
+            &base_mint,
+            &base_token_program,
+        ),
+    )
 }
 
 fn try_build_wsol_out_v3_plan(
@@ -1346,15 +1663,18 @@ fn derive_wsol_route_accounts(
     fee_vault: &Pubkey,
     route_kind: WrapperRouteKind,
     inner_program: &Pubkey,
+    venue_ix_data: &[u8],
     venue_accounts: &[AccountMeta],
     preamble: &[Instruction],
     postamble: &[Instruction],
 ) -> Result<(Option<Pubkey>, Option<Pubkey>), String> {
     let payer_wsol_ata =
         get_associated_token_address_with_program_id(payer, &wsol_mint(), &token_program_id());
-    let user_wsol_account = if venue_accounts
+    let has_payer_wsol_ata = venue_accounts
         .iter()
-        .any(|meta| meta.pubkey == payer_wsol_ata)
+        .any(|meta| meta.pubkey == payer_wsol_ata);
+    let user_wsol_account = if has_payer_wsol_ata
+        && !is_pump_bonding_v2_wsol_quote_instruction(inner_program, venue_ix_data, venue_accounts)
     {
         Some(payer_wsol_ata)
     } else if let Some(account) = derive_temp_wsol_output_account(inner_program, venue_accounts) {
@@ -1692,23 +2012,6 @@ mod tests {
     }
 
     #[test]
-    fn execute_request_serializes_with_legacy_discriminator() {
-        let request = ExecuteRequest {
-            version: ABI_VERSION,
-            route_kind: WrapperRouteKind::SolIn,
-            fee_bps: 10,
-            gross_sol_in_lamports: 1_000_000,
-            min_net_output: 0,
-            inner_accounts_offset: EXECUTE_FIXED_ACCOUNT_COUNT,
-            inner_ix_data: vec![1, 2, 3],
-        };
-        let mut data = vec![1];
-        request.serialize(&mut data).unwrap();
-        let decoded = ExecuteRequest::try_from_slice(&data[1..]).unwrap();
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
     fn build_v3_direct_swap_route_instruction_uses_v3_request_fee_bps() {
         let payer = Keypair::new();
         let instruction = build_v3_direct_swap_route_instruction(
@@ -1739,7 +2042,7 @@ mod tests {
 
     #[test]
     fn infers_sol_out_minimum_from_known_sell_instructions() {
-        let mut pump_sell_data = PUMP_SELL_DISCRIMINATOR.to_vec();
+        let mut pump_sell_data = PUMP_SELL_V2_DISCRIMINATOR.to_vec();
         pump_sell_data.extend_from_slice(&250_000u64.to_le_bytes());
         pump_sell_data.extend_from_slice(&1_000_000u64.to_le_bytes());
         let pump_sell = Instruction {
@@ -1755,11 +2058,12 @@ mod tests {
     }
 
     #[test]
-    fn already_wrapped_detection_includes_legacy_discriminators() {
+    fn already_wrapped_detection_includes_current_and_retired_discriminators() {
         for discriminator in [
-            EXECUTE_DISCRIMINATOR,
-            EXECUTE_AMM_WSOL_DISCRIMINATOR,
+            RETIRED_EXECUTE_DISCRIMINATOR,
+            RETIRED_EXECUTE_AMM_WSOL_DISCRIMINATOR,
             EXECUTE_SWAP_ROUTE_DISCRIMINATOR,
+            EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR,
         ] {
             let instruction = Instruction {
                 program_id: wrapper_program_id(),
@@ -1803,6 +2107,7 @@ mod tests {
             &fee_vault,
             WrapperRouteKind::SolOut,
             &Pubkey::new_unique(),
+            &[],
             &venue_accounts,
             &preamble,
             &postamble,
@@ -1841,6 +2146,7 @@ mod tests {
             &fee_vault,
             WrapperRouteKind::SolOut,
             &Pubkey::new_unique(),
+            &[],
             &venue_accounts,
             &[],
             &postamble,
@@ -2085,6 +2391,431 @@ mod tests {
             infer_sol_in_lamports_from_venue_instruction(&instruction),
             Some(456)
         );
+    }
+
+    #[test]
+    fn infers_token_mode_pump_buy_exact_quote_v2_input_from_inner_data() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR);
+        data.extend_from_slice(&456u64.to_le_bytes());
+        data.extend_from_slice(&123u64.to_le_bytes());
+        let instruction = Instruction {
+            program_id: parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap(),
+            accounts: vec![],
+            data,
+        };
+        assert_eq!(
+            infer_sol_in_lamports_from_venue_instruction(&instruction),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn patches_net_input_amount_for_pump_buy_exact_quote_v2() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR);
+        data.extend_from_slice(&1_000_000u64.to_le_bytes());
+        data.extend_from_slice(&123u64.to_le_bytes());
+        let mut instruction = Instruction {
+            program_id: parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap(),
+            accounts: vec![],
+            data,
+        };
+        patch_sol_in_venue_instruction_to_net(
+            &mut instruction,
+            LaunchdeckWrapRequest {
+                route_kind: WrapperRouteKind::SolIn,
+                fee_bps: 20,
+                gross_sol_in_lamports: 1_000_000,
+                infer_gross_sol_in_from_inner: false,
+                min_net_output: 0,
+                select_first_allowlisted_venue_instruction: false,
+                select_last_allowlisted_venue_instruction: false,
+            },
+        )
+        .expect("patch Pump v2 quote buy");
+        assert_eq!(&instruction.data[8..16], &998_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn inferred_sol_input_gross_covers_wrapper_fee() {
+        let net_lamports = 99_900_000;
+        let gross_lamports =
+            gross_lamports_for_net_after_wrapper_fee(net_lamports, 10).expect("gross lamports");
+        assert_eq!(gross_lamports, 100_000_000);
+        assert_eq!(
+            gross_lamports - estimate_sol_in_fee_lamports(gross_lamports, 10),
+            net_lamports
+        );
+    }
+
+    #[test]
+    fn inferred_pump_bonding_v2_buy_wraps_net_inner_amount() {
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+        let pump_program = parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap();
+        let base_mint = Pubkey::new_unique();
+        let user_base_ata = get_associated_token_address_with_program_id(
+            &payer_pubkey,
+            &base_mint,
+            &token_program_id(),
+        );
+        let user_wsol_ata = get_associated_token_address_with_program_id(
+            &payer_pubkey,
+            &wsol_mint(),
+            &token_program_id(),
+        );
+        let fee_vault_wsol_ata = get_associated_token_address_with_program_id(
+            &wrapper_fee_vault(),
+            &wsol_mint(),
+            &token_program_id(),
+        );
+        let mut venue_accounts: Vec<AccountMeta> = (0..PUMP_V2_BUY_ACCOUNT_COUNT)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
+            .collect();
+        venue_accounts[PUMP_V2_BASE_MINT_INDEX] = AccountMeta::new_readonly(base_mint, false);
+        venue_accounts[PUMP_V2_QUOTE_MINT_INDEX] = AccountMeta::new_readonly(wsol_mint(), false);
+        venue_accounts[PUMP_V2_BASE_TOKEN_PROGRAM_INDEX] =
+            AccountMeta::new_readonly(token_program_id(), false);
+        venue_accounts[PUMP_V2_USER_INDEX] = AccountMeta::new(payer_pubkey, true);
+        venue_accounts[PUMP_V2_ASSOCIATED_BASE_USER_INDEX] = AccountMeta::new(user_base_ata, false);
+        venue_accounts[PUMP_V2_ASSOCIATED_QUOTE_USER_INDEX] =
+            AccountMeta::new(user_wsol_ata, false);
+        venue_accounts[PUMP_V2_BUY_PROGRAM_INDEX] = AccountMeta::new_readonly(pump_program, false);
+        let mut data = PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&99_900_000u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let venue_ix = Instruction {
+            program_id: pump_program,
+            accounts: venue_accounts,
+            data,
+        };
+        let mut alt_addresses = vec![
+            wrapper_program_id(),
+            config_pda(),
+            instructions_sysvar_id(),
+            wrapper_fee_vault(),
+            fee_vault_wsol_ata,
+            user_base_ata,
+            base_mint,
+            user_wsol_ata,
+            wsol_mint(),
+            token_program_id(),
+            system_program_id(),
+            spl_associated_token_account::id(),
+            pump_program,
+        ];
+        alt_addresses.extend(venue_ix.accounts.iter().map(|meta| meta.pubkey));
+        let shared_alt = AddressLookupTableAccount {
+            key: parse_pubkey(SHARED_SUPER_LOOKUP_TABLE, "shared ALT").unwrap(),
+            addresses: alt_addresses,
+        };
+        let blockhash = Hash::new_unique();
+        let message = v0::Message::try_compile(
+            &payer_pubkey,
+            std::slice::from_ref(&venue_ix),
+            std::slice::from_ref(&shared_alt),
+            blockhash,
+        )
+        .expect("compile native Pump v2");
+        let signed = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer])
+            .expect("sign native");
+        let native_compiled = CompiledTransaction {
+            label: "pump-v2-buy-native".to_string(),
+            format: "v0-alt".to_string(),
+            blockhash: blockhash.to_string(),
+            lastValidBlockHeight: 123,
+            serializedBase64: BASE64.encode(bincode::serialize(&signed).expect("serialize")),
+            signature: signed.signatures.first().map(|sig| sig.to_string()),
+            lookupTablesUsed: vec![SHARED_SUPER_LOOKUP_TABLE.to_string()],
+            computeUnitLimit: Some(300_000),
+            computeUnitPriceMicroLamports: Some(2_000),
+            inlineTipLamports: None,
+            inlineTipAccount: None,
+        };
+
+        let wrapped = wrap_compiled_transaction(
+            &native_compiled,
+            &payer,
+            std::slice::from_ref(&shared_alt),
+            LaunchdeckWrapRequest {
+                route_kind: WrapperRouteKind::SolIn,
+                fee_bps: 10,
+                gross_sol_in_lamports: 0,
+                infer_gross_sol_in_from_inner: true,
+                min_net_output: 1,
+                select_first_allowlisted_venue_instruction: false,
+                select_last_allowlisted_venue_instruction: false,
+            },
+        )
+        .expect("wrap succeeds");
+
+        let wrapped_bytes = BASE64.decode(wrapped.serializedBase64.as_bytes()).unwrap();
+        let wrapped_tx: VersionedTransaction = bincode::deserialize(&wrapped_bytes).unwrap();
+        let (decoded, _) =
+            decompile_v0_transaction(&wrapped_tx, std::slice::from_ref(&shared_alt)).unwrap();
+        let wrapper_ix = decoded
+            .iter()
+            .find(|ix| ix.program_id == wrapper_program_id())
+            .expect("wrapper ix");
+        assert_eq!(wrapper_ix.data[0], EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR);
+        let route =
+            ExecutePumpBondingV2Request::try_from_slice(&wrapper_ix.data[1..]).expect("route");
+        assert_eq!(route.gross_quote_in_amount, 100_000_000);
+    }
+
+    #[test]
+    fn wrap_compiled_pump_bonding_v2_adds_wsol_ata_creates() {
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+        let pump_program = parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap();
+        let fee_vault = wrapper_fee_vault();
+        let base_mint = Pubkey::new_unique();
+        let user_base_ata = get_associated_token_address_with_program_id(
+            &payer_pubkey,
+            &base_mint,
+            &token_program_id(),
+        );
+        let user_wsol_ata = get_associated_token_address_with_program_id(
+            &payer_pubkey,
+            &wsol_mint(),
+            &token_program_id(),
+        );
+        let fee_vault_wsol_ata = get_associated_token_address_with_program_id(
+            &fee_vault,
+            &wsol_mint(),
+            &token_program_id(),
+        );
+        let mut venue_accounts: Vec<AccountMeta> = (0..PUMP_V2_BUY_ACCOUNT_COUNT)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
+            .collect();
+        venue_accounts[PUMP_V2_BASE_MINT_INDEX] = AccountMeta::new_readonly(base_mint, false);
+        venue_accounts[PUMP_V2_QUOTE_MINT_INDEX] = AccountMeta::new_readonly(wsol_mint(), false);
+        venue_accounts[PUMP_V2_BASE_TOKEN_PROGRAM_INDEX] =
+            AccountMeta::new_readonly(token_program_id(), false);
+        venue_accounts[PUMP_V2_USER_INDEX] = AccountMeta::new(payer_pubkey, true);
+        venue_accounts[PUMP_V2_ASSOCIATED_BASE_USER_INDEX] = AccountMeta::new(user_base_ata, false);
+        venue_accounts[PUMP_V2_ASSOCIATED_QUOTE_USER_INDEX] =
+            AccountMeta::new(user_wsol_ata, false);
+        venue_accounts[PUMP_V2_BUY_PROGRAM_INDEX] = AccountMeta::new_readonly(pump_program, false);
+        let mut data = PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&99_900_000u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let venue_ix = Instruction {
+            program_id: pump_program,
+            accounts: venue_accounts,
+            data,
+        };
+        let mut alt_addresses = vec![
+            wrapper_program_id(),
+            config_pda(),
+            instructions_sysvar_id(),
+            fee_vault,
+            fee_vault_wsol_ata,
+            user_base_ata,
+            base_mint,
+            user_wsol_ata,
+            wsol_mint(),
+            token_program_id(),
+            system_program_id(),
+            spl_associated_token_account::id(),
+            pump_program,
+        ];
+        alt_addresses.extend(venue_ix.accounts.iter().map(|meta| meta.pubkey));
+        let shared_alt = AddressLookupTableAccount {
+            key: parse_pubkey(SHARED_SUPER_LOOKUP_TABLE, "shared ALT").unwrap(),
+            addresses: alt_addresses,
+        };
+        let blockhash = Hash::new_unique();
+        let message = v0::Message::try_compile(
+            &payer_pubkey,
+            std::slice::from_ref(&venue_ix),
+            std::slice::from_ref(&shared_alt),
+            blockhash,
+        )
+        .expect("compile native Pump v2");
+        let signed = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer])
+            .expect("sign native");
+        let native_compiled = CompiledTransaction {
+            label: "pump-v2-buy-native".to_string(),
+            format: "v0-alt".to_string(),
+            blockhash: blockhash.to_string(),
+            lastValidBlockHeight: 123,
+            serializedBase64: BASE64.encode(bincode::serialize(&signed).expect("serialize")),
+            signature: signed.signatures.first().map(|sig| sig.to_string()),
+            lookupTablesUsed: vec![SHARED_SUPER_LOOKUP_TABLE.to_string()],
+            computeUnitLimit: Some(300_000),
+            computeUnitPriceMicroLamports: Some(2_000),
+            inlineTipLamports: None,
+            inlineTipAccount: None,
+        };
+
+        let wrapped = wrap_compiled_transaction(
+            &native_compiled,
+            &payer,
+            std::slice::from_ref(&shared_alt),
+            LaunchdeckWrapRequest {
+                route_kind: WrapperRouteKind::SolIn,
+                fee_bps: 10,
+                gross_sol_in_lamports: 100_000_000,
+                infer_gross_sol_in_from_inner: false,
+                min_net_output: 1,
+                select_first_allowlisted_venue_instruction: false,
+                select_last_allowlisted_venue_instruction: false,
+            },
+        )
+        .expect("wrap succeeds");
+
+        let wrapped_bytes = BASE64.decode(wrapped.serializedBase64.as_bytes()).unwrap();
+        let wrapped_tx: VersionedTransaction = bincode::deserialize(&wrapped_bytes).unwrap();
+        let (decoded, _) =
+            decompile_v0_transaction(&wrapped_tx, std::slice::from_ref(&shared_alt)).unwrap();
+        let ata_creates = decoded
+            .iter()
+            .filter(|ix| ix.program_id == spl_associated_token_account::id())
+            .collect::<Vec<_>>();
+        assert_eq!(ata_creates.len(), 3);
+        assert_eq!(ata_creates[0].accounts[1].pubkey, user_base_ata);
+        assert_eq!(ata_creates[0].accounts[2].pubkey, payer_pubkey);
+        assert_eq!(ata_creates[0].accounts[3].pubkey, base_mint);
+        assert_eq!(ata_creates[1].accounts[1].pubkey, user_wsol_ata);
+        assert_eq!(ata_creates[1].accounts[2].pubkey, payer_pubkey);
+        assert_eq!(ata_creates[1].accounts[3].pubkey, wsol_mint());
+        assert_eq!(ata_creates[2].accounts[1].pubkey, fee_vault_wsol_ata);
+        assert_eq!(ata_creates[2].accounts[2].pubkey, fee_vault);
+        assert_eq!(ata_creates[2].accounts[3].pubkey, wsol_mint());
+        let wrapper_index = decoded
+            .iter()
+            .position(|ix| ix.program_id == wrapper_program_id())
+            .expect("wrapper ix");
+        assert!(wrapper_index > 1);
+        assert_eq!(
+            decoded[wrapper_index].data[0],
+            EXECUTE_PUMP_BONDING_V2_DISCRIMINATOR
+        );
+        assert_eq!(wrapped.lookupTablesUsed, vec![SHARED_SUPER_LOOKUP_TABLE]);
+    }
+
+    #[test]
+    fn pump_bonding_v2_buy_rejects_stale_quote_input() {
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+        let pump_program = parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap();
+        let user_wsol_ata = get_associated_token_address_with_program_id(
+            &payer_pubkey,
+            &wsol_mint(),
+            &token_program_id(),
+        );
+        let mut venue_accounts: Vec<AccountMeta> = (0..PUMP_V2_BUY_ACCOUNT_COUNT)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
+            .collect();
+        venue_accounts[PUMP_V2_QUOTE_MINT_INDEX] = AccountMeta::new_readonly(wsol_mint(), false);
+        venue_accounts[PUMP_V2_USER_INDEX] = AccountMeta::new(payer_pubkey, true);
+        venue_accounts[PUMP_V2_ASSOCIATED_QUOTE_USER_INDEX] =
+            AccountMeta::new(user_wsol_ata, false);
+        venue_accounts[PUMP_V2_BUY_PROGRAM_INDEX] = AccountMeta::new_readonly(pump_program, false);
+        let mut data = PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&100_000_000u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let venue_ix = Instruction {
+            program_id: pump_program,
+            accounts: venue_accounts,
+            data,
+        };
+        let request = LaunchdeckWrapRequest {
+            route_kind: WrapperRouteKind::SolIn,
+            fee_bps: 10,
+            gross_sol_in_lamports: 100_000_000,
+            infer_gross_sol_in_from_inner: false,
+            min_net_output: 1,
+            select_first_allowlisted_venue_instruction: false,
+            select_last_allowlisted_venue_instruction: false,
+        };
+
+        let error =
+            try_build_pump_bonding_v2_wrapper_instruction(&payer_pubkey, request, &venue_ix)
+                .expect_err("stale Pump v2 buy amount must fail closed");
+        assert!(error.contains("net quote input"));
+    }
+
+    #[test]
+    fn pump_bonding_v2_wsol_shape_mismatch_fails_closed() {
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+        let pump_program = parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap();
+        let wrong_quote_ata = Pubkey::new_unique();
+        let mut venue_accounts: Vec<AccountMeta> = (0..PUMP_V2_BUY_ACCOUNT_COUNT)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
+            .collect();
+        venue_accounts[PUMP_V2_QUOTE_MINT_INDEX] = AccountMeta::new_readonly(wsol_mint(), false);
+        venue_accounts[PUMP_V2_USER_INDEX] = AccountMeta::new(payer_pubkey, true);
+        venue_accounts[PUMP_V2_ASSOCIATED_QUOTE_USER_INDEX] =
+            AccountMeta::new(wrong_quote_ata, false);
+        venue_accounts[PUMP_V2_BUY_PROGRAM_INDEX] = AccountMeta::new_readonly(pump_program, false);
+        let mut data = PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&100_000_000u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let venue_ix = Instruction {
+            program_id: pump_program,
+            accounts: venue_accounts,
+            data,
+        };
+        let request = LaunchdeckWrapRequest {
+            route_kind: WrapperRouteKind::SolIn,
+            fee_bps: 10,
+            gross_sol_in_lamports: 100_000_000,
+            infer_gross_sol_in_from_inner: false,
+            min_net_output: 1,
+            select_first_allowlisted_venue_instruction: false,
+            select_last_allowlisted_venue_instruction: false,
+        };
+
+        let error =
+            try_build_pump_bonding_v2_wrapper_instruction(&payer_pubkey, request, &venue_ix)
+                .expect_err("recognized Pump v2 WSOL route must not fall back");
+        assert!(error.contains("quote user account"));
+    }
+
+    #[test]
+    fn pump_bonding_v2_wsol_side_mismatch_fails_closed() {
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+        let pump_program = parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap();
+        let user_wsol_ata = get_associated_token_address_with_program_id(
+            &payer_pubkey,
+            &wsol_mint(),
+            &token_program_id(),
+        );
+        let mut venue_accounts: Vec<AccountMeta> = (0..PUMP_V2_BUY_ACCOUNT_COUNT)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
+            .collect();
+        venue_accounts[PUMP_V2_QUOTE_MINT_INDEX] = AccountMeta::new_readonly(wsol_mint(), false);
+        venue_accounts[PUMP_V2_USER_INDEX] = AccountMeta::new(payer_pubkey, true);
+        venue_accounts[PUMP_V2_ASSOCIATED_QUOTE_USER_INDEX] =
+            AccountMeta::new(user_wsol_ata, false);
+        venue_accounts[PUMP_V2_BUY_PROGRAM_INDEX] = AccountMeta::new_readonly(pump_program, false);
+        let mut data = PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&100_000_000u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let venue_ix = Instruction {
+            program_id: pump_program,
+            accounts: venue_accounts,
+            data,
+        };
+        let request = LaunchdeckWrapRequest {
+            route_kind: WrapperRouteKind::SolOut,
+            fee_bps: 10,
+            gross_sol_in_lamports: 0,
+            infer_gross_sol_in_from_inner: false,
+            min_net_output: 1,
+            select_first_allowlisted_venue_instruction: false,
+            select_last_allowlisted_venue_instruction: false,
+        };
+
+        let error =
+            try_build_pump_bonding_v2_wrapper_instruction(&payer_pubkey, request, &venue_ix)
+                .expect_err("recognized Pump v2 WSOL side mismatch must not fall back");
+        assert!(error.contains("route kind"));
     }
 
     #[test]

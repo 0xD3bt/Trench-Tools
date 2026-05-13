@@ -298,7 +298,7 @@
     function getTriggerDescription(entry = {}) {
       const triggerMode = normalizeTriggerMode(entry.triggerMode);
       if (triggerMode === "same-time") {
-        return "Compiled into the launch send batch. Might fail if landing before creation tx. Enable retry to retry if fail.";
+        return "Compiled into the launch send. Might fail if it lands before creation. Enable retry to retry if it fails.";
       }
       if (triggerMode === "on-submit") {
         const delayMs = normalizeDelayMs(entry.submitDelayMs);

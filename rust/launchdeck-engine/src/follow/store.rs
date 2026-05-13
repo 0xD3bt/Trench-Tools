@@ -703,3 +703,185 @@ impl FollowDaemonStore {
         Ok(snapshot)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{
+            NormalizedExecution, NormalizedFollowLaunch, NormalizedFollowLaunchConstraints,
+            NormalizedFollowLaunchSnipe,
+        },
+        follow::{FollowArmRequest, FollowReserveRequest},
+        transport::TransportPlan,
+    };
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_state_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("launchdeck-follow-store-{label}-{unique}.json"))
+    }
+
+    fn sample_execution() -> NormalizedExecution {
+        serde_json::from_value(json!({
+            "simulate": false,
+            "send": true,
+            "txFormat": "v0",
+            "commitment": "confirmed",
+            "skipPreflight": false,
+            "trackSendBlockHeight": true,
+            "provider": "standard-rpc",
+            "endpointProfile": "default",
+            "mevProtect": false,
+            "mevMode": "reduced",
+            "jitodontfront": false,
+            "autoGas": false,
+            "autoMode": "manual",
+            "priorityFeeSol": "0",
+            "tipSol": "0",
+            "maxPriorityFeeSol": "0",
+            "maxTipSol": "0",
+            "buyProvider": "standard-rpc",
+            "buyEndpointProfile": "default",
+            "buyMevProtect": false,
+            "buyMevMode": "reduced",
+            "buyJitodontfront": false,
+            "buyAutoGas": false,
+            "buyAutoMode": "manual",
+            "buyPriorityFeeSol": "0",
+            "buyTipSol": "0",
+            "buySlippagePercent": "5",
+            "buyMaxPriorityFeeSol": "0",
+            "buyMaxTipSol": "0",
+            "sellAutoGas": false,
+            "sellAutoMode": "manual",
+            "sellProvider": "standard-rpc",
+            "sellEndpointProfile": "default",
+            "sellMevProtect": false,
+            "sellMevMode": "reduced",
+            "sellJitodontfront": false,
+            "sellPriorityFeeSol": "0",
+            "sellTipSol": "0",
+            "sellSlippagePercent": "5",
+            "sellMaxPriorityFeeSol": "0",
+            "sellMaxTipSol": "0"
+        }))
+        .expect("sample execution")
+    }
+
+    fn sample_transport_plan() -> TransportPlan {
+        TransportPlan {
+            requestedProvider: "standard-rpc".to_string(),
+            resolvedProvider: "standard-rpc".to_string(),
+            requestedEndpointProfile: "default".to_string(),
+            resolvedEndpointProfile: "default".to_string(),
+            executionClass: "direct".to_string(),
+            transportType: "standard-rpc".to_string(),
+            ordering: "sequential".to_string(),
+            verified: true,
+            supportsBundle: false,
+            requiresInlineTip: false,
+            requiresPriorityFee: false,
+            separateTipTransaction: false,
+            skipPreflight: false,
+            maxRetries: 0,
+            standardRpcSubmitEndpoints: vec![],
+            helloMoonApiKeyConfigured: false,
+            helloMoonMevProtect: false,
+            helloMoonQuicEndpoint: None,
+            helloMoonQuicEndpoints: vec![],
+            helloMoonBundleEndpoint: None,
+            helloMoonBundleEndpoints: vec![],
+            heliusSenderEndpoint: None,
+            heliusSenderEndpoints: vec![],
+            watchEndpoint: None,
+            watchEndpoints: vec![],
+            jitoBundleEndpoints: vec![],
+            warnings: vec![],
+        }
+    }
+
+    fn sample_follow_launch_with_submit_delay(delay_ms: u64) -> NormalizedFollowLaunch {
+        NormalizedFollowLaunch {
+            enabled: true,
+            source: "test".to_string(),
+            schemaVersion: 1,
+            snipes: vec![NormalizedFollowLaunchSnipe {
+                actionId: "snipe-a".to_string(),
+                enabled: true,
+                walletEnvKey: "WALLET_A".to_string(),
+                buyAmountSol: "0.1".to_string(),
+                submitWithLaunch: false,
+                retryOnFailure: false,
+                submitDelayMs: delay_ms,
+                targetBlockOffset: None,
+                jitterMs: 0,
+                feeJitterBps: 0,
+                skipIfTokenBalancePositive: false,
+                postBuySell: None,
+            }],
+            devAutoSell: None,
+            constraints: NormalizedFollowLaunchConstraints {
+                pumpOnly: true,
+                retryBudget: 0,
+                requireDaemonReadiness: true,
+                blockOnRequiredPrechecks: true,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn arm_job_schedules_on_submit_action_from_submit_timestamp() {
+        let state_path = test_state_path("on-submit");
+        let store = FollowDaemonStore::load_or_default(state_path.clone());
+        let trace_id = "trace-on-submit-delay".to_string();
+
+        store
+            .reserve_job(FollowReserveRequest {
+                traceId: trace_id.clone(),
+                launchpad: "pump".to_string(),
+                quoteAsset: "sol".to_string(),
+                launchMode: "normal".to_string(),
+                selectedWalletKey: "WALLET_A".to_string(),
+                followLaunch: sample_follow_launch_with_submit_delay(25),
+                execution: sample_execution(),
+                tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 100,
+                jitoTipAccount: String::new(),
+                buyTipAccount: String::new(),
+                sellTipAccount: String::new(),
+                preferPostSetupCreatorVaultForSell: false,
+                bagsLaunch: None,
+                prebuiltActions: vec![],
+                deferredSetupTransactions: vec![],
+            })
+            .await
+            .expect("reserve follow job");
+
+        let armed = store
+            .arm_job(FollowArmRequest {
+                traceId: trace_id,
+                mint: "mint".to_string(),
+                launchCreator: "creator".to_string(),
+                launchSignature: "sig".to_string(),
+                launchTransactionSubscribeAccountRequired: vec![],
+                submitAtMs: 1_000,
+                sendObservedSlot: Some(10),
+                confirmedObservedSlot: None,
+                reportPath: None,
+                transportPlan: sample_transport_plan(),
+            })
+            .await
+            .expect("arm follow job");
+
+        assert_eq!(armed.submitAtMs, Some(1_000));
+        assert_eq!(armed.actions[0].submitDelayMs, Some(25));
+        assert_eq!(armed.actions[0].scheduledForMs, Some(1_025));
+
+        let _ = std::fs::remove_file(state_path);
+    }
+}

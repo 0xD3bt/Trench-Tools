@@ -73,6 +73,29 @@ pub(crate) fn selector_from_classified_bonk_raydium_pair(
     )
 }
 
+pub(crate) fn selector_from_classified_bonk_launchpad_pair(
+    request: &TradeRuntimeRequest,
+    classified: &BonkPoolAddressClassification,
+) -> Result<LifecycleAndCanonicalMarket, String> {
+    map_bonk_context_to_selector(
+        request,
+        launchdeck_bonk::BonkImportContext {
+            launchpad: "bonk".to_string(),
+            mode: if classified.platform_id.trim().is_empty() {
+                "classified-pair".to_string()
+            } else {
+                format!("classified-pair:{}", classified.platform_id)
+            },
+            quoteAsset: classified.quote_asset.trim().to_ascii_lowercase(),
+            creator: classified.creator.clone(),
+            platformId: classified.platform_id.clone(),
+            configId: classified.config_id.clone(),
+            poolId: classified.pool_id.clone(),
+            detectionSource: "launchpad-classified-pair".to_string(),
+        },
+    )
+}
+
 pub async fn quote_sol_lamports_for_exact_usd1_input(
     rpc_url: &str,
     usd1_raw: u64,

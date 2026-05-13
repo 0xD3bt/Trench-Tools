@@ -289,6 +289,12 @@ pub struct BonkPoolAddressClassification {
     pub family: String,
     #[serde(default)]
     pub quote_asset: String,
+    #[serde(default)]
+    pub creator: String,
+    #[serde(default)]
+    pub platform_id: String,
+    #[serde(default)]
+    pub config_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -545,6 +551,12 @@ pub struct TrustedRaydiumClmmSwap {
     pub expected_out: u64,
     pub min_out: u64,
     pub traversed_tick_array_starts: Vec<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustedRaydiumClmmQuote {
+    pub expected_out: u64,
+    pub min_out: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -935,11 +947,18 @@ pub fn classify_bonk_pool_address(
             Ok(pool) => pool,
             Err(_) => return Ok(None),
         };
+        let quote_asset = match pool.config_id.to_string().as_str() {
+            BONK_MAINNET_USD1_LAUNCH_CONFIG_ID => "usd1",
+            _ => "sol",
+        };
         return Ok(Some(BonkPoolAddressClassification {
             mint: pool.mint_a.to_string(),
             pool_id: pool_id.to_string(),
             family: "launchpad".to_string(),
-            quote_asset: String::new(),
+            quote_asset: quote_asset.to_string(),
+            creator: pool.creator.to_string(),
+            platform_id: pool.platform_id.to_string(),
+            config_id: pool.config_id.to_string(),
         }));
     }
     if *owner == bonk_clmm_program_id()? {
@@ -966,6 +985,9 @@ pub fn classify_bonk_pool_address(
             pool_id: pool_id.to_string(),
             family: "raydium".to_string(),
             quote_asset: quote_asset.asset.to_string(),
+            creator: String::new(),
+            platform_id: String::new(),
+            config_id: String::new(),
         }));
     }
     if *owner == bonk_cpmm_program_id()? {
@@ -992,6 +1014,9 @@ pub fn classify_bonk_pool_address(
             pool_id: pool_id.to_string(),
             family: "raydium".to_string(),
             quote_asset: quote_asset.asset.to_string(),
+            creator: String::new(),
+            platform_id: String::new(),
+            config_id: String::new(),
         }));
     }
     Ok(None)
@@ -6617,6 +6642,116 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
     })
 }
 
+pub async fn quote_trusted_raydium_clmm_exact_in(
+    rpc_url: &str,
+    pool_id_input: &str,
+    commitment: &str,
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount_in: u64,
+    slippage_bps: u64,
+) -> Result<TrustedRaydiumClmmQuote, String> {
+    let pool_id = Pubkey::from_str(pool_id_input)
+        .map_err(|error| format!("Invalid trusted Raydium CLMM pool id: {error}"))?;
+    let (pool_data, owner_string) =
+        fetch_account_data_with_owner(rpc_url, pool_id_input, commitment).await?;
+    let owner_pubkey = Pubkey::from_str(&owner_string)
+        .map_err(|error| format!("Invalid trusted Raydium CLMM owner: {error}"))?;
+    if owner_pubkey != bonk_clmm_program_id()? {
+        return Err(format!(
+            "Trusted stable Raydium pool {pool_id_input} owner mismatch: {owner_pubkey}"
+        ));
+    }
+    let pool = decode_bonk_clmm_pool(&pool_data)?;
+    if !((*input_mint == pool.mint_a && *output_mint == pool.mint_b)
+        || (*input_mint == pool.mint_b && *output_mint == pool.mint_a))
+    {
+        return Err(format!(
+            "Trusted stable Raydium pool {pool_id_input} mint pair mismatch."
+        ));
+    }
+    let config_data = fetch_account_data(rpc_url, &pool.amm_config.to_string(), commitment).await?;
+    let config = decode_bonk_clmm_config(&config_data)?;
+    if config.tick_spacing != pool.tick_spacing {
+        return Err("Trusted stable Raydium tick spacing no longer matches config.".to_string());
+    }
+    let current_array_start =
+        bonk_get_tick_array_start_index_by_tick(pool.tick_current, i32::from(pool.tick_spacing));
+    let current_bit_position =
+        bonk_tick_array_bit_position(current_array_start, i32::from(pool.tick_spacing))?;
+    if !bonk_bitmap_is_initialized(&pool.tick_array_bitmap, current_bit_position) {
+        return Err("Trusted stable Raydium current tick array is not initialized.".to_string());
+    }
+    let tick_count = BONK_CLMM_TICK_ARRAY_SIZE * i32::from(pool.tick_spacing);
+    let tick_array_starts_desc = (0..(pool.tick_array_bitmap.len() * 64))
+        .filter(|bit_position| bonk_bitmap_is_initialized(&pool.tick_array_bitmap, *bit_position))
+        .rev()
+        .map(|bit_position| ((bit_position as i32) - BONK_CLMM_DEFAULT_BITMAP_OFFSET) * tick_count)
+        .collect::<Vec<_>>();
+    let tick_array_starts_asc = tick_array_starts_desc
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    if tick_array_starts_desc.is_empty() {
+        return Err("Trusted stable Raydium pool had no initialized tick arrays.".to_string());
+    }
+    let program_id = bonk_clmm_program_id()?;
+    let tick_array_addresses = tick_array_starts_desc
+        .iter()
+        .map(|start_index| {
+            bonk_derive_clmm_tick_array_address(&program_id, &pool_id, *start_index).to_string()
+        })
+        .collect::<Vec<_>>();
+    let tick_array_account_datas =
+        rpc_get_multiple_accounts_data(rpc_url, &tick_array_addresses, commitment).await?;
+    let tick_arrays = tick_array_account_datas
+        .into_iter()
+        .map(|data| decode_bonk_clmm_tick_array(&data))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|tick_array| (tick_array.start_tick_index, tick_array))
+        .collect::<HashMap<_, _>>();
+    if !tick_arrays.contains_key(&current_array_start) {
+        return Err("Trusted stable Raydium current tick array could not be decoded.".to_string());
+    }
+    let setup = BonkUsd1RouteSetup {
+        pool_id,
+        program_id,
+        amm_config: pool.amm_config,
+        mint_a: pool.mint_a,
+        mint_b: pool.mint_b,
+        vault_a: pool.vault_a,
+        vault_b: pool.vault_b,
+        observation_id: pool.observation_id,
+        tick_spacing: i32::from(pool.tick_spacing),
+        trade_fee_rate: config.trade_fee_rate,
+        sqrt_price_x64: pool.sqrt_price_x64.clone(),
+        liquidity: pool.liquidity.clone(),
+        tick_current: pool.tick_current,
+        mint_a_decimals: u32::from(pool.mint_decimals_a),
+        mint_b_decimals: u32::from(pool.mint_decimals_b),
+        current_price: bonk_sqrt_price_x64_to_price(
+            &pool.sqrt_price_x64,
+            u32::from(pool.mint_decimals_a),
+            u32::from(pool.mint_decimals_b),
+        )?,
+        tick_arrays_desc: tick_array_starts_desc,
+        tick_arrays_asc: tick_array_starts_asc,
+        tick_arrays,
+    };
+    let quote = bonk_quote_clmm_exact_input(
+        &setup,
+        input_mint,
+        &bonk_biguint_from_u64(amount_in),
+        slippage_bps,
+    )?;
+    Ok(TrustedRaydiumClmmQuote {
+        expected_out: biguint_to_u64(&quote.expected_out, "trusted Raydium CLMM expected output")?,
+        min_out: biguint_to_u64(&quote.min_out, "trusted Raydium CLMM minimum output")?,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BonkFollowBuyQuoteDetails {
     gross_input_b: u64,
@@ -10451,6 +10586,56 @@ mod tests {
         assert_eq!(classified.pool_id, "pool-2");
         assert_eq!(classified.family, "raydium");
         assert_eq!(classified.quote_asset, "usd1");
+    }
+
+    #[test]
+    fn classify_bonk_pool_address_preserves_launchpad_quote_metadata() {
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let platform = Pubkey::new_unique();
+        let config = Pubkey::from_str(BONK_MAINNET_USD1_LAUNCH_CONFIG_ID).expect("usd1 config");
+        let mut offset = 0usize;
+        let mut data = vec![0u8; 429];
+        data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        offset += 8;
+        data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        offset += 8;
+        data[offset] = 255;
+        offset += 1;
+        data[offset] = 0;
+        offset += 1;
+        offset += 3;
+        for value in [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+            data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            offset += 8;
+        }
+        data[offset..offset + 32].copy_from_slice(config.as_ref());
+        offset += 32;
+        data[offset..offset + 32].copy_from_slice(platform.as_ref());
+        offset += 32;
+        data[offset..offset + 32].copy_from_slice(mint.as_ref());
+        offset += 32;
+        data[offset..offset + 32]
+            .copy_from_slice(Pubkey::from_str(BONK_USD1_QUOTE_MINT).expect("usd1 mint").as_ref());
+        offset += 32;
+        offset += 64;
+        data[offset..offset + 32].copy_from_slice(creator.as_ref());
+
+        let classified = classify_bonk_pool_address(
+            "launchpad-pool",
+            &bonk_launchpad_program_id().expect("launchpad program"),
+            &data,
+        )
+        .expect("classification")
+        .expect("launchpad classification");
+
+        assert_eq!(classified.mint, mint.to_string());
+        assert_eq!(classified.pool_id, "launchpad-pool");
+        assert_eq!(classified.family, "launchpad");
+        assert_eq!(classified.quote_asset, "usd1");
+        assert_eq!(classified.config_id, config.to_string());
+        assert_eq!(classified.platform_id, platform.to_string());
+        assert_eq!(classified.creator, creator.to_string());
     }
 
     #[test]

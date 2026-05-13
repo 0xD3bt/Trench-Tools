@@ -31,8 +31,9 @@ use launchdeck_engine::{
     launchpad_dispatch::{
         FollowBuyCompileRequest, FollowSellCompileRequest, LaunchpadMarketSnapshot,
         compile_follow_buy_for_launchpad, compile_follow_sell_for_launchpad,
-        derive_follow_owner_token_account_for_launchpad, fetch_market_snapshot_for_launchpad,
-        wrap_follow_buy_transaction_for_launchpad,
+        derive_follow_owner_token_account_for_launchpad,
+        derive_follow_owner_token_account_for_launchpad_with_rpc,
+        fetch_market_snapshot_for_launchpad, wrap_follow_buy_transaction_for_launchpad,
     },
     observability::{
         record_outbound_provider_http_request, update_persisted_follow_daemon_snapshot,
@@ -3566,7 +3567,7 @@ async fn run_deferred_setup_task(state: Arc<AppState>, trace_id: String) -> Resu
         let blocking_follow = job
             .actions
             .iter()
-            .any(|action| should_block_deferred_setup_for_action(action, now_ms()));
+            .any(|action| should_block_deferred_setup_for_action(&job, action, now_ms()));
         if blocking_follow {
             sleep(Duration::from_millis(50)).await;
             continue;
@@ -3655,6 +3656,9 @@ fn should_retry_pump_sell_creator_vault_mismatch(
     error: &str,
 ) -> bool {
     if !configured_enable_pump_sell_creator_vault_auto_retry() {
+        return false;
+    }
+    if action.attemptCount > job.followLaunch.constraints.retryBudget {
         return false;
     }
     if job.launchpad != "pump" {
@@ -3870,7 +3874,31 @@ fn reset_action_for_presigned_rebuild(record: &mut FollowActionRecord, message: 
     record.lastError = Some(message);
 }
 
-fn should_block_deferred_setup_for_action(action: &FollowActionRecord, now_ms: u128) -> bool {
+fn action_requires_deferred_setup_before_send(
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+) -> bool {
+    match action.kind {
+        FollowActionKind::SniperBuy => should_use_post_setup_creator_vault_for_buy(
+            job.preferPostSetupCreatorVaultForSell,
+            action,
+            &job.execution.buyMevMode,
+        ),
+        FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
+            should_use_post_setup_creator_vault_for_sell(
+                job.preferPostSetupCreatorVaultForSell,
+                action,
+                &job.execution.sellMevMode,
+            )
+        }
+    }
+}
+
+fn should_block_deferred_setup_for_action(
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+    now_ms: u128,
+) -> bool {
     if !matches!(
         action.state,
         FollowActionState::Queued
@@ -3881,6 +3909,9 @@ fn should_block_deferred_setup_for_action(action: &FollowActionRecord, now_ms: u
         return false;
     }
     if action_waiting_for_presigned_rebuild(action) {
+        return false;
+    }
+    if action_requires_deferred_setup_before_send(job, action) {
         return false;
     }
     if !action_runs_before_deferred_setup(action) {
@@ -3980,7 +4011,7 @@ async fn execute_action(
         })
         .await;
     }
-    state
+    let current_job_after_attempt = state
         .store
         .update_action(&trace_id, &effective_action.actionId, |record| {
             record.state = FollowActionState::Running;
@@ -3988,6 +4019,13 @@ async fn execute_action(
             record.submitStartedAtMs = Some(submit_started_at_ms);
         })
         .await?;
+    if let Some(current_action) = current_job_after_attempt
+        .actions
+        .iter()
+        .find(|action| action.actionId == effective_action.actionId)
+    {
+        effective_action.attemptCount = current_action.attemptCount;
+    }
     sync_follow_job_report(&state, &trace_id).await;
     let mint = job
         .mint
@@ -4322,17 +4360,26 @@ async fn execute_action(
                 retried_creator_vault = true;
                 sleep(Duration::from_millis(200)).await;
                 compiled_transactions = vec![
-                    compile_follow_sell_transaction(
-                        &state.rpc_url,
-                        &job.execution,
-                        job.tokenMayhemMode,
-                        &job.sellTipAccount,
-                        &wallet_secret,
+                    compile_follow_sell_for_launchpad(FollowSellCompileRequest {
+                        launchpad: &job.launchpad,
+                        quote_asset: &job.quoteAsset,
+                        rpc_url: &state.rpc_url,
+                        execution: &action_execution,
+                        token_mayhem_mode: job.tokenMayhemMode,
+                        jito_tip_account: &job.sellTipAccount,
+                        wallet_secret: &wallet_secret,
                         mint,
                         launch_creator,
-                        sell_percent.unwrap_or_default(),
-                        prefer_post_setup_creator_vault_for_sell,
-                    )
+                        sell_percent: sell_percent.unwrap_or_default(),
+                        prefer_post_setup_creator_vault: prefer_post_setup_creator_vault_for_sell,
+                        token_amount_override: sell_token_amount_override,
+                        bonk_pool_id: effective_action.poolId.as_deref(),
+                        bonk_launch_mode: None,
+                        bonk_launch_creator: None,
+                        pump_cashback_enabled_override: Some(job.launchMode.as_str() == "cashback"),
+                        bags_launch: job.bagsLaunch.as_ref(),
+                        wrapper_fee_bps: job.wrapperDefaultFeeBps,
+                    })
                     .await?
                     .ok_or_else(|| {
                         "Action had nothing to send after creator vault retry.".to_string()
@@ -4348,20 +4395,39 @@ async fn execute_action(
                 .to_string(),
         );
     }
-    let sent = primary_follow_submission(&mut submitted, primary_tx_index)?;
-    sent.capturePostTokenBalances = has_matching_sniper_sell(job, &effective_action);
-    sent.requestFullTransactionDetails = should_request_full_transaction_details(&effective_action);
-    sent.balanceWatchAccount = if sent.capturePostTokenBalances
+    let capture_post_token_balances = has_matching_sniper_sell(job, &effective_action);
+    let balance_watch_account = if capture_post_token_balances
         && matches!(effective_action.kind, FollowActionKind::SniperBuy)
     {
-        Some(derive_follow_owner_token_account_for_launchpad(
+        match derive_follow_owner_token_account_for_launchpad_with_rpc(
             &job.launchpad,
+            &state.rpc_url,
+            &job.execution.commitment,
             &wallet_owner_pubkey,
             mint,
-        )?)
+        )
+        .await
+        {
+            Ok(account) => Some(account),
+            Err(error) => {
+                let fallback = derive_follow_owner_token_account_for_launchpad(
+                    &job.launchpad,
+                    &wallet_owner_pubkey,
+                    mint,
+                )?;
+                warnings.push(format!(
+                    "Submitted follow buy but could not resolve mint token program for balance watch; using default launchpad ATA {fallback}: {error}"
+                ));
+                Some(fallback)
+            }
+        }
     } else {
         None
     };
+    let sent = primary_follow_submission(&mut submitted, primary_tx_index)?;
+    sent.capturePostTokenBalances = capture_post_token_balances;
+    sent.requestFullTransactionDetails = should_request_full_transaction_details(&effective_action);
+    sent.balanceWatchAccount = balance_watch_account;
     update_action_timings(&state, &trace_id, &effective_action.actionId, |timings| {
         timings.submitMs = Some(submit_latency.max(submit_ms));
     })
@@ -4554,28 +4620,19 @@ async fn execute_deferred_setup(state: Arc<AppState>, job: &FollowJobRecord) -> 
                 .await;
                 match confirmation_result {
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) if attempt < 2 => {
+                    Ok(Err(error))
+                        if attempt < 2 && !is_terminal_onchain_confirmation_error(&error) =>
+                    {
                         attempt = attempt.saturating_add(1);
-                        let retry_error = if is_terminal_onchain_confirmation_error(&error) {
-                            let refreshed = refresh_deferred_setup_transactions(
-                                &state,
-                                job,
-                                &setup_transactions,
-                            )
-                            .await?;
-                            setup_transactions = refreshed.clone();
-                            format!(
-                                "Deferred setup confirmation failed after send; rebuilt and requeued attempt {}: {}",
-                                attempt + 1,
-                                error
-                            )
-                        } else {
-                            format!(
-                                "Deferred setup confirmation failed after send; requeued attempt {}: {}",
-                                attempt + 1,
-                                error
-                            )
-                        };
+                        let refreshed =
+                            refresh_deferred_setup_transactions(&state, job, &setup_transactions)
+                                .await?;
+                        setup_transactions = refreshed.clone();
+                        let retry_error = format!(
+                            "Deferred setup confirmation failed after send; refreshed blockhash and requeued attempt {}: {}",
+                            attempt + 1,
+                            error
+                        );
                         let transactions_for_retry = setup_transactions.clone();
                         let _ = state
                             .store
@@ -4608,8 +4665,12 @@ async fn execute_deferred_setup(state: Arc<AppState>, job: &FollowJobRecord) -> 
                     }
                     Err(_) if attempt < 2 => {
                         attempt = attempt.saturating_add(1);
+                        let refreshed =
+                            refresh_deferred_setup_transactions(&state, job, &setup_transactions)
+                                .await?;
+                        setup_transactions = refreshed.clone();
                         let retry_error = format!(
-                            "Deferred setup was still unconfirmed {}s after send; requeued attempt {}.",
+                            "Deferred setup was still unconfirmed {}s after send; refreshed blockhash and requeued attempt {}.",
                             DEFERRED_SETUP_CONFIRMATION_TIMEOUT_SECS,
                             attempt + 1
                         );
@@ -4965,7 +5026,10 @@ async fn wait_for_action_eligibility(
     if observed_slot.is_none() {
         observed_slot = confirmed_launch_slot;
     }
-    if job.deferredSetup.is_some() && !action_runs_before_deferred_setup(action) {
+    if job.deferredSetup.is_some()
+        && (!action_runs_before_deferred_setup(action)
+            || action_requires_deferred_setup_before_send(job, action))
+    {
         let wait_started = Instant::now();
         wait_for_deferred_setup_confirmation(state.clone(), job, &action.actionId).await?;
         watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
@@ -8541,7 +8605,7 @@ mod tests {
     }
 
     #[test]
-    fn pump_sell_creator_vault_retry_ignores_retry_budget() {
+    fn pump_sell_creator_vault_retry_respects_retry_budget() {
         let _guard = env_lock().lock().expect("env lock");
         unsafe {
             env::remove_var("LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY");
@@ -8592,7 +8656,7 @@ mod tests {
             primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
-        assert!(should_retry_pump_sell_creator_vault_mismatch(
+        assert!(!should_retry_pump_sell_creator_vault_mismatch(
             &job,
             &action,
             r#"on-chain failure | Transaction abc failed on-chain: {"InstructionError":[2,{"Custom":2006}]}"#,
@@ -8937,7 +9001,11 @@ mod tests {
             primaryTxIndex: None,
             timings: FollowActionTimings::default(),
         };
-        assert!(!should_block_deferred_setup_for_action(&action, 0));
+        assert!(!should_block_deferred_setup_for_action(
+            &sample_job(),
+            &action,
+            0
+        ));
     }
 
     #[test]
@@ -8945,14 +9013,33 @@ mod tests {
         let mut action = sample_sniper_buy_action("buy", "SOLANA_PRIVATE_KEY", 0);
         action.targetBlockOffset = Some(1);
         assert!(!action_runs_before_deferred_setup(&action));
-        assert!(!should_block_deferred_setup_for_action(&action, 0));
+        assert!(!should_block_deferred_setup_for_action(
+            &sample_job(),
+            &action,
+            0
+        ));
     }
 
     #[test]
     fn plus_zero_buy_still_blocks_deferred_setup_phase() {
         let action = sample_sniper_buy_action("buy", "SOLANA_PRIVATE_KEY", 0);
         assert!(action_runs_before_deferred_setup(&action));
-        assert!(should_block_deferred_setup_for_action(&action, 0));
+        assert!(should_block_deferred_setup_for_action(
+            &sample_job(),
+            &action,
+            0
+        ));
+    }
+
+    #[test]
+    fn secure_post_setup_buy_waits_for_deferred_setup_instead_of_blocking_it() {
+        let action = sample_sniper_buy_action("buy", "SOLANA_PRIVATE_KEY", 0);
+        let mut job = sample_job();
+        job.preferPostSetupCreatorVaultForSell = true;
+        job.execution.buyMevMode = "secure".to_string();
+        assert!(action_runs_before_deferred_setup(&action));
+        assert!(action_requires_deferred_setup_before_send(&job, &action));
+        assert!(!should_block_deferred_setup_for_action(&job, &action, 0));
     }
 
     #[test]

@@ -6,7 +6,8 @@ use spl_token_2022_interface::{extension::PodStateWithExtensions, pod::PodMint};
 
 use crate::{
     bonk_native::{
-        classify_bonk_pool_address, compile_bonk_trade, plan_bonk_trade, plan_bonk_trade_uncached,
+        BonkPoolAddressClassification, classify_bonk_pool_address, compile_bonk_trade,
+        plan_bonk_trade, plan_bonk_trade_uncached, selector_from_classified_bonk_launchpad_pair,
         selector_from_classified_bonk_raydium_pair,
     },
     extension_api::TradeSettlementAsset,
@@ -18,8 +19,9 @@ use crate::{
         PrewarmedMint, build_fingerprint, prewarmed_from_plan, shared_mint_warm_cache,
     },
     pump_native::{
-        bonding_curve_pda, canonical_pump_amm_pool, classify_pump_bonding_curve_address,
-        compile_pump_trade, decode_pump_amm_pool_state, plan_pump_trade, pump_amm_program_id,
+        bonding_curve_pda, canonical_pump_amm_pool, canonical_pump_amm_pool_for_quote,
+        classify_pump_bonding_curve_address, compile_pump_trade, decode_pump_amm_pool_state,
+        plan_pump_trade, pump_amm_program_id,
     },
     raydium_amm_v4_native::{
         classify_raydium_amm_v4_pool_address, compile_raydium_amm_v4_trade,
@@ -271,7 +273,7 @@ async fn try_classify_route_descriptor(
             route_locked_pair: Some(classified.bonding_curve.clone()),
             family: Some(TradeVenueFamily::PumpBondingCurve),
             lifecycle: Some(TradeLifecycle::PreMigration),
-            quote_asset: Some(PlannerQuoteAsset::Sol),
+            quote_asset: Some(classified.quote_asset),
             canonical_market_key: Some(classified.bonding_curve),
             non_canonical: false,
         }));
@@ -282,7 +284,11 @@ async fn try_classify_route_descriptor(
             .map_err(|error| format!("input {input} is not a valid pubkey: {error}"))?;
         let pool = decode_pump_amm_pool_state(pool_pubkey, &data)?;
         let base_mint = pool.base_mint.to_string();
-        let canonical_pool = crate::pump_native::canonical_pump_amm_pool(&pool.base_mint)?;
+        let quote_asset = match crate::pump_native::pump_quote_asset_for_mint(&pool.quote_mint)? {
+            crate::pump_native::PumpQuoteAssetForMint::Wsol => PlannerQuoteAsset::Wsol,
+            crate::pump_native::PumpQuoteAssetForMint::Usdc => PlannerQuoteAsset::Usdc,
+        };
+        let canonical_pool = canonical_pump_amm_pool_for_quote(&pool.base_mint, &pool.quote_mint)?;
         let non_canonical = canonical_pool != pool_pubkey;
         return Ok(Some(RouteDescriptor {
             raw_address: input.trim().to_string(),
@@ -292,7 +298,7 @@ async fn try_classify_route_descriptor(
             route_locked_pair: Some(pool_pubkey.to_string()),
             family: Some(TradeVenueFamily::PumpAmm),
             lifecycle: Some(TradeLifecycle::PostMigration),
-            quote_asset: Some(PlannerQuoteAsset::Wsol),
+            quote_asset: Some(quote_asset),
             canonical_market_key: Some(canonical_pool.to_string()),
             non_canonical,
         }));
@@ -755,26 +761,56 @@ fn selector_from_authoritative_descriptor(
             runtime_bundle: None,
         }));
     }
-    if !matches!(descriptor.family, Some(TradeVenueFamily::BonkRaydium)) {
-        return Ok(None);
+    match descriptor.family {
+        Some(TradeVenueFamily::BonkLaunchpad) => {
+            let Some(pool) = descriptor.resolved_pair.as_deref().or_else(|| {
+                descriptor
+                    .canonical_market_key
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+            }) else {
+                return Ok(None);
+            };
+            let Some(quote_asset) = descriptor.quote_asset.as_ref() else {
+                return Ok(None);
+            };
+            let quote_asset = match quote_asset {
+                PlannerQuoteAsset::Sol | PlannerQuoteAsset::Wsol => "sol",
+                PlannerQuoteAsset::Usd1 => "usd1",
+                _ => return Ok(None),
+            };
+            let classified = BonkPoolAddressClassification {
+                mint: descriptor.resolved_mint.clone(),
+                pool_id: pool.to_string(),
+                family: "launchpad".to_string(),
+                quote_asset: quote_asset.to_string(),
+                creator: String::new(),
+                platform_id: String::new(),
+                config_id: String::new(),
+            };
+            selector_from_classified_bonk_launchpad_pair(request, &classified).map(Some)
+        }
+        Some(TradeVenueFamily::BonkRaydium) => {
+            let Some(pool) = descriptor.resolved_pair.as_deref().or_else(|| {
+                descriptor
+                    .canonical_market_key
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+            }) else {
+                return Ok(None);
+            };
+            let Some(quote_asset) = descriptor.quote_asset.as_ref() else {
+                return Ok(None);
+            };
+            let quote_asset = match quote_asset {
+                PlannerQuoteAsset::Sol | PlannerQuoteAsset::Wsol => "sol",
+                PlannerQuoteAsset::Usd1 => "usd1",
+                _ => return Ok(None),
+            };
+            selector_from_classified_bonk_raydium_pair(request, pool, quote_asset).map(Some)
+        }
+        _ => Ok(None),
     }
-    let Some(pool) = descriptor.resolved_pair.as_deref().or_else(|| {
-        descriptor
-            .canonical_market_key
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-    }) else {
-        return Ok(None);
-    };
-    let Some(quote_asset) = descriptor.quote_asset.as_ref() else {
-        return Ok(None);
-    };
-    let quote_asset = match quote_asset {
-        PlannerQuoteAsset::Sol | PlannerQuoteAsset::Wsol => "sol",
-        PlannerQuoteAsset::Usd1 => "usd1",
-        _ => return Ok(None),
-    };
-    selector_from_classified_bonk_raydium_pair(request, pool, quote_asset).map(Some)
 }
 
 fn planner_family_order() -> Vec<TradeVenueFamily> {
@@ -1115,6 +1151,11 @@ async fn prefetch_no_suffix_deterministic_accounts(rpc_url: &str, request: &Trad
     }
     if let Ok(pump_amm_pool) = canonical_pump_amm_pool(&mint) {
         accounts.push(pump_amm_pool.to_string());
+    }
+    if let Ok(usdc_mint) = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        && let Ok(pump_amm_usdc_pool) = canonical_pump_amm_pool_for_quote(&mint, &usdc_mint)
+    {
+        accounts.push(pump_amm_usdc_pool.to_string());
     }
     accounts.sort();
     accounts.dedup();
@@ -1592,6 +1633,12 @@ fn selector_matches_trade_side(
             crate::trade_planner::WrapperAction::PumpBondingCurveSell,
             crate::extension_api::TradeSide::Sell
         ) | (
+            crate::trade_planner::WrapperAction::PumpAmmBuy,
+            crate::extension_api::TradeSide::Buy
+        ) | (
+            crate::trade_planner::WrapperAction::PumpAmmSell,
+            crate::extension_api::TradeSide::Sell
+        ) | (
             crate::trade_planner::WrapperAction::PumpAmmWsolBuy,
             crate::extension_api::TradeSide::Buy
         ) | (
@@ -1971,6 +2018,21 @@ mod tests {
         }
     }
 
+    fn test_bonk_launchpad_pair_descriptor(pair: &str) -> RouteDescriptor {
+        RouteDescriptor {
+            raw_address: pair.to_string(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: "Mint111".to_string(),
+            resolved_pair: Some(pair.to_string()),
+            route_locked_pair: Some(pair.to_string()),
+            family: Some(TradeVenueFamily::BonkLaunchpad),
+            lifecycle: Some(crate::trade_planner::TradeLifecycle::PreMigration),
+            quote_asset: Some(crate::trade_planner::PlannerQuoteAsset::Usd1),
+            canonical_market_key: Some(pair.to_string()),
+            non_canonical: false,
+        }
+    }
+
     fn test_bags_selector(canonical_market_key: &str) -> LifecycleAndCanonicalMarket {
         LifecycleAndCanonicalMarket {
             lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
@@ -2247,6 +2309,27 @@ mod tests {
         assert_eq!(plan.resolved_mint, "Mint111");
         assert_eq!(plan.resolved_pinned_pool.as_deref(), Some("Pool222"));
         assert!(!plan.non_canonical);
+    }
+
+    #[test]
+    fn selector_from_authoritative_descriptor_accepts_bonk_launchpad_pair() {
+        let request = test_runtime_request();
+        let descriptor = test_bonk_launchpad_pair_descriptor("LaunchpadPool111");
+
+        let selector = selector_from_authoritative_descriptor(&request, &descriptor)
+            .expect("selector result")
+            .expect("launchpad pair selector");
+
+        assert_eq!(selector.family, TradeVenueFamily::BonkLaunchpad);
+        assert_eq!(selector.canonical_market_key, "LaunchpadPool111");
+        assert_eq!(
+            selector.quote_asset,
+            crate::trade_planner::PlannerQuoteAsset::Usd1
+        );
+        assert_eq!(
+            selector.wrapper_action,
+            crate::trade_planner::WrapperAction::BonkLaunchpadUsd1Buy
+        );
     }
 
     #[test]
@@ -2595,7 +2678,7 @@ mod tests {
             canonical_market_key: "pump-pool".to_string(),
             quote_asset: crate::trade_planner::PlannerQuoteAsset::Wsol,
             verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
-            wrapper_action: crate::trade_planner::WrapperAction::PumpAmmWsolBuy,
+            wrapper_action: crate::trade_planner::WrapperAction::PumpAmmBuy,
             wrapper_accounts: vec!["pump-pool".to_string()],
             market_subtype: Some("canonical-pump-amm".to_string()),
             direct_protocol_target: Some("pump-amm".to_string()),

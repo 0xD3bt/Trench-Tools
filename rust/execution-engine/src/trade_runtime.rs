@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use solana_sdk::signature::{Keypair, Signer};
 use std::{collections::BTreeSet, time::Instant};
 
+const SOLANA_TRANSACTION_PACKET_LIMIT: usize = 1232;
 const SHARED_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc";
 const DEFAULT_TRADE_EXECUTION_HARD_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(15);
@@ -233,6 +234,14 @@ fn adapter_builds_wrapped_gross_sol_route(
             selector.quote_asset,
             crate::trade_planner::PlannerQuoteAsset::Usdc
         ))
+        || matches!(
+            selector.family,
+            crate::trade_planner::TradeVenueFamily::PumpBondingCurve
+                | crate::trade_planner::TradeVenueFamily::PumpAmm
+        ) && matches!(
+            selector.quote_asset,
+            crate::trade_planner::PlannerQuoteAsset::Usdc
+        )
 }
 
 fn wrapper_inner_program_diagnostic_label(
@@ -277,6 +286,31 @@ fn validate_compiled_adapter_trade(transactions: &CompiledAdapterTrade) -> Resul
             transactions.primary_tx_index,
             transactions.transactions.len()
         ));
+    }
+    Ok(())
+}
+
+fn validate_final_transaction_packet_sizes(
+    transactions: &[CompiledTransaction],
+) -> Result<(), String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+    for transaction in transactions {
+        let raw_len = BASE64
+            .decode(transaction.serialized_base64.as_bytes())
+            .map_err(|error| {
+                format!(
+                    "Final transaction {} has invalid base64 payload: {error}",
+                    transaction.label
+                )
+            })?
+            .len();
+        if raw_len > SOLANA_TRANSACTION_PACKET_LIMIT {
+            return Err(format!(
+                "Final transaction {} exceeded Solana packet limit: raw {} > {} bytes",
+                transaction.label, raw_len, SOLANA_TRANSACTION_PACKET_LIMIT
+            ));
+        }
     }
     Ok(())
 }
@@ -381,6 +415,7 @@ async fn compile_wallet_trade_with_route_mode(
             dispatch_plan.adapter.label(),
             &transactions.transactions,
         )?;
+        validate_final_transaction_packet_sizes(&transactions.transactions)?;
         return Ok(CompiledTradePlan {
             adapter: dispatch_plan.adapter.label(),
             execution_backend: "native",
@@ -436,7 +471,7 @@ async fn compile_wallet_trade_with_route_mode(
         &dispatch_plan.selector,
         &normalized_request,
         wallet_pubkey,
-    ));
+    )?);
     let adapter_request = request_with_net_wrapper_buy_input(
         &dispatch_plan.selector,
         &normalized_request,
@@ -518,6 +553,7 @@ async fn compile_wallet_trade_with_route_mode(
             "wrapper_compile",
             wrapper_started_at.elapsed().as_millis(),
         );
+        validate_final_transaction_packet_sizes(&final_transactions)?;
         Ok::<
             (
                 CompiledAdapterTrade,
@@ -755,7 +791,21 @@ fn allow_already_wrapped_passthrough(
             | ("meteora-usdc-sell", WrapperRouteClassification::SolOut)
             | ("meteora-usdc-damm-sell", WrapperRouteClassification::SolOut)
     );
-    bonk_dynamic || meteora_usdc_dynamic
+    let pump_usdc_dynamic = matches!(
+        selector.family,
+        crate::trade_planner::TradeVenueFamily::PumpBondingCurve
+            | crate::trade_planner::TradeVenueFamily::PumpAmm
+    ) && matches!(
+        selector.quote_asset,
+        crate::trade_planner::PlannerQuoteAsset::Usdc
+    ) && matches!(
+        (source_label, wrapper_route),
+        ("pump-usdc-bonding-buy", WrapperRouteClassification::SolIn)
+            | ("pump-usdc-amm-buy", WrapperRouteClassification::SolIn)
+            | ("pump-usdc-bonding-sell", WrapperRouteClassification::SolOut)
+            | ("pump-usdc-amm-sell", WrapperRouteClassification::SolOut)
+    );
+    bonk_dynamic || meteora_usdc_dynamic || pump_usdc_dynamic
 }
 
 pub fn trade_request_touches_sol(
@@ -1057,7 +1107,9 @@ fn stale_route_error_class(error: &str) -> Option<&'static str> {
         Some("migration_family_unresolved")
     } else if normalized.contains("canonical_damm_pool_not_found") {
         Some("canonical_damm_pool_not_found")
-    } else if normalized.contains("no Pump AMM WSOL pool was found") {
+    } else if normalized.contains("no Pump AMM WSOL pool was found")
+        || normalized.contains("No supported Pump AMM pool was found")
+    {
         Some("pump_amm_missing_after_completion")
     } else {
         None
@@ -1789,6 +1841,19 @@ mod tests {
     }
 
     #[test]
+    fn final_packet_guard_rejects_oversized_payloads() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+        let mut transaction = sample_transaction(&[SHARED_SUPER_LOOKUP_TABLE]);
+        transaction.serialized_base64 =
+            BASE64.encode(vec![0u8; SOLANA_TRANSACTION_PACKET_LIMIT + 1]);
+
+        let error = validate_final_transaction_packet_sizes(&[transaction])
+            .expect_err("oversized final packet should fail");
+        assert!(error.contains("exceeded Solana packet limit"));
+    }
+
+    #[test]
     fn normalize_request_for_dispatch_plan_rewrites_pair_inputs() {
         let request = sample_runtime_request();
         let dispatch_plan = TradeDispatchPlan {
@@ -1946,6 +2011,35 @@ mod tests {
 
         let mut pump = bonk.clone();
         pump.family = TradeVenueFamily::PumpBondingCurve;
+        pump.quote_asset = PlannerQuoteAsset::Usdc;
+        assert!(allow_already_wrapped_passthrough(
+            &pump,
+            "pump-usdc-bonding-buy",
+            WrapperRouteClassification::SolIn
+        ));
+        assert!(allow_already_wrapped_passthrough(
+            &pump,
+            "pump-usdc-bonding-sell",
+            WrapperRouteClassification::SolOut
+        ));
+        pump.quote_asset = PlannerQuoteAsset::Sol;
+        assert!(!allow_already_wrapped_passthrough(
+            &pump,
+            "pump-usdc-bonding-sell",
+            WrapperRouteClassification::SolOut
+        ));
+        pump.quote_asset = PlannerQuoteAsset::Usdc;
+        pump.family = TradeVenueFamily::PumpAmm;
+        assert!(allow_already_wrapped_passthrough(
+            &pump,
+            "pump-usdc-amm-buy",
+            WrapperRouteClassification::SolIn
+        ));
+        assert!(allow_already_wrapped_passthrough(
+            &pump,
+            "pump-usdc-amm-sell",
+            WrapperRouteClassification::SolOut
+        ));
         assert!(!allow_already_wrapped_passthrough(
             &pump,
             "follow-buy-atomic",

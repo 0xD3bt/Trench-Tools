@@ -3308,11 +3308,32 @@ function getLaunchpadTokenMetadata(launchpad = getLaunchpad()) {
   };
 }
 
+function utf8ByteLength(value) {
+  return new TextEncoder().encode(String(value || "")).length;
+}
+
+function clipUtf8Bytes(value, maxBytes) {
+  const normalized = String(value || "");
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0 || utf8ByteLength(normalized) <= maxBytes) {
+    return normalized;
+  }
+  let clipped = "";
+  let usedBytes = 0;
+  const encoder = new TextEncoder();
+  for (const char of normalized) {
+    const charBytes = encoder.encode(char).length;
+    if (usedBytes + charBytes > maxBytes) break;
+    clipped += char;
+    usedBytes += charBytes;
+  }
+  return clipped;
+}
+
 function formatTickerValue(value) {
   const { symbolMaxLength } = getLaunchpadTokenMetadata();
   const normalized = String(value || "").replace(/\s+/g, " ").trimStart();
-  const clipped = normalized.slice(0, symbolMaxLength);
-  return isTickerCapsEnabled() ? clipped.toUpperCase() : clipped;
+  const formatted = isTickerCapsEnabled() ? normalized.toUpperCase() : normalized;
+  return clipUtf8Bytes(formatted, symbolMaxLength);
 }
 
 function getAutoTickerValue() {
@@ -3323,8 +3344,9 @@ function updateTokenFieldCounts() {
   const { nameMaxLength, symbolMaxLength } = getLaunchpadTokenMetadata();
   if (nameInput) {
     nameInput.maxLength = nameMaxLength;
-    if (nameInput.value.length > nameMaxLength) {
-      nameInput.value = nameInput.value.slice(0, nameMaxLength);
+    const clippedName = clipUtf8Bytes(nameInput.value, nameMaxLength);
+    if (nameInput.value !== clippedName) {
+      nameInput.value = clippedName;
     }
   }
   if (symbolInput) {
@@ -3337,10 +3359,10 @@ function updateTokenFieldCounts() {
     }
   }
   if (nameCharCount && nameInput) {
-    nameCharCount.textContent = `${nameInput.value.length}/${nameMaxLength}`;
+    nameCharCount.textContent = `${utf8ByteLength(nameInput.value)}/${nameMaxLength}`;
   }
   if (symbolCharCount && symbolInput) {
-    symbolCharCount.textContent = `${symbolInput.value.length}/${symbolMaxLength}`;
+    symbolCharCount.textContent = `${utf8ByteLength(symbolInput.value)}/${symbolMaxLength}`;
   }
 }
 
@@ -4028,6 +4050,7 @@ async function importVampToken(contractAddressOverride = "") {
       throw new Error(payload.error || "Failed to import token metadata.");
     }
 
+    applyImportedLaunchContext(payload.token || {});
     if (nameInput) nameInput.value = payload.token && payload.token.name ? payload.token.name : "";
     if (symbolInput) {
       syncingTickerFromName = true;
@@ -4044,7 +4067,6 @@ async function importVampToken(contractAddressOverride = "") {
     if (websiteInput) websiteInput.value = payload.token && payload.token.website ? payload.token.website : "";
     if (twitterInput) twitterInput.value = payload.token && payload.token.twitter ? payload.token.twitter : "";
     if (telegramInput) telegramInput.value = payload.token && payload.token.telegram ? payload.token.telegram : "";
-    applyImportedLaunchContext(payload.token || {});
     clearMetadataUploadCache({ clearInput: true });
     updateTokenFieldCounts();
 

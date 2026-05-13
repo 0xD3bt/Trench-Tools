@@ -27,6 +27,14 @@ pub const PUMP_APR28_FEE_RECIPIENTS: [&str; 8] = [
 pub const SELECTED_PUMP_APR28_FEE_RECIPIENT: &str = PUMP_APR28_FEE_RECIPIENTS[0];
 pub const SELECTED_PUMP_APR28_WSOL_FEE_RECIPIENT_ATA: &str =
     "HjQjngTDqoHE6aaGhUqfz9aQ7WZcBRjy5xB8PScLSr8i";
+pub const SELECTED_PUMP_APR28_USDC_FEE_RECIPIENT_ATA: &str =
+    "6oCkp6gpyjxVTeL6ahMYcekN2x2pzt1KY8g2LqemaTNE";
+pub const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+pub const PUMP_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+pub const PUMP_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+pub const PUMP_GLOBAL: &str = "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf";
+pub const PUMP_GLOBAL_VOLUME_ACCUMULATOR: &str = "Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y";
+pub const PUMP_FEE_CONFIG: &str = "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt";
 pub const WRAPPER_FEE_VAULT_WSOL_ATA: &str = "2HLoA8PQuxqUfNDVa6kCL8CZ1FkDMcqZZSE3HDEpKqSZ";
 pub const ORCA_WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
@@ -144,6 +152,50 @@ pub fn pump_apr28_fee_recipient_manifest_entries() -> Vec<AltManifestEntry> {
         "pump-apr28-wsol-fee-recipient-ata",
         "Execution-engine Pump AMM WSOL quote routes emit the selected April 28 fee-recipient ATA",
     ));
+    entries.push(AltManifestEntry::required(
+        SELECTED_PUMP_APR28_USDC_FEE_RECIPIENT_ATA,
+        "pump-upgrade",
+        "pump-apr28-usdc-fee-recipient-ata",
+        "Pump v2/USDC routes emit the selected April 28 USDC fee-recipient ATA",
+    ));
+    entries.extend([
+        AltManifestEntry::required(
+            PUMP_PROGRAM_ID,
+            "pump-upgrade",
+            "pump-program",
+            "Pump bonding v2 routes invoke the Pump program",
+        ),
+        AltManifestEntry::required(
+            PUMP_AMM_PROGRAM_ID,
+            "pump-upgrade",
+            "pump-amm-program",
+            "Migrated Pump AMM routes invoke the Pump AMM program",
+        ),
+        AltManifestEntry::required(
+            PUMP_FEE_PROGRAM_ID,
+            "pump-upgrade",
+            "pump-fee-program",
+            "Pump v2 and AMM routes pass the Pump fee program",
+        ),
+        AltManifestEntry::required(
+            PUMP_GLOBAL,
+            "pump-upgrade",
+            "pump-global",
+            "Pump bonding v2 routes pass the global account",
+        ),
+        AltManifestEntry::required(
+            PUMP_GLOBAL_VOLUME_ACCUMULATOR,
+            "pump-upgrade",
+            "pump-global-volume-accumulator",
+            "Pump bonding v2 buy routes pass the global volume accumulator",
+        ),
+        AltManifestEntry::required(
+            PUMP_FEE_CONFIG,
+            "pump-upgrade",
+            "pump-fee-config",
+            "Pump bonding v2 routes pass the Pump fee config PDA",
+        ),
+    ]);
     entries
 }
 
@@ -677,6 +729,17 @@ mod tests {
         let entries = shared_alt_manifest_entries();
         for recipient in PUMP_APR28_FEE_RECIPIENTS {
             assert!(entries.iter().any(|entry| entry.address == recipient));
+        }
+        for address in [
+            SELECTED_PUMP_APR28_USDC_FEE_RECIPIENT_ATA,
+            PUMP_PROGRAM_ID,
+            PUMP_AMM_PROGRAM_ID,
+            PUMP_FEE_PROGRAM_ID,
+            PUMP_GLOBAL,
+            PUMP_GLOBAL_VOLUME_ACCUMULATOR,
+            PUMP_FEE_CONFIG,
+        ] {
+            assert!(entries.iter().any(|entry| entry.address == address));
         }
     }
 

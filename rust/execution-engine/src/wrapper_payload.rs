@@ -64,10 +64,14 @@ pub fn classify_trade_route(
         selector.quote_asset,
         PlannerQuoteAsset::Sol | PlannerQuoteAsset::Wsol
     );
+    let pump_composed_usdc_route = matches!(
+        selector.family,
+        TradeVenueFamily::PumpBondingCurve | TradeVenueFamily::PumpAmm
+    ) && matches!(selector.quote_asset, PlannerQuoteAsset::Usdc);
     let trusted_stable = selector.family == TradeVenueFamily::TrustedStableSwap;
     match request.side {
         TradeSide::Buy => {
-            if quote_touches_sol {
+            if quote_touches_sol || pump_composed_usdc_route {
                 WrapperRouteClassification::SolIn
             } else if !trusted_stable
                 && matches!(
@@ -83,7 +87,7 @@ pub fn classify_trade_route(
             }
         }
         TradeSide::Sell => {
-            if quote_touches_sol {
+            if quote_touches_sol || pump_composed_usdc_route {
                 WrapperRouteClassification::SolOut
             } else if !trusted_stable
                 && matches!(
@@ -208,7 +212,7 @@ pub fn build_wrapper_instruction_payload(
     selector: &LifecycleAndCanonicalMarket,
     request: &TradeRuntimeRequest,
     _wallet_pubkey: String,
-) -> WrapperInstructionPayload {
+) -> Result<WrapperInstructionPayload, String> {
     let route_classification = classify_trade_route(selector, request);
     let fee_bps = clamp_fee_bps(wrapper_default_fee_bps());
     let gross_sol_in_lamports = match route_classification {
@@ -247,12 +251,12 @@ pub fn build_wrapper_instruction_payload(
         min_net_output,
     };
     let fee_lamports_estimate = floor_fee_lamports(gross_sol_in_lamports, fee_bps);
-    WrapperInstructionPayload {
+    Ok(WrapperInstructionPayload {
         route_classification,
         route_metadata,
         fee_lamports_estimate,
         gross_sol_in_lamports,
-    }
+    })
 }
 
 fn sell_output_target_lamports(request: &TradeRuntimeRequest) -> u64 {
@@ -406,6 +410,21 @@ mod tests {
     }
 
     #[test]
+    fn pump_usdc_buy_routes_are_composed_sol_in_even_with_usdc_funding_policy() {
+        for family in [
+            TradeVenueFamily::PumpBondingCurve,
+            TradeVenueFamily::PumpAmm,
+        ] {
+            let selector = selector(PlannerQuoteAsset::Usdc, family);
+            let request = buy_request(BuyFundingPolicy::Usd1Only);
+            assert_eq!(
+                classify_trade_route(&selector, &request),
+                WrapperRouteClassification::SolIn
+            );
+        }
+    }
+
+    #[test]
     fn sell_settling_to_sol_classifies_as_sol_out() {
         let selector = selector(PlannerQuoteAsset::Usd1, TradeVenueFamily::BonkLaunchpad);
         let request = sell_request(SellSettlementPolicy::AlwaysToSol);
@@ -436,12 +455,28 @@ mod tests {
     }
 
     #[test]
+    fn pump_usdc_sell_routes_are_composed_sol_out_even_with_token_settlement_policy() {
+        for family in [
+            TradeVenueFamily::PumpBondingCurve,
+            TradeVenueFamily::PumpAmm,
+        ] {
+            let selector = selector(PlannerQuoteAsset::Usdc, family);
+            let request = sell_request(SellSettlementPolicy::AlwaysToUsd1);
+            assert_eq!(
+                classify_trade_route(&selector, &request),
+                WrapperRouteClassification::SolOut
+            );
+        }
+    }
+
+    #[test]
     fn build_payload_uses_neutral_v3_route_metadata() {
         let payload = build_wrapper_instruction_payload(
             &selector(PlannerQuoteAsset::Sol, TradeVenueFamily::PumpBondingCurve),
             &buy_request(BuyFundingPolicy::SolOnly),
             "wallet".to_string(),
-        );
+        )
+        .expect("payload");
 
         assert_eq!(payload.route_metadata.version, ABI_VERSION);
         assert_eq!(
@@ -463,11 +498,13 @@ mod tests {
     fn sell_output_sol_sets_hard_net_output_floor() {
         let mut request = sell_request(SellSettlementPolicy::AlwaysToSol);
         request.sell_intent = Some(RuntimeSellIntent::SolOutput("1.25".to_string()));
+        request.policy.slippage_percent = "5".to_string();
         let payload = build_wrapper_instruction_payload(
             &selector(PlannerQuoteAsset::Sol, TradeVenueFamily::PumpBondingCurve),
             &request,
             "wallet".to_string(),
-        );
+        )
+        .expect("payload");
         assert_eq!(payload.route_metadata.min_net_output, 1_250_000_000);
     }
 
@@ -477,7 +514,8 @@ mod tests {
             &selector(PlannerQuoteAsset::Sol, TradeVenueFamily::PumpBondingCurve),
             &sell_request(SellSettlementPolicy::AlwaysToSol),
             "wallet".to_string(),
-        );
+        )
+        .expect("payload");
         assert_eq!(payload.route_metadata.min_net_output, 0);
     }
 
@@ -508,7 +546,8 @@ mod tests {
             &selector(PlannerQuoteAsset::Sol, TradeVenueFamily::PumpBondingCurve),
             &buy_request(BuyFundingPolicy::SolOnly),
             "wallet".to_string(),
-        );
+        )
+        .expect("payload");
         assert!(payload.route_metadata.fee_bps <= MAX_FEE_BPS);
         match prev {
             Some(value) => unsafe {
