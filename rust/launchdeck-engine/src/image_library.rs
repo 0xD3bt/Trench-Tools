@@ -335,6 +335,48 @@ pub fn save_image_bytes(
     Ok(serialize_image_record(&record))
 }
 
+pub fn replace_image_file_bytes(
+    id: &str,
+    bytes: &[u8],
+    extension: &str,
+    original_name: &str,
+) -> Result<(ImageLibraryPayload, SerializedImageRecord), String> {
+    ensure_local_dirs()?;
+    let mut library = read_image_library()?;
+    let record = library
+        .images
+        .iter_mut()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| "Image not found.".to_string())?;
+    let previous_file_name = record.fileName.clone();
+    let safe_base_name = sanitize_base_name(
+        Path::new(original_name)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image"),
+        "image",
+    );
+    let file_name = format!(
+        "{}-{}{}",
+        chrono_like_timestamp(),
+        safe_base_name,
+        extension
+    );
+    let file_path = paths::uploads_dir().join(&file_name);
+    fs::write(&file_path, bytes).map_err(|error| error.to_string())?;
+    record.fileName = file_name.clone();
+    record.updatedAt = now_ms();
+    let serialized = serialize_image_record(record);
+    if let Err(error) = write_image_library(&library) {
+        let _ = fs::remove_file(&file_path);
+        return Err(error);
+    }
+    if !previous_file_name.is_empty() && previous_file_name != file_name {
+        let _ = fs::remove_file(paths::uploads_dir().join(&previous_file_name));
+    }
+    Ok((build_image_library_payload("", "", false)?, serialized))
+}
+
 fn chrono_like_timestamp() -> String {
     let now = now_ms();
     now.to_string()

@@ -48,7 +48,7 @@ For most users:
 
 1. Read [docs/QUICKSTART.md](docs/QUICKSTART.md) for local Windows/Linux setup.
 2. If you are using a fresh server, use [docs/VPS_SETUP.md](docs/VPS_SETUP.md) instead.
-3. Install the browser extension with [docs/EXTENSION.md](docs/EXTENSION.md). Get `extension/trench-tools` by pulling the repo with git, or download the full repository to your PC and load that extension folder.
+3. Install the browser extension with [docs/EXTENSION.md](docs/EXTENSION.md). Download the latest packaged extension zip to the PC running Chrome/Edge, or pull `extension/trench-tools` / the full repo with git and load that folder.
 4. Keep [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) nearby for connection/auth issues.
 
 VPS is still the recommended real trading setup because it is cheap, private by default, and closer to the latency profile you actually care about. With a fresh VPS, the bootstrap startup script, and a Helius Developer tier plan, most users can get the stack up from scratch in about 5 minutes. Local setup is fine when you are editing, testing, or learning the tool.
@@ -109,10 +109,10 @@ Personal note: I have used Vultr for 5+ years and have not had issues with it.
 The extension site list is moving fast. Current status:
 
 - Live: `axiom.trade`
-- Available, currently disabled: `j7tracker.io`
+- Live: `j7tracker.io`
 - Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, X, and more terminals
 
-Axiom currently has the richest integration: token-page controls, Pulse quick buy and manual panel controls, watchlist and wallet-tracker quick buys, floating panel, LaunchDeck popout, Vamp import helpers, and DexScreener shortcuts. See [docs/EXTENSION.md](docs/EXTENSION.md) for the current extension setup and site-status details.
+Axiom currently includes token-page controls, Pulse quick buy and manual panel controls, watchlist and wallet-tracker quick buys, floating panel, LaunchDeck popout, Vamp import helpers, and DexScreener shortcuts. J7 includes contract-address quick actions and tweet-card LaunchDeck Deploy/Vamp buttons. See [docs/EXTENSION.md](docs/EXTENSION.md) for the current extension setup and site-status details.
 
 ## Current Route Coverage
 

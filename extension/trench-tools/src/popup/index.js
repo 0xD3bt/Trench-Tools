@@ -37,6 +37,7 @@ const state = {
   },
   preferences: {}
 };
+let authTokenSaveInProgress = false;
 
 function normalizeQuickBuyAmountInput(value) {
   const trimmed = String(value || "").trim();
@@ -523,6 +524,7 @@ authTokenForm.addEventListener("submit", async (event) => {
   authTokenSubmit.disabled = true;
   authTokenSubmit.textContent = "Connecting...";
   setAuthStatus("", "info");
+  authTokenSaveInProgress = true;
   try {
     await chrome.storage.local.set({ [HOST_AUTH_TOKEN_STORAGE_KEY]: token });
     await callBackground("trench:refresh-host-connection");
@@ -530,6 +532,7 @@ authTokenForm.addEventListener("submit", async (event) => {
   } catch (error) {
     setAuthStatus(error?.message || "Could not save auth token.", "error");
   } finally {
+    authTokenSaveInProgress = false;
     authTokenSubmit.disabled = false;
     authTokenSubmit.textContent = "Connect";
   }
@@ -597,6 +600,7 @@ async function init() {
   }
 
   try {
+    await callBackground("trench:refresh-host-connection");
     const [health, bootstrap, stored] = await Promise.all([
       callBackground("trench:get-health"),
       callBackground("trench:get-bootstrap"),
@@ -648,6 +652,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     return;
   }
   if (changes[HOST_AUTH_TOKEN_STORAGE_KEY] || changes[BOOTSTRAP_REVISION_KEY]) {
+    if (authTokenSaveInProgress && changes[HOST_AUTH_TOKEN_STORAGE_KEY]) {
+      return;
+    }
     void init();
     return;
   }

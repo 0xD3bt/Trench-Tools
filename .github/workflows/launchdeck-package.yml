@@ -1,0 +1,37 @@
+name: LaunchDeck Package
+
+on:
+  push:
+    branches:
+      - master
+      - development
+  pull_request:
+    branches:
+      - master
+      - development
+
+jobs:
+  package-current:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Verify version sync
+        run: npm run check:version-sync
+
+      - name: Install extension dependencies
+        run: npm ci --workspace extension/trench-tools --ignore-scripts
+
+      - name: Verify LaunchDeck extension package
+        run: npm --workspace extension/trench-tools run check:launchdeck-package
+
+      - name: Verify extension manifest
+        run: npm --workspace extension/trench-tools run check

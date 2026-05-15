@@ -63,7 +63,14 @@ export function defaultSiteFeatures() {
       watchlist: true
     },
     j7: {
-      enabled: false
+      enabled: false,
+      contractQuickBuy: true,
+      contractQuickPanel: true,
+      contractVamp: true,
+      cardLaunchdeck: true,
+      hideNativeCardActions: false,
+      postDeployAction: "close_modal_toast",
+      postDeployDestination: "axiom"
     }
   };
 }
@@ -107,7 +114,20 @@ export function normalizeSiteFeatures(value) {
     j7: {
       ...defaults.j7,
       ...(value?.j7 || {}),
-      enabled: false
+      enabled: value?.j7?.enabled ?? defaults.j7.enabled,
+      contractQuickBuy: value?.j7?.contractQuickBuy ?? defaults.j7.contractQuickBuy,
+      contractQuickPanel: value?.j7?.contractQuickPanel ?? defaults.j7.contractQuickPanel,
+      contractVamp: value?.j7?.contractVamp ?? defaults.j7.contractVamp,
+      cardLaunchdeck: value?.j7?.cardLaunchdeck ?? defaults.j7.cardLaunchdeck,
+      hideNativeCardActions: value?.j7?.hideNativeCardActions ?? defaults.j7.hideNativeCardActions,
+      postDeployAction: normalizeAxiomPostDeployAction(
+        value?.j7?.postDeployAction,
+        defaults.j7.postDeployAction
+      ),
+      postDeployDestination: normalizeAxiomPostDeployDestination(
+        value?.j7?.postDeployDestination,
+        defaults.j7.postDeployDestination
+      )
     }
   };
 }

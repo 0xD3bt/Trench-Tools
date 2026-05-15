@@ -15,6 +15,7 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
   const CREATE_OVERLAY_DEFAULT_HEIGHT = createOverlayTokens.height || 717;
   const CREATE_OVERLAY_SIZE_EPSILON = createOverlayTokens.sizeEpsilon || 2;
   const CREATE_OVERLAY_BACKGROUND = createOverlayTokens.background || "linear-gradient(180deg, rgba(13, 13, 13, 0.99), rgba(9, 9, 9, 1))";
+  const J7_CONTEXT_STORAGE_PREFIX = "trenchTools.launchdeckJ7Context.";
   let overlayMessageListener = null;
 
   function applyCreateOverlaySize(iframe, width, height) {
@@ -120,7 +121,80 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
     });
   }
 
-  function buildShellUrl({ shell, mode, contractAddress = "", instaLaunch = false, vampImageKey = "" } = {}) {
+  const J7_CONTEXT_TTL_MS = 5 * 60 * 1000;
+
+  async function sweepStaleJ7Contexts(now) {
+    if (!chrome?.storage?.local?.get) return;
+    try {
+      const all = await chrome.storage.local.get(null);
+      const stale = Object.keys(all).filter((key) => {
+        if (!key.startsWith(J7_CONTEXT_STORAGE_PREFIX)) return false;
+        const createdAt = Number(all[key]?.createdAt);
+        return !Number.isFinite(createdAt) || (now - createdAt) > J7_CONTEXT_TTL_MS;
+      });
+      if (stale.length) await chrome.storage.local.remove(stale);
+    } catch (_error) {
+    }
+  }
+
+  async function persistJ7Context(j7Context) {
+    if (!j7Context || typeof j7Context !== "object" || !chrome?.storage?.local) {
+      return "";
+    }
+    const now = Date.now();
+    await sweepStaleJ7Contexts(now);
+    const key = `${J7_CONTEXT_STORAGE_PREFIX}${now}.${Math.random().toString(36).slice(2)}`;
+    try {
+      await chrome.storage.local.set({
+        [key]: {
+          ...j7Context,
+          createdAt: now
+        }
+      });
+      return key;
+    } catch (_error) {
+      const fallbackContext = stripInlineJ7ImageData(j7Context);
+      if (fallbackContext !== j7Context) {
+        try {
+          await chrome.storage.local.set({
+            [key]: {
+              ...fallbackContext,
+              createdAt: now
+            }
+          });
+          return key;
+        } catch (_fallbackError) {
+        }
+      }
+      return "";
+    }
+  }
+
+  function stripInlineJ7ImageData(j7Context) {
+    const images = Array.isArray(j7Context?.images) ? j7Context.images : null;
+    if (!images || !images.some((image) => image && typeof image === "object" && image.data)) {
+      return j7Context;
+    }
+    return {
+      ...j7Context,
+      images: images.map((image) => {
+        if (!image || typeof image !== "object") return image;
+        const { data: _data, ...rest } = image;
+        return rest;
+      })
+    };
+  }
+
+  function buildShellUrl({
+    shell,
+    mode,
+    contractAddress = "",
+    instaLaunch = false,
+    vampImageKey = "",
+    j7ContextKey = "",
+    action = "",
+    sourcePlatform = ""
+  } = {}) {
     const url = new URL(chrome.runtime.getURL("launchdeck/index.html"));
     url.searchParams.set("shell", shell || "overlay");
     url.searchParams.set("mode", mode || "webapp");
@@ -135,6 +209,15 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
     }
     if (instaLaunch) {
       url.searchParams.set("instaLaunch", "1");
+    }
+    if (j7ContextKey) {
+      url.searchParams.set("j7ContextKey", String(j7ContextKey).trim());
+    }
+    if (action) {
+      url.searchParams.set("action", String(action).trim());
+    }
+    if (sourcePlatform) {
+      url.searchParams.set("sourcePlatform", String(sourcePlatform).trim());
     }
     if (shell === "popout") {
       url.searchParams.set("popout", "1");
@@ -190,7 +273,16 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
     wrapper.style.display = isOpen ? displayMode : "none";
   }
 
-  function openOverlay({ mode = "create", contractAddress = "", instaLaunch = false, vampImageKey = "" } = {}) {
+  async function openOverlay({
+    mode = "create",
+    contractAddress = "",
+    instaLaunch = false,
+    vampImageKey = "",
+    j7Context = null,
+    action = "",
+    sourcePlatform = ""
+  } = {}) {
+    const j7ContextKey = await persistJ7Context(j7Context);
     const { wrapper, iframe } = ensureOverlayFrame();
     applyOverlayPresentation(wrapper, iframe, mode);
     const nextUrl = buildShellUrl({
@@ -199,6 +291,9 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
       contractAddress,
       instaLaunch,
       vampImageKey,
+      j7ContextKey,
+      action,
+      sourcePlatform,
     });
     const currentUrl = iframe.getAttribute("data-shell-url") || "";
     if (currentUrl !== nextUrl) {
@@ -213,7 +308,16 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
     }
   }
 
-  function openPopout({ mode = "webapp", contractAddress = "", instaLaunch = false, vampImageKey = "" } = {}) {
+  async function openPopout({
+    mode = "webapp",
+    contractAddress = "",
+    instaLaunch = false,
+    vampImageKey = "",
+    j7Context = null,
+    action = "",
+    sourcePlatform = ""
+  } = {}) {
+    const j7ContextKey = await persistJ7Context(j7Context);
     const popupSize = typeof Layout.getDefaultPopoutOuterSize === "function"
       ? Layout.getDefaultPopoutOuterSize(mode, window.screen)
       : { width: 552, height: 727 };
@@ -227,6 +331,9 @@ export function createLaunchdeckShellController({ onPostDeploySuccess = null } =
         contractAddress,
         instaLaunch,
         vampImageKey,
+        j7ContextKey,
+        action,
+        sourcePlatform,
       }),
       "launchdeck-popout",
       `popup=yes,width=${popupSize.width},height=${popupSize.height},left=${popupPosition.left},top=${popupPosition.top},resizable=yes,scrollbars=yes`,

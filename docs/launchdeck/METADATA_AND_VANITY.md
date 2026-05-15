@@ -32,6 +32,12 @@ The shared metadata JSON includes:
 
 Pump metadata also includes `showName: true`. Bonk metadata follows the Bonk upload shape.
 
+## Image Selection And Cropping
+
+The LaunchDeck image field opens the local image library and can crop the selected image before upload. Use `Crop` after selecting an image to snip a region or use pan mode for a square crop; saving the crop creates a new local image-library entry and uses that cropped file for the current launch.
+
+When LaunchDeck opens from J7 tweet context, it can show detected tweet image candidates near the image field. Select a candidate to use it for the current launch, crop it if needed, or save it into the local image library for reuse.
+
 ## Vanity Mint Queues
 
 LaunchDeck supports local file-backed vanity mint queues for:

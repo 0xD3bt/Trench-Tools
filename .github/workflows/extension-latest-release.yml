@@ -1,0 +1,99 @@
+name: Extension Latest Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extension-latest-release
+  cancel-in-progress: false
+
+jobs:
+  publish-extension-latest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify version sync
+        run: npm run check:version-sync
+
+      - name: Install extension dependencies
+        run: npm ci --workspace extension/trench-tools --ignore-scripts
+
+      - name: Verify LaunchDeck extension package
+        run: npm --workspace extension/trench-tools run check:launchdeck-package
+
+      - name: Verify extension manifest
+        run: npm --workspace extension/trench-tools run check
+
+      - name: Build extension zip
+        run: npm run extension:zip
+
+      - name: Read extension version
+        id: extension-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./extension/trench-tools/manifest.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish latest extension release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: extension-latest
+          ZIP_PATH: dist/trench-tools-extension.zip
+          EXTENSION_VERSION: ${{ steps.extension-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh --version
+          RELEASE_TITLE="Latest Trench Tools Extension v${EXTENSION_VERSION}"
+          NOTES="$(printf 'Auto-updated extension build from the latest master commit.\n\nVersion: %s\nCommit: %s\n' "$EXTENSION_VERSION" "$GITHUB_SHA")"
+          ASSET_NAME="trench-tools-extension-v${EXTENSION_VERSION}.zip"
+          STABLE_ASSET_NAME="trench-tools-extension.zip"
+          TEMP_TAG_NAME="${TAG_NAME}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          TEMP_TITLE="Preparing ${RELEASE_TITLE}"
+          if gh release view "$TEMP_TAG_NAME" >/dev/null 2>&1; then
+            gh release delete "$TEMP_TAG_NAME" --cleanup-tag -y
+          fi
+          gh release create "$TEMP_TAG_NAME" "$ZIP_PATH#$ASSET_NAME" "$ZIP_PATH#$STABLE_ASSET_NAME" \
+            --target "$GITHUB_SHA" \
+            --title "$TEMP_TITLE" \
+            --notes "$NOTES" \
+            --prerelease
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            EXISTING_ASSETS="$(gh release view "$TAG_NAME" --json assets --jq '.assets[].name')"
+            while IFS= read -r asset_name; do
+              if [[ "$asset_name" == trench-tools-extension-v*.zip && "$asset_name" != "$ASSET_NAME" ]]; then
+                gh release delete-asset "$TAG_NAME" "$asset_name" -y
+              fi
+            done <<< "$EXISTING_ASSETS"
+            gh release upload "$TAG_NAME" "$ZIP_PATH#$ASSET_NAME" "$ZIP_PATH#$STABLE_ASSET_NAME" --clobber
+            git tag -f "$TAG_NAME" "$GITHUB_SHA"
+            git push origin "refs/tags/${TAG_NAME}" --force
+            gh release edit "$TAG_NAME" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" \
+              --notes "$NOTES" \
+              --prerelease
+            gh release delete "$TEMP_TAG_NAME" --cleanup-tag -y
+            exit 0
+          fi
+          gh release create "$TAG_NAME" "$ZIP_PATH#$ASSET_NAME" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TITLE" \
+            --notes "$NOTES" \
+            --prerelease
+          gh release upload "$TAG_NAME" "$ZIP_PATH#$STABLE_ASSET_NAME" --clobber
+          gh release delete "$TEMP_TAG_NAME" --cleanup-tag -y

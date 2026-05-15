@@ -158,6 +158,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   let platformHelpers = null;
   let platformAdapter = null;
+  let platformInitialized = false;
+  let platformInitPromise = null;
   const lifecycle = {
     destroyed: false,
     panelMessageListener: null,
@@ -260,14 +262,14 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           return;
         }
         ensureLaunchdeckShell();
-        state.launchdeckShell.openOverlay(options);
+        await state.launchdeckShell.openOverlay({ sourcePlatform: platform, ...options });
       },
       async openLaunchdeckPopout(options = {}) {
         if (!(await ensureValidLaunchdeckPresetForExtension())) {
           return;
         }
         ensureLaunchdeckShell();
-        state.launchdeckShell.openPopout(options);
+        await state.launchdeckShell.openPopout({ sourcePlatform: platform, ...options });
       },
       showToast,
       getQuickBuyBaseStyles: () => getQuickBuyBaseStylesForPlatform(platform)
@@ -290,9 +292,29 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   async function initialize() {
     state.siteFeatures = await loadSiteFeatures();
-    if (!isPlatformEnabled()) {
+    attachStorageChangeListener();
+    await ensurePlatformInitialized("init");
+  }
+
+  async function ensurePlatformInitialized(reason = "manual") {
+    if (lifecycle.destroyed || !isPlatformEnabled()) {
       return;
     }
+    if (platformInitialized) {
+      scanAndMount();
+      scheduleRouteReconcile(reason, 0);
+      return;
+    }
+    if (platformInitPromise) {
+      return platformInitPromise;
+    }
+    platformInitPromise = initializeEnabledPlatform(reason).finally(() => {
+      platformInitPromise = null;
+    });
+    return platformInitPromise;
+  }
+
+  async function initializeEnabledPlatform(reason = "init") {
     state.preferences = await loadPreferences();
     state.appearance = await loadAppearance();
     state.panelPosition = await loadPanelPosition();
@@ -305,29 +327,27 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         primeTradeRuntime("heartbeat");
       }, TRADE_PRIME_HEARTBEAT_MS);
     }
-    attachStorageChangeListener();
     attachPanelMessageListener();
-    primeTradeRuntime("init", { force: true });
+    primeTradeRuntime(reason, { force: true });
     void callBackground("trench:get-runtime-diagnostics")
       .then(surfaceRuntimeDiagnostics)
       .catch(() => {});
     installNavigationHooks();
     mountPlatformObserver();
-    scheduleMountSweeps("init");
+    scheduleMountSweeps(reason);
     setTradeReadiness(true, platform);
-    // Clear this surface's active mint when the page is being unloaded
-    // so the host stops subscribing to the ATA for a tab the user has
-    // closed. `pagehide` is more reliable than `beforeunload` in MV3
-    // content scripts (fires on bfcache navigations too).
-    lifecycle.pagehideListener = () => {
-      setTradeReadiness(false, platform);
-      clearActiveMarkForSurface();
-      clearActiveMintForSurface();
-    };
-    window.addEventListener("pagehide", lifecycle.pagehideListener, { once: true });
-    await reconcileSurfaceState("init");
-    scheduleRouteReconcile("init-delayed-fast", 250);
-    scheduleRouteReconcile("init-delayed-slow", 1000);
+    if (!lifecycle.pagehideListener) {
+      lifecycle.pagehideListener = () => {
+        setTradeReadiness(false, platform);
+        clearActiveMarkForSurface();
+        clearActiveMintForSurface();
+      };
+      window.addEventListener("pagehide", lifecycle.pagehideListener, { once: true });
+    }
+    platformInitialized = true;
+    await reconcileSurfaceState(reason);
+    scheduleRouteReconcile(`${reason}-delayed-fast`, 250);
+    scheduleRouteReconcile(`${reason}-delayed-slow`, 1000);
   }
 
   function ensureLaunchdeckShell() {
@@ -406,11 +426,16 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
   }
 
-  function launchdeckPostDeployPreferences() {
-    const axiom = state.siteFeatures?.axiom || {};
+  function launchdeckSourcePlatform(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    return normalized === "j7" ? "j7" : "axiom";
+  }
+
+  function launchdeckPostDeployPreferences(sourcePlatform = "") {
+    const platformFeatures = state.siteFeatures?.[launchdeckSourcePlatform(sourcePlatform)] || state.siteFeatures?.axiom || {};
     return {
-      action: normalizeAxiomPostDeployAction(axiom.postDeployAction, "close_modal_toast"),
-      destination: normalizePostDeployDestination(axiom.postDeployDestination, "axiom")
+      action: normalizeAxiomPostDeployAction(platformFeatures.postDeployAction, "close_modal_toast"),
+      destination: normalizePostDeployDestination(platformFeatures.postDeployDestination, "axiom")
     };
   }
 
@@ -443,7 +468,12 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   function handleLaunchdeckPostDeploySuccess(payload, shellActions = {}) {
     const report = payload?.report && typeof payload.report === "object" ? payload.report : null;
-    const preferences = launchdeckPostDeployPreferences();
+    const fallbackPreferences = launchdeckPostDeployPreferences(payload?.sourcePlatform);
+    const preferences = {
+      ...fallbackPreferences,
+      action: normalizeAxiomPostDeployAction(payload?.action, fallbackPreferences.action),
+      destination: normalizePostDeployDestination(payload?.destination, fallbackPreferences.destination)
+    };
     const url = normalizePostDeployUrl(payload?.url) || buildLaunchdeckPostDeployUrl(preferences.destination, report);
     const title = launchdeckPostDeployTitle(payload, report);
     renderToast({
@@ -700,7 +730,14 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         watchlist: true
       },
       j7: {
-        enabled: false
+        enabled: false,
+        contractQuickBuy: true,
+        contractQuickPanel: true,
+        contractVamp: true,
+        cardLaunchdeck: true,
+        hideNativeCardActions: false,
+        postDeployAction: "close_modal_toast",
+        postDeployDestination: "axiom"
       }
     };
   }
@@ -1481,6 +1518,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     });
     state.navigationHooksInstalled = false;
 
+    runBestEffortTeardownStep("platform-adapter", () => {
+      platformAdapter?.teardown?.();
+    });
+
     runBestEffortTeardownStep("timers-and-observers", () => {
       if (state.hostRevisionTimer) {
         window.clearInterval(state.hostRevisionTimer);
@@ -1843,7 +1884,20 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       j7: {
         ...defaults.j7,
         ...(value.j7 || {}),
-        enabled: false
+        enabled: value.j7?.enabled ?? defaults.j7.enabled,
+        contractQuickBuy: value.j7?.contractQuickBuy ?? defaults.j7.contractQuickBuy,
+        contractQuickPanel: value.j7?.contractQuickPanel ?? defaults.j7.contractQuickPanel,
+        contractVamp: value.j7?.contractVamp ?? defaults.j7.contractVamp,
+        cardLaunchdeck: value.j7?.cardLaunchdeck ?? defaults.j7.cardLaunchdeck,
+        hideNativeCardActions: value.j7?.hideNativeCardActions ?? defaults.j7.hideNativeCardActions,
+        postDeployAction: normalizeAxiomPostDeployAction(
+          value.j7?.postDeployAction,
+          defaults.j7.postDeployAction
+        ),
+        postDeployDestination: normalizeAxiomPostDeployDestination(
+          value.j7?.postDeployDestination,
+          defaults.j7.postDeployDestination
+        )
       }
     };
   }
@@ -3872,6 +3926,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       }
       if (changes[SITE_FEATURES_KEY]) {
         state.siteFeatures = normalizeSiteFeaturesValue(changes[SITE_FEATURES_KEY].newValue || {});
+        void ensurePlatformInitialized("site-features");
         dismissOpenSurfacesIfPlatformDisabled();
         ensureFloatingLauncher(state.tokenContext);
         scanAndMount();
@@ -4357,6 +4412,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       batchId: result.batchId,
       side: result.side || fallbackSide,
       status: result.status || "submitted",
+      platform: normalizeRouteValue(tokenContext?.platform || state.platform) || undefined,
       summary: {
         totalWallets: walletCount,
         queuedWallets,
@@ -4415,6 +4471,60 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     state.batchStatus = remembered;
   }
 
+  function normalizeEventPlatform(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (normalized === "axiom" || normalized === "axiom.trade") return "axiom";
+    if (normalized === "j7" || normalized === "j7tracker" || normalized === "j7tracker.io") return "j7";
+    return "";
+  }
+
+  function batchStatusPlatform(batchStatus) {
+    if (!batchStatus || typeof batchStatus !== "object") {
+      return "";
+    }
+    const candidates = [
+      batchStatus.platform,
+      batchStatus.sourcePlatform,
+      batchStatus.requestPlatform,
+      batchStatus.request?.platform,
+      batchStatus.route?.platform,
+      batchStatus.tokenContext?.platform,
+      batchStatus.plannedExecution?.platform,
+      batchStatus.plannedExecution?.request?.platform,
+      batchStatus.plannedExecution?.selector?.platform
+    ];
+    for (const candidate of candidates) {
+      const normalized = normalizeEventPlatform(candidate);
+      if (normalized) return normalized;
+    }
+    return "";
+  }
+
+  function tradeEventPlatform(event) {
+    if (!event || typeof event !== "object") {
+      return "";
+    }
+    const candidates = [
+      event.platform,
+      event.sourcePlatform,
+      event.requestPlatform,
+      event.surface,
+      event.request?.platform,
+      event.batchStatus?.platform
+    ];
+    for (const candidate of candidates) {
+      const normalized = normalizeEventPlatform(candidate);
+      if (normalized) return normalized;
+    }
+    return "";
+  }
+
+  function shouldAcceptRemoteExecutionEvent(event) {
+    const eventPlatform = batchStatusPlatform(event) || tradeEventPlatform(event);
+    if (!eventPlatform) return true;
+    return eventPlatform === normalizeEventPlatform(platform);
+  }
+
   function updatePanelBatchStatus(batchStatus) {
     if (!batchStatus?.batchId) {
       return;
@@ -4458,6 +4568,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
     if (revision > 0) {
       state.batchStatusStreamRevisions.set(batchId, revision);
+    }
+    if (!shouldAcceptRemoteExecutionEvent(event)) {
+      return;
     }
     const localPending = localExecutionPendingForBatch(batchId, clientRequestId);
     if (localPending && !localPending.batchId) {
@@ -4590,6 +4703,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const batchId = String(event?.batchId || "").trim();
     const status = String(event?.status || "").trim().toLowerCase();
     if (!batchId || !["confirmed", "failed"].includes(status)) {
+      return;
+    }
+    if (!shouldAcceptRemoteExecutionEvent(event)) {
       return;
     }
 
@@ -4882,6 +4998,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         - Number(batchStatus?.summary?.confirmedWallets || 0)
         - Number(batchStatus?.summary?.failedWallets || 0)
     );
+    if (!shouldAcceptRemoteExecutionEvent(batchStatus)) {
+      return;
+    }
     const batchId = String(batchStatus?.batchId || fallback?.id || "").trim();
     const localPending = localExecutionPendingForBatch(
       batchId,

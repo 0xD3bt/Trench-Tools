@@ -85,6 +85,17 @@ fn object_value(value: Option<&Value>) -> Value {
     }
 }
 
+fn raw_string_value(value: Option<&Value>) -> String {
+    value.and_then(Value::as_str).unwrap_or_default().to_string()
+}
+
+fn raw_string_value_or_fallback(value: Option<&Value>, fallback: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.to_string(),
+        _ => raw_string_value(fallback),
+    }
+}
+
 fn normalize_provider(provider: &str, fallback: &str) -> String {
     let normalized = provider.trim().to_lowercase();
     if normalized.is_empty() {
@@ -312,6 +323,83 @@ fn normalize_quick_dev_buy_amounts(raw: Option<&Value>, preset_items: &[Value]) 
         .collect()
 }
 
+fn default_name_preset_buttons() -> Vec<Value> {
+    vec![
+        json!({
+            "id": "ification",
+            "name": "ify, ification",
+            "namePrefix": "",
+            "nameSuffix": "ification",
+            "tickerPrefix": "",
+            "tickerSuffix": "ify",
+            "tickerUseFirstWord": true,
+            "tickerAbbreviate": false,
+        }),
+        json!({
+            "id": "otus",
+            "name": "_OTUS",
+            "namePrefix": "",
+            "nameSuffix": " Of The United States",
+            "tickerPrefix": "",
+            "tickerSuffix": "OTUS",
+            "tickerUseFirstWord": false,
+            "tickerAbbreviate": true,
+        }),
+        json!({
+            "id": "justice-for",
+            "name": "Justice For",
+            "namePrefix": "Justice For ",
+            "nameSuffix": "",
+            "tickerPrefix": "",
+            "tickerSuffix": "",
+            "tickerUseFirstWord": true,
+            "tickerAbbreviate": false,
+        }),
+    ]
+}
+
+fn normalize_name_preset_button(raw: Option<&Value>, fallback: Option<&Value>, index: usize) -> Value {
+    let raw = raw.unwrap_or(&Value::Null);
+    let fallback = fallback.unwrap_or(&Value::Null);
+    let ticker_abbreviate = bool_value(
+        raw.get("tickerAbbreviate"),
+        bool_value(fallback.get("tickerAbbreviate"), false),
+    );
+    json!({
+        "id": string_value(raw.get("id"))
+            .if_empty_then(string_value(fallback.get("id")))
+            .if_empty_then(format!("name-preset-{}", index + 1)),
+        "name": string_value(raw.get("name"))
+            .if_empty_then(string_value(fallback.get("name")))
+            .if_empty_then(format!("Preset {}", index + 1)),
+        "namePrefix": raw_string_value_or_fallback(raw.get("namePrefix"), fallback.get("namePrefix")),
+        "nameSuffix": raw_string_value_or_fallback(raw.get("nameSuffix"), fallback.get("nameSuffix")),
+        "tickerPrefix": raw_string_value_or_fallback(raw.get("tickerPrefix"), fallback.get("tickerPrefix")),
+        "tickerSuffix": raw_string_value_or_fallback(raw.get("tickerSuffix"), fallback.get("tickerSuffix")),
+        "tickerUseFirstWord": if ticker_abbreviate {
+            false
+        } else {
+            bool_value(
+                raw.get("tickerUseFirstWord"),
+                bool_value(fallback.get("tickerUseFirstWord"), false),
+            )
+        },
+        "tickerAbbreviate": ticker_abbreviate,
+    })
+}
+
+fn normalize_name_preset_buttons(raw: Option<&Value>) -> Vec<Value> {
+    let fallbacks = default_name_preset_buttons();
+    let Some(raw_items) = raw.and_then(Value::as_array) else {
+        return fallbacks;
+    };
+    raw_items
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| normalize_name_preset_button(Some(entry), fallbacks.get(index), index))
+        .collect()
+}
+
 fn preset_template(index: usize) -> Value {
     let mut buy = trade_settings("", "", "", "", "", false, "", "off");
     if let Some(object) = buy.as_object_mut() {
@@ -338,6 +426,7 @@ pub fn create_default_persistent_config() -> Value {
             "activePresetId": "",
             "presetEditing": false,
             "quickDevBuyAmounts": default_quick_dev_buy_amounts(),
+            "namePresetButtons": default_name_preset_buttons(),
             "misc": {
                 "trackSendBlockHeight": configured_track_send_block_height_default(),
                 "defaultBuyFundingPolicy": "sol_only",
@@ -699,6 +788,7 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
                 defaults.get("quickDevBuyAmounts"),
                 &items
             ),
+            "namePresetButtons": normalize_name_preset_buttons(defaults.get("namePresetButtons")),
             "misc": {
                 "trackSendBlockHeight": configured_track_send_block_height_default()
             },
@@ -839,6 +929,7 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
             "activePresetId": active_preset_id,
             "presetEditing": bool_value(merged_defaults.get("presetEditing"), false),
             "quickDevBuyAmounts": quick_dev_buy_amounts,
+            "namePresetButtons": normalize_name_preset_buttons(merged_defaults.get("namePresetButtons")),
             "misc": {
                 "sniperDraft": merged_defaults
                     .get("misc")
@@ -1116,6 +1207,59 @@ mod tests {
             normalized["defaults"]["quickDevBuyAmounts"],
             json!(["0.1", "1", "3"])
         );
+    }
+
+    #[test]
+    fn normalize_persistent_config_preserves_name_preset_buttons() {
+        let normalized = normalize_persistent_config(json!({
+            "defaults": {
+                "launchpad": "pump",
+                "mode": "regular",
+                "namePresetButtons": [{
+                    "id": "custom-test",
+                    "name": "Custom Test",
+                    "namePrefix": "Justice For ",
+                    "nameSuffix": "",
+                    "tickerPrefix": "",
+                    "tickerSuffix": "CT",
+                    "tickerUseFirstWord": true,
+                    "tickerAbbreviate": false
+                }]
+            },
+            "presets": {
+                "items": []
+            }
+        }));
+
+        assert_eq!(
+            normalized["defaults"]["namePresetButtons"][0],
+            json!({
+                "id": "custom-test",
+                "name": "Custom Test",
+                "namePrefix": "Justice For ",
+                "nameSuffix": "",
+                "tickerPrefix": "",
+                "tickerSuffix": "CT",
+                "tickerUseFirstWord": true,
+                "tickerAbbreviate": false
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_persistent_config_preserves_empty_name_preset_buttons() {
+        let normalized = normalize_persistent_config(json!({
+            "defaults": {
+                "launchpad": "pump",
+                "mode": "regular",
+                "namePresetButtons": []
+            },
+            "presets": {
+                "items": []
+            }
+        }));
+
+        assert_eq!(normalized["defaults"]["namePresetButtons"], json!([]));
     }
 
     #[test]

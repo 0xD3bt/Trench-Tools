@@ -63,7 +63,8 @@ use crate::{
     },
     fs_utils::atomic_write,
     image_library::{
-        build_image_library_payload, create_category, delete_image, save_image_bytes, update_image,
+        build_image_library_payload, create_category, delete_image, replace_image_file_bytes,
+        save_image_bytes, update_image,
     },
     launchpad_dispatch::{
         NativeLaunchArtifacts, compile_atomic_follow_buy_for_launchpad,
@@ -1053,6 +1054,12 @@ struct ImageUpdateRequest {
     tags: Option<Value>,
     category: Option<String>,
     isFavorite: Option<bool>,
+}
+
+#[allow(non_snake_case)]
+#[derive(Deserialize, Default)]
+struct ImageReplaceRequest {
+    id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -7873,6 +7880,92 @@ async fn api_image_update(
     Ok(Json(response))
 }
 
+async fn api_image_replace(
+    Query(query): Query<ImageReplaceRequest>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let id = query.id.as_deref().unwrap_or_default().trim();
+    if id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "Image id is required.",
+            })),
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut filename = "image".to_string();
+    let mut content_type = String::new();
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error.to_string(),
+            })),
+        )
+    })? {
+        if field.name().unwrap_or_default() != "file" {
+            continue;
+        }
+        filename = field.file_name().unwrap_or("image").to_string();
+        content_type = field.content_type().unwrap_or_default().to_string();
+        bytes = field
+            .bytes()
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": error.to_string(),
+                    })),
+                )
+            })?
+            .to_vec();
+        break;
+    }
+    if bytes.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "Image file is required.",
+            })),
+        ));
+    }
+    let extension = match content_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => ".png",
+        "image/avif" => ".avif",
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "image/webp" => ".webp",
+        "image/gif" => ".gif",
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": "Only png, jpg/jpeg, avif, webp, and gif images are supported.",
+                })),
+            ));
+        }
+    };
+    let (library_payload, image) = replace_image_file_bytes(id, &bytes, extension, &filename)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+        })?;
+    let mut response = serde_json::to_value(library_payload).unwrap_or(json!({"ok": true}));
+    response["image"] = serde_json::to_value(image).unwrap_or(Value::Null);
+    Ok(Json(response))
+}
+
 async fn api_image_category_create(
     Json(payload): Json<ImageCategoryRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -9661,6 +9754,7 @@ async fn main() {
         .route("/api/metadata/upload", post(api_metadata_upload))
         .route("/api/images", get(api_images_list))
         .route("/api/images/update", post(api_image_update))
+        .route("/api/images/replace", post(api_image_replace))
         .route("/api/images/categories", post(api_image_category_create))
         .route("/api/images/delete", post(api_image_delete))
         .route("/api/vamp", post(api_vamp_import))

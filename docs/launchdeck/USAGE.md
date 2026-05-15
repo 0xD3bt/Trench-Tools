@@ -58,6 +58,12 @@ LaunchDeck presets can be edited inside LaunchDeck and from the extension Option
 
 Execution-engine presets are separate. Extension token split/consolidate actions use the active execution preset, not the LaunchDeck preset.
 
+## Name Presets
+
+The launch form includes name preset buttons under the token name/ticker fields. Use them for repeated launch naming patterns such as applying a token name suffix, a ticker suffix, a prefix, the first word as ticker, or an abbreviated ticker.
+
+Name presets are saved in the LaunchDeck config and can be edited from the LaunchDeck settings modal. They only change the current launch form's token name and ticker fields; they do not change execution-engine presets, LaunchDeck trade presets, wallets, providers, or fee settings.
+
 ## Metadata And Images
 
 Metadata upload defaults to the launchpad's native uploader when `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` is blank: pump-fun for Pump, Bonk's upload endpoints for Bonk, and Bags API prepare for Bagsapp.
@@ -72,6 +78,8 @@ PINATA_JWT=YOUR_PINATA_JWT
 The image library is local state. Do not commit uploaded local assets or metadata that you do not intend to publish.
 
 Pump and Bonk use LaunchDeck's shared metadata/IPFS flow. Bagsapp uses the Bags API prepare flow because Bags returns the mint and metadata URI. Pump and Bonk can also use local vanity mint queue files.
+
+The launch form can crop a selected image before upload. When LaunchDeck opens from J7 tweet context, detected image candidates can be selected, cropped, or saved into the local image library before launch.
 
 See [METADATA_AND_VANITY.md](METADATA_AND_VANITY.md).
 

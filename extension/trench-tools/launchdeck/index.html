@@ -22,7 +22,7 @@
         </div>
       </div>
       <div class="workspace-shell">
-      <form id="launch-form" class="flow">
+      <form id="launch-form" class="flow" autocomplete="off">
         <section class="card launch-surface">
           <div class="launch-surface-section launch-surface-wallet">
             <div class="wallet-box">
@@ -164,10 +164,15 @@
                     </div>
                   </div>
                 </button>
+                <button id="edit-selected-image-button" type="button" class="image-panel-edit-button" title="Edit selected image" aria-label="Edit selected image" hidden>
+                  <span>Crop</span>
+                </button>
+                <button id="j7-open-image-library-button" type="button" class="j7-image-library-button" hidden>Image Library</button>
               </div>
               <div class="image-meta">
                 <div id="image-path" class="mono small"></div>
               </div>
+              <div id="j7-image-candidates" class="j7-image-candidates" hidden></div>
             </div>
             <div class="row two token-primary-row">
               <label>
@@ -188,6 +193,7 @@
                 <input name="symbol" type="text" placeholder="Coin Ticker" required maxlength="10">
               </label>
             </div>
+            <div id="name-preset-strip" class="name-preset-strip" aria-label="Name presets"></div>
             <div class="description-disclosure" id="description-disclosure">
               <button
                 id="description-toggle"
@@ -695,6 +701,63 @@
       </div>
     </div>
 
+    <div id="name-preset-modal" class="modal-overlay" hidden>
+      <div class="modal name-preset-modal">
+        <div class="modal-header name-preset-modal-header">
+          <h3>Edit Custom Presets</h3>
+          <button type="button" id="name-preset-close" class="modal-close" aria-label="Close name presets">
+            <img class="modal-close-icon" src="/images/modal-close.png" alt="">
+          </button>
+        </div>
+        <div class="modal-body name-preset-modal-body">
+          <div id="name-preset-editor-list" class="name-preset-editor-list"></div>
+          <section class="name-preset-add-panel">
+            <h4 id="name-preset-form-title">Add New Preset</h4>
+            <label>
+              <span>Button Name</span>
+              <input id="name-preset-new-name" type="text" placeholder="e.g., Trump Style">
+            </label>
+            <div class="name-preset-add-grid">
+              <label>
+                <span>Name Prefix</span>
+                <input id="name-preset-new-name-prefix" type="text" placeholder="Prefix+Token Name">
+              </label>
+              <label>
+                <span>Name Suffix</span>
+                <input id="name-preset-new-name-suffix" type="text" placeholder="Token Name+Suffix">
+              </label>
+              <label>
+                <span>Ticker Prefix</span>
+                <input id="name-preset-new-ticker-prefix" type="text" placeholder="Prefix+Token Ticker">
+              </label>
+              <label>
+                <span>Ticker Suffix</span>
+                <input id="name-preset-new-ticker-suffix" type="text" placeholder="Token Ticker+Suffix">
+              </label>
+            </div>
+            <div class="name-preset-checkbox-row">
+              <label class="setting-checkbox">
+                <input id="name-preset-new-first-word" type="checkbox" checked>
+                <span class="custom-check"></span>
+                Auto ticker from name
+              </label>
+              <label class="setting-checkbox">
+                <input id="name-preset-new-abbreviate" type="checkbox">
+                <span class="custom-check"></span>
+                Abbreviate ticker
+              </label>
+            </div>
+            <div id="name-preset-error" class="modal-warning name-preset-error" hidden></div>
+            <div class="name-preset-form-actions" data-name-preset-mode="add">
+              <button type="button" id="name-preset-add" class="button deploy name-preset-add-button" data-name-preset-action="add">+ Add Preset</button>
+              <button type="button" id="name-preset-cancel-edit" class="button subtle name-preset-cancel-button" data-name-preset-action="cancel-edit">Cancel</button>
+              <button type="button" id="name-preset-update" class="button deploy name-preset-update-button" data-name-preset-action="update">Update Preset</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
     <div id="image-library-modal" class="modal-overlay" hidden>
       <div class="modal image-library-modal">
         <div class="modal-header">
@@ -1057,7 +1120,7 @@
             <div class="muted small">Insert a private key to use for vanity CA generation. This is not saved to settings presets.</div>
             <label>
               <span>Private Key</span>
-              <textarea id="vanity-private-key-input" rows="2" placeholder="Paste vanity private key"></textarea>
+              <textarea id="vanity-private-key-input" rows="4" placeholder="Paste vanity private key"></textarea>
             </label>
             <div id="vanity-modal-error" class="field-error"></div>
           </div>
@@ -1072,27 +1135,40 @@
     <div id="vamp-modal" class="modal-overlay" hidden>
       <div class="modal vamp-modal">
         <div class="modal-header vamp-modal-header">
-          <h3>Vamp</h3>
+          <h3>Vamp with Tweet</h3>
           <button type="button" id="vamp-close" class="modal-close" aria-label="Close modal">
             <img class="modal-close-icon" src="/images/modal-close.png" alt="">
           </button>
         </div>
         <div class="modal-body vamp-modal-body">
           <div class="stack">
-            <input id="vamp-contract-input" type="text" inputmode="text" spellcheck="false" placeholder="Paste Solana mint / contract address">
+            <label class="vamp-tweet-url-row" hidden>
+              <span>Copy another token's details but use this tweet's URL</span>
+              <input id="vamp-tweet-url-input" type="url" readonly>
+            </label>
+            <input id="vamp-contract-input" type="text" inputmode="text" spellcheck="false" placeholder="Enter contract address to copy (e.g. pump... or 0x...)">
+            <label class="vamp-check-row">
+              <input id="vamp-auto-load-input" type="checkbox" checked>
+              <span>Auto-load</span>
+            </label>
+            <label class="vamp-check-row">
+              <input id="vamp-clipboard-detect-input" type="checkbox" checked>
+              <span>Automatically detect contract address from clipboard</span>
+            </label>
             <div id="vamp-status" class="quote muted" hidden></div>
             <div id="vamp-error" class="field-error"></div>
           </div>
         </div>
         <div class="modal-footer vamp-modal-footer">
           <button type="button" id="vamp-cancel" class="button">Cancel</button>
-          <button type="button" id="vamp-import" class="button deploy">Import</button>
+          <button type="button" id="vamp-import" class="button deploy">Vamp Token</button>
         </div>
       </div>
     </div>
 
     <div id="image-item-menu" class="image-item-menu" hidden>
       <button type="button" id="image-menu-favorite" class="image-item-menu-button">Add to Favorites</button>
+      <button type="button" id="image-menu-crop" class="image-item-menu-button">Edit / Crop</button>
       <button type="button" id="image-menu-edit" class="image-item-menu-button">Edit Details</button>
       <button type="button" id="image-menu-delete" class="image-item-menu-button danger">Delete Image</button>
     </div>
@@ -1192,7 +1268,6 @@
         <div id="benchmarks-popout-body" class="modal-body benchmarks-popout-body"></div>
       </div>
     </div>
-
     <script src="/src/shared/storage-migrations.js"></script>
     <script src="/launchdeck/extension-bootstrap.js"></script>
     <script src="/launchdeck/shared-constants.js"></script>
@@ -1215,6 +1290,7 @@
     <script src="/launchdeck/app/reports-presenters.js"></script>
     <script src="/launchdeck/app/local-binders.js"></script>
     <script src="/launchdeck/app/image-metadata-domain.js"></script>
+    <script src="/launchdeck/app/image-crop-domain.js"></script>
     <script src="/launchdeck/app.js"></script>
   </body>
 </html>

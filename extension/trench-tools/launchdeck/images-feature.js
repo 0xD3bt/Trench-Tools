@@ -20,8 +20,12 @@
       clearMetadataUploadCache,
       setImagePreview,
       scheduleMetadataPreupload,
+      openImageCropModal,
+      uploadImageFile,
+      replaceImageFile,
       escapeHTML,
       fetchJsonLatest,
+      onImageSelected,
     } = config;
 
     const {
@@ -29,6 +33,7 @@
       imagePath,
       imagePreview,
       imageEmpty,
+      editSelectedImageButton,
       imageLibraryModal,
       imageLibrarySearchInput,
       imageLibraryUploadButton,
@@ -38,6 +43,7 @@
       newImageCategoryButton,
       imageItemMenu,
       imageMenuFavorite,
+      imageMenuCrop,
       imageMenuEdit,
       imageMenuDelete,
       imageDetailsModal,
@@ -62,6 +68,7 @@
       imageLibraryClose,
       imageInput,
       openImageLibraryButton,
+      j7OpenImageLibraryButton,
     } = elements;
 
     let eventsBound = false;
@@ -132,6 +139,14 @@
       return true;
     }
 
+    function iconCropSvg() {
+      return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2v14h16"></path><path d="M18 22V8H2"></path></svg>';
+    }
+
+    function iconMoreSvg() {
+      return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01"></path><path d="M12 12h.01"></path><path d="M19 12h.01"></path></svg>';
+    }
+
     function setSelectedImage(image) {
       setUploadedImage(image || null);
       clearMetadataUploadCache({ clearInput: true });
@@ -139,11 +154,13 @@
         imageStatus.textContent = "";
         imagePath.textContent = "";
         setImagePreview("");
+        if (editSelectedImageButton) editSelectedImageButton.hidden = true;
         return;
       }
       imageStatus.textContent = "";
       imagePath.textContent = "";
       setImagePreview(resolveImagePreviewUrl(image));
+      if (editSelectedImageButton) editSelectedImageButton.hidden = false;
       scheduleMetadataPreupload({ immediate: true });
     }
 
@@ -165,13 +182,24 @@
       const state = getImageLibraryState();
       const imageTiles = state.images.map((image) => `
         <div class="image-library-item${image.id === state.activeImageId ? " active" : ""}" data-image-id="${escapeHTML(image.id)}" tabindex="0" role="button" aria-label="${escapeHTML(image.name || image.fileName || "image")}">
-          <img data-preview-url="${escapeHTML(resolveImagePreviewUrl(image))}" alt="${escapeHTML(image.name || image.fileName || "image")}">
-          <button type="button" class="image-library-item-menu-trigger" data-image-menu-id="${escapeHTML(image.id)}">&hellip;</button>
+          <div class="image-library-thumb">
+            <img data-preview-url="${escapeHTML(resolveImagePreviewUrl(image))}" alt="${escapeHTML(image.name || image.fileName || "image")}">
+            ${image.isFavorite ? '<span class="image-library-favorite" title="Favorite">★</span>' : ""}
+            <div class="image-library-card-actions">
+              <button type="button" class="image-library-card-action" data-image-crop-id="${escapeHTML(image.id)}" title="Edit / crop image" aria-label="Edit / crop image">${iconCropSvg()}</button>
+              <button type="button" class="image-library-card-action" data-image-menu-id="${escapeHTML(image.id)}" title="More actions" aria-label="More actions">${iconMoreSvg()}</button>
+            </div>
+          </div>
+          <div class="image-library-item-meta">
+            <strong>${escapeHTML(image.name || image.fileName || "Untitled")}</strong>
+            <span>${escapeHTML(image.category || "Uncategorized")}</span>
+          </div>
         </div>
       `);
       imageTiles.push(`
         <button type="button" class="image-library-item image-library-upload-tile" data-image-upload-tile>
           <span>+</span>
+          <small>Upload</small>
         </button>
       `);
       const markup = imageTiles.join("");
@@ -192,7 +220,12 @@
       imageLibraryGrid.hidden = isEmpty;
       if (imageLibraryEmpty) {
         imageLibraryEmpty.hidden = !isEmpty;
-        if (isEmpty) imageLibraryEmpty.textContent = "No images found.";
+        if (isEmpty) {
+          imageLibraryEmpty.innerHTML = `
+            <strong>No images found</strong>
+            <span>Upload a new image or adjust your search/category filters.</span>
+          `;
+        }
       }
     }
 
@@ -240,10 +273,21 @@
       if (imageLibraryGrid) imageLibraryGrid.hidden = true;
       if (imageLibraryEmpty) {
         imageLibraryEmpty.hidden = false;
-        imageLibraryEmpty.textContent = "Loading images...";
+        imageLibraryEmpty.innerHTML = `
+          <strong>Loading images...</strong>
+          <span>Fetching your image library.</span>
+        `;
       }
       fetchLibrary().catch((error) => {
-        imageStatus.textContent = error.message;
+        if (imageStatus) imageStatus.textContent = error.message;
+        if (imageLibraryEmpty) {
+          imageLibraryEmpty.hidden = false;
+          imageLibraryEmpty.innerHTML = `
+            <strong>Failed to load images</strong>
+            <span>${escapeHTML(error.message)}</span>
+            <button type="button" class="button subtle" data-image-library-retry>Retry</button>
+          `;
+        }
       });
     }
 
@@ -371,11 +415,59 @@
       renderLibraryGrid();
     }
 
+    async function cropImage(image, defaultKind = "new") {
+      if (!image || typeof openImageCropModal !== "function") return;
+      hideItemMenu();
+      const saveActions = image.id
+        ? [
+            { kind: "new", label: "Save as New" },
+            { kind: "replace", label: "Replace Original" },
+          ]
+        : [{ kind: "new", label: "Save as New" }];
+      await openImageCropModal({
+        src: resolveImagePreviewUrl(image),
+        name: image.name || image.fileName || "image",
+        alt: image.name || image.fileName || "image",
+        title: "Edit Image",
+        defaultActionKind: defaultKind,
+        saveActions,
+        onSave: async ({ file, kind }) => {
+          if (kind === "replace" && image.id && typeof replaceImageFile === "function") {
+            imageStatus.textContent = "Replacing image...";
+            const updated = await replaceImageFile(image, file);
+            await fetchLibrary();
+            if (updated) setSelectedImage(updated);
+            imageStatus.textContent = "Image replaced.";
+            return;
+          }
+          if (typeof uploadImageFile !== "function") return;
+          imageStatus.textContent = "Saving cropped image...";
+          const uploaded = await uploadImageFile(file);
+          await fetchLibrary();
+          if (uploaded) {
+            setSelectedImage(uploaded);
+            showDetailsModal(uploaded, { isNewUpload: true });
+          }
+          imageStatus.textContent = "Cropped image saved.";
+        },
+      });
+    }
+
     function bindEvents() {
       if (eventsBound) return;
       eventsBound = true;
 
       if (openImageLibraryButton) openImageLibraryButton.addEventListener("click", showLibraryModal);
+      if (j7OpenImageLibraryButton) j7OpenImageLibraryButton.addEventListener("click", showLibraryModal);
+      if (editSelectedImageButton) {
+        editSelectedImageButton.addEventListener("click", () => {
+          const image = getUploadedImage();
+          if (!image) return;
+          cropImage(image).catch((error) => {
+            if (imageStatus) imageStatus.textContent = error.message;
+          });
+        });
+      }
       if (imageLibraryClose) imageLibraryClose.addEventListener("click", hideLibraryModal);
       if (imageLibraryModal) {
         imageLibraryModal.addEventListener("click", (event) => {
@@ -426,6 +518,19 @@
             }
             return;
           }
+          const cropButton = event.target.closest("[data-image-crop-id]");
+          if (cropButton) {
+            event.preventDefault();
+            event.stopPropagation();
+            const state = getImageLibraryState();
+            const image = state.images.find((entry) => entry.id === cropButton.getAttribute("data-image-crop-id"));
+            if (image) {
+              cropImage(image).catch((error) => {
+                if (imageStatus) imageStatus.textContent = error.message;
+              });
+            }
+            return;
+          }
           const menuTrigger = event.target.closest("[data-image-menu-id]");
           if (menuTrigger) {
             event.stopPropagation();
@@ -439,9 +544,15 @@
           if (!image) return;
           state.activeImageId = image.id;
           setSelectedImage(image);
+          onImageSelected?.(image);
           hideLibraryModal();
         });
       }
+      imageLibraryEmpty?.addEventListener("click", (event) => {
+        const retry = event.target.closest("[data-image-library-retry]");
+        if (!retry) return;
+        showLibraryModal();
+      });
       if (imageMenuFavorite) {
         imageMenuFavorite.addEventListener("click", async () => {
           const state = getImageLibraryState();
@@ -462,6 +573,16 @@
           if (!image) return;
           hideItemMenu();
           showDetailsModal(image);
+        });
+      }
+      if (imageMenuCrop) {
+        imageMenuCrop.addEventListener("click", () => {
+          const state = getImageLibraryState();
+          const image = state.images.find((entry) => entry.id === getActiveImageMenuId());
+          if (!image) return;
+          cropImage(image).catch((error) => {
+            if (imageStatus) imageStatus.textContent = error.message;
+          });
         });
       }
       if (imageMenuDelete) {

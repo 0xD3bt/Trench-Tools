@@ -1953,6 +1953,8 @@ pub struct BatchStatusResponse {
     pub client_request_id: String,
     pub side: TradeSide,
     pub status: BatchLifecycleStatus,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform: String,
     #[serde(default)]
     pub created_at_unix_ms: u64,
     #[serde(default)]
@@ -2057,6 +2059,7 @@ struct ExecutionSubmission {
     client_request_id: String,
     fingerprint: String,
     side: TradeSide,
+    platform: String,
     target: ResolvedBatchTarget,
     execution_adapter: Option<String>,
     execution_backend: String,
@@ -3221,7 +3224,8 @@ async fn record_launchdeck_confirmed_trades(
                         trade.batch_id.as_deref(),
                         signature,
                         outcome.slot,
-                    );
+                    )
+                    .await;
                 }
                 ConfirmedTradeLedgerRecordState::Duplicate => {
                     response.duplicate_count = response.duplicate_count.saturating_add(1);
@@ -3340,7 +3344,18 @@ fn normalized_trade_event_identity(value: Option<&str>, fallback: &str) -> Strin
         .to_string()
 }
 
-fn publish_confirmed_trade_balance_stream_event(
+async fn platform_for_batch(state: &AppState, batch_id: Option<&str>) -> String {
+    let Some(batch_id) = batch_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return String::new();
+    };
+    let batches = state.batches.read().await;
+    batches
+        .get(batch_id)
+        .map(|batch| batch.platform.trim().to_string())
+        .unwrap_or_default()
+}
+
+async fn publish_confirmed_trade_balance_stream_event(
     state: &AppState,
     client_request_id: Option<&str>,
     batch_id: Option<&str>,
@@ -3354,6 +3369,7 @@ fn publish_confirmed_trade_balance_stream_event(
     state.balance_stream.publish_trade_event(TradeEventPayload {
         client_request_id: normalized_trade_event_identity(client_request_id, normalized_signature),
         batch_id: normalized_trade_event_identity(batch_id, normalized_signature),
+        platform: platform_for_batch(state, batch_id).await,
         signature: normalized_signature.to_string(),
         status: "confirmed".to_string(),
         slot,
@@ -3482,7 +3498,8 @@ fn spawn_confirmed_trade_ledger_recording(
                     Some(&batch_id),
                     &tx_signature,
                     slot,
-                );
+                )
+                .await;
             }
             other => {
                 let ledger_error =
@@ -4773,6 +4790,7 @@ async fn buy(
             client_request_id,
             fingerprint,
             side: TradeSide::Buy,
+            platform: request.platform.clone().unwrap_or_default(),
             target,
             execution_adapter: None,
             execution_backend,
@@ -4894,6 +4912,7 @@ async fn sell(
             client_request_id,
             fingerprint,
             side: TradeSide::Sell,
+            platform: request.platform.clone().unwrap_or_default(),
             target,
             execution_adapter: None,
             execution_backend,
@@ -5477,6 +5496,7 @@ async fn enqueue_batch(
         client_request_id: submission.client_request_id.clone(),
         side: submission.side.clone(),
         status: BatchLifecycleStatus::Queued,
+        platform: submission.platform.clone(),
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         execution_adapter: submission.execution_adapter.clone(),
@@ -6049,6 +6069,7 @@ async fn apply_wallet_submitted(
     state.balance_stream.register_trade(
         client_request_id.clone(),
         batch_id.to_string(),
+        batch_snapshot.platform.clone(),
         normalized_signature.to_string(),
     );
     publish_batch_status_snapshot(state, &batch_snapshot, "wallet_submitted");
@@ -7360,6 +7381,7 @@ async fn apply_wallet_execution_outcome(
         state.balance_stream.register_trade(
             batch_client_request_id.clone(),
             batch_id.to_string(),
+            batch_snapshot.platform.clone(),
             signature,
         );
     }
@@ -14958,6 +14980,7 @@ mod tests {
             } else {
                 BatchLifecycleStatus::Queued
             },
+            platform: "axiom".to_string(),
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             execution_adapter: None,
@@ -15303,6 +15326,7 @@ mod tests {
         let payload = TradeEventPayload {
             client_request_id: "client-batch-b".to_string(),
             batch_id: "batch-b".to_string(),
+            platform: "axiom".to_string(),
             signature: "sig-1".to_string(),
             status: "confirmed".to_string(),
             slot: Some(42),
@@ -15332,6 +15356,7 @@ mod tests {
         let payload = TradeEventPayload {
             client_request_id: "client-batch-a".to_string(),
             batch_id: "batch-a".to_string(),
+            platform: "axiom".to_string(),
             signature: "sig-1".to_string(),
             status: "confirmed".to_string(),
             slot: Some(42),

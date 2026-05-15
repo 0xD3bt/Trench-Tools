@@ -63,7 +63,7 @@
         && currentConfig.defaults.activePresetId
         ? String(currentConfig.defaults.activePresetId).trim()
         : "";
-      const activePresetId = getActivePresetId() || configuredActivePresetId || "";
+      const activePresetId = getActivePresetId() || configuredActivePresetId || defaultPresetId;
       const activePreset = presetItems.find((entry) => entry && entry.id === activePresetId)
         || presetItems[0]
         || {};
@@ -260,6 +260,12 @@
       const feeSplitDraft = normalizeFeeSplitDraft(serializeFeeSplitDraft());
       const agentSplitDraft = normalizeAgentSplitDraft(serializeAgentSplitDraft());
       const feeSplitLaunchpad = f.launchpad || "pump";
+      const presetItems = base && base.presets && Array.isArray(base.presets.items)
+        ? base.presets.items
+        : [];
+      const persistedActivePresetId = presetItems.some((entry) => entry && entry.id === f.activePresetId)
+        ? f.activePresetId
+        : "";
       const shouldPersistFeeSplitDraft = feeSplitLaunchpad === "bagsapp"
         || (feeSplitLaunchpad === "pump" && (f.mode || "regular") === "regular");
       const shouldPersistAgentSplitDraft = feeSplitLaunchpad === "pump"
@@ -329,7 +335,7 @@
         ...(base.defaults || {}),
         launchpad: f.launchpad || "pump",
         mode: f.mode || "regular",
-        activePresetId: f.activePresetId || "",
+        activePresetId: persistedActivePresetId,
         presetEditing: false,
         misc: {
           ...currentMisc,

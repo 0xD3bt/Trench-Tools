@@ -229,7 +229,7 @@
               </div>
             </section>
 
-            <div class="site-settings-grid hidden" aria-hidden="true">
+            <div class="site-settings-grid">
               <section class="card site-platform-card">
                 <div class="site-platform-row">
                   <div class="site-platform-brand">
@@ -243,6 +243,82 @@
                     <span>Enabled</span>
                     <input id="site-j7-enabled" class="site-toggle" type="checkbox" />
                   </label>
+                </div>
+                <div class="site-feature-groups">
+                  <section class="site-feature-group">
+                    <h4>Contract addresses</h4>
+                    <div class="site-feature-grid site-feature-grid-three">
+                      <label
+                        class="site-feature-chip"
+                        for="site-j7-contract-quick-buy"
+                        title="Adds a compact Trench Tools quick-buy button after Solana contract addresses on J7Tracker."
+                      >
+                        <span>Quick Buy</span>
+                        <input id="site-j7-contract-quick-buy" class="site-toggle" type="checkbox" />
+                      </label>
+                      <label
+                        class="site-feature-chip"
+                        for="site-j7-contract-quick-panel"
+                        title="Adds a compact manual-panel button after Solana contract addresses on J7Tracker."
+                      >
+                        <span>Quick Panel</span>
+                        <input id="site-j7-contract-quick-panel" class="site-toggle" type="checkbox" />
+                      </label>
+                      <label
+                        class="site-feature-chip"
+                        for="site-j7-contract-vamp"
+                        title="Adds a compact Vamp button after Solana contract addresses on J7Tracker."
+                      >
+                        <span>Vamp</span>
+                        <input id="site-j7-contract-vamp" class="site-toggle" type="checkbox" />
+                      </label>
+                    </div>
+                  </section>
+                  <section class="site-feature-group">
+                    <h4>Tweet cards</h4>
+                    <div class="site-feature-grid">
+                      <label
+                        class="site-feature-chip"
+                        for="site-j7-card-launchdeck"
+                        title="Adds Trench Tools Deploy and Vamp buttons to J7Tracker tweet cards."
+                      >
+                        <span>Deploy/Vamp Buttons</span>
+                        <input id="site-j7-card-launchdeck" class="site-toggle" type="checkbox" />
+                      </label>
+                      <label
+                        class="site-feature-chip"
+                        for="site-j7-hide-native-card-actions"
+                        title="Hide J7Tracker's native Deploy and Vamp buttons when Trench Tools buttons are shown."
+                      >
+                        <span>Hide J7 Buttons</span>
+                        <input id="site-j7-hide-native-card-actions" class="site-toggle" type="checkbox" />
+                      </label>
+                    </div>
+                  </section>
+                  <section class="site-feature-group">
+                    <h4>LaunchDeck Deploy</h4>
+                    <div class="site-feature-grid">
+                      <label
+                        class="site-feature-chip site-feature-chip-compound"
+                        for="site-j7-post-deploy-action"
+                        title="Controls what LaunchDeck does after a successful deploy from J7Tracker."
+                      >
+                        <span class="site-feature-chip-main">
+                          <span>After Deploy</span>
+                        </span>
+                        <select
+                          id="site-j7-post-deploy-action"
+                          class="site-feature-chip-select"
+                          aria-label="J7 after deploy behavior"
+                        >
+                          <option value="close_modal_toast">Close modal + toast</option>
+                          <option value="toast_only">Toast only</option>
+                          <option value="open_tab_toast">Open Axiom in new tab + toast</option>
+                          <option value="open_window_toast">Open Axiom in new window + toast</option>
+                        </select>
+                      </label>
+                    </div>
+                  </section>
                 </div>
               </section>
             </div>

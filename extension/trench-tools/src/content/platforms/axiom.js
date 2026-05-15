@@ -771,7 +771,7 @@
         Object.assign(button.style, {
           height: "28px",
           minHeight: "28px",
-          borderRadius: "12px",
+          borderRadius: "6px",
           border: "1px solid rgba(255, 255, 255, 0.20)",
           background,
           color,
@@ -7208,7 +7208,7 @@
           return;
         }
         button._trenchAxiomPresetClickCleanup?.();
-        const handleClick = (event) => {
+        const handleAction = (event) => {
           if (action.editable) {
             if (isAxiomTokenDetailEditableEventTarget(event.target)) {
               event.stopPropagation();
@@ -7252,10 +7252,39 @@
           void helpers.handleInlineTradeRequest(action.side, liveRoute, "token_detail", payload, window.location.href)
             .catch((error) => helpers.showToast?.(error?.message || "Trade failed.", "error"));
         };
-        button.addEventListener("click", handleClick);
+        const cleanupImmediateAction = bindAxiomTokenDetailImmediateAction(button, handleAction);
         button._trenchAxiomPresetClickCleanup = () => {
-          button.removeEventListener("click", handleClick);
+          cleanupImmediateAction();
           delete button._trenchAxiomPresetClickCleanup;
+        };
+      }
+
+      function bindAxiomTokenDetailImmediateAction(button, action) {
+        const handlePointerDown = (event) => {
+          if (button.disabled) {
+            return;
+          }
+          if (typeof event.button === "number" && event.button !== 0) {
+            return;
+          }
+          action(event);
+        };
+        const handleClick = (event) => {
+          if (button.disabled) {
+            return;
+          }
+          if (event.detail !== 0) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+          }
+          action(event);
+        };
+        button.addEventListener("pointerdown", handlePointerDown);
+        button.addEventListener("click", handleClick);
+        return () => {
+          button.removeEventListener("pointerdown", handlePointerDown);
+          button.removeEventListener("click", handleClick);
         };
       }
 
@@ -7779,11 +7808,7 @@
           button.setAttribute("data-pair", action.companionPair);
         }
         syncAxiomTokenDetailHardpanelActionButton(button, nativeSubmitButton, action.side);
-        button.addEventListener("mousedown", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-        });
-        button.addEventListener("click", (event) => {
+        bindAxiomTokenDetailImmediateAction(button, (event) => {
           event.preventDefault();
           event.stopPropagation();
           handleAxiomTokenDetailHardpanelActionClick(button);
@@ -8263,7 +8288,7 @@
               fallbackHeight
           )
         );
-        const compactRadius = Math.max(8, Math.min(12, Math.round(targetHeightPx * 0.38)));
+        const compactRadius = Math.max(5, Math.min(7, Math.round(targetHeightPx * 0.24)));
         const targetRadiusPx =
           readPixelValue(computed?.borderRadius) || readPixelValue(styles.base.borderRadius) || compactRadius;
 

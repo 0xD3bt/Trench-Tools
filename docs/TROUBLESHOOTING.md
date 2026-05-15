@@ -207,7 +207,7 @@ Check:
 - the page was refreshed after saving Options
 - `execution-engine` is running if trade surfaces need live data
 
-`j7tracker.io` is available in the codebase but currently disabled. Terminal and GMGN are coming later.
+If J7 does not show Trench Tools, confirm the specific contract-address or tweet-card controls are enabled in Options -> Sites, the unpacked extension was reloaded after updating, and the page was refreshed. Terminal and GMGN are coming later.
 
 ## Axiom Button Shows Unsupported Pool Or Pair
 

@@ -327,7 +327,7 @@
         }
       } catch (error) {
         setStatusLabel("Error");
-        output.textContent = error.message;
+        output.textContent = String(error && error.message ? error.message : error || "Action failed.");
       } finally {
         if (buttons.some((button) => button.disabled)) {
           setBusy(false, currentStatusLabel());
@@ -385,7 +385,7 @@
         hideSettingsModal("save");
       } catch (error) {
         setStatusLabel("Error");
-        output.textContent = error.message;
+        output.textContent = String(error && error.message ? error.message : error || "Failed to save settings.");
       } finally {
         setBusy(false, currentStatusLabel());
       }

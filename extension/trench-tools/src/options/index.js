@@ -206,6 +206,12 @@ const elements = {
   siteAxiomWalletTracker: document.getElementById("site-axiom-wallet-tracker"),
   siteAxiomWatchlist: document.getElementById("site-axiom-watchlist"),
   siteJ7Enabled: document.getElementById("site-j7-enabled"),
+  siteJ7ContractQuickBuy: document.getElementById("site-j7-contract-quick-buy"),
+  siteJ7ContractQuickPanel: document.getElementById("site-j7-contract-quick-panel"),
+  siteJ7ContractVamp: document.getElementById("site-j7-contract-vamp"),
+  siteJ7CardLaunchdeck: document.getElementById("site-j7-card-launchdeck"),
+  siteJ7HideNativeCardActions: document.getElementById("site-j7-hide-native-card-actions"),
+  siteJ7PostDeployAction: document.getElementById("site-j7-post-deploy-action"),
   executionPresetList: document.getElementById("execution-preset-list"),
   launchdeckPresetList: document.getElementById("launchdeck-preset-list"),
   launchdeckPresetModal: document.getElementById("launchdeck-preset-modal"),
@@ -1143,7 +1149,13 @@ for (const input of [
   elements.siteAxiomDexScreenerIconMode,
   elements.siteAxiomWalletTracker,
   elements.siteAxiomWatchlist,
-  elements.siteJ7Enabled
+  elements.siteJ7Enabled,
+  elements.siteJ7ContractQuickBuy,
+  elements.siteJ7ContractQuickPanel,
+  elements.siteJ7ContractVamp,
+  elements.siteJ7CardLaunchdeck,
+  elements.siteJ7HideNativeCardActions,
+  elements.siteJ7PostDeployAction
 ]) {
   if (!input) continue;
   input.addEventListener("change", () => {
@@ -1947,8 +1959,30 @@ function renderSiteSettings() {
   }
   elements.siteAxiomWalletTracker.checked = Boolean(siteFeatures.axiom?.walletTracker);
   elements.siteAxiomWatchlist.checked = Boolean(siteFeatures.axiom?.watchlist);
-  elements.siteJ7Enabled.checked = false;
-  elements.siteJ7Enabled.disabled = true;
+  elements.siteJ7Enabled.checked = Boolean(siteFeatures.j7?.enabled);
+  elements.siteJ7Enabled.disabled = false;
+  if (elements.siteJ7ContractQuickBuy) {
+    elements.siteJ7ContractQuickBuy.checked = Boolean(siteFeatures.j7?.contractQuickBuy);
+  }
+  if (elements.siteJ7ContractQuickPanel) {
+    elements.siteJ7ContractQuickPanel.checked = Boolean(siteFeatures.j7?.contractQuickPanel);
+  }
+  if (elements.siteJ7ContractVamp) {
+    elements.siteJ7ContractVamp.checked = Boolean(siteFeatures.j7?.contractVamp);
+  }
+  if (elements.siteJ7CardLaunchdeck) {
+    elements.siteJ7CardLaunchdeck.checked = Boolean(siteFeatures.j7?.cardLaunchdeck);
+  }
+  if (elements.siteJ7HideNativeCardActions) {
+    elements.siteJ7HideNativeCardActions.checked = Boolean(siteFeatures.j7?.hideNativeCardActions);
+  }
+  if (elements.siteJ7PostDeployAction) {
+    const action = String(siteFeatures.j7?.postDeployAction || "close_modal_toast").trim().toLowerCase();
+    elements.siteJ7PostDeployAction.value =
+      action === "toast_only" || action === "open_tab_toast" || action === "open_window_toast"
+        ? action
+        : "close_modal_toast";
+  }
 }
 
 function appearanceSoundKey(side) {
@@ -2881,6 +2915,13 @@ function collectSiteSettings() {
     postDeployActionRaw === "open_window_toast"
       ? postDeployActionRaw
       : "close_modal_toast";
+  const j7PostDeployActionRaw = String(elements.siteJ7PostDeployAction?.value || "").trim().toLowerCase();
+  const j7PostDeployAction =
+    j7PostDeployActionRaw === "toast_only" ||
+    j7PostDeployActionRaw === "open_tab_toast" ||
+    j7PostDeployActionRaw === "open_window_toast"
+      ? j7PostDeployActionRaw
+      : "close_modal_toast";
   return {
     axiom: {
       enabled: elements.siteAxiomEnabled.checked,
@@ -2900,7 +2941,16 @@ function collectSiteSettings() {
       watchlist: elements.siteAxiomWatchlist.checked
     },
     j7: {
-      enabled: false
+      enabled: Boolean(elements.siteJ7Enabled?.checked),
+      contractQuickBuy: elements.siteJ7ContractQuickBuy ? elements.siteJ7ContractQuickBuy.checked : true,
+      contractQuickPanel: elements.siteJ7ContractQuickPanel ? elements.siteJ7ContractQuickPanel.checked : true,
+      contractVamp: elements.siteJ7ContractVamp ? elements.siteJ7ContractVamp.checked : true,
+      cardLaunchdeck: elements.siteJ7CardLaunchdeck ? elements.siteJ7CardLaunchdeck.checked : true,
+      hideNativeCardActions: elements.siteJ7HideNativeCardActions
+        ? elements.siteJ7HideNativeCardActions.checked
+        : false,
+      postDeployAction: j7PostDeployAction,
+      postDeployDestination: "axiom"
     }
   };
 }

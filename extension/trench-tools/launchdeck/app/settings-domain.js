@@ -46,6 +46,22 @@
       sellHelloMoonMevWarning,
       sellStandardRpcWarning,
       settingsBackendRegionSummary,
+      namePresetModal,
+      namePresetClose,
+      namePresetEditorList,
+      namePresetFormActions,
+      namePresetAddButton,
+      namePresetCancelEditButton,
+      namePresetUpdateButton,
+      namePresetFormTitle,
+      namePresetNewName,
+      namePresetNewNamePrefix,
+      namePresetNewNameSuffix,
+      namePresetNewTickerPrefix,
+      namePresetNewTickerSuffix,
+      namePresetNewFirstWord,
+      namePresetNewAbbreviate,
+      namePresetError,
       settingsModal,
       settingsClose,
       settingsCancel,
@@ -83,6 +99,7 @@
       queueWarmActivity = () => {},
       syncDevAutoSellUI = () => {},
       clearDevBuyState = () => {},
+      renderNamePresetStrip = () => {},
     } = actions;
 
     let settingsModalInitialConfig = null;
@@ -91,7 +108,42 @@
     let lastTopPresetMarkup = "";
     let lastSettingsPresetMarkup = "";
     let lastQuickDevBuyMarkup = "";
+    let lastNamePresetEditorMarkup = "";
+    let namePresetEditingIndex = -1;
+    let namePresetPersistInFlight = false;
     const DEFAULT_MANUAL_FEE_SOL = "0.001";
+    const DEFAULT_NAME_PRESET_BUTTONS = [
+      {
+        id: "ification",
+        name: "ify, ification",
+        namePrefix: "",
+        nameSuffix: "ification",
+        tickerPrefix: "",
+        tickerSuffix: "ify",
+        tickerUseFirstWord: true,
+        tickerAbbreviate: false,
+      },
+      {
+        id: "otus",
+        name: "_OTUS",
+        namePrefix: "",
+        nameSuffix: " Of The United States",
+        tickerPrefix: "",
+        tickerSuffix: "OTUS",
+        tickerUseFirstWord: false,
+        tickerAbbreviate: true,
+      },
+      {
+        id: "justice-for",
+        name: "Justice For",
+        namePrefix: "Justice For ",
+        nameSuffix: "",
+        tickerPrefix: "",
+        tickerSuffix: "",
+        tickerUseFirstWord: true,
+        tickerAbbreviate: false,
+      },
+    ];
 
     function cloneConfig(value) {
       return value ? JSON.parse(JSON.stringify(value)) : null;
@@ -102,80 +154,62 @@
         defaults: {
           launchpad: "pump",
           mode: "regular",
-          activePresetId: "",
+          activePresetId: defaultPresetId,
           presetEditing: false,
           quickDevBuyAmounts: [...defaultQuickDevBuyAmounts],
+          namePresetButtons: getDefaultNamePresetButtons(),
           misc: {
             trackSendBlockHeight: false,
           },
         },
         presets: {
-          items: [],
+          items: defaultQuickDevBuyAmounts.map((_, index) => ({
+            id: `preset${index + 1}`,
+            label: `P${index + 1}`,
+            creationSettings: {
+              provider: "helius-sender",
+              tipSol: DEFAULT_MANUAL_FEE_SOL,
+              priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
+              mevMode: "off",
+              autoFee: false,
+              maxFeeSol: "",
+              devBuySol: "",
+            },
+            buySettings: {
+              provider: "helius-sender",
+              priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
+              tipSol: DEFAULT_MANUAL_FEE_SOL,
+              slippagePercent: "",
+              mevMode: "off",
+              autoFee: false,
+              maxFeeSol: "",
+              snipeBuyAmountSol: "",
+            },
+            sellSettings: {
+              provider: "helius-sender",
+              priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
+              tipSol: DEFAULT_MANUAL_FEE_SOL,
+              slippagePercent: "",
+              mevMode: "off",
+              autoFee: false,
+              maxFeeSol: "",
+            },
+            automaticDevSell: {
+              enabled: false,
+              percent: 100,
+              triggerFamily: "time",
+              triggerMode: "block-offset",
+              delayMs: 0,
+              targetBlockOffset: 0,
+              marketCapEnabled: false,
+              marketCapThreshold: "",
+              marketCapScanTimeoutSeconds: 30,
+              marketCapTimeoutAction: "stop",
+            },
+            postLaunchStrategy: "none",
+          })),
         },
       };
-    }
-
-    function nextPresetNumber(items = []) {
-      const usedNumbers = items
-        .map((preset) => {
-          const idMatch = String(preset?.id || "").trim().match(/^preset(\d+)$/i);
-          if (idMatch) {
-            return Number(idMatch[1]);
-          }
-          const labelMatch = String(preset?.label || "").trim().match(/^preset\s*(\d+)$/i);
-          return labelMatch ? Number(labelMatch[1]) : 0;
-        })
-        .filter((value) => Number.isFinite(value) && value > 0);
-      return (usedNumbers.length ? Math.max(...usedNumbers) : items.length) + 1;
-    }
-
-    function createEmptyPreset(index = nextPresetNumber()) {
-      const presetNumber = Math.max(1, Number(index) || 1);
-      return {
-        id: `preset${presetNumber}`,
-        label: `Preset ${presetNumber}`,
-        creationSettings: {
-          provider: "helius-sender",
-          tipSol: DEFAULT_MANUAL_FEE_SOL,
-          priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
-          mevMode: defaultMevModeForProvider("helius-sender"),
-          autoFee: false,
-          maxFeeSol: "",
-          devBuySol: "",
-        },
-        buySettings: {
-          provider: "helius-sender",
-          priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
-          tipSol: DEFAULT_MANUAL_FEE_SOL,
-          slippagePercent: "",
-          mevMode: defaultMevModeForProvider("helius-sender"),
-          autoFee: false,
-          maxFeeSol: "",
-        },
-        sellSettings: {
-          provider: "helius-sender",
-          priorityFeeSol: DEFAULT_MANUAL_FEE_SOL,
-          tipSol: DEFAULT_MANUAL_FEE_SOL,
-          slippagePercent: "",
-          mevMode: defaultMevModeForProvider("helius-sender"),
-          autoFee: false,
-          maxFeeSol: "",
-        },
-      };
-    }
-
-    function buildConfigWithNewPreset(configValue = getConfig()) {
-      const nextConfig = cloneConfig(configValue) || createFallbackConfig();
-      const presetItems = getPresetItems(nextConfig);
-      const preset = createEmptyPreset(nextPresetNumber(presetItems));
-      nextConfig.presets = nextConfig.presets || {};
-      nextConfig.presets.items = [...presetItems, preset];
-      nextConfig.defaults = {
-        ...(nextConfig.defaults || {}),
-        activePresetId: preset.id,
-        presetEditing: true,
-      };
-      return { configValue: nextConfig, preset };
     }
 
     function getConfig() {
@@ -195,20 +229,57 @@
     }
 
     function getPresetItems(configValue = getConfig()) {
-      return configValue && configValue.presets && Array.isArray(configValue.presets.items)
+      const items = configValue && configValue.presets && Array.isArray(configValue.presets.items)
         ? configValue.presets.items
+        : null;
+      return items && items.length ? items : createFallbackConfig().presets.items;
+    }
+
+    function getDefaultNamePresetButtons() {
+      return DEFAULT_NAME_PRESET_BUTTONS.map((entry) => ({ ...entry }));
+    }
+
+    function normalizeNamePresetButton(entry, index = 0) {
+      const source = entry && typeof entry === "object" ? entry : {};
+      const fallback = DEFAULT_NAME_PRESET_BUTTONS[index] || {};
+      const tickerAbbreviate = Boolean(source.tickerAbbreviate ?? fallback.tickerAbbreviate);
+      return {
+        id: String(source.id || fallback.id || `name-preset-${index + 1}`).trim() || `name-preset-${index + 1}`,
+        name: String(source.name || fallback.name || `Preset ${index + 1}`).trim() || `Preset ${index + 1}`,
+        namePrefix: String(source.namePrefix ?? fallback.namePrefix ?? ""),
+        nameSuffix: String(source.nameSuffix ?? fallback.nameSuffix ?? ""),
+        tickerPrefix: String(source.tickerPrefix ?? fallback.tickerPrefix ?? ""),
+        tickerSuffix: String(source.tickerSuffix ?? fallback.tickerSuffix ?? ""),
+        tickerUseFirstWord: tickerAbbreviate ? false : Boolean(source.tickerUseFirstWord ?? fallback.tickerUseFirstWord),
+        tickerAbbreviate,
+      };
+    }
+
+    function normalizeNamePresetButtons(value) {
+      if (Array.isArray(value) && value.length === 0) return [];
+      const normalized = Array.isArray(value)
+        ? value.map((entry, index) => normalizeNamePresetButton(entry, index))
         : [];
+      return normalized.length ? normalized : getDefaultNamePresetButtons();
+    }
+
+    function getNamePresetButtons(configValue = getConfig()) {
+      return normalizeNamePresetButtons(
+        configValue
+        && configValue.defaults
+        && configValue.defaults.namePresetButtons,
+      );
     }
 
     function getActivePresetId(configValue = getConfig()) {
       return configValue && configValue.defaults && configValue.defaults.activePresetId
         ? configValue.defaults.activePresetId
-        : "";
+        : defaultPresetId;
     }
 
     function getActivePreset(configValue = getConfig()) {
       const items = getPresetItems(configValue);
-      return items.find((entry) => entry.id === getActivePresetId(configValue)) || items[0] || null;
+      return items.find((entry) => entry.id === getActivePresetId(configValue)) || items[0];
     }
 
     function getPresetDisplayLabel(preset, index = 0) {
@@ -239,6 +310,8 @@
       }
       renderPresetChips();
       renderQuickDevBuyButtons(nextConfig);
+      renderNamePresetEditor(nextConfig);
+      renderNamePresetStrip();
       scheduleLiveSyncBroadcast({ immediate: true });
     }
 
@@ -704,15 +777,7 @@
 
     function renderPresetChipMarkup(configValue = getConfig(), { topBar = false } = {}) {
       const activePresetId = getActivePresetId(configValue);
-      const presetItems = getPresetItems(configValue);
-      if (!presetItems.length) {
-        return topBar ? "" : `
-    <button type="button" class="preset-chip" data-create-preset="true">
-      Create Preset
-    </button>
-  `;
-      }
-      return presetItems.map((preset, index) => `
+      return getPresetItems(configValue).map((preset, index) => `
     <button
       type="button"
       class="preset-chip${preset.id === activePresetId ? " active" : ""}${topBar ? " compact" : ""}"
@@ -736,17 +801,11 @@
         lastSettingsPresetMarkup = settingsMarkup;
       }
       if (presetEditToggle) {
-        const hasPresets = getPresetItems(configValue).length > 0;
         const editing = isPresetEditing(configValue);
-        presetEditToggle.disabled = !hasPresets;
         presetEditToggle.classList.toggle("active", editing);
         presetEditToggle.setAttribute("aria-pressed", editing ? "true" : "false");
         presetEditToggle.innerHTML = editing ? "Lock" : "&#9998;";
-        presetEditToggle.title = !hasPresets
-          ? "Create a preset first"
-          : editing
-            ? "Lock active preset"
-            : "Unlock active preset for editing";
+        presetEditToggle.title = editing ? "Lock active preset" : "Unlock active preset for editing";
       }
     }
 
@@ -802,6 +861,217 @@
       if (markup === lastQuickDevBuyMarkup) return;
       devBuyQuickButtons.innerHTML = markup;
       lastQuickDevBuyMarkup = markup;
+    }
+
+    function namePresetTickerMode(preset) {
+      if (preset && preset.tickerAbbreviate) return "abbreviate";
+      if (preset && preset.tickerUseFirstWord) return "first-word";
+      return "current";
+    }
+
+    function renderNamePresetEditor(configValue = getConfig()) {
+      if (!namePresetEditorList) return;
+      const presets = getNamePresetButtons(configValue);
+      const markup = presets.map((preset, index) => `
+        <div class="name-preset-editor-row" data-name-preset-index="${index}" data-name-preset-id="${escapeHTML(preset.id)}">
+          <div class="name-preset-editor-card-main">
+            <strong>${escapeHTML(preset.name)}</strong>
+            <span>${escapeHTML(formatNamePresetSummary(preset))}</span>
+          </div>
+          <div class="name-preset-editor-card-actions">
+            <button type="button" class="name-preset-icon-button" data-name-preset-edit="${index}" aria-label="Edit ${escapeHTML(preset.name)}">&#9998;</button>
+            <button type="button" class="name-preset-icon-button danger" data-name-preset-remove="${index}" aria-label="Remove ${escapeHTML(preset.name)}">&#128465;</button>
+          </div>
+        </div>
+      `).join("");
+      if (markup === lastNamePresetEditorMarkup) return;
+      namePresetEditorList.innerHTML = markup;
+      lastNamePresetEditorMarkup = markup;
+    }
+
+    function formatNamePresetSummary(preset) {
+      const nameParts = [
+        preset.namePrefix ? `"${preset.namePrefix}" + ` : "",
+        "name",
+        preset.nameSuffix ? ` + "${preset.nameSuffix}"` : "",
+      ].join("");
+      const tickerSource = preset.tickerAbbreviate
+        ? "abbrev"
+        : preset.tickerUseFirstWord ? "auto ticker" : "ticker";
+      const tickerParts = [
+        preset.tickerPrefix ? `"${preset.tickerPrefix}" + ` : "",
+        tickerSource,
+        preset.tickerSuffix ? ` + "${preset.tickerSuffix}"` : "",
+      ].join("");
+      return `${nameParts} / ${tickerParts}`;
+    }
+
+    function setNamePresetButtonsLocal(presets) {
+      const configValue = cloneConfig(getConfig()) || createFallbackConfig();
+      configValue.defaults = configValue.defaults || {};
+      configValue.defaults.namePresetButtons = normalizeNamePresetButtons(presets);
+      setConfig(configValue);
+      renderNamePresetEditor(configValue);
+      return configValue.defaults.namePresetButtons;
+    }
+
+    function setNamePresetFormActionsDisabled(disabled) {
+      [namePresetAddButton, namePresetCancelEditButton, namePresetUpdateButton].forEach((button) => {
+        if (button) button.disabled = Boolean(disabled);
+      });
+    }
+
+    async function persistNamePresetButtons(previousPresets) {
+      if (namePresetPersistInFlight) return false;
+      namePresetPersistInFlight = true;
+      setNamePresetFormActionsDisabled(true);
+      try {
+        const nextConfig = cloneConfig(getConfig()) || createFallbackConfig();
+        const nextNamePresetButtons = getNamePresetButtons(nextConfig);
+        const response = await global.fetch("/api/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ config: nextConfig }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok) {
+          throw new Error((payload && payload.error) || "Failed to save name presets.");
+        }
+        const savedConfig = cloneConfig(payload.config || nextConfig) || nextConfig;
+        savedConfig.defaults = savedConfig.defaults || {};
+        savedConfig.defaults.namePresetButtons = nextNamePresetButtons;
+        setRegionRouting(payload.regionRouting || (getLatestWalletStatus() && getLatestWalletStatus().regionRouting));
+        setConfig(savedConfig);
+        renderNamePresetEditor(savedConfig);
+        if (payload.regionRouting) renderBackendRegionSummary(payload.regionRouting);
+        return true;
+      } catch (error) {
+        void previousPresets;
+        setNamePresetError(error && error.message ? error.message : "Preset kept locally, but save failed.");
+        return false;
+      } finally {
+        namePresetPersistInFlight = false;
+        setNamePresetFormActionsDisabled(false);
+      }
+    }
+
+    function setNamePresetFormMode(mode) {
+      const editing = mode === "edit";
+      if (namePresetFormActions) namePresetFormActions.dataset.namePresetMode = editing ? "edit" : "add";
+      if (namePresetFormTitle) namePresetFormTitle.textContent = editing ? "Edit Preset" : "Add New Preset";
+    }
+
+    function clearNamePresetForm() {
+      namePresetEditingIndex = -1;
+      [
+        namePresetNewName,
+        namePresetNewNamePrefix,
+        namePresetNewNameSuffix,
+        namePresetNewTickerPrefix,
+        namePresetNewTickerSuffix,
+      ].forEach((input) => {
+        if (input) input.value = "";
+      });
+      if (namePresetNewFirstWord) namePresetNewFirstWord.checked = true;
+      if (namePresetNewAbbreviate) namePresetNewAbbreviate.checked = false;
+      setNamePresetError("");
+      setNamePresetFormMode("add");
+    }
+
+    function setNamePresetError(message = "") {
+      if (!namePresetError) return;
+      namePresetError.textContent = message;
+      namePresetError.hidden = !message;
+    }
+
+    function readNamePresetForm() {
+      const tickerAbbreviate = Boolean(namePresetNewAbbreviate && namePresetNewAbbreviate.checked);
+      const presets = getNamePresetButtons();
+      const existingId = namePresetEditingIndex >= 0 && presets[namePresetEditingIndex]
+        ? presets[namePresetEditingIndex].id
+        : "";
+      return {
+        id: existingId || `custom-${Date.now().toString(36)}`,
+        name: namePresetNewName ? namePresetNewName.value : "",
+        namePrefix: namePresetNewNamePrefix ? namePresetNewNamePrefix.value : "",
+        nameSuffix: namePresetNewNameSuffix ? namePresetNewNameSuffix.value : "",
+        tickerPrefix: namePresetNewTickerPrefix ? namePresetNewTickerPrefix.value : "",
+        tickerSuffix: namePresetNewTickerSuffix ? namePresetNewTickerSuffix.value : "",
+        tickerUseFirstWord: tickerAbbreviate ? false : Boolean(namePresetNewFirstWord && namePresetNewFirstWord.checked),
+        tickerAbbreviate,
+      };
+    }
+
+    function populateNamePresetForm(index) {
+      const presets = getNamePresetButtons();
+      const preset = presets[index];
+      if (!preset) return;
+      namePresetEditingIndex = index;
+      if (namePresetNewName) namePresetNewName.value = preset.name || "";
+      if (namePresetNewNamePrefix) namePresetNewNamePrefix.value = preset.namePrefix || "";
+      if (namePresetNewNameSuffix) namePresetNewNameSuffix.value = preset.nameSuffix || "";
+      if (namePresetNewTickerPrefix) namePresetNewTickerPrefix.value = preset.tickerPrefix || "";
+      if (namePresetNewTickerSuffix) namePresetNewTickerSuffix.value = preset.tickerSuffix || "";
+      if (namePresetNewFirstWord) namePresetNewFirstWord.checked = Boolean(preset.tickerUseFirstWord);
+      if (namePresetNewAbbreviate) namePresetNewAbbreviate.checked = Boolean(preset.tickerAbbreviate);
+      setNamePresetError("");
+      setNamePresetFormMode("edit");
+      if (namePresetNewName) {
+        try { namePresetNewName.focus(); } catch (_) { /* noop */ }
+      }
+    }
+
+    function cancelNamePresetEdit() {
+      clearNamePresetForm();
+    }
+
+    async function addNamePresetEditorRow() {
+      if (namePresetPersistInFlight) return;
+      const previousPresets = getNamePresetButtons();
+      const formPreset = readNamePresetForm();
+      if (!String(formPreset.name || "").trim()) {
+        setNamePresetError("Button name is required.");
+        return;
+      }
+      const targetIndex = namePresetEditingIndex >= 0 ? namePresetEditingIndex : previousPresets.length;
+      const normalized = normalizeNamePresetButton(formPreset, targetIndex);
+      const nextPresets = previousPresets.slice();
+      if (namePresetEditingIndex >= 0) {
+        nextPresets[namePresetEditingIndex] = normalized;
+      } else {
+        nextPresets.push(normalized);
+      }
+      setNamePresetButtonsLocal(nextPresets);
+      const persisted = await persistNamePresetButtons(previousPresets);
+      if (persisted) clearNamePresetForm();
+    }
+
+    async function removeNamePresetEditorRow(index) {
+      if (namePresetPersistInFlight) return;
+      const previousPresets = getNamePresetButtons();
+      const nextPresets = previousPresets.slice();
+      nextPresets.splice(index, 1);
+      setNamePresetButtonsLocal(nextPresets);
+      const persisted = await persistNamePresetButtons(previousPresets);
+      if (!persisted) return;
+      if (namePresetEditingIndex === index) {
+        clearNamePresetForm();
+      } else if (namePresetEditingIndex > index) {
+        namePresetEditingIndex -= 1;
+      }
+    }
+
+    function showNamePresetModal() {
+      clearNamePresetForm();
+      renderNamePresetEditor();
+      if (namePresetModal) namePresetModal.hidden = false;
+    }
+
+    function hideNamePresetModal() {
+      if (!namePresetModal) return false;
+      namePresetModal.hidden = true;
+      clearNamePresetForm();
+      return true;
     }
 
     function getDevBuyPresetEditorInputs() {
@@ -982,25 +1252,14 @@
 
     function setActivePreset(presetId, options = {}) {
       const configValue = cloneConfig(getConfig());
-      const presetItems = getPresetItems(configValue);
-      const exists = presetItems.some((entry) => entry.id === presetId);
+      const exists = getPresetItems(configValue).some((entry) => entry.id === presetId);
       configValue.defaults = {
         ...(configValue.defaults || {}),
-        activePresetId: exists ? presetId : (presetItems[0]?.id || ""),
+        activePresetId: exists ? presetId : defaultPresetId,
       };
       setConfig(configValue);
       applyPresetToSettingsInputs(getActivePreset(configValue), options);
       queueWarmActivity({ immediate: true });
-    }
-
-    function createPresetDraft(options = {}) {
-      const { syncToMainForm = false } = options;
-      const { configValue, preset } = buildConfigWithNewPreset(getConfig());
-      setConfig(configValue);
-      applyPresetToSettingsInputs(preset, { syncToMainForm });
-      setPresetEditing(true);
-      queueWarmActivity({ immediate: true });
-      return preset;
     }
 
     function setPresetEditing(editing) {
@@ -1085,26 +1344,21 @@
       syncSettingsCapabilities();
     }
 
-    function showSettingsModal(options = {}) {
+    function showSettingsModal() {
       if (!hasBootstrapConfig()) {
         setSettingsLoadingState(true);
         renderBackendRegionSummary(null);
         if (settingsModal) settingsModal.hidden = false;
         return;
       }
-      const initialConfig = cloneConfig(getConfig()) || createFallbackConfig();
-      let configValue = initialConfig;
-      if (options.createPreset && !getPresetItems(configValue).length) {
-        const created = buildConfigWithNewPreset(configValue);
-        configValue = created.configValue;
-        setConfig(configValue);
-      }
       setSettingsLoadingState(false);
       renderPresetChips();
-      applyPresetToSettingsInputs(getActivePreset(configValue), { syncToMainForm: false });
-      setPresetEditing(isPresetEditing(configValue));
+      renderNamePresetEditor();
+      renderNamePresetStrip();
+      applyPresetToSettingsInputs(getActivePreset(getConfig()), { syncToMainForm: false });
+      setPresetEditing(isPresetEditing(getConfig()));
       renderBackendRegionSummary();
-      settingsModalInitialConfig = initialConfig;
+      settingsModalInitialConfig = cloneConfig(getConfig());
       if (settingsModal) settingsModal.hidden = false;
     }
 
@@ -1116,6 +1370,8 @@
           if (!restoredConfig.defaults) restoredConfig.defaults = {};
           restoredConfig.defaults.presetEditing = false;
           setConfig(restoredConfig);
+          renderNamePresetEditor(restoredConfig);
+          renderNamePresetStrip();
           applyPresetToSettingsInputs(getActivePreset(restoredConfig), { syncToMainForm: false });
           renderBackendRegionSummary();
         }
@@ -1141,6 +1397,8 @@
       getActivePresetId,
       getBuyProvider,
       getConfig,
+      getDefaultNamePresetButtons,
+      getNamePresetButtons,
       getPresetDisplayLabel,
       getPresetItems,
       getProvider,
@@ -1161,10 +1419,16 @@
       renderPresetChips,
       renderQuickDevBuyButtons,
       saveDevBuyPresetEditor,
-      createPresetDraft,
       setConfig,
       setDevBuyPresetEditorOpen,
       setMevModeSelectValue,
+      addNamePresetEditorRow,
+      removeNamePresetEditorRow,
+      renderNamePresetEditor,
+      showNamePresetModal,
+      hideNamePresetModal,
+      populateNamePresetForm,
+      cancelNamePresetEdit,
       setPresetEditing,
       setRegionRouting,
       setSettingsLoadingState,

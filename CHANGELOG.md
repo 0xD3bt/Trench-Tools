@@ -7,6 +7,26 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-05-15
+
+### Added
+
+- Browser extension: full `j7tracker.io` adapter with Options-site toggles, contract-address quick buy/manual panel/Vamp controls, tweet-card LaunchDeck Deploy/Vamp buttons, optional native J7 button hiding, and after-deploy behavior controls.
+- LaunchDeck: editable name preset buttons for quickly applying token name and ticker prefixes/suffixes from the launch form.
+- LaunchDeck: image crop tooling, compact image selection, and J7 image candidates that can be selected, cropped, or saved into the local image library when launching from tweet context.
+- Release tooling: latest-extension release workflow, LaunchDeck package workflow, version sync scripts/checks, and a pre-commit LaunchDeck package check.
+
+### Changed
+
+- Trench Tools, LaunchDeck, the extension, and the execution engine now report the same `1.1.4` patch version.
+- The embedded LaunchDeck shell bundled with the extension was refreshed to stay in sync with the standalone LaunchDeck UI, including settings, reports, image handling, and runtime request wiring.
+- Extension Options now exposes per-surface controls for the live J7 feature set alongside Axiom.
+
+### Fixed
+
+- The toolbar popup now refreshes host connection state during token login and avoids racing its own storage listener while a new auth token is being saved.
+- LaunchDeck package checks now verify that the packaged extension shell includes the expected generated files before release packaging.
+
 ## [1.1.3] - 2026-05-13
 
 ### Added

@@ -11,19 +11,28 @@ const tempRoot = path.join(distDir, ".extension-zip-tmp");
 const packagedFolderName = "trench-tools-extension";
 const stagedExtension = path.join(tempRoot, packagedFolderName);
 
-const excludedNames = new Set([
-  "node_modules",
-  ".DS_Store",
-  "playwright-report",
-  "test-results",
-  "blob-report",
-]);
+const includedRuntimePaths = [
+  "assets",
+  "images",
+  "launchdeck",
+  "src/background",
+  "src/content",
+  "src/offscreen",
+  "src/options",
+  "src/panel",
+  "src/popup",
+  "src/shared",
+  "manifest.json",
+];
 
-function copyFilter(source) {
-  const name = path.basename(source);
-  if (excludedNames.has(name)) return false;
-  if (name.endsWith(".trace.zip") || name.endsWith(".webm") || name.endsWith(".har")) return false;
-  return true;
+function copyRuntimePath(relativePath) {
+  const source = path.join(extensionSource, relativePath);
+  const target = path.join(stagedExtension, relativePath);
+  if (!fs.existsSync(source)) {
+    throw new Error(`Missing extension runtime path: ${relativePath}`);
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.cpSync(source, target, { recursive: true });
 }
 
 function run(command, args, options = {}) {
@@ -65,10 +74,10 @@ if (!fs.existsSync(path.join(extensionSource, "manifest.json"))) {
 fs.mkdirSync(distDir, { recursive: true });
 fs.rmSync(tempRoot, { recursive: true, force: true });
 fs.mkdirSync(tempRoot, { recursive: true });
-fs.cpSync(extensionSource, stagedExtension, {
-  recursive: true,
-  filter: copyFilter,
-});
+fs.mkdirSync(stagedExtension, { recursive: true });
+for (const relativePath of includedRuntimePaths) {
+  copyRuntimePath(relativePath);
+}
 fs.rmSync(outputZip, { force: true });
 
 if (os.platform() === "win32") {

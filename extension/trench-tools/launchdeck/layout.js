@@ -6,7 +6,7 @@
   const TOKENS = Object.freeze({
     createOverlay: Object.freeze({
       width: 532,
-      height: 672,
+      height: 717,
       viewportGap: 64,
       sizeEpsilon: 2,
       background: "linear-gradient(180deg, rgba(13, 13, 13, 0.99), rgba(9, 9, 9, 1))",

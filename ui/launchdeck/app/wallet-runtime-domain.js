@@ -222,10 +222,12 @@
 
     function walletDisplayName(wallet) {
       if (!wallet) return "No wallet";
-      if (wallet.customName && String(wallet.customName).trim()) {
-        return String(wallet.customName).trim();
+      const customName = wallet.customName ? String(wallet.customName).trim() : "";
+      const envKey = wallet.envKey ? String(wallet.envKey).trim() : "";
+      if (customName && customName !== envKey && !/^SOLANA_PRIVATE_KEY\d*$/i.test(customName)) {
+        return customName;
       }
-      const index = walletIndexFromEnvKey(wallet.envKey);
+      const index = walletIndexFromEnvKey(envKey);
       return `#${index}`;
     }
 
@@ -536,6 +538,7 @@
     function setWalletDropdownOpen(isOpen) {
       if (walletDropdown) walletDropdown.hidden = !isOpen;
       if (walletTriggerButton) walletTriggerButton.setAttribute("aria-expanded", String(isOpen));
+      schedulePopoutAutosize({ immediate: Boolean(isOpen) });
     }
 
     function toggleWalletDropdown() {

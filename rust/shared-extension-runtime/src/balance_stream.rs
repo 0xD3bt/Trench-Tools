@@ -176,6 +176,8 @@ pub struct TokenBalanceCacheEventPayload {
 pub struct TradeEventPayload {
     pub client_request_id: String,
     pub batch_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub platform: String,
     pub signature: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +326,7 @@ enum StreamCommand {
     RegisterTrade {
         client_request_id: String,
         batch_id: String,
+        platform: String,
         signature: String,
     },
     Shutdown,
@@ -401,11 +404,13 @@ impl BalanceStreamHandle {
         &self,
         client_request_id: impl Into<String>,
         batch_id: impl Into<String>,
+        platform: impl Into<String>,
         signature: impl Into<String>,
     ) {
         let _ = self.inner.command_tx.send(StreamCommand::RegisterTrade {
             client_request_id: client_request_id.into(),
             batch_id: batch_id.into(),
+            platform: platform.into(),
             signature: signature.into(),
         });
     }
@@ -597,6 +602,7 @@ struct PendingAccountAck {
 struct PendingTrade {
     client_request_id: String,
     batch_id: String,
+    platform: String,
     signature: String,
     registered_at: Instant,
 }
@@ -1375,10 +1381,11 @@ async fn run_session(
                             }
                         }
                     }
-                    Some(StreamCommand::RegisterTrade { client_request_id, batch_id, signature }) => {
+                    Some(StreamCommand::RegisterTrade { client_request_id, batch_id, platform, signature }) => {
                         let trade = PendingTrade {
                             client_request_id,
                             batch_id,
+                            platform,
                             signature,
                             registered_at: Instant::now(),
                         };
@@ -2069,6 +2076,7 @@ async fn handle_signature_notification(
     let _ = event_tx.send(StreamEvent::Trade(TradeEventPayload {
         client_request_id: trade.client_request_id,
         batch_id: trade.batch_id,
+        platform: trade.platform,
         signature: trade.signature,
         status,
         slot,
@@ -2118,10 +2126,11 @@ async fn wait_for_reconnect_or_command(
                             return false;
                         }
                     }
-                    Some(StreamCommand::RegisterTrade { client_request_id, batch_id, signature }) => {
+                    Some(StreamCommand::RegisterTrade { client_request_id, batch_id, platform, signature }) => {
                         pending_trades.push(PendingTrade {
                             client_request_id,
                             batch_id,
+                            platform,
                             signature,
                             registered_at: Instant::now(),
                         });
@@ -2167,11 +2176,13 @@ async fn wait_for_demand_or_shutdown(
             Some(StreamCommand::RegisterTrade {
                 client_request_id,
                 batch_id,
+                platform,
                 signature,
             }) => {
                 pending_trades.push(PendingTrade {
                     client_request_id,
                     batch_id,
+                    platform,
                     signature,
                     registered_at: Instant::now(),
                 });

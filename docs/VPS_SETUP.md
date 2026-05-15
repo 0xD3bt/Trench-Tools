@@ -402,6 +402,8 @@ If `8788` works but `8789` fails, extension trading can work while LaunchDeck is
 
 ## 7. Connect The Extension
 
+Install or update the browser extension on the local PC that runs Chrome/Edge. The simplest path is to download `trench-tools-extension.zip` from the `extension-latest` GitHub release, unzip it locally, and load the unzipped `trench-tools-extension` folder as an unpacked extension. You can also pull the full repo or only `extension/trench-tools` with git. See [EXTENSION.md](EXTENSION.md).
+
 Open the Trench Tools extension Options page, then open `Global settings`.
 
 Use these values when you are using SSH forwards:
@@ -461,6 +463,8 @@ If you use the browser extension, reload the unpacked extension in Chrome/Edge a
 2. find Trench Tools
 3. click reload
 4. re-test Options -> Global settings
+
+If you installed from the packaged zip, download the newest `trench-tools-extension.zip` on your local PC, unzip it over or beside the old extension folder, then reload Trench Tools in Chrome/Edge. If you loaded `extension/trench-tools` from a git checkout, update that checkout with `git pull --ff-only` first.
 
 ## Useful Commands
 

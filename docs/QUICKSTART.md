@@ -182,12 +182,12 @@ Follow [EXTENSION.md](EXTENSION.md) for the full guide. Short version:
 1. Open Chrome or Edge.
 2. Open `chrome://extensions` or `edge://extensions`.
 3. Enable Developer mode.
-4. Get the extension folder by pulling this repo with git, or download the full repository to your PC.
+4. Download `trench-tools-extension.zip` from the latest extension release, unzip it on the PC running Chrome/Edge, or get the extension folder by pulling this repo with git.
 5. Click `Load unpacked`.
-6. Select the `extension/trench-tools` folder.
+6. Select the unzipped `trench-tools-extension` folder. If you are using a git checkout, select `extension/trench-tools`.
 7. Open the extension Options page and fill the host URLs and shared access token.
 
-[EXTENSION.md](EXTENSION.md) also shows a git sparse-checkout flow if you only want to pull `extension/trench-tools`.
+[EXTENSION.md](EXTENSION.md) shows the packaged zip link, full-repo option, and git sparse-checkout flow if you only want to pull `extension/trench-tools`.
 
 ## 7. Verify Setup
 
@@ -198,8 +198,8 @@ Before using real size:
 - auth token exists at `.local/trench-tools/default-engine-token.txt`
 - extension Options -> Global settings shows the expected host connection state
 - Axiom shows the enabled Trench Tools surfaces
+- J7Tracker shows the enabled Trench Tools surfaces
 - the toolbar popup shows host status, active preset, wallet/group selection, and quick-buy amount
-- `j7tracker.io` is available in the codebase but currently disabled, so do not expect it to be live until re-enabled
 
 Start with a small test amount and the recommended providers: `Helius Sender` or `Hello Moon`.
 

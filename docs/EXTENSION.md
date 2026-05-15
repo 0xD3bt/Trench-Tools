@@ -13,7 +13,7 @@ When `LaunchDeck` is running too, the extension also gives you an embedded Launc
 npm start
 ```
 
-3. Get the extension folder by pulling this repo with git, or download the full repository to your PC.
+3. Download the latest packaged extension zip to the PC running Chrome/Edge, unzip it, and load the unzipped `trench-tools-extension` folder as an unpacked extension. You can also pull `extension/trench-tools` or the full repo with git and load that source folder.
 4. Load the extension folder as an unpacked Chrome/Edge extension.
 5. Open extension Options -> `Global settings`.
 6. Set `Execution host` to `http://127.0.0.1:8788`.
@@ -28,12 +28,12 @@ For VPS installs, keep the SSH tunnel open first so those local-looking URLs poi
 Current status:
 
 - Live: `axiom.trade`
-- Available, currently disabled: `j7tracker.io`
+- Live: `j7tracker.io`
 - Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, X, and many more platforms
 
 Axiom currently includes token-page instant trade, Pulse quick buy, Pulse manual panel, watchlist quick buy, wallet-tracker quick buy, floating launcher, embedded LaunchDeck popout, Pulse/Token Vamp helpers, and DexScreener shortcuts.
 
-J7 is wired but disabled for now. It will be enabled again soon, so do not expect it to be live until the toggle ships back on.
+J7 includes contract-address quick actions, tweet-card Deploy/Vamp buttons, LaunchDeck context handoff, and configurable after-deploy behavior.
 
 The foundation is ready. Adding more terminals, trackers, and web apps should be incremental rather than a rewrite.
 
@@ -74,6 +74,17 @@ The token-page instant panel can show Axiom controls, Trench Tools controls, or 
 
 Pair addresses from Axiom are treated as route hints, not blind execution authority. When a pair is available, the extension sends it so the engine can classify the route directly from RPC owner/layout checks. If the engine cannot verify the pair as a supported route, it fails with a clear unsupported-pool message.
 
+## J7Tracker Surfaces
+
+J7 support is live on `j7tracker.io`. Depending on which J7 toggles are enabled in Options -> `Sites`, Trench Tools can show:
+
+- quick-buy, manual-panel, and Vamp buttons after detected Solana contract addresses
+- LaunchDeck Deploy and Vamp buttons on tweet cards
+- optional hiding of J7's native Deploy/Vamp buttons when Trench Tools buttons are shown
+- after-deploy behavior controls, including toast-only and Axiom open-tab/open-window actions
+
+LaunchDeck deploys opened from J7 can carry tweet context into the launch form. When images are detected from that context, LaunchDeck can offer image candidates that can be selected, cropped, or saved to the local image library.
+
 ## Which Backend Mode?
 
 Set `TRENCH_TOOLS_MODE` in `.env`, then use `npm start`.
@@ -89,15 +100,30 @@ For normal extension use, run `ee` or `both`. You can still use `trench-tools-st
 1. Start the backend first:
    - set `TRENCH_TOOLS_MODE=both` in `.env`, or leave it blank for the same default
    - run `npm start` from the repo root
-2. Get the extension folder by pulling this repo with git, or download the full repository to your PC.
-3. Open Chrome or Edge.
-4. Open `chrome://extensions` or `edge://extensions`.
-5. Enable `Developer mode`.
-6. Click `Load unpacked`.
-7. Select the `extension/trench-tools` folder.
-8. Open the Trench Tools extension Options page.
+2. Get the extension on the PC that runs Chrome/Edge. The simplest path is the latest packaged zip: `trench-tools-extension.zip` from the `extension-latest` GitHub release.
+3. Unzip it and keep the unzipped `trench-tools-extension` folder somewhere stable, such as `Documents\Trench Tools Extension`.
+4. Open Chrome or Edge.
+5. Open `chrome://extensions` or `edge://extensions`.
+6. Enable `Developer mode`.
+7. Click `Load unpacked`.
+8. Select the unzipped `trench-tools-extension` folder.
+9. Open the Trench Tools extension Options page.
 
 If you only need quick trading and PnL, set `TRENCH_TOOLS_MODE=ee`. If you want LaunchDeck in the popout, use `TRENCH_TOOLS_MODE=both` or leave it blank.
+
+Packaged release path:
+
+```text
+https://github.com/0xD3bt/Execution-engine/releases/tag/extension-latest
+```
+
+Download `trench-tools-extension.zip`, unzip it, and load the unzipped `trench-tools-extension` folder. Chrome/Edge cannot load the zip directly.
+
+If you already cloned the full repository, you can load this source folder instead:
+
+```text
+extension/trench-tools
+```
 
 To pull only the extension folder from git:
 
@@ -119,6 +145,8 @@ To update that fallback copy later:
 cd trench-tools-extension-source
 git pull --ff-only
 ```
+
+If you use the packaged zip, update by downloading the newest `trench-tools-extension.zip`, replacing the old unzipped folder, then clicking reload for Trench Tools on `chrome://extensions` or `edge://extensions`.
 
 ## Connect The Extension
 
@@ -253,6 +281,8 @@ For LaunchDeck presets:
 
 The panel needs at least one usable execution preset and at least one selected wallet or wallet group before it can submit trades.
 
+LaunchDeck's launch form also has token name preset buttons. These are separate from execution presets: they apply saved name/ticker prefixes and suffixes to the current launch form so repeated naming patterns are faster to enter.
+
 ## Wallets And Wallet Groups
 
 Open Options -> `Wallets`.
@@ -299,7 +329,7 @@ If a warm route is stale, unsupported, or invalidated after a trade, the next ac
 
 Open Options -> `Sites`.
 
-Use the per-site toggles to choose where Trench Tools is active. Axiom has separate toggles for trading buttons, panels, and LaunchDeck-related injection. J7 is present but currently disabled until it is re-enabled.
+Use the per-site toggles to customize where Trench Tools is active. Axiom has separate toggles for trading buttons, panels, Vamp/DexScreener helpers, and LaunchDeck-related injection. J7 has separate toggles for contract-address quick actions, tweet-card Deploy/Vamp buttons, optional native-button hiding, and after-deploy behavior.
 
 Future platforms such as Terminal, GMGN, Telegram web, Discord web, X, and others will appear here as they ship.
 
@@ -334,6 +364,8 @@ After pulling a new repo version:
 5. Open `chrome://extensions` or `edge://extensions`.
 6. Click reload on the unpacked Trench Tools extension.
 7. Open Options -> `Global settings` and test the execution host and LaunchDeck host again.
+
+If you installed from the packaged zip instead of a git checkout, download the latest `trench-tools-extension.zip` from the `extension-latest` release, unzip it over or beside the old extension folder, then reload the unpacked extension in Chrome/Edge.
 
 Upgrade the extension and local binaries together when a release changes host routes or auth behavior.
 

@@ -53,6 +53,9 @@
       fetchImageLibrary = async () => {},
       showImageDetailsModal = () => {},
       setSelectedImageInFeature = () => {},
+      setDisplayImageSrc = (image, value) => {
+        image.src = value;
+      },
     } = actions;
 
     function metadataUploadState() {
@@ -71,11 +74,7 @@
         imageEmpty.hidden = false;
         return;
       }
-      if (typeof global.__launchdeckSetDisplayImageSrc === "function") {
-        global.__launchdeckSetDisplayImageSrc(imagePreview, previewUrl);
-      } else {
-        imagePreview.src = previewUrl;
-      }
+      setDisplayImageSrc(imagePreview, previewUrl);
       imagePreview.hidden = false;
       imageEmpty.hidden = true;
     }
@@ -317,7 +316,8 @@
       );
     }
 
-    async function uploadSelectedImage(file) {
+    async function uploadSelectedImage(file, options = {}) {
+      const { showDetails = true, selectImage = true } = options || {};
       const formData = new global.FormData();
       formData.append("file", file, file.name);
       const response = await global.fetch("/api/upload-image", {
@@ -338,7 +338,13 @@
       } catch (error) {
         if (imageStatus) imageStatus.textContent = error.message;
       }
-      showImageDetailsModal(payload, { isNewUpload: true });
+      if (showDetails) {
+        showImageDetailsModal(payload, { isNewUpload: true });
+      }
+      if (selectImage) {
+        setSelectedImage(payload);
+      }
+      return payload;
     }
 
     async function ensureTestImageSelected() {

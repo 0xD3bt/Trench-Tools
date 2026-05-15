@@ -21,6 +21,13 @@
       twitterInput,
       telegramInput,
       tickerCapsToggle,
+      namePresetStrip,
+      namePresetModal,
+      namePresetClose,
+      namePresetEditorList,
+      namePresetAddButton,
+      namePresetCancelEditButton,
+      namePresetUpdateButton,
       changeDevBuyPresetsButton,
       cancelDevBuyPresetsButton,
       saveDevBuyPresetsButton,
@@ -135,6 +142,15 @@
       applyTickerCapsMode,
       isTickerCapsEnabled,
       setTickerCapsEnabled,
+      applyNamePreset,
+      renderNamePresetStrip,
+      getNamePresetButtons,
+      addNamePresetEditorRow,
+      removeNamePresetEditorRow,
+      showNamePresetModal,
+      hideNamePresetModal,
+      populateNamePresetForm,
+      cancelNamePresetEdit,
       setDevBuyPresetEditorOpen,
       populateDevBuyPresetEditor,
       getConfig,
@@ -331,9 +347,34 @@
       }
     }
 
+    function disableBrowserHistory(root = document) {
+      if (!root || typeof root.querySelectorAll !== "function") return;
+      root.querySelectorAll("input, textarea, select").forEach((field) => {
+        const type = String(field.getAttribute("type") || "").toLowerCase();
+        if (type === "hidden" || type === "radio" || type === "checkbox" || type === "file") return;
+        field.setAttribute("autocomplete", "off");
+        field.setAttribute("autocorrect", "off");
+        field.setAttribute("autocapitalize", "off");
+        field.setAttribute("spellcheck", "false");
+      });
+    }
+
     function bindEvents() {
       if (eventsBound) return;
       eventsBound = true;
+
+      if (form) form.setAttribute("autocomplete", "off");
+      disableBrowserHistory(document);
+      if (document.body && typeof MutationObserver === "function") {
+        const observer = new MutationObserver((mutations) => {
+          for (const mutation of mutations) {
+            mutation.addedNodes.forEach((node) => {
+              if (node instanceof Element) disableBrowserHistory(node);
+            });
+          }
+        });
+        observer.observe(document.body, { subtree: true, childList: true });
+      }
 
       if (form) {
         form.querySelectorAll('input[name="mode"]').forEach((node) => {
@@ -388,6 +429,7 @@
       if (nameInput) {
         nameInput.addEventListener("input", () => {
           syncTickerFromName();
+          if (typeof renderNamePresetStrip === "function") renderNamePresetStrip();
           markMetadataUploadDirty();
           scheduleMetadataPreupload({ immediate: true });
         });
@@ -431,6 +473,7 @@
           setTickerManuallyEdited(true);
           setTickerClearedForManualEntry(symbolInput.value.trim().length === 0);
           updateTokenFieldCounts();
+          if (typeof renderNamePresetStrip === "function") renderNamePresetStrip();
           markMetadataUploadDirty();
           scheduleMetadataPreupload({ immediate: true });
         });
@@ -463,6 +506,66 @@
           applyTickerCapsMode();
           if (!getTickerManuallyEdited()) {
             syncTickerFromName();
+          }
+        });
+      }
+
+      if (namePresetStrip) {
+        namePresetStrip.addEventListener("click", (event) => {
+          const button = event.target.closest("[data-name-preset-index], [data-name-preset-manage]");
+          if (!button) return;
+          if (button.matches("[data-name-preset-manage]")) {
+            if (typeof showNamePresetModal === "function") showNamePresetModal();
+            return;
+          }
+          const index = Number(button.dataset.namePresetIndex);
+          const presetList = typeof getNamePresetButtons === "function" ? getNamePresetButtons() : [];
+          const preset = Array.isArray(presetList) ? presetList[index] : null;
+          if (preset && typeof applyNamePreset === "function") applyNamePreset(preset);
+        });
+      }
+
+      if (namePresetEditorList) {
+        namePresetEditorList.addEventListener("click", (event) => {
+          const editButton = event.target.closest("[data-name-preset-edit]");
+          if (editButton && typeof populateNamePresetForm === "function") {
+            populateNamePresetForm(Number(editButton.dataset.namePresetEdit));
+            return;
+          }
+          const removeButton = event.target.closest("[data-name-preset-remove]");
+          if (!removeButton || typeof removeNamePresetEditorRow !== "function") return;
+          removeNamePresetEditorRow(Number(removeButton.dataset.namePresetRemove));
+        });
+      }
+
+      if (namePresetAddButton) {
+        namePresetAddButton.addEventListener("click", () => {
+          if (typeof addNamePresetEditorRow === "function") addNamePresetEditorRow();
+        });
+      }
+
+      if (namePresetUpdateButton) {
+        namePresetUpdateButton.addEventListener("click", () => {
+          if (typeof addNamePresetEditorRow === "function") addNamePresetEditorRow();
+        });
+      }
+
+      if (namePresetCancelEditButton) {
+        namePresetCancelEditButton.addEventListener("click", () => {
+          if (typeof cancelNamePresetEdit === "function") cancelNamePresetEdit();
+        });
+      }
+
+      if (namePresetClose) {
+        namePresetClose.addEventListener("click", () => {
+          if (typeof hideNamePresetModal === "function") hideNamePresetModal();
+        });
+      }
+
+      if (namePresetModal) {
+        namePresetModal.addEventListener("click", (event) => {
+          if (event.target === namePresetModal && typeof hideNamePresetModal === "function") {
+            hideNamePresetModal();
           }
         });
       }

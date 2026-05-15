@@ -1,6 +1,6 @@
 {
   "name": "launchdeck",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "private": true,
   "description": "Production-grade Solana launch deck for Pump, Bonk, and Bags-style launch flows.",
   "workspaces": [
@@ -29,11 +29,21 @@
     "start": "node ./scripts/runtime-control.js start",
     "stop": "node ./scripts/runtime-control.js stop",
     "restart": "node ./scripts/runtime-control.js restart",
+    "sync:version": "node ./scripts/sync-version.js",
+    "check:version-sync": "node ./scripts/sync-version.js --check",
     "extension:zip": "node ./scripts/package-extension-zip.js",
+    "precommit:launchdeck-package": "node ./scripts/precommit-launchdeck-package.js",
+    "prepare": "simple-git-hooks",
     "analyze": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml --bin launchdeck-debug-cli -- analyze-launch",
     "trace-agent": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml --bin launchdeck-debug-cli -- trace-agent-account"
   },
+  "simple-git-hooks": {
+    "pre-commit": "npm run precommit:launchdeck-package"
+  },
   "dependencies": {
     "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "simple-git-hooks": "^2.13.1"
   }
 }

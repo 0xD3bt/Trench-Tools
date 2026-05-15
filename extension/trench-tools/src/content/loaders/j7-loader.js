@@ -31,6 +31,52 @@
     });
   }
 
+  function restoreJ7InlineStyleSnapshot(element, attributeName, properties) {
+    if (!(element instanceof HTMLElement)) return;
+    const raw = element.getAttribute(attributeName);
+    if (raw === null) return;
+    let saved = {};
+    try {
+      saved = JSON.parse(raw) || {};
+    } catch (_error) {
+      saved = {};
+    }
+    for (const property of properties) {
+      element.style.removeProperty(property);
+    }
+    if (saved.property) {
+      element.style.setProperty(saved.property, saved.original || "");
+    }
+    for (const property of properties) {
+      const key = property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+      if (saved[key]) {
+        element.style.setProperty(property, saved[key]);
+      }
+      if (saved[property]) {
+        element.style.setProperty(property, saved[property]);
+      }
+    }
+    element.removeAttribute(attributeName);
+  }
+
+  function restoreJ7CompactButton(element) {
+    if (!(element instanceof HTMLElement) && !(element instanceof SVGElement)) return;
+    const props = ["font-size", "width", "min-width", "max-width", "flex", "padding-left", "padding-right", "gap", "height"];
+    for (const property of props) {
+      const key = property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+      const valueKey = `trenchToolsJ7Orig${key}`;
+      const priorityKey = `trenchToolsJ7Orig${key}Priority`;
+      if (!(valueKey in element.dataset)) continue;
+      const value = element.dataset[valueKey] || "";
+      const priority = element.dataset[priorityKey] || "";
+      element.style.removeProperty(property);
+      if (value) element.style.setProperty(property, value, priority);
+      delete element.dataset[valueKey];
+      delete element.dataset[priorityKey];
+    }
+    element.removeAttribute("data-trench-tools-j7-compact");
+  }
+
   function reconnectState() {
     if (!window[RECONNECT_STATE_KEY] || typeof window[RECONNECT_STATE_KEY] !== "object") {
       window[RECONNECT_STATE_KEY] = {
@@ -289,20 +335,51 @@
       "#trench-tools-drag-overlay",
       "#trench-tools-launchdeck-overlay",
       "#trench-tools-vamp-overlay",
+      "#trench-tools-j7-no-twitch-style",
       "[data-trench-tools-inline]",
       "[data-trench-tools-token-detail-inline]",
       "[data-trench-tools-pulse-inline]",
       "[data-trench-tools-pulse-panel-inline]",
       "[data-trench-tools-wallet-tracker-inline]",
       "[data-trench-tools-axiom-watchlist-inline]",
-      "[data-trench-tools-launchdeck-shell]"
+      "[data-trench-tools-launchdeck-shell]",
+      "[data-trench-tools-j7-contract-controls]",
+      "[data-trench-tools-j7-card-action]",
+      "[data-trench-tools-j7-fallback-deploy-section]"
     ].forEach(removeAll);
 
     document.querySelectorAll(".trench-tools-pulse-panel-owner").forEach((element) => {
       element.classList.remove("trench-tools-pulse-panel-owner");
     });
+    document.querySelectorAll("[data-trench-tools-j7-fallback-deploy-class]").forEach((element) => {
+      const className = element.getAttribute("data-trench-tools-j7-fallback-deploy-class");
+      if (className) element.classList.remove(className);
+      element.removeAttribute("data-trench-tools-j7-fallback-deploy-class");
+    });
+    document.querySelectorAll("[data-trench-tools-j7-action-container]").forEach((element) => {
+      element.removeAttribute("data-trench-tools-j7-action-container");
+      delete element.dataset.trenchToolsJ7CardProcessed;
+    });
+    document.querySelectorAll("[data-trench-tools-j7-grouped]").forEach((element) => {
+      element.removeAttribute("data-trench-tools-j7-grouped");
+    });
+    document.querySelectorAll("[data-trench-tools-j7-card-padded]").forEach((element) => {
+      restoreJ7InlineStyleSnapshot(element, "data-trench-tools-j7-card-padded", ["padding-left", "padding-right"]);
+    });
+    document.querySelectorAll("[data-trench-tools-j7-rail-resized]").forEach((element) => {
+      restoreJ7InlineStyleSnapshot(element, "data-trench-tools-j7-rail-resized", ["width", "left", "right"]);
+    });
+    document.querySelectorAll("[data-trench-tools-j7-vamp-shifted]").forEach((element) => {
+      restoreJ7InlineStyleSnapshot(element, "data-trench-tools-j7-vamp-shifted", ["right", "left", "margin-left"]);
+    });
+    document.querySelectorAll("[data-trench-tools-j7-compact='1']").forEach((element) => {
+      restoreJ7CompactButton(element);
+      element.querySelectorAll("[data-trench-tools-j7-compact='1']").forEach(restoreJ7CompactButton);
+    });
 
     clearMarker("[data-trench-tools-mounted]", "data-trench-tools-mounted");
+    clearMarker("[data-trench-tools-j7-processed]", "data-trench-tools-j7-processed");
+    clearMarker("[data-trench-tools-j7-controls-signature]", "data-trench-tools-j7-controls-signature");
     clearMarker("[data-trench-tools-j7-prewarm-wired]", "data-trench-tools-j7-prewarm-wired");
     clearMarker("[data-trench-tools-pulse-anchor-id]", "data-trench-tools-pulse-anchor-id");
     clearMarker("[data-trench-tools-pulse-card-id]", "data-trench-tools-pulse-card-id");

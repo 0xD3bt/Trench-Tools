@@ -37,12 +37,15 @@ const feeSplitPillTitle = document.getElementById("fee-split-pill-title");
 const feeSplitPillProgress = document.getElementById("fee-split-pill-progress");
 const imageInput = document.getElementById("image-input");
 const openImageLibraryButton = document.getElementById("open-image-library-button");
+const j7OpenImageLibraryButton = document.getElementById("j7-open-image-library-button");
 const imageLayoutToggle = document.getElementById("image-layout-toggle");
+const editSelectedImageButton = document.getElementById("edit-selected-image-button");
 const tokenSurfaceSection = document.getElementById("token-surface-section");
 const imagePreview = document.getElementById("image-preview");
 const imageEmpty = document.getElementById("image-empty");
 const imageStatus = document.getElementById("image-status");
 const imagePath = document.getElementById("image-path");
+const j7ImageCandidates = document.getElementById("j7-image-candidates");
 const imageLibraryModal = document.getElementById("image-library-modal");
 const imageLibraryClose = document.getElementById("image-library-close");
 const imageLibrarySearchInput = document.getElementById("image-library-search-input");
@@ -53,6 +56,7 @@ const imageCategoryChips = document.getElementById("image-category-chips");
 const newImageCategoryButton = document.getElementById("new-image-category-button");
 const imageItemMenu = document.getElementById("image-item-menu");
 const imageMenuFavorite = document.getElementById("image-menu-favorite");
+const imageMenuCrop = document.getElementById("image-menu-crop");
 const imageMenuEdit = document.getElementById("image-menu-edit");
 const imageMenuDelete = document.getElementById("image-menu-delete");
 const imageDetailsModal = document.getElementById("image-details-modal");
@@ -88,6 +92,23 @@ const descriptionCharCount = document.getElementById("description-char-count");
 const nameCharCount = document.getElementById("name-char-count");
 const symbolCharCount = document.getElementById("symbol-char-count");
 const tickerCapsToggle = document.getElementById("ticker-caps-toggle");
+const namePresetStrip = document.getElementById("name-preset-strip");
+const namePresetModal = document.getElementById("name-preset-modal");
+const namePresetClose = document.getElementById("name-preset-close");
+const namePresetEditorList = document.getElementById("name-preset-editor-list");
+const namePresetFormActions = document.querySelector(".name-preset-form-actions");
+const namePresetAddButton = document.getElementById("name-preset-add");
+const namePresetCancelEditButton = document.getElementById("name-preset-cancel-edit");
+const namePresetUpdateButton = document.getElementById("name-preset-update");
+const namePresetFormTitle = document.getElementById("name-preset-form-title");
+const namePresetNewName = document.getElementById("name-preset-new-name");
+const namePresetNewNamePrefix = document.getElementById("name-preset-new-name-prefix");
+const namePresetNewNameSuffix = document.getElementById("name-preset-new-name-suffix");
+const namePresetNewTickerPrefix = document.getElementById("name-preset-new-ticker-prefix");
+const namePresetNewTickerSuffix = document.getElementById("name-preset-new-ticker-suffix");
+const namePresetNewFirstWord = document.getElementById("name-preset-new-first-word");
+const namePresetNewAbbreviate = document.getElementById("name-preset-new-abbreviate");
+const namePresetError = document.getElementById("name-preset-error");
 const devBuyModeInput = getNamedInput("devBuyMode");
 const devBuyAmountInput = getNamedInput("devBuyAmount");
 const postLaunchStrategyInput = getNamedInput("postLaunchStrategy");
@@ -258,6 +279,9 @@ const vampClose = document.getElementById("vamp-close");
 const vampCancel = document.getElementById("vamp-cancel");
 const vampImport = document.getElementById("vamp-import");
 const vampContractInput = document.getElementById("vamp-contract-input");
+const vampTweetUrlInput = document.getElementById("vamp-tweet-url-input");
+const vampAutoLoadInput = document.getElementById("vamp-auto-load-input");
+const vampClipboardDetectInput = document.getElementById("vamp-clipboard-detect-input");
 const vampStatus = document.getElementById("vamp-status");
 const vampError = document.getElementById("vamp-error");
 let vampAutoImportTimer = null;
@@ -299,13 +323,6 @@ const hasLegacyPopoutQuery = pageSearchParams.get("popout") === "1";
 const isPopoutMode = window.name === POPOUT_WINDOW_NAME || hasLegacyPopoutQuery;
 const extensionShellConfig = window.__launchdeckExtensionShell || null;
 const isOverlayMode = Boolean(extensionShellConfig && extensionShellConfig.shell === "overlay");
-const TRUSTED_OVERLAY_PARENT_ORIGINS = new Set([
-  "https://axiom.trade",
-  "https://j7tracker.io",
-]);
-const overlayParentOrigin = isOverlayMode
-  ? trustedOverlayParentOrigin(pageSearchParams.get("parentOrigin"))
-  : "";
 const isCreateOverlayMode = Boolean(
   isOverlayMode
   && extensionShellConfig
@@ -321,6 +338,28 @@ let lastCreateOverlayPostedHeight = 0;
 const CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE = "trench-tools-launchdeck";
 const CREATE_OVERLAY_RESIZE_MESSAGE_TYPE = "resize-create-overlay";
 const POST_DEPLOY_MESSAGE_TYPE = "post-deploy-success";
+const TRUSTED_OVERLAY_PARENT_ORIGINS = new Set([
+  "https://axiom.trade",
+  "https://backup.axiom.trade",
+  "https://j7tracker.io",
+]);
+const overlayParentOrigin = (() => {
+  const candidates = [String(extensionShellConfig?.parentOrigin || "").trim()];
+  const ancestorOrigins = window.location?.ancestorOrigins;
+  if (ancestorOrigins && ancestorOrigins.length) {
+    candidates.push(String(ancestorOrigins[0] || "").trim());
+  }
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const origin = new URL(candidate).origin;
+      if (TRUSTED_OVERLAY_PARENT_ORIGINS.has(origin)) return origin;
+    } catch (_error) {
+      continue;
+    }
+  }
+  return "";
+})();
 const SITE_FEATURES_STORAGE_KEY = "trenchTools.siteFeatures";
 const POST_DEPLOY_ACTIONS = new Set([
   "close_modal_toast",
@@ -342,10 +381,12 @@ const WalletRuntimeDomainModule = window.LaunchDeckWalletRuntimeDomain || {};
 const LiveSyncModule = window.LaunchDeckLiveSync || {};
 const LocalBindersModule = window.LaunchDeckLocalBinders || {};
 const ImageMetadataDomainModule = window.LaunchDeckImageMetadataDomain || {};
+const ImageCropDomainModule = window.LaunchDeckImageCropDomain || {};
 let settingsDomain = null;
 let splitEditorsDomain = null;
 let walletRuntimeDomain = null;
 let imageMetadataDomain = null;
+let imageCropDomain = null;
 let quotePreviewDomain = null;
 let reportsPresenters = null;
 let reportsHistory = null;
@@ -356,15 +397,6 @@ const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
   symbolMaxLength: 10,
 });
 const STANDARD_RPC_SLIPPAGE_DEFAULT = "20";
-
-function trustedOverlayParentOrigin(value) {
-  try {
-    const parsed = new URL(String(value || ""));
-    return TRUSTED_OVERLAY_PARENT_ORIGINS.has(parsed.origin) ? parsed.origin : "";
-  } catch (_error) {
-    return "";
-  }
-}
 
 function readEarlyLiveSyncSnapshot() {
   return typeof LiveSyncModule.readEarlyLiveSyncSnapshot === "function"
@@ -419,6 +451,13 @@ if (pageSearchParams.has("popout") || pageSearchParams.has("output") || pageSear
     // Ignore history replacement failures and keep boot functional.
   }
 }
+
+let j7TweetContext = null;
+let j7ImageCandidateState = {
+  candidates: [],
+  selectedId: "",
+};
+let j7ImagePersistPromise = null;
 
 setThemeMode(getStoredThemeMode(), { persist: false });
 setOutputSectionVisible(
@@ -680,6 +719,22 @@ settingsDomain = SettingsDomainModule.create ? SettingsDomainModule.create({
     sellHelloMoonMevWarning,
     sellStandardRpcWarning,
     settingsBackendRegionSummary,
+    namePresetModal,
+    namePresetClose,
+    namePresetEditorList,
+    namePresetFormActions,
+    namePresetAddButton,
+    namePresetCancelEditButton,
+    namePresetUpdateButton,
+    namePresetFormTitle,
+    namePresetNewName,
+    namePresetNewNamePrefix,
+    namePresetNewNameSuffix,
+    namePresetNewTickerPrefix,
+    namePresetNewTickerSuffix,
+    namePresetNewFirstWord,
+    namePresetNewAbbreviate,
+    namePresetError,
     settingsModal,
     settingsClose,
     settingsCancel,
@@ -699,7 +754,6 @@ settingsDomain = SettingsDomainModule.create ? SettingsDomainModule.create({
     getLatestWalletStatus: () => latestWalletStatus,
     setLatestWalletStatus: (value) => {
       latestWalletStatus = value;
-      syncLaunchdeckPresetEmptyState();
     },
     getLatestRuntimeStatus: () => latestRuntimeStatus,
   },
@@ -718,6 +772,7 @@ settingsDomain = SettingsDomainModule.create ? SettingsDomainModule.create({
     queueWarmActivity: (options) => queueWarmActivity(options),
     syncDevAutoSellUI: () => syncDevAutoSellUI(),
     clearDevBuyState: () => clearDevBuyState(),
+    renderNamePresetStrip: () => renderNamePresetStrip(),
   },
 }) : null;
 const TOTAL_SUPPLY_TOKENS = 1_000_000_000n;
@@ -738,12 +793,10 @@ function setStatusLabel(label = "") {
   const hidden = !normalized || /^(idle|ready)$/i.test(normalized);
   if (statusNode) {
     statusNode.textContent = hidden ? "" : normalized;
-    statusNode.title = hidden ? "" : normalized;
     statusNode.hidden = hidden;
   }
   if (imageStatus) {
     imageStatus.textContent = hidden ? "" : normalized;
-    imageStatus.title = hidden ? "" : normalized;
   }
 }
 
@@ -1605,7 +1658,6 @@ walletRuntimeDomain = WalletRuntimeDomainModule.create({
     getLatestWalletStatus: () => latestWalletStatus,
     setLatestWalletStatus: (value) => {
       latestWalletStatus = value;
-      syncLaunchdeckPresetEmptyState();
     },
     getLatestRuntimeStatus: () => latestRuntimeStatus,
     setLatestRuntimeStatus: (value) => {
@@ -1830,12 +1882,14 @@ const imagesFeature = window.ImagesFeature.create({
     imageLibraryModal,
     imageLibrarySearchInput,
     imageLibraryUploadButton,
+    editSelectedImageButton,
     imageLibraryGrid,
     imageLibraryEmpty,
     imageCategoryChips,
     newImageCategoryButton,
     imageItemMenu,
     imageMenuFavorite,
+    imageMenuCrop,
     imageMenuEdit,
     imageMenuDelete,
     imageDetailsModal,
@@ -1860,6 +1914,7 @@ const imagesFeature = window.ImagesFeature.create({
     imageLibraryClose,
     imageInput,
     openImageLibraryButton,
+    j7OpenImageLibraryButton,
   },
   renderCache,
   requestStates,
@@ -1891,8 +1946,12 @@ const imagesFeature = window.ImagesFeature.create({
   clearMetadataUploadCache,
   setImagePreview,
   scheduleMetadataPreupload,
+  openImageCropModal: (options) => imageCropDomain?.open(options),
+  uploadImageFile: (file) => uploadImageFile(file),
+  replaceImageFile: (image, file) => replaceImageFile(image, file),
   escapeHTML,
   fetchJsonLatest: RequestUtils.fetchJsonLatest,
+  onImageSelected: (image) => addLibraryImageToJ7Row(image),
 });
 
 imagesFeature.bindEvents();
@@ -2346,6 +2405,25 @@ imageMetadataDomain = ImageMetadataDomainModule.create ? ImageMetadataDomainModu
     fetchImageLibrary,
     showImageDetailsModal,
     setSelectedImageInFeature: (image) => imagesFeature.setSelectedImage(image),
+    setDisplayImageSrc: (image, value) => {
+      if (typeof window.__launchdeckSetDisplayImageSrc === "function") {
+        window.__launchdeckSetDisplayImageSrc(image, value);
+      } else {
+        image.src = value;
+      }
+    },
+  },
+}) : null;
+
+imageCropDomain = ImageCropDomainModule.create ? ImageCropDomainModule.create({
+  resolveDisplayUrl: async (value) => {
+    if (typeof window.__launchdeckResolveDisplayUrl === "function") {
+      return window.__launchdeckResolveDisplayUrl(value);
+    }
+    return value;
+  },
+  onError: (message) => {
+    if (imageStatus && message) imageStatus.textContent = message;
   },
 }) : null;
 
@@ -2585,8 +2663,6 @@ function toggleDescriptionDisclosure(forceOpen) {
   const nextOpen = typeof forceOpen === "boolean" ? forceOpen : descriptionPanelBody.hidden;
   descriptionPanelBody.hidden = !nextOpen;
   updateDescriptionDisclosure();
-  postCreateOverlayResize();
-  scheduleCreateOverlayAutosize();
 }
 
 function parseDecimalToBigInt(rawValue, decimals) {
@@ -2638,6 +2714,34 @@ function populateDevBuyPresetEditor(config = latestWalletStatus && latestWalletS
   return settingsDomain.populateDevBuyPresetEditor(config);
 }
 
+function renderNamePresetEditor(config = latestWalletStatus && latestWalletStatus.config) {
+  return settingsDomain.renderNamePresetEditor(config);
+}
+
+function addNamePresetEditorRow() {
+  return settingsDomain.addNamePresetEditorRow();
+}
+
+function removeNamePresetEditorRow(index) {
+  return settingsDomain.removeNamePresetEditorRow(index);
+}
+
+function showNamePresetModal() {
+  return settingsDomain.showNamePresetModal();
+}
+
+function hideNamePresetModal() {
+  return settingsDomain.hideNamePresetModal();
+}
+
+function populateNamePresetForm(index) {
+  return settingsDomain.populateNamePresetForm(index);
+}
+
+function cancelNamePresetEdit() {
+  return settingsDomain.cancelNamePresetEdit();
+}
+
 function setDevBuyPresetEditorOpen(isOpen) {
   return settingsDomain.setDevBuyPresetEditorOpen(isOpen);
 }
@@ -2660,6 +2764,10 @@ function createFallbackConfig() {
 
 function getConfig() {
   return settingsDomain.getConfig();
+}
+
+function getNamePresetButtons(config = getConfig()) {
+  return settingsDomain.getNamePresetButtons(config);
 }
 
 function isTrackSendBlockHeightEnabled(config = getConfig()) {
@@ -3362,6 +3470,90 @@ function getAutoTickerValue() {
   return formatTickerValue(nameInput ? nameInput.value : "");
 }
 
+function titleCasePresetName(value) {
+  return String(value || "").replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function isNamePresetApplied(preset) {
+  if (!preset || !nameInput || !symbolInput) return false;
+  const currentName = String(nameInput.value || "").trim().toLowerCase();
+  const currentSymbol = String(symbolInput.value || "").trim().toLowerCase();
+  return Boolean(
+    (preset.namePrefix && currentName.startsWith(String(preset.namePrefix).toLowerCase()))
+    || (preset.nameSuffix && currentName.endsWith(String(preset.nameSuffix).toLowerCase()))
+    || (preset.tickerPrefix && currentSymbol.startsWith(String(preset.tickerPrefix).toLowerCase()))
+    || (preset.tickerSuffix && currentSymbol.endsWith(String(preset.tickerSuffix).toLowerCase())),
+  );
+}
+
+function buildNamePresetTicker(preset, sourceName, sourceSymbol) {
+  let ticker = "";
+  if (preset.tickerPrefix) ticker += preset.tickerPrefix;
+  if (preset.tickerAbbreviate) {
+    ticker += String(sourceName || "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase())
+      .join("");
+  } else if (preset.tickerUseFirstWord) {
+    ticker += titleCasePresetName(String(sourceName || "").trim().split(/\s+/)[0] || "");
+  } else {
+    ticker += String(sourceSymbol || "").trim();
+  }
+  if (preset.tickerSuffix) ticker += preset.tickerSuffix;
+  return formatTickerValue(ticker);
+}
+
+function applyNamePreset(preset) {
+  if (!preset || !nameInput || !symbolInput) return;
+  const { nameMaxLength } = getLaunchpadTokenMetadata();
+  const sourceName = String(nameInput.value || "").trim();
+  const sourceSymbol = String(symbolInput.value || "").trim();
+  const nextName = clipUtf8Bytes(
+    titleCasePresetName(`${preset.namePrefix || ""}${sourceName}${preset.nameSuffix || ""}`),
+    nameMaxLength,
+  );
+  nameInput.value = nextName;
+  syncingTickerFromName = true;
+  symbolInput.value = buildNamePresetTicker(preset, sourceName, sourceSymbol);
+  syncingTickerFromName = false;
+  tickerManuallyEdited = true;
+  tickerClearedForManualEntry = false;
+  updateTokenFieldCounts();
+  markMetadataUploadDirty();
+  scheduleMetadataPreupload({ immediate: true });
+  scheduleLiveSyncBroadcast({ immediate: true });
+  renderNamePresetStrip();
+}
+
+function renderNamePresetStrip() {
+  if (!namePresetStrip || !settingsDomain || typeof settingsDomain.getNamePresetButtons !== "function") return;
+  const presets = settingsDomain.getNamePresetButtons();
+  const markup = presets.map((preset, index) => {
+    const disabled = isNamePresetApplied(preset);
+    const currentName = nameInput ? String(nameInput.value || "").trim() : "";
+    const currentSymbol = symbolInput ? String(symbolInput.value || "").trim() : "";
+    const previewName = `${preset.namePrefix || ""}${currentName || "[name]"}${preset.nameSuffix || ""}`;
+    const previewTicker = `${preset.tickerPrefix || ""}${currentSymbol || "[ticker]"}${preset.tickerSuffix || ""}`;
+    return `
+      <button
+        type="button"
+        class="name-preset-button${disabled ? " disabled" : ""}"
+        data-name-preset-index="${index}"
+        title="Apply: ${escapeHTML(previewName)} / ${escapeHTML(previewTicker)}"
+        ${disabled ? "disabled" : ""}
+      >${escapeHTML(preset.name)}</button>
+    `;
+  }).join("");
+  const manageMarkup = `
+    <button type="button" class="name-preset-button name-preset-manage-button" data-name-preset-manage title="Edit name presets" aria-label="Edit name presets">
+      +
+    </button>
+  `;
+  namePresetStrip.innerHTML = presets.length ? `${markup}${manageMarkup}` : manageMarkup;
+}
+
 function updateTokenFieldCounts() {
   const { nameMaxLength, symbolMaxLength } = getLaunchpadTokenMetadata();
   if (nameInput) {
@@ -3845,10 +4037,6 @@ function setPresetEditing(editing) {
   return settingsDomain.setPresetEditing(editing);
 }
 
-function createPresetDraft(options = {}) {
-  return settingsDomain.createPresetDraft(options);
-}
-
 
 function renderVanityButtonState() {
   if (!modeVanityButton) return;
@@ -3884,12 +4072,20 @@ function hideVanityModal() {
   if (vanityModal) vanityModal.hidden = true;
 }
 
-function showVampModal() {
+function showVampModal({ tweetUrl = "" } = {}) {
   if (vampError) vampError.textContent = "";
   if (vampStatus) {
     vampStatus.hidden = true;
     vampStatus.textContent = "";
   }
+  const contextTweetUrl = String(tweetUrl || j7TweetContext?.tweetUrl || "").trim();
+  const isTweetVamp = Boolean(contextTweetUrl);
+  if (vampTweetUrlInput) {
+    vampTweetUrlInput.value = contextTweetUrl;
+    vampTweetUrlInput.closest(".vamp-tweet-url-row")?.toggleAttribute("hidden", !contextTweetUrl);
+  }
+  vampAutoLoadInput?.closest(".vamp-check-row")?.toggleAttribute("hidden", !isTweetVamp);
+  vampClipboardDetectInput?.closest(".vamp-check-row")?.toggleAttribute("hidden", !isTweetVamp);
   if (vampContractInput) {
     const presetAddress = extensionShellConfig && extensionShellConfig.contractAddress
       ? String(extensionShellConfig.contractAddress).trim()
@@ -3905,6 +4101,8 @@ function showVampModal() {
     && looksLikeSolanaAddress(vampContractInput.value)
   ) {
     scheduleVampAutoImport();
+  } else if (contextTweetUrl && vampClipboardDetectInput?.checked) {
+    detectVampAddressFromClipboard().catch(() => {});
   }
 }
 
@@ -3926,12 +4124,27 @@ function looksLikeSolanaAddress(value) {
   return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(value || "").trim());
 }
 
+function extractSolanaAddressFromText(value) {
+  const match = String(value || "").match(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/);
+  return match ? match[0] : "";
+}
+
+async function detectVampAddressFromClipboard() {
+  if (!vampContractInput || !navigator.clipboard?.readText) return;
+  const text = await navigator.clipboard.readText();
+  const address = extractSolanaAddressFromText(text);
+  if (!address || !looksLikeSolanaAddress(address)) return;
+  vampContractInput.value = address;
+  scheduleVampAutoImport();
+}
+
 function scheduleVampAutoImport() {
   if (vampAutoImportTimer) {
     window.clearTimeout(vampAutoImportTimer);
     vampAutoImportTimer = null;
   }
   if (!vampModal || vampModal.hidden || !vampContractInput) return;
+  if (vampAutoLoadInput && !vampAutoLoadInput.checked) return;
   const contractAddress = vampContractInput.value.trim();
   if (!looksLikeSolanaAddress(contractAddress)) return;
   vampAutoImportTimer = window.setTimeout(() => {
@@ -4093,6 +4306,10 @@ async function importVampToken(contractAddressOverride = "") {
     if (websiteInput) websiteInput.value = payload.token && payload.token.website ? payload.token.website : "";
     if (twitterInput) twitterInput.value = payload.token && payload.token.twitter ? payload.token.twitter : "";
     if (telegramInput) telegramInput.value = payload.token && payload.token.telegram ? payload.token.telegram : "";
+    applyJ7ContextLinks({
+      ...j7TweetContext,
+      tweetUrl: String(vampTweetUrlInput?.value || j7TweetContext?.tweetUrl || "").trim(),
+    }, { preferExisting: false });
     clearMetadataUploadCache({ clearInput: true });
     updateTokenFieldCounts();
 
@@ -4243,6 +4460,353 @@ function setImagePreview(previewUrl) {
   }
   imagePreview.hidden = false;
   imageEmpty.hidden = true;
+}
+
+async function uploadImageFile(file) {
+  const formData = new FormData();
+  formData.append("file", file, file.name);
+  const response = await fetch("/api/upload-image", {
+    method: "POST",
+    body: formData,
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Image upload failed.");
+  }
+  return payload;
+}
+
+async function replaceImageFile(image, file) {
+  const formData = new FormData();
+  formData.append("file", file, file.name);
+  const response = await fetch(`/api/images/replace?id=${encodeURIComponent(image.id || "")}`, {
+    method: "POST",
+    body: formData,
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Image replacement failed.");
+  }
+  return payload.image || null;
+}
+
+function normalizeJ7ImageCandidate(candidate, index) {
+  if (!candidate || typeof candidate !== "object") return null;
+  const src = String(candidate.src || candidate.url || candidate.data || "").trim();
+  if (!src) return null;
+  return {
+    id: String(candidate.id || `j7-image-${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`),
+    src,
+    data: String(candidate.data || "").trim(),
+    name: String(candidate.name || candidate.alt || `j7-image-${index + 1}`).trim(),
+    role: String(candidate.role || "media").trim(),
+    alt: String(candidate.alt || "").trim(),
+    order: Number.isFinite(Number(candidate.order)) ? Number(candidate.order) : index,
+    croppedFromId: String(candidate.croppedFromId || "").trim(),
+    removed: false,
+  };
+}
+
+function selectedJ7Candidate() {
+  return j7ImageCandidateState.candidates.find((candidate) => candidate.id === j7ImageCandidateState.selectedId)
+    || j7ImageCandidateState.candidates.find((candidate) => !candidate.removed)
+    || null;
+}
+
+function j7CandidatePreviewUrl(candidate) {
+  return String(candidate?.data || candidate?.src || "").trim();
+}
+
+function addLibraryImageToJ7Row(image) {
+  if (
+    !j7ImageCandidates
+    || !tokenSurfaceSection?.classList.contains("has-j7-image-candidates")
+    || !image
+    || typeof image !== "object"
+  ) return;
+  const previewUrl = String(image.previewUrl || "").trim()
+    || (image.fileName ? `/uploads/${encodeURIComponent(image.fileName)}` : "");
+  if (!previewUrl) return;
+  const id = `library-${String(image.id || image.fileName || previewUrl)}`;
+  const name = String(image.name || image.fileName || "library-image").trim();
+  const existing = j7ImageCandidateState.candidates.find((candidate) => candidate.id === id);
+  if (existing) {
+    existing.removed = false;
+    existing.src = previewUrl;
+    existing.data = "";
+    existing.name = name;
+    existing.alt = name;
+  } else {
+    j7ImageCandidateState.candidates.unshift({
+      id,
+      src: previewUrl,
+      data: "",
+      name,
+      role: "library",
+      alt: name,
+      order: -1,
+      removed: false,
+    });
+  }
+  j7ImageCandidateState.selectedId = id;
+  j7ImagePersistPromise = null;
+  setJ7ImagePickerActive(true);
+  renderJ7ImageCandidates();
+}
+
+function isXProfileOrStatusUrl(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    return /(^|\.)x\.com$/i.test(url.hostname) || /(^|\.)twitter\.com$/i.test(url.hostname);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function normalizeHttpUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    return new URL(raw).toString();
+  } catch (_error) {
+    return "";
+  }
+}
+
+function applyJ7ContextLinks(context, { preferExisting = true } = {}) {
+  if (!context || typeof context !== "object") return;
+  const urls = [
+    context.tweetUrl,
+    ...(Array.isArray(context.externalLinks) ? context.externalLinks : []),
+  ].map(normalizeHttpUrl).filter(Boolean);
+  const xUrl = urls.find(isXProfileOrStatusUrl) || "";
+  const websiteUrl = urls.find((url) => !isXProfileOrStatusUrl(url)) || "";
+  if (twitterInput && xUrl && (!preferExisting || !twitterInput.value.trim())) {
+    twitterInput.value = xUrl;
+  }
+  if (websiteInput && websiteUrl && (!preferExisting || !websiteInput.value.trim())) {
+    websiteInput.value = websiteUrl;
+  }
+}
+
+function setJ7ImagePickerActive(isActive) {
+  if (!tokenSurfaceSection) return;
+  tokenSurfaceSection.classList.toggle("has-j7-image-candidates", Boolean(isActive));
+  if (j7OpenImageLibraryButton) j7OpenImageLibraryButton.hidden = !isActive;
+}
+
+function selectJ7ImageCandidate(candidateId) {
+  const candidate = j7ImageCandidateState.candidates.find((entry) => entry.id === candidateId && !entry.removed);
+  if (!candidate) return;
+  if (uploadedImage?.j7CandidateId !== candidate.id) {
+    j7ImagePersistPromise = null;
+  }
+  j7ImageCandidateState.selectedId = candidate.id;
+  uploadedImage = {
+    id: candidate.id,
+    name: candidate.name,
+    fileName: candidate.name || candidate.id,
+    previewUrl: j7CandidatePreviewUrl(candidate),
+    j7SessionOnly: true,
+    j7CandidateId: candidate.id,
+  };
+  clearMetadataUploadCache({ clearInput: true });
+  setImagePreview(j7CandidatePreviewUrl(candidate));
+  if (imageStatus) imageStatus.textContent = "J7 image selected for this deploy session.";
+  if (imagePath) imagePath.textContent = "";
+  setJ7ImagePickerActive(true);
+  renderJ7ImageCandidates();
+  persistSelectedJ7ImageForMetadata().catch((error) => {
+    if (imageStatus) imageStatus.textContent = error.message;
+    if (imagePath) imagePath.textContent = "";
+  });
+}
+
+function removeJ7ImageCandidate(candidateId) {
+  const candidate = j7ImageCandidateState.candidates.find((entry) => entry.id === candidateId);
+  if (!candidate) return;
+  candidate.removed = true;
+  if (j7ImageCandidateState.selectedId === candidateId) {
+    const next = j7ImageCandidateState.candidates.find((entry) => !entry.removed);
+    if (next) {
+      selectJ7ImageCandidate(next.id);
+      return;
+    }
+    j7ImageCandidateState.selectedId = "";
+    uploadedImage = null;
+    setImagePreview("");
+  }
+  renderJ7ImageCandidates();
+}
+
+async function blobFromJ7Candidate(candidate) {
+  const source = j7CandidatePreviewUrl(candidate);
+  if (!source) throw new Error("Image source missing.");
+  if (source.startsWith("data:")) {
+    const response = await fetch(source);
+    return response.blob();
+  }
+  try {
+    const response = await fetch(source, { mode: "cors" });
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    return response.blob();
+  } catch (_error) {
+    throw new Error("Failed to load tweet image. Use the crop/save action or choose another image.");
+  }
+}
+
+async function fileFromJ7Candidate(candidate) {
+  const blob = await blobFromJ7Candidate(candidate);
+  const extension = blob.type.includes("jpeg") ? "jpg" : blob.type.includes("webp") ? "webp" : "png";
+  const safeName = String(candidate.name || "j7-image").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "j7-image";
+  return new File([blob], `${safeName}.${extension}`, { type: blob.type || "image/png" });
+}
+
+async function saveJ7ImageCandidate(candidateId) {
+  const candidate = j7ImageCandidateState.candidates.find((entry) => entry.id === candidateId && !entry.removed);
+  if (!candidate) return;
+  if (imageStatus) imageStatus.textContent = "Saving J7 image to library...";
+  const file = await fileFromJ7Candidate(candidate);
+  await uploadSelectedImage(file);
+}
+
+async function persistSelectedJ7ImageForMetadata() {
+  const candidate = selectedJ7Candidate();
+  if (!candidate || !uploadedImage?.j7SessionOnly || uploadedImage.j7CandidateId !== candidate.id) {
+    return;
+  }
+  if (!j7ImagePersistPromise) {
+    const persistPromise = (async () => {
+      if (imageStatus) imageStatus.textContent = "Saving selected J7 image for metadata...";
+      const file = await fileFromJ7Candidate(candidate);
+      const persisted = await uploadSelectedImage(file, { showDetails: false, selectImage: false });
+      if (
+        !persisted
+        || j7ImageCandidateState.selectedId !== candidate.id
+        || !uploadedImage?.j7SessionOnly
+        || uploadedImage.j7CandidateId !== candidate.id
+      ) {
+        return persisted;
+      }
+      imagesFeature.setSelectedImage(persisted);
+      if (persisted && imageStatus) imageStatus.textContent = "J7 image ready for metadata.";
+      scheduleMetadataPreupload({ immediate: true });
+      return persisted;
+    })().finally(() => {
+      if (j7ImagePersistPromise === persistPromise) {
+        j7ImagePersistPromise = null;
+      }
+    });
+    j7ImagePersistPromise = persistPromise;
+  }
+  await j7ImagePersistPromise;
+}
+
+function renderJ7ImageCandidates() {
+  if (!j7ImageCandidates) return;
+  const candidates = j7ImageCandidateState.candidates.filter((candidate) => !candidate.removed);
+  j7ImageCandidates.hidden = candidates.length === 0 || isImageLayoutCompactActive();
+  setJ7ImagePickerActive(candidates.length > 0 && !j7ImageCandidates.hidden);
+  if (j7ImageCandidates.hidden) {
+    j7ImageCandidates.innerHTML = "";
+    return;
+  }
+  j7ImageCandidates.innerHTML = candidates.map((candidate) => {
+    const selected = candidate.id === j7ImageCandidateState.selectedId;
+    return `
+      <div class="j7-image-candidate${selected ? " is-selected" : ""}" data-j7-image-id="${escapeHTML(candidate.id)}">
+        <img src="${escapeHTML(j7CandidatePreviewUrl(candidate))}" alt="${escapeHTML(candidate.alt || candidate.name)}">
+        <div class="j7-image-selected-mark" aria-hidden="true">${selected ? j7IconCheckSvg() : ""}</div>
+        <div class="j7-image-candidate-actions" aria-label="Image actions">
+          <button type="button" class="j7-image-action j7-image-action-crop" data-j7-image-action="crop" title="Crop image" aria-label="Crop image">${j7IconCropSvg()}</button>
+          <button type="button" class="j7-image-action j7-image-action-save" data-j7-image-action="save" title="Save to library" aria-label="Save to library">${j7IconSaveSvg()}</button>
+          <button type="button" class="j7-image-action j7-image-action-remove" data-j7-image-action="remove" title="Remove image" aria-label="Remove image">${j7IconTrashSvg()}</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+function j7IconCheckSvg() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 9.4 17 19 7"></path></svg>';
+}
+
+function j7IconCropSvg() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2v14h16"></path><path d="M18 22V8H2"></path></svg>';
+}
+
+function j7IconSaveSvg() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path><path d="M7 3v6h8"></path><path d="M7 21v-8h10v8"></path></svg>';
+}
+
+function j7IconTrashSvg() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M6 7l1 14h10l1-14"></path><path d="M9 7V4h6v3"></path></svg>';
+}
+
+function openJ7CropModal(candidateId) {
+  const candidate = j7ImageCandidateState.candidates.find((entry) => entry.id === candidateId && !entry.removed);
+  if (!candidate || !imageCropDomain) return;
+  imageCropDomain.open({
+    src: j7CandidatePreviewUrl(candidate),
+    name: candidate.name || "j7-image",
+    alt: candidate.alt || candidate.name || "Tweet image",
+    title: "Crop Image",
+    onSave: ({ dataUrl }) => saveJ7CroppedCandidate(candidate, dataUrl),
+  }).catch((error) => {
+    if (imageStatus) imageStatus.textContent = error.message;
+  });
+}
+
+function closeJ7CropModal() {
+  imageCropDomain?.close();
+}
+
+function saveJ7CroppedCandidate(candidate, dataUrl) {
+  if (!dataUrl) return;
+  const cropped = {
+    ...candidate,
+    id: `j7-crop-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    data: dataUrl,
+    src: dataUrl,
+    name: `${candidate.name || "j7-image"}-cropped`,
+    croppedFromId: candidate.id,
+    removed: false,
+  };
+  j7ImageCandidateState.candidates.unshift(cropped);
+  closeJ7CropModal();
+  selectJ7ImageCandidate(cropped.id);
+}
+
+async function loadJ7TweetContextFromShell() {
+  const key = String(extensionShellConfig?.j7ContextKey || "").trim();
+  if (!key || !window.chrome?.storage?.local) return;
+  try {
+    const stored = await chrome.storage.local.get(key);
+    const context = stored[key];
+    await chrome.storage.local.remove(key);
+    if (!context || typeof context !== "object") return;
+    j7TweetContext = context;
+    const images = Array.isArray(context.images) ? context.images : [];
+    j7ImageCandidateState.candidates = images
+      .map((candidate, index) => normalizeJ7ImageCandidate(candidate, index))
+      .filter(Boolean)
+      .sort((a, b) => a.order - b.order);
+    if (j7ImageCandidateState.candidates.length) {
+      selectJ7ImageCandidate(j7ImageCandidateState.candidates[0].id);
+    } else {
+      renderJ7ImageCandidates();
+    }
+    if (context.text && descriptionInput && !descriptionInput.value.trim()) {
+      descriptionInput.value = String(context.text).slice(0, descriptionInput.maxLength || 1000);
+      updateTokenFieldCounts();
+    }
+    applyJ7ContextLinks(context);
+    if (String(extensionShellConfig?.action || "") === "vamp-with-tweet") {
+      showVampModal({ tweetUrl: context.tweetUrl || "" });
+    }
+  } catch (error) {
+    if (imageStatus) imageStatus.textContent = error.message || "Failed to load J7 tweet context.";
+  }
 }
 
 function selectedWalletKey() {
@@ -4424,12 +4988,10 @@ function walletIndexFromEnvKey(envKey) {
 
 function walletDisplayName(wallet) {
   if (!wallet) return "No wallet";
-  const customName = wallet.customName ? String(wallet.customName).trim() : "";
-  const envKey = wallet.envKey ? String(wallet.envKey).trim() : "";
-  if (customName && customName !== envKey && !/^SOLANA_PRIVATE_KEY\d*$/i.test(customName)) {
-    return customName;
+  if (wallet.customName && String(wallet.customName).trim()) {
+    return String(wallet.customName).trim();
   }
-  const index = walletIndexFromEnvKey(envKey);
+  const index = walletIndexFromEnvKey(wallet.envKey);
   return `#${index}`;
 }
 
@@ -4768,6 +5330,8 @@ function applyPersistentDefaults(config) {
   }
   renderQuickDevBuyButtons(resolvedConfig);
   populateDevBuyPresetEditor(resolvedConfig);
+  renderNamePresetEditor(resolvedConfig);
+  renderNamePresetStrip();
   defaultsApplied = true;
 }
 
@@ -4818,11 +5382,19 @@ function surfaceMetadataWarning(warning) {
 
 function scheduleMetadataPreupload({ immediate = false } = {}) {
   if (!imageMetadataDomain) return;
+  if (uploadedImage?.j7SessionOnly) {
+    persistSelectedJ7ImageForMetadata().catch((error) => {
+      if (imageStatus) imageStatus.textContent = error.message;
+      if (imagePath) imagePath.textContent = "";
+    });
+    return;
+  }
   imageMetadataDomain.scheduleMetadataPreupload({ immediate });
 }
 
 async function ensureMetadataReadyForAction(action) {
   if (!imageMetadataDomain) return;
+  await persistSelectedJ7ImageForMetadata();
   return imageMetadataDomain.ensureMetadataReadyForAction(action);
 }
 
@@ -5006,9 +5578,9 @@ function queueQuoteUpdate() {
   });
 }
 
-async function uploadSelectedImage(file) {
+async function uploadSelectedImage(file, options = {}) {
   if (!imageMetadataDomain) return;
-  return imageMetadataDomain.uploadSelectedImage(file);
+  return imageMetadataDomain.uploadSelectedImage(file, options);
 }
 
 async function applyTestPreset() {
@@ -5253,43 +5825,10 @@ function validateFeeSplit(...args) {
   return splitEditorsDomain.validateFeeSplit(...args);
 }
 
-const MISSING_LAUNCHDECK_PRESET_MESSAGE = "No valid LaunchDeck preset saved. Open Settings to create one first.";
-
-function hasValidLaunchdeckPreset() {
-  const presetItems = settingsDomain.getPresetItems(settingsDomain.getConfig());
-  return presetItems.some((preset) => String(preset?.id || "").trim());
-}
-
-function syncLaunchdeckPresetEmptyState() {
-  const existing = document.getElementById("launchdeck-preset-empty-state");
-  if (hasValidLaunchdeckPreset()) {
-    existing?.remove();
-    return;
-  }
-  const container = existing || document.createElement("div");
-  container.id = "launchdeck-preset-empty-state";
-  container.className = "validation-errors";
-  container.innerHTML = `
-    <span>${escapeHTML(MISSING_LAUNCHDECK_PRESET_MESSAGE)}</span>
-    <button type="button" class="secondary-button" data-open-launchdeck-settings>Open Settings</button>
-  `;
-  const outputAnchor = outputSection || document.querySelector(".output");
-  if (!existing && outputAnchor?.parentNode) {
-    outputAnchor.parentNode.insertBefore(container, outputAnchor);
-  }
-  const actionButton = container.querySelector("[data-open-launchdeck-settings]");
-  if (actionButton) {
-    actionButton.onclick = () => {
-      showSettingsModal({ createPreset: true });
-    };
-  }
-}
-
 function validateForm() {
   const errors = [];
   const f = readForm();
   const launchpadCapabilities = getLaunchpadUiCapabilities(f.launchpad);
-  if (!hasValidLaunchdeckPreset()) errors.push(MISSING_LAUNCHDECK_PRESET_MESSAGE);
   if (!f.name.trim()) errors.push("Token name is required.");
   if (!f.symbol.trim()) errors.push("Ticker is required.");
   if (!hasAttachedImage()) errors.push("Token image is required.");
@@ -5492,16 +6031,22 @@ function normalizePostDeployPreferences(value) {
   };
 }
 
+function postDeploySourcePlatform() {
+  const source = String(extensionShellConfig?.sourcePlatform || "").trim().toLowerCase();
+  return source === "j7" ? "j7" : "axiom";
+}
+
 async function loadPostDeployPreferences() {
   if (!extensionShellConfig || !window.chrome || !chrome.storage || !chrome.storage.local) {
     return defaultPostDeployPreferences();
   }
   try {
     const stored = await chrome.storage.local.get(SITE_FEATURES_STORAGE_KEY);
-    const axiom = stored && stored[SITE_FEATURES_STORAGE_KEY] && stored[SITE_FEATURES_STORAGE_KEY].axiom;
+    const features = stored && stored[SITE_FEATURES_STORAGE_KEY] ? stored[SITE_FEATURES_STORAGE_KEY] : {};
+    const platformFeatures = features[postDeploySourcePlatform()] || features.axiom;
     return normalizePostDeployPreferences({
-      action: axiom && axiom.postDeployAction,
-      destination: axiom && axiom.postDeployDestination,
+      action: platformFeatures && platformFeatures.postDeployAction,
+      destination: platformFeatures && platformFeatures.postDeployDestination,
     });
   } catch (_error) {
     return defaultPostDeployPreferences();
@@ -5659,8 +6204,7 @@ function openPostDeployUrlWithWindow(url, mode) {
 }
 
 function postPostDeploySuccessToHost(payload) {
-  if (!isOverlayMode || window.parent === window) return false;
-  if (!overlayParentOrigin) return false;
+  if (!isOverlayMode || window.parent === window || !overlayParentOrigin) return false;
   window.parent.postMessage({
     source: CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE,
     type: POST_DEPLOY_MESSAGE_TYPE,
@@ -5679,6 +6223,7 @@ async function handlePostDeploySuccess({ report, formPayload } = {}) {
     url,
     action: preferences.action,
     destination: preferences.destination,
+    sourcePlatform: postDeploySourcePlatform(),
   })) {
     return;
   }
@@ -5817,29 +6362,6 @@ async function run(action) {
   return runtimeActions.run(action);
 }
 
-function runInstaLaunchFromShell() {
-  const deployButton = devBuyCustomDeployButton instanceof HTMLButtonElement
-    ? devBuyCustomDeployButton
-    : document.getElementById("dev-buy-custom-deploy");
-  if (!(deployButton instanceof HTMLButtonElement) || deployButton.disabled) {
-    return;
-  }
-  deployButton.click();
-  const confirmButton = modalConfirm instanceof HTMLButtonElement
-    ? modalConfirm
-    : document.getElementById("modal-confirm");
-  if (!(confirmButton instanceof HTMLButtonElement)) {
-    return;
-  }
-  const modal = deployModal instanceof HTMLElement
-    ? deployModal
-    : document.getElementById("deploy-modal");
-  if (modal instanceof HTMLElement && modal.hidden) {
-    return;
-  }
-  confirmButton.click();
-}
-
 function buildSavedConfigFromForm() {
   return formDomain.buildSavedConfigFromForm();
 }
@@ -5848,8 +6370,8 @@ async function saveSettings() {
   return runtimeActions.saveSettings();
 }
 
-function showSettingsModal(options = {}) {
-  return settingsDomain.showSettingsModal(options);
+function showSettingsModal() {
+  return settingsDomain.showSettingsModal();
 }
 
 function hideSettingsModal(reason = "dismiss") {
@@ -5956,6 +6478,7 @@ function setImageLayoutCompact(isCompact, { persist = true } = {}) {
   }
   schedulePopoutAutosize();
   scheduleLiveSyncBroadcast();
+  renderJ7ImageCandidates();
 }
 
 function clampReportsTerminalListWidth(width) {
@@ -6579,33 +7102,21 @@ function measureVisibleModalOverlayContent() {
   return { width: 0, height: 0 };
 }
 
-function measureOpenWalletDropdownContentHeight() {
-  if (
-    !(walletDropdown instanceof HTMLElement)
-    || walletDropdown.hidden
-    || !(form instanceof HTMLElement)
-  ) {
-    return 0;
-  }
-  const dropdownRect = walletDropdown.getBoundingClientRect();
-  const formRect = form.getBoundingClientRect();
-  return Math.max(0, Math.ceil(dropdownRect.bottom - formRect.top));
-}
-
 function getPreferredCreateOverlayContentSize() {
   const stableCreateOverlaySize = typeof LaunchDeckLayout.getCreateOverlayStableSize === "function"
     ? LaunchDeckLayout.getCreateOverlayStableSize()
     : { width: CREATE_OVERLAY_STABLE_WIDTH, height: CREATE_OVERLAY_STABLE_HEIGHT };
+  if (document.documentElement.classList.contains("boot-pending")) {
+    return stableCreateOverlaySize;
+  }
   const workspace = measureVisibleWorkspaceContent();
   const bootOverlayContent = measureVisibleBootOverlayContent();
   const modalOverlayContent = measureVisibleModalOverlayContent();
   const formRect = form ? form.getBoundingClientRect() : null;
-  let preferredWidth = stableCreateOverlaySize.width;
-  const measuredHeight = Math.max(
-    Math.ceil(formRect ? formRect.height : 0),
-    bootOverlayContent.height,
-    modalOverlayContent.height,
-  );
+  let preferredWidth = 0;
+  if (form && !form.hidden) {
+    preferredWidth = stableCreateOverlaySize.width;
+  }
   return {
     width: Math.max(
       preferredWidth,
@@ -6613,12 +7124,18 @@ function getPreferredCreateOverlayContentSize() {
       bootOverlayContent.width,
       modalOverlayContent.width,
     ),
-    height: measuredHeight || stableCreateOverlaySize.height,
+    height: Math.max(
+      stableCreateOverlaySize.height,
+      Math.ceil(formRect ? formRect.height : 0),
+      workspace.height,
+      bootOverlayContent.height,
+      modalOverlayContent.height,
+    ),
   };
 }
 
 function postCreateOverlayResize() {
-  if (!isCreateOverlayMode || window.parent === window) return;
+  if (!isCreateOverlayMode || window.parent === window || !overlayParentOrigin) return;
   const size = getPreferredCreateOverlayContentSize();
   if (!size.width || !size.height) return;
   if (
@@ -6629,9 +7146,6 @@ function postCreateOverlayResize() {
   }
   lastCreateOverlayPostedWidth = size.width;
   lastCreateOverlayPostedHeight = size.height;
-  if (!overlayParentOrigin) {
-    return;
-  }
   window.parent.postMessage({
     source: CREATE_OVERLAY_RESIZE_MESSAGE_SOURCE,
     type: CREATE_OVERLAY_RESIZE_MESSAGE_TYPE,
@@ -6656,7 +7170,6 @@ function getPreferredPopoutLayoutMetrics() {
       };
   const workspace = measureVisibleWorkspaceContent();
   const modalOverlayContent = measureVisibleModalOverlayContent();
-  const openWalletDropdownHeight = measureOpenWalletDropdownContentHeight();
   return {
     formVisible,
     reportsVisible,
@@ -6664,7 +7177,7 @@ function getPreferredPopoutLayoutMetrics() {
     baseHeight: base.height,
     modalWidth: modalOverlayContent.width,
     modalHeight: modalOverlayContent.height,
-    measuredContentHeight: Math.max(base.height, workspace.height, modalOverlayContent.height, openWalletDropdownHeight),
+    measuredContentHeight: Math.max(base.height, workspace.height, modalOverlayContent.height),
   };
 }
 
@@ -6741,7 +7254,9 @@ function scheduleCreateOverlayAutosize() {
   }
   createOverlayAutosizeFrame = window.requestAnimationFrame(() => {
     createOverlayAutosizeFrame = 0;
-    postCreateOverlayResize();
+    window.requestAnimationFrame(() => {
+      postCreateOverlayResize();
+    });
   });
 }
 
@@ -6816,6 +7331,23 @@ const localBinders = LocalBindersModule.create ? LocalBindersModule.create({
     twitterInput,
     telegramInput,
     tickerCapsToggle,
+    namePresetStrip,
+    namePresetModal,
+    namePresetClose,
+    namePresetEditorList,
+    namePresetFormActions,
+    namePresetAddButton,
+    namePresetCancelEditButton,
+    namePresetUpdateButton,
+    namePresetFormTitle,
+    namePresetNewName,
+    namePresetNewNamePrefix,
+    namePresetNewNameSuffix,
+    namePresetNewTickerPrefix,
+    namePresetNewTickerSuffix,
+    namePresetNewFirstWord,
+    namePresetNewAbbreviate,
+    namePresetError,
     changeDevBuyPresetsButton,
     cancelDevBuyPresetsButton,
     saveDevBuyPresetsButton,
@@ -6972,6 +7504,15 @@ const localBinders = LocalBindersModule.create ? LocalBindersModule.create({
     applyTickerCapsMode,
     isTickerCapsEnabled,
     setTickerCapsEnabled,
+    applyNamePreset,
+    renderNamePresetStrip,
+    getNamePresetButtons,
+    addNamePresetEditorRow,
+    removeNamePresetEditorRow,
+    showNamePresetModal,
+    hideNamePresetModal,
+    populateNamePresetForm,
+    cancelNamePresetEdit,
     setDevBuyPresetEditorOpen,
     populateDevBuyPresetEditor,
     getConfig,
@@ -7032,7 +7573,6 @@ const localBinders = LocalBindersModule.create ? LocalBindersModule.create({
     setThemeMode,
     showSettingsModal,
     saveSettings,
-    createPresetDraft,
     validateForm,
     showValidationErrors,
     clearValidationErrors,
@@ -7074,6 +7614,39 @@ const localBinders = LocalBindersModule.create ? LocalBindersModule.create({
 
 if (localBinders && typeof localBinders.bindEvents === "function") {
   localBinders.bindEvents();
+}
+
+if (j7ImageCandidates) {
+  j7ImageCandidates.addEventListener("click", (event) => {
+    const actionButton = event.target instanceof Element
+      ? event.target.closest("[data-j7-image-action]")
+      : null;
+    const tile = event.target instanceof Element
+      ? event.target.closest("[data-j7-image-id]")
+      : null;
+    if (!tile) return;
+    const candidateId = tile.getAttribute("data-j7-image-id") || "";
+    if (!actionButton) {
+      selectJ7ImageCandidate(candidateId);
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const action = actionButton.getAttribute("data-j7-image-action");
+    if (action === "select") {
+      selectJ7ImageCandidate(candidateId);
+    } else if (action === "remove") {
+      removeJ7ImageCandidate(candidateId);
+    } else if (action === "save") {
+      saveJ7ImageCandidate(candidateId).catch((error) => {
+        if (imageStatus) imageStatus.textContent = error.message;
+      });
+    } else if (action === "crop") {
+      openJ7CropModal(candidateId);
+    } else {
+      selectJ7ImageCandidate(candidateId);
+    }
+  });
 }
 
 form.querySelectorAll('input[name="launchpad"]').forEach((node) => {
@@ -7141,24 +7714,22 @@ Promise.resolve(bootstrapApp())
       }).catch(() => {});
     }
     completeInitialBoot({ offline: Boolean(bootResult && bootResult.offline) });
+    loadJ7TweetContextFromShell();
+    const hasJ7TweetContext = Boolean(String(extensionShellConfig?.j7ContextKey || "").trim());
     if (
       (!bootResult || !bootResult.offline)
       && extensionShellConfig
       && !isPopoutMode
+      && !hasJ7TweetContext
       && String(extensionShellConfig.contractAddress || "").trim()
     ) {
-      const shouldInstaLaunch = Boolean(extensionShellConfig.instaLaunch);
       window.requestAnimationFrame(() => {
         importVampToken(String(extensionShellConfig.contractAddress || "").trim())
           .then(() => {
-            if (!shouldInstaLaunch) return;
-            window.setTimeout(() => {
-              try {
-                runInstaLaunchFromShell();
-              } catch (_error) {
-                // Ignore insta-launch failures so the user can still review the prefilled form.
-              }
-            }, 250);
+            if (extensionShellConfig.instaLaunch) {
+              return run("deploy");
+            }
+            return null;
           })
           .catch((error) => {
             if (imageStatus) {
@@ -7230,5 +7801,4 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-syncLaunchdeckPresetEmptyState();
 liveSyncSupport.bindGlobalListeners();
