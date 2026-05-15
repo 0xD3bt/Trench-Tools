@@ -62,12 +62,14 @@ jobs:
           NOTES="$(printf 'Auto-updated extension build from the latest master commit.\n\nVersion: %s\nCommit: %s\n' "$EXTENSION_VERSION" "$GITHUB_SHA")"
           ASSET_NAME="trench-tools-extension-v${EXTENSION_VERSION}.zip"
           STABLE_ASSET_NAME="trench-tools-extension.zip"
+          VERSIONED_ZIP_PATH="dist/${ASSET_NAME}"
           TEMP_TAG_NAME="${TAG_NAME}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           TEMP_TITLE="Preparing ${RELEASE_TITLE}"
+          cp "$ZIP_PATH" "$VERSIONED_ZIP_PATH"
           if gh release view "$TEMP_TAG_NAME" >/dev/null 2>&1; then
             gh release delete "$TEMP_TAG_NAME" --cleanup-tag -y
           fi
-          gh release create "$TEMP_TAG_NAME" "$ZIP_PATH#$ASSET_NAME" "$ZIP_PATH#$STABLE_ASSET_NAME" \
+          gh release create "$TEMP_TAG_NAME" "$VERSIONED_ZIP_PATH" "$ZIP_PATH" \
             --target "$GITHUB_SHA" \
             --title "$TEMP_TITLE" \
             --notes "$NOTES" \
@@ -79,7 +81,7 @@ jobs:
                 gh release delete-asset "$TAG_NAME" "$asset_name" -y
               fi
             done <<< "$EXISTING_ASSETS"
-            gh release upload "$TAG_NAME" "$ZIP_PATH#$ASSET_NAME" "$ZIP_PATH#$STABLE_ASSET_NAME" --clobber
+            gh release upload "$TAG_NAME" "$VERSIONED_ZIP_PATH" "$ZIP_PATH" --clobber
             git tag -f "$TAG_NAME" "$GITHUB_SHA"
             git push origin "refs/tags/${TAG_NAME}" --force
             gh release edit "$TAG_NAME" \
@@ -90,7 +92,7 @@ jobs:
             gh release delete "$TEMP_TAG_NAME" --cleanup-tag -y
             exit 0
           fi
-          gh release create "$TAG_NAME" "$ZIP_PATH#$ASSET_NAME" \
+          gh release create "$TAG_NAME" "$VERSIONED_ZIP_PATH" \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TITLE" \
             --notes "$NOTES" \
