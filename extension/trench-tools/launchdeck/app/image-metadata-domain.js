@@ -38,6 +38,7 @@
         autoRetryFailures: 0,
         autoRetryDisabled: false,
         lastAlertedWarning: "",
+        suppressWarningFingerprint: "",
       }),
     } = state;
 
@@ -198,12 +199,18 @@
             uploadState.autoRetryFailures = 0;
             uploadState.autoRetryDisabled = false;
             if (imageStatus) {
-              imageStatus.textContent = payload.metadataWarning ? payload.metadataWarning : "Metadata ready.";
+              imageStatus.textContent = payload.metadataWarning && uploadState.suppressWarningFingerprint !== fingerprint
+                ? payload.metadataWarning
+                : "Metadata ready.";
             }
           } else {
             uploadState.staleWhileUploading = true;
           }
-          surfaceMetadataWarning(payload.metadataWarning);
+          if (uploadState.suppressWarningFingerprint === fingerprint) {
+            uploadState.suppressWarningFingerprint = "";
+          } else {
+            surfaceMetadataWarning(payload.metadataWarning);
+          }
           return payload.metadataUri || "";
         })
         .catch((error) => {
@@ -379,11 +386,20 @@
         || (image && image.fileName ? `/uploads/${encodeURIComponent(image.fileName)}` : "");
     }
 
-    async function selectImportedImage(image) {
+    async function selectImportedImage(image, options = {}) {
       if (!image) return;
+      const { suppressMetadataWarning = false } = options || {};
+      const suppressMetadataWarningForCurrentForm = () => {
+        if (!suppressMetadataWarning) return;
+        const formValues = readForm();
+        metadataUploadState().suppressWarningFingerprint = canPreuploadMetadata(formValues)
+          ? metadataFingerprintFromForm(formValues)
+          : "";
+      };
       const importedPreviewUrl = resolvePreviewUrl(image);
       imageLibraryState().activeImageId = image.id || "";
       setSelectedImage(image);
+      suppressMetadataWarningForCurrentForm();
       if (importedPreviewUrl) {
         setImagePreview(importedPreviewUrl);
       }
@@ -392,6 +408,7 @@
         const refreshedImportedImage = imageLibraryState().images.find((entry) => entry.id === imageLibraryState().activeImageId);
         if (refreshedImportedImage) {
           setSelectedImage(refreshedImportedImage);
+          suppressMetadataWarningForCurrentForm();
         } else if (importedPreviewUrl) {
           setImagePreview(importedPreviewUrl);
         }

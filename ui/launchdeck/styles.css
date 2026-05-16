@@ -2062,11 +2062,18 @@ label.is-field-error {
 .vamp-check-row {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   color: var(--text-secondary);
   font-weight: 700;
   font-size: 11px;
   line-height: 1.25;
+}
+
+.vamp-check-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
 }
 
 .vamp-check-row input {
@@ -5362,12 +5369,12 @@ label.is-field-error {
 }
 
 .vamp-modal-body {
-  padding: 10px 12px;
+  padding: 8px 12px;
   display: block;
 }
 
 .vamp-modal-body .stack {
-  gap: 6px;
+  gap: 5px;
 }
 
 .vamp-modal-body input {

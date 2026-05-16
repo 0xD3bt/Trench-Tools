@@ -8037,6 +8037,7 @@ async fn api_vamp_import(
             )
         })?;
     let mut image = Value::Null;
+    let mut images = Vec::new();
     let mut warning = String::new();
     let mut image_candidates = Vec::new();
     for candidate in &imported.imageCandidates {
@@ -8076,7 +8077,11 @@ async fn api_vamp_import(
             .await
             {
                 Ok(Some(record)) => {
-                    image = serde_json::to_value(record).unwrap_or(Value::Null);
+                    let value = serde_json::to_value(record).unwrap_or(Value::Null);
+                    if image.is_null() {
+                        image = value.clone();
+                    }
+                    images.push(value);
                     warning.clear();
                     break;
                 }
@@ -8102,6 +8107,7 @@ async fn api_vamp_import(
             "detection": imported.detection,
         },
         "image": image,
+        "images": images,
         "warning": warning,
     })))
 }

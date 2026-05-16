@@ -555,6 +555,7 @@ let metadataUploadState = {
   autoRetryFailures: 0,
   autoRetryDisabled: false,
   lastAlertedWarning: "",
+  suppressWarningFingerprint: "",
 };
 let runtimeStatusRefreshTimer = null;
 let walletStatusRefreshTimer = null;
@@ -1995,9 +1996,9 @@ async function ensureTestImageSelected() {
   return imageMetadataDomain.ensureTestImageSelected();
 }
 
-async function selectImportedImage(image) {
+async function selectImportedImage(image, options = {}) {
   if (!imageMetadataDomain) return;
-  await imageMetadataDomain.selectImportedImage(image);
+  await imageMetadataDomain.selectImportedImage(image, options);
 }
 
 function restoreLaunchHistoryImage(launch) {
@@ -4313,8 +4314,16 @@ async function importVampToken(contractAddressOverride = "") {
     clearMetadataUploadCache({ clearInput: true });
     updateTokenFieldCounts();
 
+    const importedVampImages = Array.isArray(payload.images) && payload.images.length
+      ? payload.images
+      : (payload.image ? [payload.image] : []);
+    const addedVampImagesToJ7 = addImportedVampImagesToJ7Row(importedVampImages, { selectFirst: !usedCapturedImage });
     if (!usedCapturedImage && payload.image) {
-      await selectImportedImage(payload.image);
+      await selectImportedImage(payload.image, { suppressMetadataWarning: addedVampImagesToJ7 });
+      if (addedVampImagesToJ7) {
+        j7ImageCandidateState.selectedId = upsertLibraryImageJ7Candidate(payload.image) || j7ImageCandidateState.selectedId;
+        renderJ7ImageCandidates();
+      }
     } else if (usedCapturedImage) {
       scheduleMetadataPreupload({ immediate: true });
     }
@@ -4326,8 +4335,9 @@ async function importVampToken(contractAddressOverride = "") {
       usedCapturedImage
         ? "Axiom image imported to library."
         : (payload.image ? "Token image imported to library." : ""),
+      addedVampImagesToJ7 ? "Vamp coin image added to J7 image choices." : "",
       capturedImageWarning,
-      payload.warning || "",
+      j7TweetContext ? "" : (payload.warning || ""),
       detectionNotes.join(" "),
     ].filter(Boolean).join(" ");
     imagePath.textContent = "";
@@ -4517,16 +4527,15 @@ function j7CandidatePreviewUrl(candidate) {
   return String(candidate?.data || candidate?.src || "").trim();
 }
 
-function addLibraryImageToJ7Row(image) {
+function upsertLibraryImageJ7Candidate(image) {
   if (
     !j7ImageCandidates
-    || !tokenSurfaceSection?.classList.contains("has-j7-image-candidates")
     || !image
     || typeof image !== "object"
-  ) return;
+  ) return "";
   const previewUrl = String(image.previewUrl || "").trim()
     || (image.fileName ? `/uploads/${encodeURIComponent(image.fileName)}` : "");
-  if (!previewUrl) return;
+  if (!previewUrl) return "";
   const id = `library-${String(image.id || image.fileName || previewUrl)}`;
   const name = String(image.name || image.fileName || "library-image").trim();
   const existing = j7ImageCandidateState.candidates.find((candidate) => candidate.id === id);
@@ -4548,10 +4557,38 @@ function addLibraryImageToJ7Row(image) {
       removed: false,
     });
   }
+  return id;
+}
+
+function addLibraryImageToJ7Row(image) {
+  if (
+    !j7ImageCandidates
+    || !tokenSurfaceSection?.classList.contains("has-j7-image-candidates")
+  ) return;
+  const id = upsertLibraryImageJ7Candidate(image);
+  if (!id) return;
   j7ImageCandidateState.selectedId = id;
   j7ImagePersistPromise = null;
   setJ7ImagePickerActive(true);
   renderJ7ImageCandidates();
+}
+
+function addImportedVampImagesToJ7Row(images, { selectFirst = false } = {}) {
+  if (!j7ImageCandidates || !j7TweetContext) return false;
+  const importedImages = (Array.isArray(images) ? images : [images]).filter((image) => image && typeof image === "object");
+  const currentSelectedId = j7ImageCandidateState.selectedId;
+  const ids = importedImages.map(upsertLibraryImageJ7Candidate).filter(Boolean);
+  if (!ids.length) return false;
+  j7ImagePersistPromise = null;
+  setJ7ImagePickerActive(true);
+  if (selectFirst) {
+    j7ImageCandidateState.selectedId = ids[0];
+    renderJ7ImageCandidates();
+  } else {
+    j7ImageCandidateState.selectedId = currentSelectedId;
+    renderJ7ImageCandidates();
+  }
+  return true;
 }
 
 function isXProfileOrStatusUrl(value) {

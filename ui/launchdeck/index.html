@@ -1146,15 +1146,17 @@
               <span>Copy another token's details but use this tweet's URL</span>
               <input id="vamp-tweet-url-input" type="url" readonly>
             </label>
-            <input id="vamp-contract-input" type="text" inputmode="text" spellcheck="false" placeholder="Enter contract address to copy (e.g. pump... or 0x...)">
-            <label class="vamp-check-row">
-              <input id="vamp-auto-load-input" type="checkbox" checked>
-              <span>Auto-load</span>
-            </label>
-            <label class="vamp-check-row">
-              <input id="vamp-clipboard-detect-input" type="checkbox" checked>
-              <span>Automatically detect contract address from clipboard</span>
-            </label>
+            <input id="vamp-contract-input" type="text" inputmode="text" spellcheck="false" placeholder="Enter contract address to copy (e.g. pump...)">
+            <div class="vamp-check-grid">
+              <label class="vamp-check-row">
+                <input id="vamp-auto-load-input" type="checkbox" checked>
+                <span>Auto-load</span>
+              </label>
+              <label class="vamp-check-row">
+                <input id="vamp-clipboard-detect-input" type="checkbox" checked>
+                <span>Detect address from clipboard</span>
+              </label>
+            </div>
             <div id="vamp-status" class="quote muted" hidden></div>
             <div id="vamp-error" class="field-error"></div>
           </div>
