@@ -1,6 +1,13 @@
 const trenchToolsContentModules = window.__trenchToolsContentModules || {};
 const callBackground = trenchToolsContentModules.callBackground;
+const tradePreferences = trenchToolsContentModules.tradePreferences || {};
 const createLaunchdeckShellController = trenchToolsContentModules.createLaunchdeckShellController;
+const isEeOnlyTrenchToolsMode =
+  trenchToolsContentModules.isEeOnlyTrenchToolsMode ||
+  ((value) => String(value || "").trim().toLowerCase() === "ee");
+const isLdOnlyTrenchToolsMode =
+  trenchToolsContentModules.isLdOnlyTrenchToolsMode ||
+  ((value) => String(value || "").trim().toLowerCase() === "ld");
 
 (function trenchToolsContentScript() {
   if (window.__trenchToolsContentScriptInstance?.active) {
@@ -12,13 +19,18 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   const BASE58_REGEX = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
-  const PREFERENCES_KEY = "trenchTools.panelPreferences";
+  const LOCAL_PANEL_UI_PREFERENCES_KEY = "trenchTools.panelUiPreferences";
   const PANEL_CHANNEL_OUT = "trench-tools-content";
   const PANEL_CHANNEL_IN = "trench-tools-panel";
   function buildPanelIframeUrl(mode = "persistent") {
     const url = new URL(chrome.runtime.getURL("src/panel/index.html"));
     url.searchParams.set("parentOrigin", window.location.origin);
     url.searchParams.set("mode", mode);
+    return url.toString();
+  }
+  function buildPnlCardIframeUrl() {
+    const url = new URL(chrome.runtime.getURL("src/pnl-card/index.html"));
+    url.searchParams.set("parentOrigin", window.location.origin);
     return url.toString();
   }
   const PANEL_ORIGIN = new URL(buildPanelIframeUrl()).origin;
@@ -29,7 +41,11 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   const TOAST_FAIL_ICON_URL = chrome.runtime.getURL("assets/fail-icon.png");
   const SITE_FEATURES_KEY = "trenchTools.siteFeatures";
   const APPEARANCE_KEY = "trenchTools.appearance";
+  const LAST_KNOWN_QUICK_TRADE_PREFERENCES_KEY = "trenchTools.lastKnownQuickTradePreferences";
+  const LAST_KNOWN_TRENCH_TOOLS_MODE_KEY = "trenchTools.lastKnownMode";
+  const PNL_MINT_ALIAS_CACHE_KEY = "trenchTools.pnlMintAliases.v1";
   const BOOTSTRAP_REVISION_KEY = "trenchTools.bootstrapRevision";
+  const QUICK_TRADE_PREFERENCES_REVISION_KEY = "trenchTools.quickTradePreferencesRevision";
   const WALLET_STATUS_REVISION_KEY = "trenchTools.walletStatusRevision";
   const WALLET_STATUS_DIFF_KEY = "trenchTools.walletStatusDiff";
   const WALLET_STATUS_MARK_REVISION_KEY = "trenchTools.walletStatusMarkRevision";
@@ -56,8 +72,13 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   const EXTENSION_RELOAD_TOAST_FALLBACK_DELAY_MS = 1800;
   const WALLET_STATUS_QUOTE_REFRESH_MS = 1250;
   const WALLET_STATUS_FAST_QUOTE_REFRESH_MS = 75;
+  const WALLET_STATUS_VISIBLE_STALE_MS = 7000;
+  const WALLET_STATUS_VISIBLE_WATCHDOG_MS = 10000;
+  const WALLET_STATUS_LIVE_DIFF_SKIP_WINDOW_MS = 15000;
+  const WALLET_STATUS_EXTERNAL_REFRESH_DELAYS_MS = [500, 1500, 4000, 10000];
   const TRADE_PRIME_HEARTBEAT_MS = 15000;
   const TRADE_PRIME_MIN_INTERVAL_MS = 4000;
+  const TRENCH_TOOLS_MODE_CACHE_TTL_MS = 15000;
   const EXTENSION_RELOAD_FRIENDLY_MESSAGE =
     "Extension connection lost. Refresh to reconnect.";
   const PANEL_Z_INDEX = {
@@ -97,6 +118,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     walletStatus: null,
     hostError: "",
     siteFeatures: defaultSiteFeatures(),
+    rawSiteFeatures: defaultSiteFeatures(),
     preferences: defaultPreferences(),
     tokenContext: null,
     panelTokenContext: null,
@@ -124,13 +146,32 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     quickPanelAnchorElement: null,
     quickPanelCloseHandlers: null,
     quickPanelLifecycleCleanup: null,
+    pnlCardWrapper: null,
+    pnlCardFrame: null,
+    pnlCardPort: null,
+    pnlCardReady: false,
+    pnlCardOpen: false,
+    pnlCardTokenContext: null,
+    pnlCardWalletStatus: null,
+    pnlCardState: null,
+    pnlCardSolUsd: null,
+    pnlCardSettings: null,
+    pnlCardDownloadToken: "",
     statusPollTimers: new Map(),
     activeToasts: new Map(),
     localExecutionPendings: new Map(),
     localExecutionPendingBatchIds: new Map(),
     batchToastIds: new Map(),
+    shownExecutionTerminalToastSignatures: new Map(),
     runtimeDiagnosticToastKeys: new Set(),
     runtimeDiagnosticNotice: null,
+    trenchToolsMode: "",
+    trenchToolsModeCachedAt: 0,
+    trenchToolsModePromise: null,
+    pnlMintAliasCache: null,
+    pnlMintAliasCachePromise: null,
+    backendHydrationSeq: 0,
+    backendHydrationPromise: null,
     toastCleanupInterval: null,
     mutationObserver: null,
     panelLayerObservers: new Map(),
@@ -149,10 +190,18 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     previewRequestSeq: 0,
     walletStatusRefreshTimer: null,
     walletStatusQuoteRefreshTimer: null,
+    walletStatusVisibleWatchdogTimer: null,
+    walletStatusInFlightKey: "",
+    activeWalletStatusRefreshTimers: new Map(),
+    walletStatusFreshnessByKey: new Map(),
+    walletStatusLastFullRefreshAt: 0,
+    walletStatusLastLiveBalanceAt: 0,
+    walletStatusLastLiveMintAt: 0,
     tokenDistributionPending: "",
     extensionReloadToastShown: false,
     extensionReloadFallbackTimer: null,
     appearance: defaultAppearance(),
+    axiomQuickBuyDesignRevision: 0,
     buySoundPlayed: new Set()
   };
 
@@ -164,6 +213,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     destroyed: false,
     panelMessageListener: null,
     storageChangeListener: null,
+    runtimeMessageListener: null,
     pagehideListener: null,
     popstateListener: null,
     hashchangeListener: null,
@@ -172,7 +222,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     errorListener: null,
     unhandledRejectionListener: null,
     originalPushState: null,
-    originalReplaceState: null
+    originalReplaceState: null,
+    quickTradePreferencesRefreshTimer: 0
   };
 
   window.__trenchToolsContentScriptInstance = {
@@ -226,6 +277,57 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       .catch(() => {});
   }
 
+  function shouldUseExecutionSurfaces() {
+    const mode = normalizeTrenchToolsModeValue(state.trenchToolsMode);
+    return Boolean(mode && !isLdOnlyTrenchToolsMode(mode));
+  }
+
+  function applyRuntimeModeToSiteFeatures(features) {
+    const normalized = normalizeSiteFeaturesValue(features || {});
+    if (shouldUseExecutionSurfaces()) {
+      return normalized;
+    }
+    return {
+      ...normalized,
+      axiom: {
+        ...normalized.axiom,
+        instantTrade: false,
+        pulseButton: false,
+        walletTracker: false,
+        watchlist: false
+      },
+      j7: {
+        ...normalized.j7,
+        contractQuickBuy: false,
+        contractQuickPanel: false
+      }
+    };
+  }
+
+  function setRawSiteFeatures(features) {
+    state.rawSiteFeatures = normalizeSiteFeaturesValue(features || {});
+    state.siteFeatures = applyRuntimeModeToSiteFeatures(state.rawSiteFeatures);
+    return state.siteFeatures;
+  }
+
+  function syncExecutionRuntimeForMode(reason = "mode") {
+    if (shouldUseExecutionSurfaces()) {
+      if (!state.hostRevisionTimer) {
+        state.hostRevisionTimer = window.setInterval(() => {
+          primeTradeRuntime("heartbeat");
+        }, TRADE_PRIME_HEARTBEAT_MS);
+      }
+      setTradeReadiness(true, platform);
+      primeTradeRuntime(reason, { force: true });
+      return;
+    }
+    if (state.hostRevisionTimer) {
+      window.clearInterval(state.hostRevisionTimer);
+      state.hostRevisionTimer = null;
+    }
+    setTradeReadiness(false, platform);
+  }
+
   function getPlatformHelpers() {
     if (platformHelpers) {
       return platformHelpers;
@@ -249,23 +351,35 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       resolveInlineToken,
       setInlineTokenContext,
       handleInlineTradeRequest,
+      openPnlCardEditorForMint,
       openInlinePanelForMint,
       prewarmForMint,
+      syncActiveWalletStatusSurface,
+      scheduleExternalWalletStatusRefresh,
+      scheduleActiveWalletStatusRefresh,
       handleTradeRequest,
       handleTokenDistributionRequest,
       savePreferences,
       resolveQuickBuyAmount,
       quickBuyLabel,
+      resolveQuickBuyButtonDesign,
+      applyQuickBuyButtonDesign,
       openPanel,
       async openLaunchdeckOverlay(options = {}) {
-        if (!(await ensureValidLaunchdeckPresetForExtension())) {
+        if (!(await ensureLaunchdeckEnabledForExtension())) {
+          return;
+        }
+        if (!(await ensureValidLaunchdeckPresetForExtension({ forceRefresh: true }))) {
           return;
         }
         ensureLaunchdeckShell();
         await state.launchdeckShell.openOverlay({ sourcePlatform: platform, ...options });
       },
       async openLaunchdeckPopout(options = {}) {
-        if (!(await ensureValidLaunchdeckPresetForExtension())) {
+        if (!(await ensureLaunchdeckEnabledForExtension())) {
+          return;
+        }
+        if (!(await ensureValidLaunchdeckPresetForExtension({ forceRefresh: true }))) {
           return;
         }
         ensureLaunchdeckShell();
@@ -291,7 +405,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   async function initialize() {
-    state.siteFeatures = await loadSiteFeatures();
+    setRawSiteFeatures(await loadSiteFeatures());
     attachStorageChangeListener();
     await ensurePlatformInitialized("init");
   }
@@ -302,6 +416,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
     if (platformInitialized) {
       scanAndMount();
+      void hydrateBackendState(reason);
       scheduleRouteReconcile(reason, 0);
       return;
     }
@@ -315,37 +430,47 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   async function initializeEnabledPlatform(reason = "init") {
-    state.preferences = await loadPreferences();
-    state.appearance = await loadAppearance();
-    state.panelPosition = await loadPanelPosition();
-    state.panelDimensions = await loadPanelDimensions();
-    state.panelScale = await loadPanelScale();
+    const [
+      preferences,
+      appearance,
+      panelPosition,
+      panelDimensions,
+      panelScale,
+      trenchToolsMode
+    ] = await Promise.all([
+      loadFastPreferences(),
+      loadAppearance(),
+      loadPanelPosition(),
+      loadPanelDimensions(),
+      loadPanelScale(),
+      loadLastKnownTrenchToolsMode()
+    ]);
+    applyTrenchToolsMode(trenchToolsMode);
+    setRawSiteFeatures(state.rawSiteFeatures);
+    state.preferences = preferences;
+    state.appearance = appearance;
+    state.panelPosition = panelPosition;
+    state.panelDimensions = panelDimensions;
+    state.panelScale = panelScale;
     ensureLaunchdeckShell();
-    await refreshBootstrap();
-    if (!state.hostRevisionTimer) {
-      state.hostRevisionTimer = window.setInterval(() => {
-        primeTradeRuntime("heartbeat");
-      }, TRADE_PRIME_HEARTBEAT_MS);
-    }
     attachPanelMessageListener();
-    primeTradeRuntime(reason, { force: true });
-    void callBackground("trench:get-runtime-diagnostics")
-      .then(surfaceRuntimeDiagnostics)
-      .catch(() => {});
     installNavigationHooks();
     mountPlatformObserver();
     scheduleMountSweeps(reason);
-    setTradeReadiness(true, platform);
+    platformInitialized = true;
+    void reconcileSurfaceState(reason);
+    void hydrateBackendState(reason);
+    syncExecutionRuntimeForMode(reason);
     if (!lifecycle.pagehideListener) {
       lifecycle.pagehideListener = () => {
-        setTradeReadiness(false, platform);
+        if (shouldUseExecutionSurfaces()) {
+          setTradeReadiness(false, platform);
+        }
         clearActiveMarkForSurface();
         clearActiveMintForSurface();
       };
       window.addEventListener("pagehide", lifecycle.pagehideListener, { once: true });
     }
-    platformInitialized = true;
-    await reconcileSurfaceState(reason);
     scheduleRouteReconcile(`${reason}-delayed-fast`, 250);
     scheduleRouteReconcile(`${reason}-delayed-slow`, 1000);
   }
@@ -531,21 +656,29 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     };
     lifecycle.visibilityChangeListener = () => {
       if (document.visibilityState === "visible") {
-        setTradeReadiness(true, platform);
-        primeTradeRuntime("visibility", { force: true });
+        if (shouldUseExecutionSurfaces()) {
+          setTradeReadiness(true, platform);
+          primeTradeRuntime("visibility", { force: true });
+        }
         scheduleRouteReconcile("visibility", 0);
         scheduleMountSweeps("visibility");
         syncWalletStatusQuoteRefresh();
+        scheduleWalletStatusVisibleWatchdog();
         syncActiveMarkSubscription();
       } else {
-        setTradeReadiness(false, platform);
+        if (shouldUseExecutionSurfaces()) {
+          setTradeReadiness(false, platform);
+        }
         syncWalletStatusQuoteRefresh();
+        scheduleWalletStatusVisibleWatchdog();
         syncActiveMarkSubscription();
       }
     };
     lifecycle.focusListener = () => {
-      setTradeReadiness(true, platform);
-      primeTradeRuntime("focus", { force: true });
+      if (shouldUseExecutionSurfaces()) {
+        setTradeReadiness(true, platform);
+        primeTradeRuntime("focus", { force: true });
+      }
     };
     window.addEventListener("popstate", lifecycle.popstateListener);
     window.addEventListener("hashchange", lifecycle.hashchangeListener);
@@ -578,9 +711,6 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const existingTimers = state.mountSweepTimers.get(reason) || [];
     existingTimers.forEach((timer) => window.clearTimeout(timer));
 
-    // Bloom's Axiom path does an immediate sweep, then retries while the SPA
-    // finishes replacing virtualized rows/panels. Keep this idempotent: the
-    // platform mount functions decide whether anything is missing.
     const timers = [];
     for (const delayMs of [0, 100, 300, 750, 1500, 3000, 5000]) {
       const timer = window.setTimeout(() => {
@@ -705,7 +835,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
 
     syncActiveMintSubscription();
-    primeTradeRuntime(`route-${reason}`, { force: routeChanged });
+    if (shouldUseExecutionSurfaces()) {
+      primeTradeRuntime(`route-${reason}`, { force: routeChanged });
+    }
     scheduleMountSweeps(`reconcile-${reason}`);
   }
 
@@ -721,6 +853,8 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         pulsePanel: true,
         pulseVamp: true,
         pulseVampMode: "prefill",
+        pulseQuickBuyButtonCount: 1,
+        pulseSecondButtonTables: defaultAxiomPulseSecondButtonTables(),
         instantTradeButtonModeCount: 3,
         vampIconMode: "both",
         dexScreenerIconMode: "both",
@@ -789,6 +923,34 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   function normalizeAxiomInstantTradeButtonModeCount(value, fallback = 3) {
     const count = Number(value);
     return count === 1 || count === 2 || count === 3 ? count : fallback;
+  }
+
+  function normalizeAxiomPulseQuickBuyButtonCount(value, fallback = 1) {
+    const count = Number(value);
+    return count === 1 || count === 2 ? count : fallback;
+  }
+
+  function axiomPulseSecondButtonTableIds() {
+    return ["new_pairs", "final_stretch", "migrated"];
+  }
+
+  function defaultAxiomPulseSecondButtonTables() {
+    return axiomPulseSecondButtonTableIds().reduce((accumulator, tableId) => {
+      accumulator[tableId] = true;
+      return accumulator;
+    }, {});
+  }
+
+  function normalizeAxiomPulseSecondButtonTables(value) {
+    const defaults = defaultAxiomPulseSecondButtonTables();
+    if (!value || typeof value !== "object") {
+      return defaults;
+    }
+    const result = {};
+    for (const tableId of axiomPulseSecondButtonTableIds()) {
+      result[tableId] = value[tableId] === undefined ? defaults[tableId] : Boolean(value[tableId]);
+    }
+    return result;
   }
 
   function normalizeAxiomPostDeployAction(value, fallback = "close_modal_toast") {
@@ -866,6 +1028,20 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     return null;
   }
 
+  function currentActiveWalletStatusTokenContext() {
+    const panelTokenContext = currentActivePanelTokenContext();
+    if (panelTokenContext) {
+      return panelTokenContext;
+    }
+    try {
+      const platformTokenContext = getPlatformAdapter()?.getActiveWalletStatusTokenContext?.();
+      if (platformTokenContext?.routeAddress || platformTokenContext?.mint) {
+        return platformTokenContext;
+      }
+    } catch (_error) {}
+    return null;
+  }
+
   function currentVisiblePanelMode() {
     if (state.quickPanelOpen) {
       return "quick";
@@ -880,11 +1056,40 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     state.walletStatusRequestSeq += 1;
     state.previewRequestSeq += 1;
     state.walletStatus = null;
+    state.walletStatusLastFullRefreshAt = 0;
+    state.walletStatusLastLiveBalanceAt = 0;
+    state.walletStatusLastLiveMintAt = 0;
+    state.walletStatusFreshnessByKey.clear();
+    state.walletStatusInFlightKey = "";
+    clearActiveWalletStatusRefreshTimers();
+    clearWalletStatusVisibleWatchdogTimer();
+    clearExecutionPendingToasts();
+    clearBatchStatusPollers();
     state.preview = null;
     state.batchStatus = null;
     state.activePanelBatchId = null;
     state.batchStatusStreamRevisions.clear();
+    state.shownExecutionTerminalToastSignatures.clear();
     syncActiveMarkSubscription();
+  }
+
+  function applyResolvedTokenContext(baseTokenContext, nextTokenContext) {
+    if (!baseTokenContext || !nextTokenContext || baseTokenContext === nextTokenContext) {
+      return nextTokenContext;
+    }
+    if (state.quickPanelTokenContext === baseTokenContext) {
+      setQuickPanelTokenContext(nextTokenContext);
+    }
+    if (state.panelTokenContext === baseTokenContext) {
+      setPersistentPanelTokenContext(nextTokenContext);
+    }
+    if (state.tokenContext === baseTokenContext) {
+      setPageTokenContext(nextTokenContext);
+    }
+    if (state.pnlCardTokenContext === baseTokenContext) {
+      state.pnlCardTokenContext = nextTokenContext;
+    }
+    return nextTokenContext;
   }
 
   function clearPendingRouteReconcile(delayKey) {
@@ -906,6 +1111,174 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }, delayMs);
   }
 
+  function activeWalletStatusRefreshKey(tokenContext = null) {
+    const resolvedTokenContext = tokenContext || currentActiveWalletStatusTokenContext() || state.tokenContext || null;
+    const mint = String(resolvedTokenContext?.mint || state.walletStatus?.mint || "").trim();
+    const selection = normalizeWalletSelectionPreference(state.preferences);
+    const selectionKey = selection.selectionSource === "group"
+      ? `group:${selectedWalletGroupIdFromValue(selection)}`
+      : `wallets:${(selection.manualWalletKeys || []).slice().sort().join(",")}`;
+    return `${mint || "no-mint"}|${selectionKey}`;
+  }
+
+  function markWalletStatusFreshness(kind = "full", tokenContext = null) {
+    const now = Date.now();
+    if (kind === "balance") {
+      state.walletStatusLastLiveBalanceAt = now;
+    } else if (kind === "mint") {
+      state.walletStatusLastLiveMintAt = now;
+    } else {
+      state.walletStatusLastFullRefreshAt = now;
+    }
+    state.walletStatusFreshnessByKey.set(activeWalletStatusRefreshKey(tokenContext), now);
+  }
+
+  function latestWalletStatusFreshnessAt(tokenContext = null) {
+    const scopedAt = state.walletStatusFreshnessByKey.get(activeWalletStatusRefreshKey(tokenContext));
+    return Number(scopedAt) > 0 ? Number(scopedAt) : 0;
+  }
+
+  function activeWalletStatusFreshEnough(
+    tokenContext = null,
+    maxAgeMs = WALLET_STATUS_VISIBLE_STALE_MS,
+    minFreshAt = 0
+  ) {
+    const latestAt = latestWalletStatusFreshnessAt(tokenContext);
+    const minimumFreshAt = Math.max(0, Number(minFreshAt) || 0);
+    return latestAt > 0 &&
+      latestAt >= minimumFreshAt &&
+      Date.now() - latestAt < Math.max(0, Number(maxAgeMs) || 0);
+  }
+
+  function clearActiveWalletStatusRefreshTimers(key = "") {
+    if (key) {
+      const timers = state.activeWalletStatusRefreshTimers.get(key);
+      if (Array.isArray(timers)) {
+        timers.forEach((timer) => window.clearTimeout(timer));
+      }
+      state.activeWalletStatusRefreshTimers.delete(key);
+      return;
+    }
+    for (const timers of state.activeWalletStatusRefreshTimers.values()) {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    }
+    state.activeWalletStatusRefreshTimers.clear();
+  }
+
+  function activeWalletStatusRefreshPending(key = "") {
+    const refreshKey = key || activeWalletStatusRefreshKey();
+    const timers = state.activeWalletStatusRefreshTimers.get(refreshKey);
+    return Array.isArray(timers) && timers.length > 0;
+  }
+
+  function scheduleActiveWalletStatusRefresh(tokenContext = null, options = {}) {
+    if (lifecycle.destroyed || document.visibilityState === "hidden") {
+      return;
+    }
+    const reason = String(options.reason || "active-wallet").trim() || "active-wallet";
+    const scheduledAt = Date.now();
+    const minFreshAt = options.requireFreshAfterSchedule
+      ? scheduledAt
+      : Math.max(0, Number(options.minFreshAt) || 0);
+    notifyPlatformExternalWalletStatusRefresh(reason);
+    const staleAfterMs = Math.max(0, Number(options.staleAfterMs) || WALLET_STATUS_VISIBLE_STALE_MS);
+    if (options.skipIfFresh !== false && activeWalletStatusFreshEnough(tokenContext, staleAfterMs, minFreshAt)) {
+      return;
+    }
+    const key = activeWalletStatusRefreshKey(tokenContext);
+    if (options.coalesce !== false) {
+      clearActiveWalletStatusRefreshTimers(key);
+    }
+    const requestedDelays = Array.isArray(options.delays) ? options.delays : [];
+    const delays = requestedDelays.length ? requestedDelays : [0];
+    const timers = [];
+    delays
+      .map((delayMs) => Math.max(0, Number(delayMs) || 0))
+      .forEach((delayMs) => {
+        const timer = window.setTimeout(() => {
+          const activeTimers = state.activeWalletStatusRefreshTimers.get(key);
+          if (Array.isArray(activeTimers)) {
+            const index = activeTimers.indexOf(timer);
+            if (index !== -1) {
+              activeTimers.splice(index, 1);
+            }
+            if (!activeTimers.length) {
+              state.activeWalletStatusRefreshTimers.delete(key);
+            }
+          }
+          if (lifecycle.destroyed || document.visibilityState === "hidden") {
+            return;
+          }
+          if (options.skipIfFresh !== false && activeWalletStatusFreshEnough(tokenContext, staleAfterMs, minFreshAt)) {
+            notifyPlatformExternalWalletStatusRefresh(reason);
+            return;
+          }
+          const activeTokenContext =
+            tokenContext ||
+            currentActiveWalletStatusTokenContext() ||
+            state.tokenContext ||
+            null;
+          void refreshPanelWalletStatus({ tokenContext: activeTokenContext, force: options.force !== false })
+            .finally(() => notifyPlatformExternalWalletStatusRefresh(reason))
+            .catch(() => null);
+        }, delayMs);
+        timers.push(timer);
+      });
+    state.activeWalletStatusRefreshTimers.set(key, timers);
+  }
+
+  function clearWalletStatusVisibleWatchdogTimer() {
+    if (state.walletStatusVisibleWatchdogTimer) {
+      window.clearTimeout(state.walletStatusVisibleWatchdogTimer);
+      state.walletStatusVisibleWatchdogTimer = null;
+    }
+  }
+
+  function activeVisibleWalletStatusTokenContext() {
+    if (document.visibilityState === "hidden") {
+      return null;
+    }
+    const tokenContext = currentActiveWalletStatusTokenContext();
+    return tokenContext?.mint ? tokenContext : null;
+  }
+
+  function scheduleWalletStatusVisibleWatchdog(delayMs = WALLET_STATUS_VISIBLE_WATCHDOG_MS) {
+    if (lifecycle.destroyed) {
+      return;
+    }
+    clearWalletStatusVisibleWatchdogTimer();
+    if (!activeVisibleWalletStatusTokenContext()) {
+      return;
+    }
+    state.walletStatusVisibleWatchdogTimer = window.setTimeout(() => {
+      state.walletStatusVisibleWatchdogTimer = null;
+      runWalletStatusVisibleWatchdog();
+    }, Math.max(1000, Number(delayMs) || WALLET_STATUS_VISIBLE_WATCHDOG_MS));
+  }
+
+  function runWalletStatusVisibleWatchdog() {
+    const tokenContext = activeVisibleWalletStatusTokenContext();
+    if (!tokenContext) {
+      return;
+    }
+    const key = activeWalletStatusRefreshKey(tokenContext);
+    if (
+      state.walletStatusInFlightKey === key ||
+      activeWalletStatusRefreshPending(key) ||
+      activeWalletStatusFreshEnough(tokenContext, WALLET_STATUS_VISIBLE_STALE_MS)
+    ) {
+      scheduleWalletStatusVisibleWatchdog();
+      return;
+    }
+    scheduleActiveWalletStatusRefresh(tokenContext, {
+      reason: "visible-wallet-stale",
+      delays: [0],
+      skipIfFresh: false,
+      staleAfterMs: WALLET_STATUS_VISIBLE_STALE_MS
+    });
+    scheduleWalletStatusVisibleWatchdog();
+  }
+
   function clearWalletStatusQuoteRefreshTimer() {
     if (state.walletStatusQuoteRefreshTimer) {
       window.clearTimeout(state.walletStatusQuoteRefreshTimer);
@@ -914,10 +1287,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   function activeQuoteRefreshTokenContext() {
-    if (!(state.panelOpen || state.quickPanelOpen) || document.visibilityState === "hidden") {
+    if (document.visibilityState === "hidden") {
       return null;
     }
-    const tokenContext = currentActivePanelTokenContext();
+    const tokenContext = currentActiveWalletStatusTokenContext();
     const mint = String(tokenContext?.mint || state.walletStatus?.mint || "").trim();
     if (!tokenContext || !mint) {
       return null;
@@ -971,18 +1344,78 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
   }
 
+  function syncActiveWalletStatusSurface() {
+    syncActiveMintSubscription();
+    syncWalletStatusQuoteRefresh();
+    scheduleWalletStatusVisibleWatchdog();
+  }
+
+  function scheduleExternalWalletStatusRefresh(tokenContext = null, options = {}) {
+    if (lifecycle.destroyed) {
+      return;
+    }
+    void callBackground("trench:invalidate-balances", { afterTrade: true }).catch(() => {});
+    syncActiveWalletStatusSurface();
+    const requestedDelays = Array.isArray(options.delays) ? options.delays : [];
+    scheduleActiveWalletStatusRefresh(tokenContext, {
+      ...options,
+      reason: options.reason || "external-trade",
+      delays: requestedDelays.length ? requestedDelays : WALLET_STATUS_EXTERNAL_REFRESH_DELAYS_MS,
+      requireFreshAfterSchedule: options.requireFreshAfterSchedule !== false,
+      skipIfFresh: false,
+      staleAfterMs: options.staleAfterMs || WALLET_STATUS_LIVE_DIFF_SKIP_WINDOW_MS
+    });
+  }
+
+  function notifyPlatformExternalWalletStatusRefresh(reason = "external-trade") {
+    try {
+      getPlatformAdapter()?.handleExternalWalletStatusRefresh?.({ reason });
+    } catch (error) {
+      if (isExtensionReloadedError(error)) {
+        scheduleExtensionReloadFallbackToast();
+        return;
+      }
+      console.error("Trench Tools external wallet-status platform refresh failed", error);
+    }
+  }
+
   function syncActiveMintSubscription() {
     const activeTokenContext =
       currentActivePanelTokenContext() ||
       ((shouldAutoOpenPanel(state.tokenContext) || shouldMountLauncher(state.tokenContext))
         ? state.tokenContext
         : null);
-    if (activeTokenContext?.mint) {
-      setActiveMintForSurface(activeTokenContext.mint);
-    } else {
+    const activeRouteKey = tokenContextKey(activeTokenContext);
+    if (!activeTokenContext || !activeRouteKey) {
       clearActiveMintForSurface();
+      syncActiveMarkSubscription();
+      return;
     }
-    syncActiveMarkSubscription();
+    void resolvePnlWalletStatusTokenContext(activeTokenContext)
+      .then((resolvedTokenContext) => {
+        const currentTokenContext =
+          currentActivePanelTokenContext() ||
+          ((shouldAutoOpenPanel(state.tokenContext) || shouldMountLauncher(state.tokenContext))
+            ? state.tokenContext
+            : null);
+        if (
+          tokenContextKey(currentTokenContext) !== activeRouteKey ||
+          tokenContextKey(resolvedTokenContext) !== activeRouteKey
+        ) {
+          return;
+        }
+        const mint = String(resolvedTokenContext?.mint || "").trim();
+        if (mint) {
+          setActiveMintForSurface(mint);
+        } else {
+          clearActiveMintForSurface();
+        }
+        syncActiveMarkSubscription();
+      })
+      .catch(() => {
+        clearActiveMintForSurface();
+        clearActiveMarkForSurface();
+      });
   }
 
   function setPageTokenContext(tokenContext) {
@@ -1119,6 +1552,13 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           message: "Execution engine token rejected."
         };
       case "HOST_TIMEOUT":
+        if (String(error?.routeKey || "").trim() === "resyncPnlHistory") {
+          return {
+            title: "PnL resync timed out",
+            detail: "This coin has a deep transaction history. The provider fallback did not finish before the resync timeout.",
+            message: "PnL resync timed out."
+          };
+        }
         return {
           title: "Engine request timed out",
           detail: "The execution engine did not respond in time. Check that it is running and not overloaded.",
@@ -1464,6 +1904,18 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         lifecycle.storageChangeListener = null;
       }
     });
+    runBestEffortTeardownStep("runtime-message-listener", () => {
+      if (lifecycle.runtimeMessageListener) {
+        chrome.runtime.onMessage.removeListener(lifecycle.runtimeMessageListener);
+        lifecycle.runtimeMessageListener = null;
+      }
+    });
+    runBestEffortTeardownStep("quick-trade-preferences-refresh", () => {
+      if (lifecycle.quickTradePreferencesRefreshTimer) {
+        window.clearTimeout(lifecycle.quickTradePreferencesRefreshTimer);
+        lifecycle.quickTradePreferencesRefreshTimer = 0;
+      }
+    });
     runBestEffortTeardownStep("pagehide-listener", () => {
       if (lifecycle.pagehideListener) {
         window.removeEventListener("pagehide", lifecycle.pagehideListener);
@@ -1535,6 +1987,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         window.clearTimeout(state.walletStatusRefreshTimer);
         state.walletStatusRefreshTimer = null;
       }
+      state.walletStatusFreshnessByKey.clear();
+      state.walletStatusInFlightKey = "";
+      clearActiveWalletStatusRefreshTimers();
+      clearWalletStatusVisibleWatchdogTimer();
       clearWalletStatusQuoteRefreshTimer();
       for (const timer of state.routeReconcileDelays.values()) {
         window.clearTimeout(timer);
@@ -1574,6 +2030,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
     runBestEffortTeardownStep("panels-and-drag", () => {
       clearQuickPanelCloseHandlers();
+      destroyPnlCardFrame();
       closeQuickPanel();
       destroyPersistentPanelFrame();
       if (state.activeDrag?.dragging) {
@@ -1644,6 +2101,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       walletKeys: [],
       includeFees: null,
       quickBuyAmount: "",
+      quickBuyAmount2: "",
       buyAmountSol: "",
       customSellPercent: "",
       customSellSol: ""
@@ -1656,7 +2114,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       return "";
     }
 
-    let normalized = trimmed.replace(/[^\d.]/g, "");
+    let normalized = trimmed.replace(/,/g, ".").replace(/[^\d.]/g, "");
     const firstDotIndex = normalized.indexOf(".");
     if (firstDotIndex >= 0) {
       normalized =
@@ -1690,39 +2148,38 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     return normalized;
   }
 
-  function normalizePreferencesValue(value) {
-    const normalized = {
-      presetId: String(value?.presetId || "").trim(),
-      selectionSource: "group",
-      activeWalletGroupId: "",
-      manualWalletKeys: [],
-      selectionRevision: 0,
-      selectionTarget: {
-        type: "wallet_group",
-        walletKey: "",
-        walletGroupId: "",
-        walletKeys: []
-      },
-      selectionMode: "wallet_group",
-      walletKey: "",
-      walletGroupId: "",
-      walletKeys: [],
+  function normalizeLocalPanelUiPreferences(value) {
+    return {
       includeFees: typeof value?.includeFees === "boolean" ? value.includeFees : null,
-      quickBuyAmount: normalizeQuickBuyAmountInput(value?.quickBuyAmount || ""),
-      // Custom panel buy input is intentionally session-local. Quick-buy
-      // buttons should not backfill it, and a page refresh should reset it.
-      buyAmountSol: "",
       customSellPercent: normalizeQuickBuyAmountInput(value?.customSellPercent || ""),
       customSellSol: normalizeQuickBuyAmountInput(value?.customSellSol || ""),
       hideWalletGroupRow: Boolean(value?.hideWalletGroupRow),
       hidePresetChipRow: Boolean(value?.hidePresetChipRow)
     };
-    mirrorWalletSelectionPreferenceOntoPreferences(normalized, value);
-    normalized.selectionRevision = Math.max(0, Number(value?.selectionRevision || 0) || 0);
+  }
+
+  function normalizePreferencesValue(value) {
+    const normalized = typeof tradePreferences.normalizeTradePreferences === "function"
+      ? tradePreferences.normalizeTradePreferences(value || {})
+      : {
+          ...defaultPreferences(),
+          ...(value || {}),
+          presetId: String(value?.presetId || "").trim(),
+          quickBuyAmount: normalizeQuickBuyAmountInput(value?.quickBuyAmount || ""),
+          quickBuyAmount2: normalizeQuickBuyAmountInput(value?.quickBuyAmount2 || "")
+        };
+    Object.assign(normalized, normalizeLocalPanelUiPreferences(value || {}), {
+      // Custom panel buy input is intentionally session-local. Quick-buy
+      // buttons should not backfill it, and a page refresh should reset it.
+      buyAmountSol: "",
+    });
     return normalized;
   }
 
   function normalizeWalletSelectionPreference(value) {
+    if (typeof tradePreferences.normalizeWalletSelectionPreference === "function") {
+      return tradePreferences.normalizeWalletSelectionPreference(value || {});
+    }
     const selectionSource = String(value?.selectionSource || "").trim().toLowerCase();
     const activeWalletGroupId = String(
       value?.activeWalletGroupId ||
@@ -1776,6 +2233,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   function selectionTargetFromWalletSelectionPreference(selection) {
+    if (typeof tradePreferences.selectionTargetFromWalletSelectionPreference === "function") {
+      return tradePreferences.selectionTargetFromWalletSelectionPreference(selection || {});
+    }
     if (selection.selectionSource === "group") {
       return {
         type: "wallet_group",
@@ -1794,6 +2254,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   function mirrorWalletSelectionPreferenceOntoPreferences(preferences, sourceValue = preferences) {
+    if (typeof tradePreferences.mirrorWalletSelectionPreferenceOntoPreferences === "function") {
+      tradePreferences.mirrorWalletSelectionPreferenceOntoPreferences(preferences, sourceValue);
+      return;
+    }
     const selection = normalizeWalletSelectionPreference(sourceValue);
     preferences.selectionSource = selection.selectionSource;
     preferences.activeWalletGroupId = selection.activeWalletGroupId;
@@ -1818,21 +2282,38 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     };
   }
 
-  async function loadPreferences() {
-    const stored = await safeStorageGet(PREFERENCES_KEY);
-    return normalizePreferencesValue(stored[PREFERENCES_KEY] || {});
+  async function loadFastPreferences() {
+    const stored = await safeStorageGet([
+      LAST_KNOWN_QUICK_TRADE_PREFERENCES_KEY,
+      LOCAL_PANEL_UI_PREFERENCES_KEY
+    ]);
+    return normalizePreferencesValue({
+      ...(stored[LAST_KNOWN_QUICK_TRADE_PREFERENCES_KEY] || {}),
+      ...normalizeLocalPanelUiPreferences(stored[LOCAL_PANEL_UI_PREFERENCES_KEY] || {})
+    });
   }
 
-  function serializePreferencesForStorage(preferences) {
-    const selection = normalizeWalletSelectionPreference(preferences);
+  async function persistLastKnownQuickTradePreferences(preferences) {
+    const normalized = normalizePreferencesValue(preferences || {});
+    const snapshot = typeof tradePreferences.tradePreferencePatchFromValue === "function"
+      ? tradePreferences.tradePreferencePatchFromValue(normalized)
+      : {
+          presetId: normalized.presetId,
+          selectionSource: normalized.selectionSource,
+          activeWalletGroupId: normalized.activeWalletGroupId,
+          manualWalletKeys: [...(normalized.manualWalletKeys || [])],
+          selectionRevision: Math.max(0, Number(normalized.selectionRevision || 0) || 0),
+          quickBuyAmount: normalizeQuickBuyAmountInput(normalized.quickBuyAmount || ""),
+          quickBuyAmount2: normalizeQuickBuyAmountInput(normalized.quickBuyAmount2 || "")
+        };
+    await safeStorageSet({
+      [LAST_KNOWN_QUICK_TRADE_PREFERENCES_KEY]: snapshot
+    });
+  }
+
+  function serializePanelUiPreferencesForStorage(preferences) {
     return {
-      presetId: String(preferences?.presetId || "").trim(),
-      selectionSource: selection.selectionSource,
-      activeWalletGroupId: selection.activeWalletGroupId,
-      manualWalletKeys: [...selection.manualWalletKeys],
-      selectionRevision: Math.max(0, Number(preferences?.selectionRevision || 0) || 0),
       includeFees: typeof preferences?.includeFees === "boolean" ? preferences.includeFees : null,
-      quickBuyAmount: normalizeQuickBuyAmountInput(preferences?.quickBuyAmount || ""),
       customSellPercent: normalizeQuickBuyAmountInput(preferences?.customSellPercent || ""),
       customSellSol: normalizeQuickBuyAmountInput(preferences?.customSellSol || ""),
       hideWalletGroupRow: Boolean(preferences?.hideWalletGroupRow),
@@ -1858,6 +2339,13 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         pulsePanel: value.axiom?.pulsePanel ?? defaults.axiom.pulsePanel,
         pulseVamp: value.axiom?.pulseVamp ?? defaults.axiom.pulseVamp,
         pulseVampMode: normalizePulseVampMode(value.axiom?.pulseVampMode, defaults.axiom.pulseVampMode),
+        pulseQuickBuyButtonCount: normalizeAxiomPulseQuickBuyButtonCount(
+          value.axiom?.pulseQuickBuyButtonCount,
+          defaults.axiom.pulseQuickBuyButtonCount
+        ),
+        pulseSecondButtonTables: normalizeAxiomPulseSecondButtonTables(
+          value.axiom?.pulseSecondButtonTables
+        ),
         instantTradeButtonModeCount: normalizeAxiomInstantTradeButtonModeCount(
           value.axiom?.instantTradeButtonModeCount,
           defaults.axiom.instantTradeButtonModeCount
@@ -1910,11 +2398,98 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     };
   }
 
+  function defaultQuickBuyButtonDesign() {
+    return {
+      color: "#ffffff",
+      backgroundColor: "#000000",
+      borderColor: "#ffffff80"
+    };
+  }
+
+  function defaultQuickBuyButtonsAppearance() {
+    return {
+      1: defaultQuickBuyButtonDesign(),
+      2: defaultQuickBuyButtonDesign()
+    };
+  }
+
+  const QUICK_BUY_DESIGN_HEX6_REGEX = /^#[0-9a-f]{6}$/i;
+  const QUICK_BUY_DESIGN_HEX8_REGEX = /^#[0-9a-f]{8}$/i;
+
+  function normalizeQuickBuyButtonColorValue(value, fallback) {
+    const trimmed = String(value || "").trim().toLowerCase();
+    if (QUICK_BUY_DESIGN_HEX6_REGEX.test(trimmed)) {
+      return trimmed;
+    }
+    return String(fallback || "#ffffff").toLowerCase();
+  }
+
+  function normalizeQuickBuyButtonBackgroundColorValue(value, fallback) {
+    const trimmed = String(value || "").trim().toLowerCase();
+    if (QUICK_BUY_DESIGN_HEX6_REGEX.test(trimmed) || QUICK_BUY_DESIGN_HEX8_REGEX.test(trimmed)) {
+      return trimmed;
+    }
+    return String(fallback || "#000000").toLowerCase();
+  }
+
+  function normalizeQuickBuyButtonBorderColorValue(value, fallback) {
+    const trimmed = String(value || "").trim().toLowerCase();
+    if (QUICK_BUY_DESIGN_HEX6_REGEX.test(trimmed) || QUICK_BUY_DESIGN_HEX8_REGEX.test(trimmed)) {
+      return trimmed;
+    }
+    return String(fallback || "#ffffff80").toLowerCase();
+  }
+
+  function normalizeQuickBuyButtonDesignValue(value, defaults) {
+    const source = value || {};
+    const fallback = defaults || defaultQuickBuyButtonDesign();
+    return {
+      color: normalizeQuickBuyButtonColorValue(source.color, fallback.color),
+      backgroundColor: normalizeQuickBuyButtonBackgroundColorValue(
+        source.backgroundColor,
+        fallback.backgroundColor
+      ),
+      borderColor: normalizeQuickBuyButtonBorderColorValue(
+        source.borderColor,
+        fallback.borderColor
+      )
+    };
+  }
+
+  function normalizeQuickBuyButtonsAppearance(value) {
+    const defaults = defaultQuickBuyButtonsAppearance();
+    const source = value && typeof value === "object" ? value : {};
+    const buttonOne = normalizeQuickBuyButtonDesignValue(source[1] ?? source["1"], defaults[1]);
+    const rawButtonTwo = source[2] ?? source["2"];
+    const buttonTwo = rawButtonTwo
+      ? normalizeQuickBuyButtonDesignValue(rawButtonTwo, defaults[2])
+      : { ...defaults[2] };
+    return {
+      1: buttonOne,
+      2: buttonTwo
+    };
+  }
+
+  function quickBuyButtonDesignSignature(appearanceValue) {
+    const buttons = normalizeQuickBuyButtonsAppearance(appearanceValue?.quickBuyButtons);
+    return [1, 2]
+      .map((slot) => {
+        const design = buttons[slot] || {};
+        return [
+          design.color || "",
+          design.backgroundColor || "",
+          design.borderColor || ""
+        ].join("|");
+      })
+      .join("||");
+  }
+
   function defaultAppearance() {
     return {
       volume: 70,
       buySound: defaultSoundSettings("buy"),
-      sellSound: defaultSoundSettings("sell")
+      sellSound: defaultSoundSettings("sell"),
+      quickBuyButtons: defaultQuickBuyButtonsAppearance()
     };
   }
 
@@ -1959,10 +2534,13 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   function normalizeAppearanceValue(value) {
     const defaults = defaultAppearance();
+    const source = value && typeof value === "object" ? value : {};
     return {
+      ...source,
       volume: pickSharedVolume(value, defaults.volume),
       buySound: normalizeSoundValue(value?.buySound, defaults.buySound),
-      sellSound: normalizeSoundValue(value?.sellSound, defaults.sellSound)
+      sellSound: normalizeSoundValue(value?.sellSound, defaults.sellSound),
+      quickBuyButtons: normalizeQuickBuyButtonsAppearance(value?.quickBuyButtons)
     };
   }
 
@@ -2070,16 +2648,97 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   async function savePreferences(nextPreferences) {
     const previousSelection = normalizeWalletSelectionPreference(state.preferences);
-    state.preferences = normalizePreferencesValue({
+    const previousPreferences = normalizePreferencesValue(state.preferences);
+    const nextState = normalizePreferencesValue({
       ...state.preferences,
       ...nextPreferences
     });
-    const nextSelection = normalizeWalletSelectionPreference(state.preferences);
+    const nextSelection = normalizeWalletSelectionPreference(nextState);
+    const previousPnlMode = activePnlMode();
+    state.preferences = nextState;
     if (!walletSelectionsEqual(previousSelection, nextSelection)) {
       state.preview = null;
     }
-    await safeStorageSet({ [PREFERENCES_KEY]: serializePreferencesForStorage(state.preferences) });
     pushPanelState();
+
+    const patch = buildTradePreferencesPatch(previousPreferences, state.preferences, nextPreferences);
+    if (Object.keys(patch).length) {
+      let canonical;
+      try {
+        canonical = await callBackground("trench:update-quick-trade-preferences", { patch });
+      } catch (error) {
+        if (isStaleQuickTradePreferencesError(error)) {
+          canonical = await callBackground("trench:get-quick-trade-preferences");
+        } else {
+          state.preferences = previousPreferences;
+          state.preview = null;
+          pushPanelState();
+          throw error;
+        }
+      }
+      const canonicalSelection = normalizeWalletSelectionPreference(canonical || {});
+      if (!walletSelectionsEqual(nextSelection, canonicalSelection)) {
+        state.preview = null;
+      }
+      state.preferences = normalizePreferencesValue({
+        ...state.preferences,
+        ...(canonical || {})
+      });
+      await persistLastKnownQuickTradePreferences(state.preferences);
+    }
+    const localPanelPatch = serializePanelUiPreferencesForStorage(nextPreferences || {});
+    if (Object.keys(localPanelPatch).some((key) => Object.prototype.hasOwnProperty.call(nextPreferences || {}, key))) {
+      await safeStorageSet({
+        [LOCAL_PANEL_UI_PREFERENCES_KEY]: serializePanelUiPreferencesForStorage(state.preferences)
+      });
+    }
+    pushPanelState();
+    if (previousPnlMode !== activePnlMode()) {
+      pushPnlCardState();
+    }
+  }
+
+  function isStaleQuickTradePreferencesError(error) {
+    if (error?.status !== 400) {
+      return false;
+    }
+    return /stale wallet selection update/i.test(String(error?.message || error || ""));
+  }
+
+  function buildTradePreferencesPatch(previousPreferences, nextPreferences, sourcePatch = {}) {
+    const fields = [];
+    const selectionFields = ["selectionSource", "activeWalletGroupId", "manualWalletKeys"];
+    const allowedFields = ["presetId", ...selectionFields, "quickBuyAmount", "quickBuyAmount2"];
+    let selectionChanged = false;
+    for (const field of allowedFields) {
+      if (!Object.prototype.hasOwnProperty.call(sourcePatch || {}, field)) {
+        continue;
+      }
+      const previousValue = previousPreferences?.[field];
+      const nextValue = nextPreferences?.[field];
+      const changed = Array.isArray(nextValue)
+        ? JSON.stringify(previousValue || []) !== JSON.stringify(nextValue)
+        : previousValue !== nextValue;
+      if (changed) {
+        fields.push(field);
+        if (selectionFields.includes(field)) {
+          selectionChanged = true;
+        }
+      }
+    }
+    if (
+      selectionChanged &&
+      Object.prototype.hasOwnProperty.call(sourcePatch || {}, "selectionRevision")
+    ) {
+      fields.push("selectionRevision");
+    }
+    if (!fields.length) {
+      return {};
+    }
+    if (typeof tradePreferences.tradePreferencePatchFromValue === "function") {
+      return tradePreferences.tradePreferencePatchFromValue(nextPreferences, fields);
+    }
+    return Object.fromEntries(fields.map((field) => [field, nextPreferences[field]]));
   }
 
   function buildWalletStatusRequestPayload({ tokenContext = null, force = false } = {}) {
@@ -2165,10 +2824,15 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     });
   }
 
-  function buildPnlHistoryScopePayload(tokenContext = null) {
+  async function buildPnlHistoryScopePayload(tokenContext = null) {
     const resolvedTokenContext = tokenContext || currentActivePanelTokenContext() || state.tokenContext || null;
-    const mint = String(resolvedTokenContext?.mint || state.walletStatus?.mint || "").trim();
-    const payload = { mint };
+    let mint = resolvedTokenContext
+      ? await getPnlMint(resolvedTokenContext)
+      : String(state.walletStatus?.mint || "").trim();
+    if (!mint && walletStatusMatchesCurrentTokenContext(resolvedTokenContext)) {
+      mint = String(state.walletStatus?.mint || "").trim();
+    }
+    const payload = { mint, historicalUsdPrefetch: true };
     const selection = normalizeWalletSelectionPreference(state.preferences);
     if (selection.selectionSource === "group") {
       payload.walletGroupId = requireSelectedWalletGroupId(selection);
@@ -2349,6 +3013,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       return false;
     }
     if (!changed) {
+      markWalletStatusFreshness("balance");
       return true;
     }
     const selectedWalletKeys = new Set(
@@ -2379,6 +3044,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       balanceLamports,
       usd1Balance,
     };
+    markWalletStatusFreshness("balance");
     pushPanelState();
     notifyPlatformWalletStatusChange();
     syncActiveMarkSubscription();
@@ -2485,6 +3151,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       return nextWallet;
     });
     if (!changed) {
+      markWalletStatusFreshness("mint");
       return true;
     }
     const selectedWalletKeys = new Set(
@@ -2594,6 +3261,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           ? aggregateMintUi > 0 && (shouldRefreshQuote || walletStatus.pnlRequiresQuote === true)
           : walletStatus.pnlRequiresQuote,
     };
+    markWalletStatusFreshness("mint");
     pushPanelState();
     notifyPlatformWalletStatusChange();
     syncActiveMarkSubscription();
@@ -2676,6 +3344,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       holdingQuoteError: null,
       pnlRequiresQuote: false,
     };
+    markWalletStatusFreshness("mint");
     pushPanelState();
     notifyPlatformWalletStatusChange();
     return true;
@@ -2685,6 +3354,17 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const baseTokenContext = tokenContext || currentActivePanelTokenContext() || state.tokenContext || null;
     if (!baseTokenContext) {
       return null;
+    }
+    const pnlMint = await getPnlMint(baseTokenContext);
+    if (pnlMint) {
+      const baseMint = String(baseTokenContext?.mint || "").trim();
+      if (baseMint === pnlMint) {
+        return baseTokenContext;
+      }
+      return applyResolvedTokenContext(baseTokenContext, {
+        ...baseTokenContext,
+        mint: pnlMint
+      });
     }
     if (String(baseTokenContext?.mint || "").trim()) {
       return baseTokenContext;
@@ -2712,18 +3392,14 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       ...resolved,
       url: baseTokenContext.url || resolved.url || window.location.href
     };
-    if (state.quickPanelOpen && state.quickPanelTokenContext === baseTokenContext) {
-      setQuickPanelTokenContext(nextTokenContext);
-    } else if (state.panelOpen && state.panelTokenContext === baseTokenContext) {
-      setPersistentPanelTokenContext(nextTokenContext);
-    } else if (state.tokenContext === baseTokenContext) {
-      setPageTokenContext(nextTokenContext);
-    }
-    return nextTokenContext;
+    return applyResolvedTokenContext(baseTokenContext, nextTokenContext);
   }
 
   async function refreshPanelWalletStatus({ tokenContext = null, force = false } = {}) {
     const requestSeq = ++state.walletStatusRequestSeq;
+    const requestedTokenContext = tokenContext || currentActiveWalletStatusTokenContext() || state.tokenContext || null;
+    const requestedRefreshKey = activeWalletStatusRefreshKey(requestedTokenContext);
+    state.walletStatusInFlightKey = requestedRefreshKey;
     try {
       const resolvedTokenContext = await resolveWalletStatusTokenContext(tokenContext);
       const expectedMint = String(resolvedTokenContext?.mint || "").trim();
@@ -2736,6 +3412,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       );
       if (requestSeq !== state.walletStatusRequestSeq) {
         return state.walletStatus;
+      }
+      if (state.walletStatusInFlightKey === requestedRefreshKey) {
+        state.walletStatusInFlightKey = "";
       }
       // Mint is the only dimension of the token context that actually scopes
       // the wallet-status payload (aggregate_trade_ledger keys by
@@ -2759,38 +3438,133 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         return state.walletStatus;
       }
       state.walletStatus = nextWalletStatus;
+      markWalletStatusFreshness("full", resolvedTokenContext);
       state.hostError = "";
       pushPanelState();
       notifyPlatformWalletStatusChange();
       syncActiveMarkSubscription();
       syncWalletStatusQuoteRefresh();
+      scheduleWalletStatusVisibleWatchdog();
       return state.walletStatus;
     } catch (error) {
       if (requestSeq !== state.walletStatusRequestSeq) {
         return state.walletStatus;
       }
+      if (state.walletStatusInFlightKey === requestedRefreshKey) {
+        state.walletStatusInFlightKey = "";
+      }
       state.hostError = isHostAvailabilityError(error) ? userFacingErrorMessage(error) : "";
       surfaceUserFacingError(error, { pushToPanel: true, toast: false });
       pushPanelState();
       syncWalletStatusQuoteRefresh();
+      scheduleWalletStatusVisibleWatchdog();
       return null;
     }
   }
 
-  async function handlePnlHistoryAction(action) {
-    const tokenContext = currentActivePanelTokenContext() || state.tokenContext || null;
-    const payload = buildPnlHistoryScopePayload(tokenContext);
+  async function handlePnlHistoryAction(action, tokenContextOverride = null) {
+    const tokenContext = tokenContextOverride || currentActivePanelTokenContext() || state.tokenContext || null;
+    const resolvedTokenContext = await resolvePnlHistoryTokenContext(tokenContext);
+    const payload = await buildPnlHistoryScopePayload(resolvedTokenContext);
     if (!String(payload.mint || "").trim()) {
-      throw new Error("Open a token page before using PnL history actions.");
+      throw new Error("Could not resolve this pair to a token mint before using PnL history actions.");
     }
     if (action === "resync") {
-      await callBackground("trench:resync-pnl-history", payload);
+      const toastId = "pnl-resync";
+      renderToast({
+        id: toastId,
+        title: "Resyncing PnL...",
+        kind: "info",
+        pending: true,
+        persistent: true,
+        ttlMs: 0
+      });
+      try {
+        await callBackground("trench:resync-pnl-history", payload);
+        await refreshPanelWalletStatus({ tokenContext: resolvedTokenContext || tokenContext, force: true });
+        renderToast({
+          id: toastId,
+          title: "PnL resynced",
+          kind: "success",
+          ttlMs: 3200
+        });
+      } catch (error) {
+        renderToast({
+          id: toastId,
+          title: "PnL resync failed",
+          detail: userFacingErrorMessage(error),
+          kind: "error",
+          ttlMs: 4200
+        });
+        throw error;
+      }
+      return;
     } else if (action === "reset") {
       await callBackground("trench:reset-pnl-history", payload);
     } else {
       return;
     }
-    await refreshPanelWalletStatus({ tokenContext, force: true });
+    await refreshPanelWalletStatus({ tokenContext: resolvedTokenContext || tokenContext, force: true });
+    return resolvedTokenContext;
+  }
+
+  function panelMessageTokenContext(payload = {}, isQuickSource = false) {
+    const rawTokenContext = payload?.tokenContext && typeof payload.tokenContext === "object"
+      ? payload.tokenContext
+      : null;
+    const currentTokenContext = isQuickSource ? state.quickPanelTokenContext : state.panelTokenContext;
+    const tokenContext = rawTokenContext || currentTokenContext || null;
+    const walletStatusMint = String(payload?.walletStatusMint || "").trim();
+    if (!tokenContext || !walletStatusMint) {
+      return tokenContext;
+    }
+    if (rawTokenContext && currentTokenContext) {
+      const rawKey = tokenContextKey(rawTokenContext);
+      const currentKey = tokenContextKey(currentTokenContext);
+      if (rawKey && currentKey && rawKey !== currentKey) {
+        return currentTokenContext;
+      }
+    }
+    const routeAddress = getTokenContextRouteAddress(tokenContext);
+    const tokenMint = String(tokenContext.mint || "").trim();
+    if (tokenMint && tokenMint !== routeAddress) {
+      return tokenContext;
+    }
+    return {
+      ...tokenContext,
+      mint: walletStatusMint
+    };
+  }
+
+  function pnlHistoryActionContext(refreshedContext = null, fallbackContext = null) {
+    if (!refreshedContext) {
+      return fallbackContext;
+    }
+    const refreshedMint = pnlHistoryMintFromTokenContext(refreshedContext);
+    if (refreshedMint) {
+      return refreshedContext;
+    }
+    const fallbackMint = pnlHistoryMintFromTokenContext(fallbackContext);
+    return fallbackMint ? fallbackContext : refreshedContext;
+  }
+
+  function walletStatusMatchesCurrentTokenContext(tokenContext = null) {
+    const walletStatusMint = String(state.walletStatus?.mint || "").trim();
+    if (!walletStatusMint) {
+      return false;
+    }
+    const candidate = tokenContext || currentActivePanelTokenContext() || state.tokenContext || null;
+    if (!candidate) {
+      return false;
+    }
+    const candidateMint = String(candidate.mint || "").trim();
+    const routeAddress = getTokenContextRouteAddress(candidate);
+    if (candidateMint && candidateMint !== routeAddress) {
+      return candidateMint === walletStatusMint;
+    }
+    const activeKey = tokenContextKey(candidate);
+    const panelKey = tokenContextKey(currentActivePanelTokenContext());
+    return Boolean(activeKey && panelKey && activeKey === panelKey);
   }
 
   async function refreshBootstrap(showFailureToast = false) {
@@ -2807,6 +3581,117 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         surfaceUserFacingError(error);
       }
       pushPanelState();
+      return null;
+    }
+  }
+
+  async function hydrateBackendState(reason = "init") {
+    if (lifecycle.destroyed) {
+      return null;
+    }
+    if (state.backendHydrationPromise) {
+      return state.backendHydrationPromise;
+    }
+    const hydrationSeq = state.backendHydrationSeq + 1;
+    state.backendHydrationSeq = hydrationSeq;
+    state.backendHydrationPromise = (async () => {
+      const tasks = [
+        hydrateQuickTradePreferences(hydrationSeq),
+        hydrateRuntimeModeAndBootstrap(hydrationSeq),
+        hydrateRuntimeDiagnostics(hydrationSeq)
+      ];
+      const results = await Promise.allSettled(tasks);
+      if (lifecycle.destroyed || hydrationSeq !== state.backendHydrationSeq) {
+        return results;
+      }
+      pushPanelState();
+      scanAndMount();
+      scheduleRouteReconcile(`backend-hydration-${reason}`, 0);
+      scheduleWalletStatusRefresh({ force: true, delayMs: 40 });
+      notifyPlatformWalletStatusChange();
+      return results;
+    })().finally(() => {
+      if (state.backendHydrationSeq === hydrationSeq) {
+        state.backendHydrationPromise = null;
+      }
+    });
+    return state.backendHydrationPromise;
+  }
+
+  async function hydrateQuickTradePreferences(hydrationSeq) {
+    try {
+      const incomingPreferences = normalizePreferencesValue(
+        await callBackground("trench:get-quick-trade-preferences")
+      );
+      if (lifecycle.destroyed || hydrationSeq !== state.backendHydrationSeq) {
+        return null;
+      }
+      applyIncomingQuickTradePreferences(incomingPreferences);
+      await persistLastKnownQuickTradePreferences(state.preferences);
+      return state.preferences;
+    } catch (error) {
+      if (isExtensionReloadedError(error)) {
+        scheduleExtensionReloadFallbackToast();
+        return null;
+      }
+      state.hostError = isHostAvailabilityError(error) ? userFacingErrorMessage(error) : state.hostError;
+      pushPanelState();
+      return null;
+    }
+  }
+
+  async function hydrateTrenchToolsMode(hydrationSeq) {
+    try {
+      const mode = await refreshTrenchToolsModeCache();
+      if (lifecycle.destroyed || hydrationSeq !== state.backendHydrationSeq) {
+        return "";
+      }
+      setRawSiteFeatures(state.rawSiteFeatures);
+      if (isLdOnlyTrenchToolsMode(mode)) {
+        state.bootstrap = null;
+      }
+      syncExecutionRuntimeForMode("backend-hydration-mode");
+      scanAndMount();
+      pushPanelState();
+      return mode;
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  async function hydrateRuntimeModeAndBootstrap(hydrationSeq) {
+    await hydrateTrenchToolsMode(hydrationSeq);
+    if (lifecycle.destroyed || hydrationSeq !== state.backendHydrationSeq) {
+      return null;
+    }
+    return hydrateBootstrapForCurrentMode(hydrationSeq);
+  }
+
+  async function hydrateBootstrapForCurrentMode(hydrationSeq) {
+    if (!shouldUseExecutionSurfaces()) {
+      return null;
+    }
+    const bootstrap = await refreshBootstrap(false);
+    if (lifecycle.destroyed || hydrationSeq !== state.backendHydrationSeq) {
+      return null;
+    }
+    if (!shouldUseExecutionSurfaces()) {
+      state.bootstrap = null;
+      pushPanelState();
+      return null;
+    }
+    return bootstrap;
+  }
+
+  async function hydrateRuntimeDiagnostics(hydrationSeq) {
+    try {
+      const diagnostics = await callBackground("trench:get-runtime-diagnostics");
+      if (lifecycle.destroyed || hydrationSeq !== state.backendHydrationSeq) {
+        return null;
+      }
+      surfaceRuntimeDiagnostics(diagnostics);
+      return diagnostics;
+    } catch (_error) {
       return null;
     }
   }
@@ -2865,10 +3750,13 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const initialPresetId = String(state.preferences?.presetId || "").trim();
     const initialSelection = normalizeWalletSelectionPreference(state.preferences);
 
-    if (!state.preferences.presetId && presets[0]) {
-      state.preferences.presetId = presets[0].id;
+    const displayPreferences = {
+      ...state.preferences
+    };
+    if (!displayPreferences.presetId && presets[0]) {
+      displayPreferences.presetId = presets[0].id;
     }
-    const selection = normalizeWalletSelectionPreference(state.preferences);
+    const selection = normalizeWalletSelectionPreference(displayPreferences);
     if (walletGroups[0] && !selection.activeWalletGroupId) {
       selection.activeWalletGroupId = walletGroups[0].id;
     }
@@ -2886,19 +3774,31 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       const knownWalletKeys = new Set(wallets.map((wallet) => wallet.key));
       selection.manualWalletKeys = selection.manualWalletKeys.filter((key) => knownWalletKeys.has(key));
     }
-    mirrorWalletSelectionPreferenceOntoPreferences(state.preferences, selection);
-    state.preferences = normalizePreferencesValue(state.preferences);
+    mirrorWalletSelectionPreferenceOntoPreferences(displayPreferences, selection);
 
-    const presetChanged = String(state.preferences?.presetId || "").trim() !== initialPresetId;
-    const finalSelection = normalizeWalletSelectionPreference(state.preferences);
+    const finalSelection = normalizeWalletSelectionPreference(displayPreferences);
+    const presetChanged = String(displayPreferences?.presetId || "").trim() !== initialPresetId;
     const selectionChanged = !walletSelectionsEqual(initialSelection, finalSelection);
     if (selectionChanged) {
-      state.preferences.selectionRevision =
-        Math.max(0, Number(state.preferences.selectionRevision || 0) || 0) + 1;
+      displayPreferences.selectionRevision =
+        Math.max(0, Number(displayPreferences.selectionRevision || 0) || 0) + 1;
       state.preview = null;
     }
     if (presetChanged || selectionChanged) {
-      void safeStorageSet({ [PREFERENCES_KEY]: serializePreferencesForStorage(state.preferences) });
+      const patch = {};
+      if (presetChanged) {
+        patch.presetId = displayPreferences.presetId;
+      }
+      if (selectionChanged) {
+        patch.selectionSource = finalSelection.selectionSource;
+        patch.activeWalletGroupId = finalSelection.activeWalletGroupId;
+        patch.manualWalletKeys = [...finalSelection.manualWalletKeys];
+        patch.selectionRevision = displayPreferences.selectionRevision;
+      }
+      void savePreferences(patch).catch((error) => {
+        state.hostError = isHostAvailabilityError(error) ? userFacingErrorMessage(error) : "";
+        pushPanelState();
+      });
     }
   }
 
@@ -2963,8 +3863,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   async function ensureValidExecutionPreset({
     missingMessage = "No valid preset saved. Click here to create a preset",
     pushToPanel = false,
-    requestedPresetId,
-    persistRepair = true
+    requestedPresetId
   } = {}) {
     if (!isBootstrapLoaded()) {
       await refreshBootstrap(true);
@@ -3007,9 +3906,6 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       showMissingExecutionPresetToast(missingMessage);
       return null;
     }
-    if (resolution.repaired && persistRepair) {
-      await savePreferences({ presetId: resolution.preset.id });
-    }
     return resolution.preset;
   }
 
@@ -3025,16 +3921,6 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     if (!resolution.preset) {
       showMissingExecutionPresetToast(missingMessage);
       return null;
-    }
-    if (resolution.repaired) {
-      state.preferences = normalizePreferencesValue({
-        ...state.preferences,
-        presetId: resolution.preset.id
-      });
-      pushPanelState();
-      void safeStorageSet({
-        [PREFERENCES_KEY]: serializePreferencesForStorage(state.preferences)
-      });
     }
     return resolution.preset;
   }
@@ -3077,6 +3963,113 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     });
   }
 
+  function showLaunchdeckDisabledToast() {
+    renderToast({
+      id: "launchdeck-disabled-ee-mode",
+      title: "LaunchDeck is disabled",
+      detail: "TRENCH_TOOLS_MODE is set to ee in .env. Set it to both or ld and restart Trench Tools to access LaunchDeck.",
+      kind: "info",
+      ttlMs: 8200
+    });
+  }
+
+  function cachedTrenchToolsMode() {
+    if (
+      state.trenchToolsMode &&
+      Date.now() - state.trenchToolsModeCachedAt < TRENCH_TOOLS_MODE_CACHE_TTL_MS
+    ) {
+      return state.trenchToolsMode;
+    }
+    return "";
+  }
+
+  function normalizeTrenchToolsModeValue(value) {
+    const mode = String(value || "").trim().toLowerCase();
+    return mode === "ee" || mode === "ld" || mode === "both" ? mode : "";
+  }
+
+  function applyTrenchToolsMode(value, { persist = false } = {}) {
+    const mode = normalizeTrenchToolsModeValue(value);
+    if (!mode) {
+      return "";
+    }
+    state.trenchToolsMode = mode;
+    state.trenchToolsModeCachedAt = Date.now();
+    if (persist) {
+      void safeStorageSet({ [LAST_KNOWN_TRENCH_TOOLS_MODE_KEY]: mode });
+    }
+    return mode;
+  }
+
+  async function loadLastKnownTrenchToolsMode() {
+    const stored = await safeStorageGet(LAST_KNOWN_TRENCH_TOOLS_MODE_KEY);
+    return normalizeTrenchToolsModeValue(stored[LAST_KNOWN_TRENCH_TOOLS_MODE_KEY]);
+  }
+
+  async function refreshTrenchToolsModeCache() {
+    if (state.trenchToolsModePromise) {
+      return state.trenchToolsModePromise;
+    }
+    state.trenchToolsModePromise = callBackground("trench:get-trench-tools-mode")
+      .then((status) => {
+        return applyTrenchToolsMode(status?.trenchToolsMode, { persist: true });
+      })
+      .finally(() => {
+        state.trenchToolsModePromise = null;
+      });
+    return state.trenchToolsModePromise;
+  }
+
+  async function resolveTrenchToolsModeForGate({ refresh = true } = {}) {
+    const cached = cachedTrenchToolsMode();
+    if (cached) {
+      return cached;
+    }
+    if (!refresh) {
+      if (state.trenchToolsModePromise) {
+        try {
+          return await state.trenchToolsModePromise;
+        } catch (_error) {
+          return state.trenchToolsMode;
+        }
+      }
+      return state.trenchToolsMode;
+    }
+    try {
+      return await refreshTrenchToolsModeCache();
+    } catch (_error) {
+      return cachedTrenchToolsMode();
+    }
+  }
+
+  async function ensureLaunchdeckEnabledForExtension() {
+    const mode = await resolveTrenchToolsModeForGate({ refresh: true });
+    if (isEeOnlyTrenchToolsMode(mode)) {
+      showLaunchdeckDisabledToast();
+      return false;
+    }
+    return true;
+  }
+
+  function showExecutionEngineDisabledToast() {
+    renderToast({
+      id: "execution-engine-disabled-ld-mode",
+      title: "Execution Engine is disabled",
+      detail: "TRENCH_TOOLS_MODE is set to ld in .env. Set it to both or ee and restart Trench Tools to use the trading panel.",
+      kind: "info",
+      ttlMs: 8200
+    });
+  }
+
+  async function ensureExecutionEnabledForExtension({ refresh = true } = {}) {
+    const mode = await resolveTrenchToolsModeForGate({ refresh });
+    if (isLdOnlyTrenchToolsMode(mode)) {
+      showExecutionEngineDisabledToast();
+      return false;
+    }
+    return true;
+  }
+
   function isUnknownBackgroundMessageError(error, type) {
     return String(error?.message || "").includes(`Unknown message type: ${type}`);
   }
@@ -3103,9 +4096,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     launchdeckPresetCheckCachedPayload = null;
   }
 
-  async function ensureValidLaunchdeckPresetForExtension() {
+  async function ensureValidLaunchdeckPresetForExtension({ forceRefresh = false } = {}) {
     const now = Date.now();
     if (
+      !forceRefresh &&
       launchdeckPresetCheckCachedPayload
       && now - launchdeckPresetCheckCachedAt < LAUNCHDECK_PRESET_CHECK_TTL_MS
     ) {
@@ -3325,6 +4319,62 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     state.quickPanelWrapper = wrapper;
     state.quickPanelFrame = iframe;
     ensurePanelLayerObserver(wrapper);
+  }
+
+  function ensurePnlCardFrame() {
+    if (state.pnlCardWrapper && state.pnlCardFrame) {
+      return;
+    }
+
+    const wrapper = document.createElement("div");
+    wrapper.id = "trench-tools-pnl-card-wrapper";
+    Object.assign(wrapper.style, {
+      position: "fixed",
+      inset: "0",
+      display: "none",
+      background: "rgba(0, 0, 0, 0.72)",
+      backdropFilter: "blur(4px)",
+      zIndex: "1000001",
+      pointerEvents: "auto"
+    });
+
+    const iframe = document.createElement("iframe");
+    iframe.src = buildPnlCardIframeUrl();
+    iframe.title = "Trench Tools PnL Card";
+    iframe.allow = "clipboard-read; clipboard-write";
+    Object.assign(iframe.style, {
+      width: "100%",
+      height: "100%",
+      border: "0",
+      margin: "0",
+      padding: "0",
+      display: "block",
+      background: "transparent"
+    });
+
+    wrapper.appendChild(iframe);
+    document.documentElement.appendChild(wrapper);
+    state.pnlCardWrapper = wrapper;
+    state.pnlCardFrame = iframe;
+    const connectPnlCardFrame = () => {
+      try {
+        state.pnlCardPort?.close?.();
+      } catch (_error) {}
+      const channel = new MessageChannel();
+      state.pnlCardPort = channel.port1;
+      state.pnlCardPort.onmessage = (event) => {
+        void handlePnlCardPortMessage(event);
+      };
+      state.pnlCardReady = false;
+      iframe.contentWindow?.postMessage(
+        { channel: PANEL_CHANNEL_OUT, type: "pnl-card-connect" },
+        PANEL_ORIGIN,
+        [channel.port2]
+      );
+    };
+    iframe.addEventListener("load", () => {
+      connectPnlCardFrame();
+    });
   }
 
   function shouldIgnorePanelLayerCandidate(element) {
@@ -3776,6 +4826,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       return;
     }
     lifecycle.panelMessageListener = async (event) => {
+      if (event.data?.channel === "trench-tools-pnl-card") {
+        await handlePnlCardMessage(event);
+        return;
+      }
       if (!event.data || event.data.channel !== PANEL_CHANNEL_IN) {
         return;
       }
@@ -3893,10 +4947,26 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
             await handleTokenDistributionRequest("consolidate", event.data.payload || {});
             break;
           case "resync-pnl-history":
-            await handlePnlHistoryAction("resync");
+            {
+              const mode = isQuickSource ? "quick" : "persistent";
+              const refreshedContext = await refreshPanelTokenContext({ mode, silent: true });
+              const fallbackContext = panelMessageTokenContext(event.data.payload || {}, isQuickSource);
+              await handlePnlHistoryAction(
+                "resync",
+                pnlHistoryActionContext(refreshedContext, fallbackContext)
+              );
+            }
             break;
           case "reset-pnl-history":
-            await handlePnlHistoryAction("reset");
+            {
+              const mode = isQuickSource ? "quick" : "persistent";
+              const refreshedContext = await refreshPanelTokenContext({ mode, silent: true });
+              const fallbackContext = panelMessageTokenContext(event.data.payload || {}, isQuickSource);
+              await handlePnlHistoryAction(
+                "reset",
+                pnlHistoryActionContext(refreshedContext, fallbackContext)
+              );
+            }
             break;
           case "refresh-panel":
             await refreshBootstrap(true);
@@ -3906,6 +4976,25 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           case "open-options":
             await callBackground("trench:open-options", event.data.payload || {});
             break;
+          case "request-open-pnl-card": {
+            const mode = isQuickSource ? "quick" : "persistent";
+            const refreshedContext = await refreshPanelTokenContext({ mode, silent: true });
+            const panelContext = refreshedContext || (isQuickSource ? state.quickPanelTokenContext : state.panelTokenContext);
+            if (!panelContext?.mint && !panelContext?.routeAddress && !panelContext?.address) {
+              showToast("Open a token first to share a PnL card.", "error");
+              break;
+            }
+            const platformSymbol = readPlatformTokenSymbol();
+            const tokenContext = platformSymbol
+              ? { ...panelContext, symbol: platformSymbol }
+              : panelContext;
+            openPnlCardEditorForMint(
+              tokenContext,
+              tokenContext.surface || "token_detail",
+              tokenContext.url || window.location.href
+            );
+            break;
+          }
           default:
             break;
         }
@@ -3916,16 +5005,223 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     window.addEventListener("message", lifecycle.panelMessageListener);
   }
 
+  async function handlePnlCardMessage(event) {
+    if (event.source !== state.pnlCardFrame?.contentWindow || event.origin !== PANEL_ORIGIN) {
+      return;
+    }
+    if (event.data?.type === "pnl-card-ready") {
+      state.pnlCardReady = true;
+      pushPnlCardState();
+    }
+  }
+
+  async function handlePnlCardPortMessage(event) {
+    const messageType = event.data.type;
+    try {
+      switch (messageType) {
+        case "pnl-card-ready":
+          state.pnlCardReady = true;
+          pushPnlCardState();
+          break;
+        case "pnl-card-close":
+          closePnlCardEditor();
+          break;
+        case "pnl-card-save-profile":
+          state.pnlCardState = await callBackground("trench:save-pnl-card-profile", event.data.payload || {});
+          await refreshPnlCardState();
+          break;
+        case "pnl-card-save-settings":
+          state.pnlCardSettings = event.data.payload?.defaults || null;
+          state.pnlCardState = await callBackground("trench:save-pnl-card-settings", event.data.payload || {});
+          await refreshPnlCardState();
+          break;
+        case "pnl-card-save-media":
+          {
+            const mediaSaveResponse = await callBackground("trench:save-pnl-card-media", event.data.payload || {});
+            state.pnlCardState = mediaSaveResponse;
+            const savedMedia = mediaSaveResponse?.media || null;
+            await refreshPnlCardState();
+            postPnlCardMessage({
+              type: "pnl-card-media-saved",
+              payload: {
+                mediaId: savedMedia?.id || "",
+                media: savedMedia
+              }
+            });
+          }
+          break;
+        case "pnl-card-delete-media":
+          await callBackground("trench:delete-pnl-card-media", event.data.payload || {});
+          await refreshPnlCardState();
+          break;
+        case "pnl-card-resync-history":
+          {
+            const tokenContext = await handlePnlHistoryAction("resync", state.pnlCardTokenContext || currentActivePanelTokenContext() || state.tokenContext || null);
+            if (tokenContext || state.pnlCardTokenContext) {
+              state.pnlCardWalletStatus = await fetchPnlCardWalletStatus(tokenContext || state.pnlCardTokenContext, { force: true });
+              pushPnlCardState();
+            }
+          }
+          await refreshPnlCardState();
+          pushPnlCardState();
+          break;
+        case "pnl-card-get-media-data":
+          postPnlCardMessage({
+            type: "pnl-card-media-data",
+            payload: await callBackground("trench:get-pnl-card-media-data", event.data.payload || {})
+          });
+          break;
+        case "pnl-card-download":
+          if (
+            !state.pnlCardOpen ||
+            !state.pnlCardDownloadToken ||
+            event.data.payload?.downloadToken !== state.pnlCardDownloadToken
+          ) {
+            throw new Error("Invalid PnL card download request.");
+          }
+          try {
+            await callBackground("trench:download-pnl-card", event.data.payload || {});
+            postPnlCardMessage({ type: "pnl-card-download-complete" });
+          } catch (error) {
+            if (error?.code === "DOWNLOAD_CANCELED") {
+              postPnlCardMessage({ type: "pnl-card-download-canceled" });
+            } else {
+              throw error;
+            }
+          }
+          break;
+        case "pnl-card-resize":
+          break;
+        default:
+          break;
+      }
+    } catch (error) {
+      const message = pnlCardErrorMessage(error, messageType);
+      postPnlCardMessage({
+        type: "pnl-card-action-error",
+        payload: { type: messageType, message }
+      });
+      if (!PNL_CARD_SILENT_TOAST_ACTIONS.has(messageType)) {
+        showToast(message, "error");
+      }
+      pushPnlCardState();
+    }
+  }
+
+  function postPnlCardMessage(message) {
+    if (state.pnlCardPort) {
+      state.pnlCardPort.postMessage({
+        channel: PANEL_CHANNEL_OUT,
+        ...message
+      });
+      return;
+    }
+    state.pnlCardFrame?.contentWindow?.postMessage(
+      {
+        channel: PANEL_CHANNEL_OUT,
+        ...message
+      },
+      PANEL_ORIGIN
+    );
+  }
+
+  const PNL_CARD_SILENT_TOAST_ACTIONS = new Set(["pnl-card-save-media", "pnl-card-delete-media"]);
+
+  function pnlCardErrorMessage(error, messageType) {
+    const raw = error?.message || "";
+    if (/failed to fetch|networkerror|host_unreachable/i.test(raw)) {
+      if (messageType === "pnl-card-save-media") {
+        return "Upload failed. File may be too large or host is unreachable.";
+      }
+      return "Could not reach the execution host.";
+    }
+    return raw || "PnL card action failed.";
+  }
+
+  function applyIncomingQuickTradePreferences(incomingPreferences) {
+    if (lifecycle.destroyed) {
+      return;
+    }
+    const localPanelUiPreferences = normalizeLocalPanelUiPreferences(state.preferences);
+    const currentSelectionRevision = Math.max(0, Number(state.preferences?.selectionRevision || 0) || 0);
+    const incomingSelectionRevision = Math.max(0, Number(incomingPreferences.selectionRevision || 0) || 0);
+    const previousSelection = normalizeWalletSelectionPreference(state.preferences);
+    const previousPnlMode = activePnlMode();
+    state.preferences = normalizePreferencesValue({
+      ...state.preferences,
+      ...incomingPreferences,
+      ...localPanelUiPreferences,
+      ...(incomingSelectionRevision < currentSelectionRevision
+        ? {
+            selectionSource: state.preferences.selectionSource,
+            activeWalletGroupId: state.preferences.activeWalletGroupId,
+            manualWalletKeys: [...(state.preferences.manualWalletKeys || [])],
+            selectionRevision: currentSelectionRevision
+          }
+        : {})
+    });
+    const nextSelection = normalizeWalletSelectionPreference(state.preferences);
+    if (!walletSelectionsEqual(previousSelection, nextSelection)) {
+      state.preview = null;
+    }
+    pushPanelState();
+    if (previousPnlMode !== activePnlMode()) {
+      pushPnlCardState();
+    }
+    scheduleWalletStatusRefresh({ force: true, delayMs: 40 });
+    scanAndMount();
+    notifyPlatformWalletStatusChange();
+  }
+
   function attachStorageChangeListener() {
     if (lifecycle.storageChangeListener) {
       return;
     }
+    async function refreshQuickTradePreferencesFromHost() {
+      lifecycle.quickTradePreferencesRefreshTimer = 0;
+      if (lifecycle.destroyed) {
+        return;
+      }
+      try {
+        const incomingPreferences = normalizePreferencesValue(
+          await callBackground("trench:get-quick-trade-preferences")
+        );
+        if (lifecycle.destroyed) {
+          return;
+        }
+        applyIncomingQuickTradePreferences(incomingPreferences);
+        void persistLastKnownQuickTradePreferences(state.preferences);
+      } catch (error) {
+        if (isExtensionReloadedError(error)) {
+          scheduleExtensionReloadFallbackToast();
+          return;
+        }
+        console.debug("Failed to refresh quick-trade preferences", error);
+      }
+    }
+    function scheduleQuickTradePreferencesRefresh() {
+      if (lifecycle.destroyed) {
+        return;
+      }
+      if (lifecycle.quickTradePreferencesRefreshTimer) {
+        window.clearTimeout(lifecycle.quickTradePreferencesRefreshTimer);
+      }
+      lifecycle.quickTradePreferencesRefreshTimer = window.setTimeout(refreshQuickTradePreferencesFromHost, 40);
+    }
+    lifecycle.runtimeMessageListener = (message) => {
+      if (message?.type !== "trench:quick-trade-preferences-updated") {
+        return;
+      }
+      applyIncomingQuickTradePreferences(normalizePreferencesValue(message.payload || {}));
+      void persistLastKnownQuickTradePreferences(state.preferences);
+    };
+    chrome.runtime.onMessage.addListener(lifecycle.runtimeMessageListener);
     lifecycle.storageChangeListener = (changes, areaName) => {
       if (areaName !== "local") {
         return;
       }
       if (changes[SITE_FEATURES_KEY]) {
-        state.siteFeatures = normalizeSiteFeaturesValue(changes[SITE_FEATURES_KEY].newValue || {});
+        setRawSiteFeatures(changes[SITE_FEATURES_KEY].newValue || {});
         void ensurePlatformInitialized("site-features");
         dismissOpenSurfacesIfPlatformDisabled();
         ensureFloatingLauncher(state.tokenContext);
@@ -3933,13 +5229,25 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         scheduleRouteReconcile("site-features", 0);
       }
       if (changes[APPEARANCE_KEY]) {
-        state.appearance = normalizeAppearanceValue(changes[APPEARANCE_KEY].newValue || {});
+        const previousSignature = quickBuyButtonDesignSignature(state.appearance);
+        const nextAppearance = normalizeAppearanceValue(changes[APPEARANCE_KEY].newValue || {});
+        const nextSignature = quickBuyButtonDesignSignature(nextAppearance);
+        state.appearance = nextAppearance;
+        if (previousSignature !== nextSignature) {
+          state.axiomQuickBuyDesignRevision += 1;
+        }
+        if (platformInitialized && platform === "axiom" && previousSignature !== nextSignature) {
+          scanAndMount();
+        }
       }
       if (changes[BOOTSTRAP_REVISION_KEY]) {
         void refreshBootstrap().then(() => {
           scheduleWalletStatusRefresh({ force: true, delayMs: 40 });
           notifyPlatformWalletStatusChange();
         });
+      }
+      if (changes[QUICK_TRADE_PREFERENCES_REVISION_KEY]) {
+        scheduleQuickTradePreferencesRefresh();
       }
       if (changes[HOST_AUTH_TOKEN_KEY]) {
         invalidateLaunchdeckPresetCache();
@@ -3988,18 +5296,6 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       if (changes[BATCH_STATUS_EVENT_KEY]?.newValue) {
         applyStreamedBatchStatus(changes[BATCH_STATUS_EVENT_KEY].newValue);
       }
-      if (changes[PREFERENCES_KEY]) {
-        const previousSelection = normalizeWalletSelectionPreference(state.preferences);
-        state.preferences = normalizePreferencesValue(changes[PREFERENCES_KEY].newValue || {});
-        const nextSelection = normalizeWalletSelectionPreference(state.preferences);
-        if (!walletSelectionsEqual(previousSelection, nextSelection)) {
-          state.preview = null;
-        }
-        pushPanelState();
-        scheduleWalletStatusRefresh({ force: true, delayMs: 40 });
-        scanAndMount();
-        notifyPlatformWalletStatusChange();
-      }
     };
     chrome.storage.onChanged.addListener(lifecycle.storageChangeListener);
   }
@@ -4007,10 +5303,14 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   async function handlePreviewRequest(payload) {
     const requestSeq = ++state.previewRequestSeq;
     try {
-      await savePreferences(payload);
+      const effectivePreferences = normalizePreferencesValue({
+        ...state.preferences,
+        ...payload
+      });
       if (!(await ensureValidExecutionPreset({
         missingMessage: "No valid preset saved. Click here to create a preset",
-        pushToPanel: true
+        pushToPanel: true,
+        requestedPresetId: String(effectivePreferences?.presetId || "").trim()
       }))) {
         return;
       }
@@ -4034,22 +5334,22 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         platform: normalizeRouteValue(tokenContext?.platform || state.platform) || undefined,
         mint: normalizeRouteValue(tokenContext?.mint) || undefined,
         pair: routeRequest.pair || undefined,
-        presetId: state.preferences.presetId,
+        presetId: effectivePreferences.presetId,
         side: previewSide,
         buyAmountSol:
           previewSide === "buy"
-            ? String(payload?.buyAmountSol || "").trim() || undefined
+            ? normalizeQuickBuyAmountInput(payload?.buyAmountSol || "") || undefined
             : undefined,
         sellPercent:
           previewSide === "sell"
-            ? String(payload?.sellPercent || "").trim() || undefined
+            ? normalizeQuickBuyAmountInput(payload?.sellPercent || "") || undefined
             : undefined,
         sellOutputSol:
           previewSide === "sell"
-            ? String(payload?.sellOutputSol || "").trim() || undefined
+            ? normalizeQuickBuyAmountInput(payload?.sellOutputSol || "") || undefined
             : undefined,
         ...warmReuseFields,
-        ...selectionPayloadFromPreferences()
+        ...selectionPayloadFromPreferences(effectivePreferences)
       };
       const preview = await callBackground("trench:preview-batch", previewPayload);
       if (requestSeq !== state.previewRequestSeq) {
@@ -4157,6 +5457,9 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   async function handleTokenDistributionRequest(action, payload, options = {}) {
     const normalizedAction = action === "consolidate" ? "consolidate" : "split";
+    if (!(await ensureExecutionEnabledForExtension({ refresh: false }))) {
+      return;
+    }
     if (state.tokenDistributionPending) {
       showToast("Token distribution already in progress.", "error");
       return;
@@ -4171,9 +5474,6 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const failureMessage = normalizedAction === "split" ? "Token split failed." : "Token consolidation failed.";
 
     try {
-      if (options.persistPreferences !== false) {
-        await savePreferences(payload);
-      }
       const tokenContext =
         (await refreshPanelTokenContext({ silent: true })) ||
         currentActivePanelTokenContext() ||
@@ -4279,24 +5579,20 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const requestEntryStartedAt = Date.now();
     let clientRequestId = "";
     try {
-      const requestedBuyAmount = String(payload?.buyAmountSol || "").trim();
-      const requestedSellPercent = String(payload?.sellPercent || "").trim();
-      const requestedSellOutputSol = String(payload?.sellOutputSol || "").trim();
-      let effectivePreferences;
-      if (options.persistPreferences === false) {
-        effectivePreferences = normalizePreferencesValue({
-          ...state.preferences,
-          ...payload
-        });
-      } else {
-        await savePreferences(payload);
-        effectivePreferences = state.preferences;
+      if (!(await ensureExecutionEnabledForExtension({ refresh: false }))) {
+        return;
       }
+      const requestedBuyAmount = normalizeQuickBuyAmountInput(payload?.buyAmountSol || "");
+      const requestedSellPercent = normalizeQuickBuyAmountInput(payload?.sellPercent || "");
+      const requestedSellOutputSol = normalizeQuickBuyAmountInput(payload?.sellOutputSol || "");
+      const effectivePreferences = normalizePreferencesValue({
+        ...state.preferences,
+        ...payload
+      });
       const activePreset = await ensureValidExecutionPreset({
         missingMessage: "No valid preset saved. Click here to create a preset",
         pushToPanel: true,
-        requestedPresetId: String(effectivePreferences?.presetId || "").trim(),
-        persistRepair: options.persistPreferences !== false
+        requestedPresetId: String(effectivePreferences?.presetId || "").trim()
       });
       if (!activePreset) {
         return;
@@ -4389,6 +5685,13 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       window.clearInterval(timer);
       state.statusPollTimers.delete(batchId);
     }
+  }
+
+  function clearBatchStatusPollers() {
+    for (const timer of state.statusPollTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    state.statusPollTimers.clear();
   }
 
   function surfaceAutoFeeWarnings(result) {
@@ -4607,10 +5910,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
     const status = String(event.status || "").trim().toLowerCase();
     if (status === "confirmed") {
-      void callBackground("trench:invalidate-balances", { afterTrade: true }).catch(() => {});
-      window.setTimeout(() => {
-        void refreshPanelWalletStatus({ force: true });
-      }, 900);
+      scheduleExternalWalletStatusRefresh(null, {
+        delays: [900],
+        reason: "tt-confirmed"
+      });
     }
     if (status && !["confirmed", "failed"].includes(status)) {
       scheduleBatchStatusFallback(batchId, event.side, event.summary?.totalWallets, clientRequestId, revision);
@@ -4778,11 +6081,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         syncExecutionToastsFromBatchStatus(batchStatus, { side, walletCount, clientRequestId });
         if (["confirmed", "failed"].includes(latestStatus)) {
           if (latestStatus === "confirmed") {
-            // Background owns the cross-surface balance invalidation (see balances-store).
-            void callBackground("trench:invalidate-balances", { afterTrade: true }).catch(() => {});
-            window.setTimeout(() => {
-              void refreshPanelWalletStatus({ force: true });
-            }, 900);
+            scheduleExternalWalletStatusRefresh(null, {
+              delays: [900],
+              reason: "tt-confirmed"
+            });
           }
           clearBatchStatusPoller(batchId);
           return;
@@ -4822,10 +6124,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       updatePanelBatchStatus(batchStatus);
       syncExecutionToastsFromBatchStatus(batchStatus, { side, walletCount, clientRequestId });
       if (latestStatus === "confirmed") {
-        void callBackground("trench:invalidate-balances", { afterTrade: true }).catch(() => {});
-        window.setTimeout(() => {
-          void refreshPanelWalletStatus({ force: true });
-        }, 900);
+        scheduleExternalWalletStatusRefresh(null, {
+          delays: [900],
+          reason: "tt-confirmed"
+        });
       }
       if (!["confirmed", "failed"].includes(latestStatus)) {
         scheduleBatchStatusFallback(
@@ -4987,6 +6289,24 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     };
   }
 
+  function isTerminalExecutionToastPayload(payload) {
+    if (!payload || payload.pending || payload.persistent || !payload.ttlMs) {
+      return false;
+    }
+    const id = String(payload.id || "");
+    return id.startsWith("execution-") || id.startsWith("execution-balance-gate-");
+  }
+
+  function terminalExecutionToastSignature(payload) {
+    return [
+      String(payload?.kind || ""),
+      String(payload?.title || ""),
+      String(payload?.detail || ""),
+      String(payload?.linkHref || ""),
+      String(payload?.actionLabel || "")
+    ].join("|");
+  }
+
   function syncExecutionToastsFromBatchStatus(batchStatus, fallback = {}) {
     const wallets = Array.isArray(batchStatus?.wallets) ? batchStatus.wallets : [];
     const totalWallets = Number(
@@ -5006,10 +6326,23 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       batchId,
       String(batchStatus?.clientRequestId || fallback?.clientRequestId || "").trim()
     );
+    const renderExecutionToast = (payload) => {
+      if (!payload?.id) {
+        return;
+      }
+      if (isTerminalExecutionToastPayload(payload)) {
+        const signature = terminalExecutionToastSignature(payload);
+        if (state.shownExecutionTerminalToastSignatures.get(payload.id) === signature) {
+          return;
+        }
+        state.shownExecutionTerminalToastSignatures.set(payload.id, signature);
+      }
+      renderToast(payload);
+    };
     if (totalWallets > 1) {
       const zeroBalanceFailures = zeroTokenBalanceFailureCount(wallets);
       const balanceGateFailures = balanceGateFailureSummary(wallets);
-      renderToast(
+      renderExecutionToast(
         batchExecutionToastPayload(
           batchStatus,
           fallback,
@@ -5020,7 +6353,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         balanceGateFailures &&
         !(Number(batchStatus?.summary?.failedWallets || 0) === totalWallets && pendingWallets === 0)
       ) {
-        renderToast({
+        renderExecutionToast({
           id: `execution-balance-gate-${batchId || fallback?.id || "batch"}`,
           title: balanceGateFailures.title,
           kind: "error",
@@ -5040,7 +6373,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
             (zeroBalanceFailures <= 1 || !isZeroTokenBalanceError(walletState?.error));
         })
         .forEach((walletState) => {
-          renderToast(executionToastPayloadForWallet(batchStatus, walletState, fallback));
+          renderExecutionToast(executionToastPayloadForWallet(batchStatus, walletState, fallback));
         });
       const side = String(batchStatus?.side || fallback?.side || "").trim().toLowerCase();
       if (side === "buy" || side === "sell") {
@@ -5068,7 +6401,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
 
     wallets.forEach((walletState) => {
-      renderToast(executionToastPayloadForWallet(batchStatus, walletState, fallback));
+      renderExecutionToast(executionToastPayloadForWallet(batchStatus, walletState, fallback));
     });
 
     const side = String(batchStatus?.side || fallback?.side || "").trim().toLowerCase();
@@ -5104,6 +6437,213 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   function getCandidateMintAddress(candidate) {
     return normalizeRouteValue(candidate?.mint || candidate?.tokenMint);
+  }
+
+  function pnlHistoryMintFromTokenContext(tokenContext) {
+    const mint = normalizeRouteValue(tokenContext?.mint);
+    if (!mint) {
+      return "";
+    }
+    const explicitRouteAddress = normalizeRouteValue(
+      tokenContext?.routeAddress
+      || tokenContext?.rawAddress
+      || tokenContext?.address
+    );
+    if (!explicitRouteAddress) {
+      return mint;
+    }
+    if (mint !== explicitRouteAddress) {
+      return isPnlHistoryMintCandidate(mint, tokenContext);
+    }
+    const platformLabel = String(tokenContext?.platform || platform || "").trim().toLowerCase();
+    return platformLabel === "axiom" ? "" : mint;
+  }
+
+  function isPnlHistoryMintCandidate(value, tokenContext) {
+    const mint = normalizeRouteValue(value);
+    if (!mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
+      return "";
+    }
+    const routeValues = [
+      tokenContext?.routeAddress,
+      tokenContext?.rawAddress,
+      tokenContext?.address,
+      tokenContext?.pairAddress,
+      tokenContext?.resolvedPair,
+      tokenContext?.pair
+    ].map(normalizeRouteValue).filter(Boolean);
+    return routeValues.includes(mint) ? "" : mint;
+  }
+
+  function selectPnlHistoryMintCandidate(tokenContext, candidates = []) {
+    for (const candidate of candidates) {
+      const mint = isPnlHistoryMintCandidate(candidate, tokenContext);
+      if (mint) {
+        return mint;
+      }
+    }
+    return "";
+  }
+
+  function readPnlHistoryMintFromElement(element, tokenContext) {
+    if (!(element instanceof Element)) {
+      return "";
+    }
+    const candidates = [
+      element.getAttribute("data-mint"),
+      element.getAttribute("data-token-mint"),
+      element.getAttribute("data-token-address"),
+      element.getAttribute("data-address"),
+      element.getAttribute("data-copy"),
+      element.getAttribute("title"),
+      element.textContent
+    ];
+    if (element instanceof HTMLImageElement) {
+      candidates.push(element.currentSrc, element.src, element.alt);
+    }
+    element.querySelectorAll("img").forEach((image) => {
+      candidates.push(image.currentSrc, image.src, image.getAttribute("src"), image.alt);
+    });
+    return selectPnlHistoryMintCandidate(tokenContext, candidates.map(extractMintFromText));
+  }
+
+  function readPnlHistoryMintFromPage(tokenContext) {
+    const routeAddress = getTokenContextRouteAddress(tokenContext);
+    const elements = Array.from(document.querySelectorAll(
+      "[data-route-key][data-mint], [data-trench-tools-token-detail-action-inline][data-mint], [data-mint]"
+    ));
+    const routeMatchedElements = routeAddress
+      ? elements.filter((element) => normalizeRouteValue(element.getAttribute("data-route-key")) === routeAddress)
+      : [];
+    const scopedElements = routeAddress ? routeMatchedElements : elements;
+    for (const element of scopedElements) {
+      const mint = readPnlHistoryMintFromElement(element, tokenContext);
+      if (mint) {
+        return mint;
+      }
+    }
+    return "";
+  }
+
+  function pnlMintAliasKey(tokenContext) {
+    const routeAddress = getTokenContextRouteAddress(tokenContext);
+    if (!routeAddress) {
+      return "";
+    }
+    return [
+      String(tokenContext?.platform || state.platform || platform || "").trim().toLowerCase(),
+      routeAddress
+    ].join("|");
+  }
+
+  function normalizePnlMintAliasCache(value) {
+    if (!value || typeof value !== "object") {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(value)
+        .map(([key, mint]) => [String(key || "").trim(), normalizeRouteValue(mint)])
+        .filter(([key, mint]) => key && mint)
+    );
+  }
+
+  async function loadPnlMintAliasCache() {
+    if (state.pnlMintAliasCache) {
+      return state.pnlMintAliasCache;
+    }
+    if (!state.pnlMintAliasCachePromise) {
+      state.pnlMintAliasCachePromise = safeStorageGet(PNL_MINT_ALIAS_CACHE_KEY)
+        .then((stored) => {
+          state.pnlMintAliasCache = normalizePnlMintAliasCache(stored[PNL_MINT_ALIAS_CACHE_KEY]);
+          return state.pnlMintAliasCache;
+        })
+        .finally(() => {
+          state.pnlMintAliasCachePromise = null;
+        });
+    }
+    return state.pnlMintAliasCachePromise;
+  }
+
+  async function rememberPnlMintAlias(tokenContext, mint) {
+    const normalizedMint = isPnlHistoryMintCandidate(mint, tokenContext);
+    const key = pnlMintAliasKey(tokenContext);
+    if (!key || !normalizedMint) {
+      return normalizedMint;
+    }
+    const cache = await loadPnlMintAliasCache();
+    if (cache[key] === normalizedMint) {
+      return normalizedMint;
+    }
+    cache[key] = normalizedMint;
+    state.pnlMintAliasCache = cache;
+    void safeStorageSet({ [PNL_MINT_ALIAS_CACHE_KEY]: cache });
+    return normalizedMint;
+  }
+
+  async function readCachedPnlMintAlias(tokenContext) {
+    const key = pnlMintAliasKey(tokenContext);
+    if (!key) {
+      return "";
+    }
+    const cache = await loadPnlMintAliasCache();
+    return isPnlHistoryMintCandidate(cache[key], tokenContext);
+  }
+
+  async function getPnlMint(tokenContext) {
+    const directMint = pnlHistoryMintFromTokenContext(tokenContext);
+    if (directMint) {
+      await rememberPnlMintAlias(tokenContext, directMint);
+      return directMint;
+    }
+    const routeAddress = getTokenContextRouteAddress(tokenContext);
+    if (routeAddress && tokenContext?.surface) {
+      const resolved = await resolveInlineTokenInternal(
+        {
+          address: routeAddress,
+          mint: normalizeRouteValue(tokenContext?.mint),
+          pair: getTokenContextPairAddress(tokenContext),
+          surface: tokenContext.surface,
+          url: tokenContext.url || window.location.href,
+          source: tokenContext.source || "page"
+        },
+        tokenContext.surface,
+        tokenContext.url || window.location.href,
+        { silent: true }
+      );
+      const resolvedMint = pnlHistoryMintFromTokenContext({
+        ...tokenContext,
+        ...resolved
+      });
+      if (resolvedMint) {
+        await rememberPnlMintAlias(tokenContext, resolvedMint);
+        return resolvedMint;
+      }
+    }
+    const pageMint = readPnlHistoryMintFromPage(tokenContext);
+    if (pageMint) {
+      await rememberPnlMintAlias(tokenContext, pageMint);
+      return pageMint;
+    }
+    const cachedMint = await readCachedPnlMintAlias(tokenContext);
+    if (cachedMint) {
+      return cachedMint;
+    }
+    return "";
+  }
+
+  async function resolvePnlWalletStatusTokenContext(tokenContext = null) {
+    const baseTokenContext = tokenContext || currentActivePanelTokenContext() || state.tokenContext || null;
+    if (!baseTokenContext) {
+      return null;
+    }
+    const mint = await getPnlMint(baseTokenContext);
+    if (!mint || String(baseTokenContext?.mint || "").trim() === mint) {
+      return baseTokenContext;
+    }
+    return applyResolvedTokenContext(baseTokenContext, {
+      ...baseTokenContext,
+      mint
+    });
   }
 
   function getTokenContextRouteAddress(tokenContext) {
@@ -5158,6 +6698,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
         address: getCandidateRouteAddress(routeOrAddress),
         mint: getCandidateMintAddress(routeOrAddress),
         pair: getTokenContextPairAddress(routeOrAddress, options.pair),
+        symbol: String(routeOrAddress.symbol || routeOrAddress.ticker || options.symbol || "").trim(),
         source: String(routeOrAddress.source || options.source || "page").trim() || "page",
         surface: String(routeOrAddress.surface || surface || "").trim(),
         url: String(routeOrAddress.url || url || window.location.href).trim() || window.location.href
@@ -5179,12 +6720,11 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       return tokenContext;
     }
     const fallbackPair = normalizeRouteValue(fallback.pair);
-    const fallbackMint = normalizeRouteValue(fallback.mint);
+    const routeAddress = getTokenContextRouteAddress(tokenContext) || normalizeRouteValue(fallback.address);
     return enrichTokenContextWithPriceHint({
       ...tokenContext,
-      mint: normalizeRouteValue(tokenContext.mint || fallbackMint) || undefined,
-      routeAddress:
-        getTokenContextRouteAddress(tokenContext) || normalizeRouteValue(fallback.address) || undefined,
+      mint: normalizeRouteValue(tokenContext.mint || fallback.mint) || undefined,
+      routeAddress: routeAddress || undefined,
       rawAddress:
         normalizeRouteValue(tokenContext.rawAddress || fallback.address) || undefined,
       pairAddress:
@@ -5597,10 +7137,10 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   function buildActiveMarkPayload() {
-    if (!(state.panelOpen || state.quickPanelOpen) || document.visibilityState === "hidden") {
+    if (document.visibilityState === "hidden") {
       return { active: false, surfaceId: ACTIVE_MINTS_SURFACE_ID };
     }
-    const tokenContext = currentActivePanelTokenContext();
+    const tokenContext = currentActiveWalletStatusTokenContext();
     const mint = String(tokenContext?.mint || state.walletStatus?.mint || "").trim();
     if (!tokenContext || !mint) {
       return { active: false, surfaceId: ACTIVE_MINTS_SURFACE_ID };
@@ -5804,20 +7344,33 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     target.insertAdjacentElement("afterend", quickBuyButton);
   }
 
-  function buildInlineButton(onClick, styleSet = quickBuyStyles()) {
-    const button = document.createElement("button");
-    button.type = "button";
-    const logo = document.createElement("img");
-    logo.src = INLINE_LOGO_URL;
-    logo.alt = "";
+  function buildInlineLogo() {
+    const logo = document.createElement("span");
+    logo.setAttribute("aria-hidden", "true");
     Object.assign(logo.style, {
       width: "14px",
       height: "14px",
-      objectFit: "contain",
+      display: "inline-block",
       flexShrink: "0",
       marginRight: "4px",
-      pointerEvents: "none"
+      pointerEvents: "none",
+      backgroundColor: "#ffffff",
+      maskImage: `url(${INLINE_LOGO_URL})`,
+      webkitMaskImage: `url(${INLINE_LOGO_URL})`,
+      maskRepeat: "no-repeat",
+      webkitMaskRepeat: "no-repeat",
+      maskPosition: "center",
+      webkitMaskPosition: "center",
+      maskSize: "contain",
+      webkitMaskSize: "contain"
     });
+    return logo;
+  }
+
+  function buildInlineButton(onClick, styleSet = quickBuyStyles()) {
+    const button = document.createElement("button");
+    button.type = "button";
+    const logo = buildInlineLogo();
 
     const label = document.createElement("span");
     Object.assign(label.style, {
@@ -5826,9 +7379,20 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       pointerEvents: "none"
     });
 
-    button.append(logo, label);
+    const content = document.createElement("span");
+    Object.assign(content.style, {
+      display: "inline-flex",
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      flexShrink: "0",
+      pointerEvents: "none"
+    });
+    content.append(logo, label);
+    button.append(content);
     button._trenchInlineLabel = label;
     button._trenchInlineLogo = logo;
+    button._trenchInlineContent = content;
     setInlineButtonLabel(button, quickBuyLabel());
     setInlineButtonStyleSet(button, styleSet);
     button.addEventListener("mouseenter", () => {
@@ -5855,19 +7419,22 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     const button = document.createElement("button");
     button.type = "button";
 
-    const logo = document.createElement("img");
-    logo.src = INLINE_LOGO_URL;
-    logo.alt = "";
-    Object.assign(logo.style, {
-      width: "14px",
-      height: "14px",
-      objectFit: "contain",
+    const logo = buildInlineLogo();
+    logo.style.marginRight = "0px";
+
+    const content = document.createElement("span");
+    Object.assign(content.style, {
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
       flexShrink: "0",
       pointerEvents: "none"
     });
+    content.appendChild(logo);
 
-    button.appendChild(logo);
+    button.appendChild(content);
     button._trenchInlineLogo = logo;
+    button._trenchInlineContent = content;
     setInlineButtonStyleSet(button, styleSet);
     button.addEventListener("mouseenter", () => {
       if (button._trenchInlineStyles) {
@@ -5892,15 +7459,26 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   function setInlineButtonStyleSet(button, styleSet) {
     button._trenchInlineStyles = styleSet;
     Object.assign(button.style, styleSet.base);
-    if (button._trenchInlineLogo instanceof HTMLImageElement) {
+    const logo = button._trenchInlineLogo;
+    const content = button._trenchInlineContent;
+    if (logo instanceof HTMLElement) {
       const logoSize = styleSet.logoSize || "14px";
       const hasVisibleLabel = Boolean(button?._trenchInlineLabel?.textContent);
       const logoGap = hasVisibleLabel ? styleSet.logoGap || "4px" : "0px";
-      Object.assign(button._trenchInlineLogo.style, {
+      Object.assign(logo.style, {
         width: logoSize,
-        height: logoSize,
-        marginRight: logoGap
+        height: logoSize
       });
+      if (content instanceof HTMLElement) {
+        content.style.gap = logoGap;
+        logo.style.marginRight = "0px";
+      } else {
+        logo.style.marginRight = logoGap;
+      }
+      const logoColor = styleSet.logoColor || styleSet.base?.color || "";
+      if (logoColor) {
+        logo.style.backgroundColor = logoColor;
+      }
     }
   }
 
@@ -6019,12 +7597,29 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     }
   }
 
+  async function resolvePnlHistoryTokenContext(tokenContext = null) {
+    const baseTokenContext = tokenContext || currentActivePanelTokenContext() || state.tokenContext || null;
+    if (!baseTokenContext) {
+      return baseTokenContext;
+    }
+    const mint = await getPnlMint(baseTokenContext);
+    if (!mint || String(baseTokenContext?.mint || "").trim() === mint) {
+      return baseTokenContext;
+    }
+    return applyResolvedTokenContext(baseTokenContext, {
+      ...baseTokenContext,
+      mint
+    });
+  }
+
   function setInlineTokenContext(routeOrAddress, surface, url = window.location.href, options = {}) {
     const routeRef = normalizeInlineRouteReference(routeOrAddress, surface, url, options);
+    const mint = routeRef.mint || (shouldPreferPairRouteForTokenContext({ platform, surface }) ? "" : routeRef.address);
     return enrichResolvedTokenContext({
       platform,
       surface: routeRef.surface,
-      mint: routeRef.mint || routeRef.address,
+      mint: mint || undefined,
+      symbol: routeRef.symbol || undefined,
       routeAddress: routeRef.address,
       pairAddress: routeRef.pair || undefined,
       url: routeRef.url
@@ -6176,6 +7771,15 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       state.localExecutionPendingBatchIds.delete(record.batchId);
       state.batchToastIds.delete(record.batchId);
     }
+  }
+
+  function clearExecutionPendingToasts() {
+    for (const record of state.localExecutionPendings.values()) {
+      dismissToast(record.toastId);
+    }
+    state.localExecutionPendings.clear();
+    state.localExecutionPendingBatchIds.clear();
+    state.batchToastIds.clear();
   }
 
   function releaseLocalExecutionPendingTracking({ clientRequestId = "", batchId = "" } = {}) {
@@ -6351,6 +7955,159 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
 
   function openInlinePanelForMint(routeOrAddress, surface, url = window.location.href, anchor = null, options = {}) {
     const tokenContext = setInlineTokenContext(routeOrAddress, surface, url, options);
+    void ensureExecutionEnabledForExtension().then((enabled) => {
+      if (enabled) openInlinePanelForMintAfterModeCheck(tokenContext, anchor, options);
+    });
+  }
+
+  function openPnlCardEditorForMint(routeOrAddress, surface, url = window.location.href, anchor = null, options = {}) {
+    const tokenContext = setInlineTokenContext(routeOrAddress, surface, url, options);
+    void ensureExecutionEnabledForExtension().then(async (enabled) => {
+      if (!enabled) {
+        return;
+      }
+      ensurePnlCardFrame();
+      state.pnlCardTokenContext = tokenContext;
+      state.pnlCardWalletStatus = reusablePnlCardWalletStatus(tokenContext);
+      state.pnlCardDownloadToken = `${Date.now()}:${Math.random().toString(36).slice(2)}`;
+      state.pnlCardOpen = true;
+      state.pnlCardWrapper.style.display = "block";
+      pushPnlCardState();
+      void refreshPnlCardState();
+      void fetchPnlCardWalletStatus(tokenContext, { force: true })
+        .then((walletStatus) => {
+          if (!walletStatus || !pnlCardWalletStatusStillApplies(tokenContext, walletStatus)) {
+            return;
+          }
+          state.pnlCardWalletStatus = walletStatus;
+          pushPnlCardState();
+        })
+        .catch(() => {});
+      syncActiveMarkSubscription();
+      void refreshPnlCardSolUsd();
+    });
+  }
+
+  function closePnlCardEditor() {
+    postPnlCardMessage({ type: "pnl-card-pause-media" });
+    if (state.pnlCardWrapper) {
+      state.pnlCardWrapper.style.display = "none";
+    }
+    state.pnlCardOpen = false;
+    state.pnlCardDownloadToken = "";
+  }
+
+  function destroyPnlCardFrame() {
+    try {
+      postPnlCardMessage({ type: "pnl-card-pause-media" });
+    } catch (_error) {}
+    try {
+      state.pnlCardPort?.close?.();
+    } catch (_error) {}
+    state.pnlCardWrapper?.remove();
+    state.pnlCardWrapper = null;
+    state.pnlCardFrame = null;
+    state.pnlCardPort = null;
+    state.pnlCardReady = false;
+    state.pnlCardOpen = false;
+    state.pnlCardTokenContext = null;
+    state.pnlCardWalletStatus = null;
+    state.pnlCardDownloadToken = "";
+  }
+
+  async function refreshPnlCardState() {
+    try {
+      state.pnlCardState = await callBackground("trench:get-pnl-card-state");
+      state.pnlCardSettings = state.pnlCardState?.settings?.defaults || state.pnlCardSettings;
+      pushPnlCardState();
+    } catch (error) {
+      showToast(error?.message || "PnL card settings unavailable.", "error");
+    }
+  }
+
+  async function refreshPnlCardSolUsd() {
+    try {
+      state.pnlCardSolUsd = await callBackground("trench:get-pnl-card-sol-usd");
+      pushPnlCardState();
+    } catch (_error) {
+      state.pnlCardSolUsd = null;
+      pushPnlCardState();
+    }
+  }
+
+  function walletSelectionKey(value = {}) {
+    const walletGroupId = String(value?.walletGroupId || "").trim();
+    if (walletGroupId) {
+      return `group:${walletGroupId}`;
+    }
+    const walletKeys = Array.isArray(value?.walletKeys)
+      ? value.walletKeys.map((key) => String(key || "").trim()).filter(Boolean).sort()
+      : [];
+    const singleWalletKey = String(value?.walletKey || value?.selectedWalletKey || "").trim();
+    return `wallets:${walletKeys.length ? walletKeys.join(",") : singleWalletKey}`;
+  }
+
+  function walletStatusMatchesTokenContext(walletStatus, tokenContext) {
+    const statusMint = String(walletStatus?.mint || "").trim();
+    const contextMint = String(tokenContext?.mint || "").trim();
+    if (!walletStatus || !statusMint || !contextMint || statusMint !== contextMint) {
+      return false;
+    }
+    return walletStatusMatchesCurrentSelection(walletStatus, tokenContext);
+  }
+
+  function walletStatusMatchesCurrentSelection(walletStatus, tokenContext) {
+    try {
+      return walletSelectionKey(walletStatus) === walletSelectionKey(buildWalletStatusRequestPayload({ tokenContext }));
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function reusablePnlCardWalletStatus(tokenContext) {
+    return walletStatusMatchesTokenContext(state.walletStatus, tokenContext)
+      ? state.walletStatus
+      : null;
+  }
+
+  function pnlCardTokenContextMatches(tokenContext) {
+    const expectedRoute = tokenContextKey(tokenContext);
+    const currentRoute = tokenContextKey(state.pnlCardTokenContext);
+    return Boolean(expectedRoute && currentRoute && expectedRoute === currentRoute);
+  }
+
+  function pnlCardWalletStatusStillApplies(tokenContext, walletStatus) {
+    if (!pnlCardTokenContextMatches(tokenContext)) {
+      return false;
+    }
+    const statusMint = String(walletStatus?.mint || "").trim();
+    const currentMint = String(state.pnlCardTokenContext?.mint || "").trim();
+    return Boolean(
+      statusMint &&
+      currentMint &&
+      statusMint === currentMint &&
+      walletStatusMatchesCurrentSelection(walletStatus, state.pnlCardTokenContext)
+    );
+  }
+
+  async function fetchPnlCardWalletStatus(tokenContext, { force = true } = {}) {
+    const resolvedTokenContext = await resolvePnlWalletStatusTokenContext(tokenContext);
+    const expectedMint = String(resolvedTokenContext?.mint || "").trim();
+    if (!expectedMint) {
+      return null;
+    }
+    const walletStatus = await callBackground(
+      "trench:get-wallet-status",
+      buildWalletStatusRequestPayload({
+        tokenContext: resolvedTokenContext,
+        force
+      })
+    );
+    const responseMint = String(walletStatus?.mint || "").trim();
+    return responseMint && responseMint === expectedMint ? walletStatus : null;
+  }
+
+  function openInlinePanelForMintAfterModeCheck(tokenContext, anchor = null, options = {}) {
     if (!isBootstrapLoaded()) {
       openQuickPanelSurface(tokenContext, anchor, options);
       void refreshBootstrap(true).then((bootstrap) => {
@@ -6403,6 +8160,12 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
   }
 
   function openPanel(tokenContext, options = {}) {
+    void ensureExecutionEnabledForExtension().then((enabled) => {
+      if (enabled) openPanelAfterModeCheck(tokenContext, options);
+    });
+  }
+
+  function openPanelAfterModeCheck(tokenContext, options = {}) {
     if (options.requireValidPreset) {
       if (!isBootstrapLoaded()) {
         openPersistentPanelSurface(tokenContext);
@@ -6469,7 +8232,16 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     if (!windows.length) {
       return;
     }
+    const platformSymbol = readPlatformTokenSymbol();
+    const platformSymbolRouteIdentity = platformSymbol
+      ? tokenContextRouteIdentity(state.tokenContext)
+      : "";
     windows.forEach(({ windowRef, tokenContext }) => {
+      const enrichedTokenContext = enrichPanelTokenContextWithSymbol(
+        tokenContext,
+        platformSymbol,
+        platformSymbolRouteIdentity
+      );
       windowRef.postMessage(
         {
           channel: PANEL_CHANNEL_OUT,
@@ -6477,7 +8249,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
           payload: {
             bootstrap: state.bootstrap,
             walletStatus: state.walletStatus,
-            tokenContext: tokenContext || null,
+            tokenContext: enrichedTokenContext || null,
             preferences: state.preferences,
             preview: state.preview,
             batchStatus: state.batchStatus,
@@ -6491,6 +8263,73 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     });
   }
 
+  function pushPnlCardState() {
+    if (!state.pnlCardOpen || !state.pnlCardReady || !state.pnlCardFrame?.contentWindow) {
+      return;
+    }
+    const platformSymbol = readPlatformTokenSymbol();
+    const platformSymbolRouteIdentity = platformSymbol
+      ? tokenContextRouteIdentity(state.tokenContext)
+      : "";
+    const tokenContext = enrichPanelTokenContextWithSymbol(
+      state.pnlCardTokenContext || currentActivePanelTokenContext() || state.tokenContext,
+      platformSymbol,
+      platformSymbolRouteIdentity
+    );
+    const tokenMint = String(tokenContext?.mint || "").trim();
+    const walletStatusMint = String(state.pnlCardWalletStatus?.mint || "").trim();
+    postPnlCardMessage({
+      type: "pnl-card-state",
+      payload: {
+        tokenContext: tokenContext || null,
+        walletStatus: tokenMint && walletStatusMint === tokenMint ? state.pnlCardWalletStatus : null,
+        cardState: state.pnlCardState,
+        solUsd: state.pnlCardSolUsd,
+        downloadToken: state.pnlCardDownloadToken,
+        settings: state.pnlCardSettings,
+        pnlMode: activePnlMode()
+      }
+    });
+  }
+
+  function activePnlMode() {
+    const includeFees = typeof state.preferences?.includeFees === "boolean"
+      ? state.preferences.includeFees
+      : Boolean(state.walletStatus?.includeFees);
+    return includeFees ? "net" : "gross";
+  }
+
+  function readPlatformTokenSymbol() {
+    try {
+      return String(getPlatformAdapter()?.getCurrentTokenSymbol?.() || "").trim();
+    } catch (error) {
+      if (isExtensionReloadedError(error)) {
+        scheduleExtensionReloadFallbackToast();
+      }
+      return "";
+    }
+  }
+
+  function enrichPanelTokenContextWithSymbol(tokenContext, platformSymbol, platformSymbolRouteIdentity = "") {
+    if (!tokenContext) {
+      return tokenContext;
+    }
+    if (!platformSymbol) {
+      return tokenContext;
+    }
+    const targetRouteIdentity = tokenContextRouteIdentity(tokenContext);
+    if (!platformSymbolRouteIdentity || !targetRouteIdentity) {
+      return tokenContext;
+    }
+    if (targetRouteIdentity !== platformSymbolRouteIdentity) {
+      return tokenContext;
+    }
+    if (String(tokenContext.symbol || "").trim() === platformSymbol) {
+      return tokenContext;
+    }
+    return { ...tokenContext, symbol: platformSymbol };
+  }
+
   function notifyPlatformWalletStatusChange() {
     try {
       getPlatformAdapter()?.handleWalletStatusChange?.();
@@ -6501,6 +8340,7 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
       }
       console.error("Trench Tools wallet-status platform refresh failed", error);
     }
+    pushPnlCardState();
   }
 
   function pushPanelPreview() {
@@ -7218,14 +9058,62 @@ const createLaunchdeckShellController = trenchToolsContentModules.createLaunchde
     return String(value).charAt(0).toUpperCase() + String(value).slice(1);
   }
 
-  function quickBuyLabel() {
-    const quickBuyAmount = getValidQuickBuyAmount(state.preferences.quickBuyAmount);
+  function quickBuyPreferenceField(index = 1) {
+    return Number(index) === 2 ? "quickBuyAmount2" : "quickBuyAmount";
+  }
+
+  function quickBuyLabel(index = 1) {
+    const field = quickBuyPreferenceField(index);
+    const quickBuyAmount = getValidQuickBuyAmount(state.preferences[field]);
     return quickBuyAmount || "";
   }
 
-  function resolveQuickBuyAmount() {
-    const quickBuyAmount = getValidQuickBuyAmount(state.preferences.quickBuyAmount);
+  function resolveQuickBuyAmount(index = 1) {
+    const field = quickBuyPreferenceField(index);
+    const quickBuyAmount = getValidQuickBuyAmount(state.preferences[field]);
     return quickBuyAmount || "";
+  }
+
+  function resolveQuickBuyButtonDesign(index = 1) {
+    const buttons = state.appearance?.quickBuyButtons || {};
+    const fallback = buttons[1] || {
+      color: "#ffffff",
+      backgroundColor: "#000000",
+      borderColor: "#ffffff80"
+    };
+    if (Number(index) === 2) {
+      return buttons[2] || fallback;
+    }
+    return fallback;
+  }
+
+  function deriveQuickBuyButtonHoverBackground(backgroundColor) {
+    const normalized = String(backgroundColor || "").trim().toLowerCase();
+    return `${normalized.slice(0, 7)}cc`;
+  }
+
+  function applyQuickBuyButtonDesign(styleSet, index = 1) {
+    if (!styleSet || typeof styleSet !== "object") {
+      return styleSet;
+    }
+    const design = resolveQuickBuyButtonDesign(index);
+    const backgroundColor = design.backgroundColor;
+    const color = design.color;
+    const borderColor = design.borderColor || "#ffffff80";
+    const border = `1px solid ${borderColor}`;
+    const hoverBackground = deriveQuickBuyButtonHoverBackground(backgroundColor);
+    if (styleSet.base) {
+      styleSet.base.backgroundColor = backgroundColor;
+      styleSet.base.color = color;
+      styleSet.base.border = border;
+    }
+    if (styleSet.hover) {
+      styleSet.hover.backgroundColor = hoverBackground;
+      styleSet.hover.color = color;
+      styleSet.hover.border = border;
+    }
+    styleSet.logoColor = color;
+    return styleSet;
   }
 
   function getQuickBuyBaseStylesForPlatform(platformId = platform) {

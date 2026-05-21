@@ -25,6 +25,7 @@ use crate::{
 };
 
 const BAGS_IMPORT_CONTEXT_TTL: Duration = Duration::from_millis(2_500);
+const BAGS_IMPORT_CONTEXT_LRU_CAP: usize = 256;
 
 pub type BagsImportContext = launchdeck_bags::BagsImportContext;
 pub type BagsPoolAddressClassification = launchdeck_bags::BagsPoolAddressClassification;
@@ -39,12 +40,14 @@ enum ImportContextCacheMode {
 struct CachedBagsImportContext {
     context: launchdeck_bags::BagsImportContext,
     fetched_at: Instant,
+    last_used_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct CachedBagsFollowBuyContext {
     context: launchdeck_bags::BagsFollowBuyContext,
     fetched_at: Instant,
+    last_used_at: Instant,
 }
 
 fn bags_import_context_cache() -> &'static Mutex<HashMap<String, CachedBagsImportContext>> {
@@ -80,13 +83,25 @@ async fn cached_bags_import_context(
 ) -> Option<launchdeck_bags::BagsImportContext> {
     let key = bags_import_context_cache_key(rpc_url, &request.mint, request.pinned_pool.as_deref());
     let mut cache = bags_import_context_cache().lock().await;
-    if let Some(entry) = cache.get(&key) {
+    if let Some(entry) = cache.get_mut(&key) {
         if entry.fetched_at.elapsed() <= BAGS_IMPORT_CONTEXT_TTL {
+            entry.last_used_at = Instant::now();
             return Some(entry.context.clone());
         }
     }
     cache.remove(&key);
     None
+}
+
+pub(crate) async fn invalidate_bags_import_contexts_for_mint(rpc_url: &str, mint: &str) {
+    let normalized_rpc = rpc_url.trim().to_string();
+    let normalized_mint = mint.trim().to_string();
+    bags_import_context_cache().lock().await.retain(|key, _| {
+        let mut parts = key.split('|');
+        let key_rpc = parts.next().unwrap_or_default();
+        let key_mint = parts.next().unwrap_or_default();
+        key_rpc != normalized_rpc || key_mint != normalized_mint
+    });
 }
 
 async fn warmed_bags_import_context(
@@ -108,18 +123,38 @@ async fn warmed_bags_import_context(
     }
 }
 
+pub(crate) async fn cached_bags_dbc_route_is_active(
+    rpc_url: &str,
+    mint: &str,
+    market_key: &str,
+    commitment: &str,
+) -> Result<bool, String> {
+    launchdeck_bags::cached_bags_dbc_route_is_active(rpc_url, mint, market_key, commitment).await
+}
+
 async fn cache_bags_import_context(
     rpc_url: &str,
     request: &TradeRuntimeRequest,
     context: &launchdeck_bags::BagsImportContext,
 ) {
-    bags_import_context_cache().lock().await.insert(
+    let mut cache = bags_import_context_cache().lock().await;
+    cache.retain(|_, entry| entry.fetched_at.elapsed() <= BAGS_IMPORT_CONTEXT_TTL);
+    cache.insert(
         bags_import_context_cache_key(rpc_url, &request.mint, request.pinned_pool.as_deref()),
         CachedBagsImportContext {
             context: context.clone(),
             fetched_at: Instant::now(),
+            last_used_at: Instant::now(),
         },
     );
+    if cache.len() > BAGS_IMPORT_CONTEXT_LRU_CAP
+        && let Some(victim_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&victim_key);
+    }
 }
 
 async fn warmed_bags_follow_buy_context(
@@ -130,13 +165,22 @@ async fn warmed_bags_follow_buy_context(
         return None;
     }
     let mut cache = bags_follow_buy_context_cache().lock().await;
-    if let Some(entry) = cache.get(warm_key) {
+    if let Some(entry) = cache.get_mut(warm_key) {
         if entry.fetched_at.elapsed() <= BAGS_IMPORT_CONTEXT_TTL {
+            entry.last_used_at = Instant::now();
             return Some(entry.context.clone());
         }
     }
     cache.remove(warm_key);
     None
+}
+
+pub(crate) async fn invalidate_bags_follow_buy_context(warm_key: &str) {
+    let key = warm_key.trim();
+    if key.is_empty() {
+        return;
+    }
+    bags_follow_buy_context_cache().lock().await.remove(key);
 }
 
 async fn cache_bags_follow_buy_context(
@@ -147,13 +191,24 @@ async fn cache_bags_follow_buy_context(
     if key.is_empty() {
         return;
     }
-    bags_follow_buy_context_cache().lock().await.insert(
+    let mut cache = bags_follow_buy_context_cache().lock().await;
+    cache.retain(|_, entry| entry.fetched_at.elapsed() <= BAGS_IMPORT_CONTEXT_TTL);
+    cache.insert(
         key.to_string(),
         CachedBagsFollowBuyContext {
             context: context.clone(),
             fetched_at: Instant::now(),
+            last_used_at: Instant::now(),
         },
     );
+    if cache.len() > BAGS_IMPORT_CONTEXT_LRU_CAP
+        && let Some(victim_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&victim_key);
+    }
 }
 
 fn bags_context_is_executable(context: &launchdeck_bags::BagsImportContext) -> bool {
@@ -171,11 +226,11 @@ async fn load_bags_import_context(
     request: &TradeRuntimeRequest,
     cache_mode: ImportContextCacheMode,
 ) -> Result<Option<launchdeck_bags::BagsImportContext>, String> {
-    if let Some(context) = warmed_bags_import_context(request).await {
-        cache_bags_import_context(rpc_url, request, &context).await;
-        return Ok(Some(context));
-    }
     if matches!(cache_mode, ImportContextCacheMode::AllowCached) {
+        if let Some(context) = warmed_bags_import_context(request).await {
+            cache_bags_import_context(rpc_url, request, &context).await;
+            return Ok(Some(context));
+        }
         if let Some(context) = cached_bags_import_context(rpc_url, request).await {
             return Ok(Some(context));
         }
@@ -726,6 +781,59 @@ fn read_mint_decimals(data: &[u8]) -> Result<u8, String> {
 mod tests {
     use super::*;
 
+    fn sample_request(mint: &str, warm_key: Option<String>) -> TradeRuntimeRequest {
+        TradeRuntimeRequest {
+            side: TradeSide::Buy,
+            mint: mint.to_string(),
+            buy_amount_sol: Some("0.5".to_string()),
+            sell_intent: None,
+            policy: crate::trade_runtime::RuntimeExecutionPolicy {
+                slippage_percent: "5".to_string(),
+                mev_mode: crate::extension_api::MevMode::Off,
+                auto_tip_enabled: false,
+                fee_sol: "0".to_string(),
+                tip_sol: "0".to_string(),
+                provider: String::new(),
+                endpoint_profile: String::new(),
+                commitment: "processed".to_string(),
+                skip_preflight: false,
+                track_send_block_height: false,
+                buy_funding_policy: crate::extension_api::BuyFundingPolicy::SolOnly,
+                sell_settlement_policy: crate::extension_api::SellSettlementPolicy::AlwaysToSol,
+                sell_settlement_asset: crate::extension_api::TradeSettlementAsset::Sol,
+            },
+            platform_label: None,
+            planned_route: None,
+            planned_trade: None,
+            pinned_pool: None,
+            warm_key,
+            fallback_mint_hint: None,
+        }
+    }
+
+    fn sample_context(market_key: &str) -> launchdeck_bags::BagsImportContext {
+        launchdeck_bags::BagsImportContext {
+            launchpad: "bagsapp".to_string(),
+            mode: "default".to_string(),
+            quoteAsset: "sol".to_string(),
+            creator: "creator".to_string(),
+            marketKey: market_key.to_string(),
+            configKey: "config".to_string(),
+            venue: "Meteora DAMM v2".to_string(),
+            detectionSource: "bags-state+rpc-damm-v2".to_string(),
+            feeRecipients: Vec::new(),
+            notes: Vec::new(),
+            launchMetadata: None,
+        }
+    }
+
+    fn now_unix_ms_for_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or_default()
+    }
+
     #[test]
     fn maps_damm_context_to_post_migration_selector() {
         let selector = map_bags_context_to_selector(
@@ -777,6 +885,89 @@ mod tests {
         assert_eq!(selector.family, TradeVenueFamily::MeteoraDammV2);
         assert_eq!(selector.lifecycle, TradeLifecycle::PostMigration);
         assert_eq!(selector.wrapper_action, WrapperAction::MeteoraDammV2Sell);
+    }
+
+    #[tokio::test]
+    async fn cached_bags_import_context_updates_last_used_and_invalidates_by_mint() {
+        let request = sample_request("MintBagsCache111", None);
+        let key = bags_import_context_cache_key("https://rpc-bags-cache", &request.mint, None);
+        let context = sample_context("MarketBagsCache111");
+        {
+            let mut cache = bags_import_context_cache().lock().await;
+            cache.remove(&key);
+            let old = Instant::now() - Duration::from_secs(1);
+            cache.insert(
+                key.clone(),
+                CachedBagsImportContext {
+                    context: context.clone(),
+                    fetched_at: Instant::now(),
+                    last_used_at: old,
+                },
+            );
+        }
+
+        let cached = cached_bags_import_context("https://rpc-bags-cache", &request)
+            .await
+            .expect("cached context");
+        assert_eq!(cached.marketKey, context.marketKey);
+        {
+            let cache = bags_import_context_cache().lock().await;
+            let entry = cache.get(&key).expect("cache entry");
+            assert!(entry.last_used_at > entry.fetched_at - Duration::from_millis(500));
+        }
+
+        invalidate_bags_import_contexts_for_mint("https://rpc-bags-cache", &request.mint).await;
+        assert!(
+            cached_bags_import_context("https://rpc-bags-cache", &request)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_cached_bags_import_context_ignores_warm_key_context() {
+        let warm_key = "bags-bypass-warm-key";
+        let context = sample_context("WarmMarketShouldNotReturn");
+        let fingerprint = crate::mint_warm_cache::build_fingerprint(
+            "MintBagsBypass111",
+            None,
+            "bad-rpc-url",
+            "processed",
+            "buy:sol_only",
+            false,
+        );
+        let request = sample_request("MintBagsBypass111", Some(warm_key.to_string()));
+        crate::mint_warm_cache::shared_mint_warm_cache()
+            .insert(
+                fingerprint,
+                crate::mint_warm_cache::PrewarmedMint {
+                    mint: request.mint.clone(),
+                    resolved_pair: None,
+                    warm_key: warm_key.to_string(),
+                    allow_non_canonical: false,
+                    plan: None,
+                    venue: crate::mint_warm_cache::VenueWarmData::Bags {
+                        lifecycle: Some(TradeLifecycle::PreMigration),
+                        import_context: Some(context),
+                        bags_launch: None,
+                    },
+                    warmed_at_unix_ms: now_unix_ms_for_test(),
+                    last_used_at_unix_ms: now_unix_ms_for_test(),
+                },
+            )
+            .await;
+
+        let bypassed = load_bags_import_context(
+            "bad-rpc-url",
+            &request,
+            ImportContextCacheMode::BypassCached,
+        )
+        .await;
+        assert!(!matches!(
+            bypassed,
+            Ok(Some(launchdeck_bags::BagsImportContext { marketKey, .. }))
+                if marketKey == "WarmMarketShouldNotReturn"
+        ));
     }
 
     #[test]

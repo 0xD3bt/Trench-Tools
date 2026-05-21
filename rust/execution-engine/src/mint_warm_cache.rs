@@ -2,15 +2,15 @@
 //!
 //! The warming_service module already handles cross-cutting static state
 //! (blockhash runway, Pump global configs, rent exemptions). This module
-//! owns the *per-mint* layer: a short-lived, single-flight cache of the
+//! owns the *per-mint* layer: a bounded, single-flight cache of the
 //! resolved trade plan plus any family-specific state that a subsequent
 //! buy/sell click can consume to skip venue discovery.
 //!
 //! Design notes:
 //! - **Intent-driven, not surface-driven.** Entries are created when the
 //!   UI signals intent (token page mount, panel open, hover on an
-//!   actionable control) and expire quickly so we don't keep hundreds of
-//!   Pulse rows warm.
+//!   actionable control) and expire after a fixed window so we don't keep
+//!   hundreds of Pulse rows warm.
 //! - **Family-specific variants.** Pump, Bonk, and Meteora have genuinely
 //!   different hot paths — Pump needs pool + creator, Bonk needs pool +
 //!   config + quote-asset route, Meteora needs DBC/DAMM selection. The
@@ -20,8 +20,9 @@
 //!   so settings changes invalidate automatically without trusting scraped route hints.
 //! - **Single-flight.** A `tokio::Mutex` per mint dedupes concurrent
 //!   hover + panel-open + click warms into one RPC burst.
-//! - **TTL + LRU.** Entries get a rolling 30s TTL (refreshed on hit) and
-//!   a small LRU cap so the cache size stays bounded.
+//! - **Guard + TTL + LRU.** Pre-migration entries are guarded at execution
+//!   time with cheap venue-status probes, and the 1h TTL plus small LRU cap
+//!   keep memory bounded.
 
 use std::{
     collections::HashMap,
@@ -39,15 +40,13 @@ use crate::{
     trade_planner::{LifecycleAndCanonicalMarket, PlannerRuntimeBundle, TradeLifecycle},
 };
 
-/// Pre-migration routes are the riskiest to cache because the mint can
-/// still move to its final venue underneath us, so keep this path tight.
-const PRE_MIGRATION_WARM_TTL_MS: u64 = 10_000;
-/// Post-migration routes are materially more stable, so let repeated
-/// clicks reuse the resolved route for longer.
+/// Route warm entries are guarded before reuse and kept for at most one
+/// hour, so repeated clicks avoid discovery while idle routes age out.
+const PRE_MIGRATION_WARM_TTL_MS: u64 = 60 * 60 * 1000;
 const POST_MIGRATION_WARM_TTL_MS: u64 = 60 * 60 * 1000;
 /// Fallback when we do not have enough routing context to classify the
 /// lifecycle confidently. Bias short rather than serving stale routes.
-const UNKNOWN_WARM_TTL_MS: u64 = PRE_MIGRATION_WARM_TTL_MS;
+const UNKNOWN_WARM_TTL_MS: u64 = 10_000;
 
 /// Hard cap on the number of warm mints we keep simultaneously. Once the
 /// cap is exceeded, the least-recently-used entry is dropped. Tuned for
@@ -159,7 +158,9 @@ pub struct CachedPlan {
 
 impl PrewarmedMint {
     pub fn is_stale(&self, now_unix_ms: u64) -> bool {
-        now_unix_ms.saturating_sub(self.last_used_at_unix_ms) > self.ttl_ms()
+        let ttl_ms = self.ttl_ms();
+        now_unix_ms.saturating_sub(self.last_used_at_unix_ms) > ttl_ms
+            || now_unix_ms.saturating_sub(self.warmed_at_unix_ms) > ttl_ms
     }
 
     pub fn ttl_ms(&self) -> u64 {
@@ -318,7 +319,9 @@ impl MintWarmCache {
     /// Insert / replace a warm entry. Enforces the LRU cap by evicting
     /// the least-recently-used entry when the cap is exceeded.
     pub async fn insert(&self, fingerprint: WarmFingerprint, entry: PrewarmedMint) {
+        let now = now_unix_ms();
         let mut entries = self.entries.write().await;
+        entries.retain(|_, entry| !entry.is_stale(now));
         entries.insert(fingerprint, entry);
         if entries.len() > WARM_LRU_CAP {
             // Find + drop the oldest `last_used_at_unix_ms`.
@@ -339,6 +342,34 @@ impl MintWarmCache {
         self.entries.write().await.remove(fingerprint);
     }
 
+    pub async fn invalidate_by_warm_key(&self, warm_key: &str) {
+        let normalized = warm_key.trim();
+        if normalized.is_empty() {
+            return;
+        }
+        self.entries
+            .write()
+            .await
+            .retain(|_, entry| entry.warm_key != normalized);
+    }
+
+    pub async fn invalidate_pre_migration_for_mint(
+        &self,
+        rpc_url: &str,
+        commitment: &str,
+        mint: &str,
+    ) {
+        let normalized_rpc = rpc_url.trim();
+        let normalized_commitment = commitment.trim().to_ascii_lowercase();
+        let normalized_mint = mint.trim();
+        self.entries.write().await.retain(|fingerprint, entry| {
+            !(matches!(entry.lifecycle(), Some(TradeLifecycle::PreMigration))
+                && fingerprint.rpc_url == normalized_rpc
+                && fingerprint.commitment == normalized_commitment
+                && entry.mint == normalized_mint)
+        });
+    }
+
     /// Single-flight flight-lock retrieval. Callers use this to dedupe
     /// concurrent warms for the same fingerprint: the first caller
     /// holds the lock and does the RPC work, the second caller awaits
@@ -351,9 +382,24 @@ impl MintWarmCache {
             .clone()
     }
 
+    pub async fn finish_flight(&self, fingerprint: &WarmFingerprint, lock: &Arc<Mutex<()>>) {
+        let mut locks = self.flight_locks.lock().await;
+        if locks
+            .get(fingerprint)
+            .is_some_and(|current| Arc::ptr_eq(current, lock) && Arc::strong_count(lock) <= 2)
+        {
+            locks.remove(fingerprint);
+        }
+    }
+
     /// Returns the number of live entries. Test + metrics only.
     pub async fn len(&self) -> usize {
         self.entries.read().await.len()
+    }
+
+    #[cfg(test)]
+    async fn flight_lock_len(&self) -> usize {
+        self.flight_locks.lock().await.len()
     }
 }
 
@@ -470,7 +516,7 @@ pub fn prewarmed_from_plan(
         },
     };
     PrewarmedMint {
-        mint: fingerprint.mint.clone(),
+        mint: plan.resolved_mint.clone(),
         resolved_pair,
         warm_key: fingerprint.as_warm_key(),
         allow_non_canonical: fingerprint.allow_non_canonical,
@@ -508,6 +554,37 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_plan(
+        raw_address: &str,
+        resolved_mint: &str,
+        resolved_pool: Option<&str>,
+    ) -> TradeDispatchPlan {
+        TradeDispatchPlan {
+            adapter: crate::trade_dispatch::TradeAdapter::BonkNative,
+            selector: LifecycleAndCanonicalMarket {
+                lifecycle: TradeLifecycle::PreMigration,
+                family: crate::trade_planner::TradeVenueFamily::BonkLaunchpad,
+                canonical_market_key: resolved_pool.unwrap_or("Pool111").to_string(),
+                quote_asset: crate::trade_planner::PlannerQuoteAsset::Usd1,
+                verification_source:
+                    crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+                wrapper_action: crate::trade_planner::WrapperAction::BonkLaunchpadUsd1Buy,
+                wrapper_accounts: vec![resolved_pool.unwrap_or("Pool111").to_string()],
+                market_subtype: Some("launchpad-classified-pair".to_string()),
+                direct_protocol_target: Some("bonk-launchpad".to_string()),
+                input_amount_hint: None,
+                minimum_output_hint: None,
+                runtime_bundle: None,
+            },
+            execution_backend: crate::rollout::TradeExecutionBackend::Native,
+            raw_address: raw_address.to_string(),
+            resolved_input_kind: crate::trade_dispatch::TradeInputKind::Pair,
+            resolved_mint: resolved_mint.to_string(),
+            resolved_pinned_pool: resolved_pool.map(str::to_string),
+            non_canonical: false,
+        }
+    }
 
     #[test]
     fn fingerprint_warm_key_is_stable() {
@@ -558,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_ttl_is_short_pre_migration_and_long_post_migration() {
+    fn lifecycle_ttl_is_one_hour_for_known_routes() {
         assert_eq!(
             warm_ttl_ms_for_lifecycle(Some(&TradeLifecycle::PreMigration)),
             PRE_MIGRATION_WARM_TTL_MS
@@ -584,6 +661,26 @@ mod tests {
             warm_ttl_ms_for_lifecycle_label(Some("mystery")),
             UNKNOWN_WARM_TTL_MS
         );
+    }
+
+    #[test]
+    fn prewarmed_alias_keeps_resolved_mint() {
+        let alias_fingerprint = build_fingerprint(
+            "PairInput111",
+            None,
+            "https://rpc",
+            "confirmed",
+            "buy:sol_only",
+            false,
+        );
+        let plan = sample_plan("PairInput111", "Mint111", Some("PairInput111"));
+
+        let entry =
+            prewarmed_from_plan(&alias_fingerprint, Some("PairInput111".to_string()), &plan);
+
+        assert_eq!(entry.mint, "Mint111");
+        assert_eq!(entry.warm_key, alias_fingerprint.as_warm_key());
+        assert_eq!(entry.resolved_pair.as_deref(), Some("PairInput111"));
     }
 
     #[tokio::test]
@@ -702,5 +799,89 @@ mod tests {
 
         assert_eq!(pre_entry.ttl_ms(), PRE_MIGRATION_WARM_TTL_MS);
         assert_eq!(post_entry.ttl_ms(), POST_MIGRATION_WARM_TTL_MS);
+    }
+
+    #[test]
+    fn pre_migration_entry_expires_by_age() {
+        let mut entry = PrewarmedMint {
+            mint: "Mint111".to_string(),
+            resolved_pair: None,
+            warm_key: "pre".to_string(),
+            allow_non_canonical: false,
+            plan: None,
+            venue: VenueWarmData::Pump {
+                pinned_pool: None,
+                non_canonical: false,
+                lifecycle: TradeLifecycle::PreMigration,
+                market_key: "Mint111".to_string(),
+                mint_token_program: None,
+                creator: None,
+                is_mayhem_mode: false,
+                is_cashback_coin: false,
+            },
+            warmed_at_unix_ms: 1,
+            last_used_at_unix_ms: 1,
+        };
+        assert!(entry.is_stale(now_unix_ms()));
+
+        entry.venue = VenueWarmData::Pump {
+            pinned_pool: None,
+            non_canonical: false,
+            lifecycle: TradeLifecycle::PostMigration,
+            market_key: "Mint111".to_string(),
+            mint_token_program: None,
+            creator: None,
+            is_mayhem_mode: false,
+            is_cashback_coin: false,
+        };
+        assert!(entry.is_stale(now_unix_ms()));
+    }
+
+    #[tokio::test]
+    async fn finish_flight_removes_completed_lock() {
+        let cache = MintWarmCache::default();
+        let fingerprint = build_fingerprint(
+            "Mint111",
+            None,
+            "https://rpc",
+            "confirmed",
+            "buy:sol_only",
+            false,
+        );
+        let lock = cache.flight_lock(&fingerprint).await;
+        {
+            let _guard = lock.lock().await;
+        }
+
+        cache.finish_flight(&fingerprint, &lock).await;
+
+        assert_eq!(cache.flight_lock_len().await, 0);
+        let next = cache.flight_lock(&fingerprint).await;
+        assert!(!Arc::ptr_eq(&lock, &next));
+    }
+
+    #[tokio::test]
+    async fn finish_flight_keeps_lock_while_waiters_hold_clones() {
+        let cache = MintWarmCache::default();
+        let fingerprint = build_fingerprint(
+            "Mint111",
+            None,
+            "https://rpc",
+            "confirmed",
+            "buy:sol_only",
+            false,
+        );
+        let lock = cache.flight_lock(&fingerprint).await;
+        let waiter = lock.clone();
+
+        cache.finish_flight(&fingerprint, &lock).await;
+        assert_eq!(cache.flight_lock_len().await, 1);
+        let current = cache.flight_lock(&fingerprint).await;
+        assert!(Arc::ptr_eq(&lock, &current));
+
+        drop(waiter);
+        drop(current);
+        cache.finish_flight(&fingerprint, &lock).await;
+        assert_eq!(cache.flight_lock_len().await, 0);
     }
 }

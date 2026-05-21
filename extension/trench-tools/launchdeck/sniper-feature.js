@@ -91,9 +91,9 @@
     }
 
     function normalizeSellPercent(value) {
-      const numeric = Number(value || 0);
+      const numeric = Number(normalizeDecimalInput(value, 2) || 0);
       if (!Number.isFinite(numeric) || numeric <= 0) return "";
-      return String(Math.max(1, Math.min(100, Math.round(numeric))));
+      return String(Math.max(1, Math.min(100, numeric)));
     }
 
     function normalizeSellTriggerMode(value, fallbackEntry = {}) {

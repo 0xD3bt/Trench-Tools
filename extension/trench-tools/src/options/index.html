@@ -57,7 +57,7 @@
               </div>
               <div class="site-feature-groups">
                 <section class="site-feature-group">
-                  <h4>Pulse Cards</h4>
+                  <h4>Axiom Pulse</h4>
                   <div class="site-feature-grid site-feature-grid-three">
                     <label
                       class="site-feature-chip"
@@ -84,45 +84,66 @@
                       <input id="site-axiom-launchdeck" class="site-toggle" type="checkbox" />
                     </label>
                   </div>
+                  <div class="site-feature-subgroup">
+                    <h5>2nd buy button</h5>
+                    <p class="muted site-feature-subgroup-hint">Only show the 2nd Trench Tools quick-buy button in the selected Pulse tables.</p>
+                    <div
+                      class="site-feature-chip site-feature-chip-compound"
+                      title="Enable and choose where to show the 2nd Trench Tools quick-buy button on Pulse cards."
+                    >
+                      <label class="site-feature-chip-main" for="site-axiom-pulse-quick-buy-button-count">
+                        <span>Enable 2nd buy button</span>
+                        <input id="site-axiom-pulse-quick-buy-button-count" class="site-toggle" type="checkbox" />
+                      </label>
+                      <span class="site-feature-chip-options">
+                        <label class="site-feature-chip-option" for="site-axiom-pulse-second-button-table-new-pairs">
+                          <span>New Pairs</span>
+                          <input id="site-axiom-pulse-second-button-table-new-pairs" class="site-toggle" type="checkbox" />
+                        </label>
+                        <label class="site-feature-chip-option" for="site-axiom-pulse-second-button-table-final-stretch">
+                          <span>Final Stretch</span>
+                          <input id="site-axiom-pulse-second-button-table-final-stretch" class="site-toggle" type="checkbox" />
+                        </label>
+                        <label class="site-feature-chip-option" for="site-axiom-pulse-second-button-table-migrated">
+                          <span>Migrated</span>
+                          <input id="site-axiom-pulse-second-button-table-migrated" class="site-toggle" type="checkbox" />
+                        </label>
+                      </span>
+                    </div>
+                  </div>
                 </section>
                 <section class="site-feature-group">
                   <h4>Token Pages</h4>
                   <div class="site-feature-grid">
                     <label
-                      class="site-feature-chip"
+                      class="site-feature-chip site-feature-chip-fit"
                       for="site-axiom-launcher"
-                      title="Shows the floating Trench Tools button on Axiom token pages. Clicking it opens the full manual trading panel for the current token."
+                      title="Shows the Trench Tools native floating instant panel on Axiom token pages."
                     >
-                      <span>Trenchtools Instant Panel</span>
+                      <span>Trench Tools Native Floating Panel</span>
                       <input id="site-axiom-launcher" class="site-toggle" type="checkbox" />
                     </label>
-                    <label
-                      class="site-feature-chip"
-                      for="site-axiom-instant-trade"
-                      title="Adds a Trench Tools button to Axiom's own token-page trade panel, next to Axiom's normal Buy/Sell form."
-                    >
-                      <span>Axioms instant panel</span>
-                      <input id="site-axiom-instant-trade" class="site-toggle" type="checkbox" />
-                    </label>
-                    <label
+                    <div
                       class="site-feature-chip site-feature-chip-compound"
-                      for="site-axiom-instant-trade-button-mode-count"
-                      title="Controls how many states the TT button cycles through inside Axiom's instant panel."
+                      title="Injects mirrored Trench Tools controls into Axiom's native floating panel and controls how many states the TT mode button cycles through."
                     >
-                      <span class="site-feature-chip-main">
-                        <span>Instant Panel TT Button Modes</span>
+                      <label class="site-feature-chip-main" for="site-axiom-instant-trade">
+                        <span>Mirror Into Axiom Native Panel</span>
+                        <input id="site-axiom-instant-trade" class="site-toggle" type="checkbox" />
+                      </label>
+                      <span class="site-feature-chip-control-row site-feature-chip-control-row-single">
+                        <select
+                          id="site-axiom-instant-trade-button-mode-count"
+                          class="site-feature-chip-select"
+                          aria-label="Axiom instant panel TT button mode count"
+                          title="3 modes: Axiom only, TT only, and both. 2 modes: TT only and both. 1 mode: TT only."
+                        >
+                          <option value="3">3 modes: Axiom / TT / Both</option>
+                          <option value="2">2 modes: TT / Both</option>
+                          <option value="1">1 mode: TT only</option>
+                        </select>
                       </span>
-                      <select
-                        id="site-axiom-instant-trade-button-mode-count"
-                        class="site-feature-chip-select"
-                        aria-label="Axiom instant panel TT button mode count"
-                        title="3 modes: Axiom only, TT only, and both. 2 modes: TT only and both. 1 mode: TT only."
-                      >
-                        <option value="3">3 modes: Axiom / TT / Both</option>
-                        <option value="2">2 modes: TT / Both</option>
-                        <option value="1">1 mode: TT only</option>
-                      </select>
-                    </label>
+                    </div>
                   </div>
                 </section>
                 <section class="site-feature-group">
@@ -614,6 +635,158 @@
           </header>
 
           <div class="appearance-stack">
+            <section class="settings-panel appearance-panel appearance-quick-buy-panel" data-quick-buy-slot="1">
+              <div class="appearance-quick-buy-row">
+                <div class="appearance-quick-buy-summary">
+                  <h3>Main Quick Buy Button</h3>
+                  <p class="muted">Customize the main Trench Tools quick-buy button colors on supported sites.</p>
+                </div>
+                <div class="appearance-quick-buy-controls-area">
+                  <div class="appearance-quick-buy-controls">
+                    <div class="appearance-quick-buy-field">
+                      <button
+                        id="appearance-quick-buy-1-background-swatch"
+                        type="button"
+                        class="appearance-quick-buy-swatch"
+                        data-quick-buy-field="backgroundColor"
+                        data-quick-buy-slot="1"
+                        aria-label="Main Quick Buy Button background color"
+                        aria-haspopup="dialog"
+                      ></button>
+                      <span class="appearance-quick-buy-field-label">Background Color</span>
+                    </div>
+                    <div class="appearance-quick-buy-field">
+                      <button
+                        id="appearance-quick-buy-1-color-swatch"
+                        type="button"
+                        class="appearance-quick-buy-swatch"
+                        data-quick-buy-field="color"
+                        data-quick-buy-slot="1"
+                        aria-label="Main Quick Buy Button text color"
+                        aria-haspopup="dialog"
+                      ></button>
+                      <span class="appearance-quick-buy-field-label">Text Color</span>
+                    </div>
+                    <div class="appearance-quick-buy-field">
+                      <button
+                        id="appearance-quick-buy-1-border-swatch"
+                        type="button"
+                        class="appearance-quick-buy-swatch"
+                        data-quick-buy-field="borderColor"
+                        data-quick-buy-slot="1"
+                        aria-label="Main Quick Buy Button border color"
+                        aria-haspopup="dialog"
+                      ></button>
+                      <span class="appearance-quick-buy-field-label">Border Color</span>
+                    </div>
+                    <button
+                      id="appearance-quick-buy-1-reset"
+                      type="button"
+                      class="secondary-button appearance-quick-buy-reset"
+                      data-quick-buy-slot="1"
+                    >
+                      Reset to default
+                    </button>
+                  </div>
+                  <div class="appearance-quick-buy-preview-panel" data-quick-buy-slot="1">
+                    <div class="appearance-quick-buy-preview-card">
+                      <div class="appearance-quick-buy-preview-rows">
+                        <div class="appearance-quick-buy-preview-row"></div>
+                        <div class="appearance-quick-buy-preview-row"></div>
+                        <div class="appearance-quick-buy-preview-row"></div>
+                      </div>
+                      <button
+                        id="appearance-quick-buy-1-preview-button"
+                        type="button"
+                        class="appearance-quick-buy-preview-button"
+                        data-quick-buy-slot="1"
+                        aria-label="Main Quick Buy Button preview"
+                      >
+                        <span class="appearance-quick-buy-preview-logo" aria-hidden="true"></span>
+                        <span class="appearance-quick-buy-preview-amount">1.0</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-panel appearance-panel appearance-quick-buy-panel" data-quick-buy-slot="2">
+              <div class="appearance-quick-buy-row">
+                <div class="appearance-quick-buy-summary">
+                  <h3>2nd Quick Buy Button</h3>
+                  <p class="muted">Customize the 2nd Trench Tools quick-buy button colors. Uses the default design until customized.</p>
+                </div>
+                <div class="appearance-quick-buy-controls-area">
+                  <div class="appearance-quick-buy-controls">
+                    <div class="appearance-quick-buy-field">
+                      <button
+                        id="appearance-quick-buy-2-background-swatch"
+                        type="button"
+                        class="appearance-quick-buy-swatch"
+                        data-quick-buy-field="backgroundColor"
+                        data-quick-buy-slot="2"
+                        aria-label="2nd Quick Buy Button background color"
+                        aria-haspopup="dialog"
+                      ></button>
+                      <span class="appearance-quick-buy-field-label">Background Color</span>
+                    </div>
+                    <div class="appearance-quick-buy-field">
+                      <button
+                        id="appearance-quick-buy-2-color-swatch"
+                        type="button"
+                        class="appearance-quick-buy-swatch"
+                        data-quick-buy-field="color"
+                        data-quick-buy-slot="2"
+                        aria-label="2nd Quick Buy Button text color"
+                        aria-haspopup="dialog"
+                      ></button>
+                      <span class="appearance-quick-buy-field-label">Text Color</span>
+                    </div>
+                    <div class="appearance-quick-buy-field">
+                      <button
+                        id="appearance-quick-buy-2-border-swatch"
+                        type="button"
+                        class="appearance-quick-buy-swatch"
+                        data-quick-buy-field="borderColor"
+                        data-quick-buy-slot="2"
+                        aria-label="2nd Quick Buy Button border color"
+                        aria-haspopup="dialog"
+                      ></button>
+                      <span class="appearance-quick-buy-field-label">Border Color</span>
+                    </div>
+                    <button
+                      id="appearance-quick-buy-2-reset"
+                      type="button"
+                      class="secondary-button appearance-quick-buy-reset"
+                      data-quick-buy-slot="2"
+                    >
+                      Reset to default
+                    </button>
+                  </div>
+                  <div class="appearance-quick-buy-preview-panel" data-quick-buy-slot="2">
+                    <div class="appearance-quick-buy-preview-card">
+                      <div class="appearance-quick-buy-preview-rows">
+                        <div class="appearance-quick-buy-preview-row"></div>
+                        <div class="appearance-quick-buy-preview-row"></div>
+                        <div class="appearance-quick-buy-preview-row"></div>
+                      </div>
+                      <button
+                        id="appearance-quick-buy-2-preview-button"
+                        type="button"
+                        class="appearance-quick-buy-preview-button"
+                        data-quick-buy-slot="2"
+                        aria-label="2nd Quick Buy Button preview"
+                      >
+                        <span class="appearance-quick-buy-preview-logo" aria-hidden="true"></span>
+                        <span class="appearance-quick-buy-preview-amount">2.0</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
             <section class="settings-panel appearance-panel appearance-sounds-panel">
               <div class="panel-heading">
                 <div>
@@ -1392,6 +1565,56 @@
     </div>
 
     <div id="options-toast-host" aria-live="polite" aria-atomic="false"></div>
+
+    <div
+      id="appearance-color-popover"
+      class="appearance-color-popover hidden"
+      role="dialog"
+      aria-label="Color picker"
+      hidden
+    >
+      <div class="appearance-color-popover-preview"></div>
+      <label class="appearance-color-popover-field">
+        <span>Color</span>
+        <input id="appearance-color-popover-color" type="color" value="#000000" />
+      </label>
+      <label class="appearance-color-popover-field">
+        <span>Hex</span>
+        <input
+          id="appearance-color-popover-hex"
+          class="appearance-color-popover-hex"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          maxlength="9"
+          placeholder="#RRGGBB"
+        />
+      </label>
+      <label
+        id="appearance-color-popover-alpha-field"
+        class="appearance-color-popover-field appearance-color-popover-alpha-field"
+      >
+        <span>Alpha</span>
+        <div class="appearance-color-popover-alpha-row">
+          <input
+            id="appearance-color-popover-alpha"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value="100"
+          />
+          <span id="appearance-color-popover-alpha-value" class="appearance-color-popover-alpha-value">100%</span>
+        </div>
+      </label>
+      <div class="appearance-color-popover-actions">
+        <button
+          id="appearance-color-popover-close"
+          type="button"
+          class="secondary-button"
+        >Close</button>
+      </div>
+    </div>
 
     <script type="module" src="./index.js"></script>
   </body>

@@ -11,10 +11,7 @@ use crate::{
     trade_planner::{LifecycleAndCanonicalMarket, TradeLifecycle},
 };
 
-const PRE_MIGRATION_ROLLING_TTL_MS: u64 = 10_000;
-const PRE_MIGRATION_ABSOLUTE_MAX_AGE_MS: u64 = 30_000;
-const POST_MIGRATION_ROLLING_TTL_MS: u64 = 60 * 60 * 1000;
-const POST_MIGRATION_ABSOLUTE_MAX_AGE_MS: u64 = 4 * 60 * 60 * 1000;
+const ROUTE_INDEX_TTL_MS: u64 = 60 * 60 * 1000;
 const ROUTE_INDEX_LRU_CAP: usize = 256;
 const ROUTE_INDEX_POLICY_VERSION: &str = "verified-mint-or-pool-v2";
 
@@ -86,18 +83,8 @@ impl RouteIndexEntry {
     }
 
     fn is_stale(&self, now: u64) -> bool {
-        let (rolling_ttl, absolute_max_age) = match self.selector.lifecycle {
-            TradeLifecycle::PreMigration => (
-                PRE_MIGRATION_ROLLING_TTL_MS,
-                PRE_MIGRATION_ABSOLUTE_MAX_AGE_MS,
-            ),
-            TradeLifecycle::PostMigration => (
-                POST_MIGRATION_ROLLING_TTL_MS,
-                POST_MIGRATION_ABSOLUTE_MAX_AGE_MS,
-            ),
-        };
-        now.saturating_sub(self.last_used_at_unix_ms) > rolling_ttl
-            || now.saturating_sub(self.fetched_at_unix_ms) > absolute_max_age
+        now.saturating_sub(self.last_used_at_unix_ms) > ROUTE_INDEX_TTL_MS
+            || now.saturating_sub(self.fetched_at_unix_ms) > ROUTE_INDEX_TTL_MS
     }
 }
 
@@ -127,7 +114,9 @@ impl RouteIndex {
     }
 
     pub async fn insert_plan(&self, key: RouteIndexKey, plan: &TradeDispatchPlan, source: &str) {
+        let now = now_unix_ms();
         let mut entries = self.entries.write().await;
+        entries.retain(|_, entry| !entry.is_stale(now));
         entries.insert(key, RouteIndexEntry::from_plan(plan, source));
         if entries.len() > ROUTE_INDEX_LRU_CAP {
             if let Some(victim_key) = entries
@@ -142,6 +131,25 @@ impl RouteIndex {
 
     pub async fn invalidate(&self, key: &RouteIndexKey) {
         self.entries.write().await.remove(key);
+    }
+
+    pub async fn invalidate_pre_migration_for_mint(
+        &self,
+        rpc_url: &str,
+        commitment: &str,
+        _side: &str,
+        mint: &str,
+    ) {
+        let normalized_rpc = rpc_url.trim().to_string();
+        let normalized_commitment = commitment.trim().to_ascii_lowercase();
+        let normalized_mint = mint.trim().to_string();
+        self.entries.write().await.retain(|key, entry| {
+            !(entry.selector.lifecycle == TradeLifecycle::PreMigration
+                && key.rpc_url == normalized_rpc
+                && key.commitment == normalized_commitment
+                && (entry.resolved_mint == normalized_mint
+                    || key.submitted_address == normalized_mint))
+        });
     }
 
     pub async fn flight_lock(&self, key: &RouteIndexKey) -> Arc<Mutex<()>> {
@@ -165,8 +173,7 @@ impl RouteIndex {
 
 pub fn route_index_ttl_ms_for_plan(plan: &TradeDispatchPlan) -> u64 {
     match plan.selector.lifecycle {
-        TradeLifecycle::PreMigration => PRE_MIGRATION_ROLLING_TTL_MS,
-        TradeLifecycle::PostMigration => POST_MIGRATION_ROLLING_TTL_MS,
+        TradeLifecycle::PreMigration | TradeLifecycle::PostMigration => ROUTE_INDEX_TTL_MS,
     }
 }
 
@@ -264,12 +271,30 @@ mod tests {
     fn route_index_uses_lifecycle_ttls() {
         assert_eq!(
             route_index_ttl_ms_for_plan(&plan(TradeLifecycle::PreMigration)),
-            PRE_MIGRATION_ROLLING_TTL_MS
+            ROUTE_INDEX_TTL_MS
         );
         assert_eq!(
             route_index_ttl_ms_for_plan(&plan(TradeLifecycle::PostMigration)),
-            POST_MIGRATION_ROLLING_TTL_MS
+            ROUTE_INDEX_TTL_MS
         );
+    }
+
+    #[test]
+    fn pre_migration_entries_expire_by_age() {
+        let mut entry = RouteIndexEntry::from_plan(&plan(TradeLifecycle::PreMigration), "test");
+        entry.fetched_at_unix_ms = 1;
+        entry.last_used_at_unix_ms = 1;
+
+        assert!(entry.is_stale(now_unix_ms()));
+    }
+
+    #[test]
+    fn post_migration_entries_still_expire_by_age() {
+        let mut entry = RouteIndexEntry::from_plan(&plan(TradeLifecycle::PostMigration), "test");
+        entry.fetched_at_unix_ms = 1;
+        entry.last_used_at_unix_ms = 1;
+
+        assert!(entry.is_stale(now_unix_ms()));
     }
 
     #[tokio::test]

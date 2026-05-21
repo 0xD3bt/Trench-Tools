@@ -131,7 +131,7 @@ Use the shorter names for new installs.
 - `EXECUTION_ENGINE_WRAPPER_DEFAULT_FEE_BPS` - legacy alias for existing installs. Values are basis points: blank or `10` = `0.1%`, `0` = off, `20` = `0.2%`. Prefer `TRENCH_TOOL_FEE` for new installs.
 - `ALT_COVERAGE_DIAGNOSTICS` - emit ALT coverage diagnostics to logs. Debugging only.
 
-## Execution-engine Rollout / Safety
+## Execution Engine Rollout / Safety
 
 - `EXECUTION_ENGINE_ENABLE_PUMP_NATIVE` - enable/disable native Pump family path. Operational safety switch.
 - `EXECUTION_ENGINE_ENABLE_RAYDIUM_AMM_V4_NATIVE` - enable/disable native Raydium AMM v4 path. Operational safety switch.

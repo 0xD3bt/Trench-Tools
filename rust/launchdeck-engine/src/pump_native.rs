@@ -311,14 +311,29 @@ pub async fn try_compile_native_pump(
     let launch_lookup_table_variants =
         lookup_table_variants_for_transaction("launch", config, &lookup_tables);
     let mut launch_instructions = launch_pre_instructions;
-    launch_instructions.extend(build_launch_instructions(
-        config,
-        mint,
-        creator,
-        launch_creator,
-        agent_authority.as_ref(),
-        global.as_ref(),
-    )?);
+    if config.quoteAsset.eq_ignore_ascii_case("usdc") {
+        launch_instructions.extend(
+            build_usdc_launch_instructions(
+                rpc_url,
+                config,
+                mint,
+                creator,
+                launch_creator,
+                agent_authority.as_ref(),
+                global.as_ref(),
+            )
+            .await?,
+        );
+    } else {
+        launch_instructions.extend(build_launch_instructions(
+            config,
+            mint,
+            creator,
+            launch_creator,
+            agent_authority.as_ref(),
+            global.as_ref(),
+        )?);
+    }
     let launch_tx_instructions = with_tx_settings(
         launch_instructions,
         &launch_tx_config,
@@ -676,6 +691,7 @@ struct PumpGlobalState {
 pub struct PumpPreviewBasis {
     pub initialVirtualTokenReserves: String,
     pub initialVirtualSolReserves: String,
+    pub initialVirtualQuoteReserves: String,
     pub initialRealTokenReserves: String,
     pub feeBasisPoints: String,
     pub creatorFeeBasisPoints: String,
@@ -744,6 +760,7 @@ fn pump_preview_basis_from_global(global: &PumpGlobalState) -> PumpPreviewBasis 
     PumpPreviewBasis {
         initialVirtualTokenReserves: global.initial_virtual_token_reserves.to_string(),
         initialVirtualSolReserves: global.initial_virtual_sol_reserves.to_string(),
+        initialVirtualQuoteReserves: global.initial_virtual_quote_reserves.to_string(),
         initialRealTokenReserves: global.initial_real_token_reserves.to_string(),
         feeBasisPoints: global.fee_basis_points.to_string(),
         creatorFeeBasisPoints: global.creator_fee_basis_points.to_string(),
@@ -1577,6 +1594,33 @@ fn quote_buy_sol_from_tokens(global: &PumpGlobalState, token_amount: u64) -> u64
         .unwrap_or(u64::MAX)
 }
 
+fn quote_buy_quote_from_tokens(
+    curve: &PumpBondingCurveState,
+    global: &PumpGlobalState,
+    token_amount: u64,
+) -> u64 {
+    if token_amount == 0 {
+        return 0;
+    }
+    let amount = u128::from(token_amount).min(u128::from(curve.real_token_reserves));
+    if amount >= u128::from(curve.virtual_token_reserves) {
+        return u64::MAX;
+    }
+    let quote_cost =
+        ((amount * u128::from(curve.virtual_sol_reserves))
+            / (u128::from(curve.virtual_token_reserves) - amount))
+            + 1;
+    let protocol_fee = ceil_div(quote_cost * u128::from(global.fee_basis_points), 10_000);
+    let creator_fee = ceil_div(
+        quote_cost * u128::from(global.creator_fee_basis_points),
+        10_000,
+    );
+    (quote_cost + protocol_fee + creator_fee + 1)
+        .min(u128::from(u64::MAX))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn quote_sell_sol_from_curve(
     curve: &PumpBondingCurveState,
     global: &PumpGlobalState,
@@ -1653,6 +1697,32 @@ fn synthetic_curve_after_buy_tokens(
     }
 }
 
+fn initial_bonding_curve_for_quote(
+    global: &PumpGlobalState,
+    launch_creator: &Pubkey,
+    quote_mint: &Pubkey,
+) -> PumpBondingCurveState {
+    let quote_reserves = if *quote_mint == usdc_mint().unwrap_or_default()
+        && global.initial_virtual_quote_reserves > 0
+    {
+        global.initial_virtual_quote_reserves
+    } else {
+        global.initial_virtual_sol_reserves
+    };
+    PumpBondingCurveState {
+        virtual_token_reserves: global.initial_virtual_token_reserves,
+        virtual_sol_reserves: quote_reserves,
+        real_token_reserves: global.initial_real_token_reserves,
+        real_sol_reserves: 0,
+        token_total_supply: global.initial_real_token_reserves,
+        complete: false,
+        creator: *launch_creator,
+        is_mayhem_mode: false,
+        cashback_enabled: false,
+        quote_mint: *quote_mint,
+    }
+}
+
 fn current_market_cap_lamports(curve: &PumpBondingCurveState) -> u64 {
     if curve.virtual_token_reserves == 0 {
         return 0;
@@ -1691,10 +1761,84 @@ fn resolve_dev_buy_quote(
     ))
 }
 
+async fn quote_sol_input_for_usdc_output(
+    rpc_url: &str,
+    commitment: &str,
+    owner: &Pubkey,
+    input_account: &Pubkey,
+    output_account: &Pubkey,
+    required_usdc: u64,
+    slippage_bps: u64,
+    max_gross_sol_lamports: u64,
+    fee_bps: u16,
+) -> Result<u64, String> {
+    if required_usdc == 0 {
+        return Ok(0);
+    }
+    let mut low = 1u64;
+    let mut high = ((u128::from(required_usdc) * 1_000_000_000u128) / 1_000_000u128)
+        .saturating_add(1_000_000)
+        .min(u128::from(max_gross_sol_lamports.max(1))) as u64;
+    high = high.max(1);
+    loop {
+        let net_high = wrapper_net_sol_input(high, fee_bps)?;
+        let quote = build_trusted_raydium_clmm_swap_exact_in(
+            rpc_url,
+            RAYDIUM_SOL_USDC_POOL,
+            commitment,
+            owner,
+            input_account,
+            output_account,
+            &wsol_mint()?,
+            &usdc_mint()?,
+            net_high,
+            slippage_bps,
+        )
+        .await?;
+        if quote.min_out >= required_usdc {
+            break;
+        }
+        if high >= max_gross_sol_lamports {
+            return Err("Pump USDC token-target dev-buy could not fit in the maximum SOL conversion budget.".to_string());
+        }
+        low = high.saturating_add(1);
+        high = high.saturating_mul(2).min(max_gross_sol_lamports);
+    }
+    for _ in 0..64 {
+        if low >= high {
+            break;
+        }
+        let mid = low + (high - low) / 2;
+        let net_mid = wrapper_net_sol_input(mid, fee_bps)?;
+        let quote = build_trusted_raydium_clmm_swap_exact_in(
+            rpc_url,
+            RAYDIUM_SOL_USDC_POOL,
+            commitment,
+            owner,
+            input_account,
+            output_account,
+            &wsol_mint()?,
+            &usdc_mint()?,
+            net_mid,
+            slippage_bps,
+        )
+        .await?;
+        if quote.min_out >= required_usdc {
+            high = mid;
+        } else {
+            low = mid.saturating_add(1);
+        }
+    }
+    Ok(high)
+}
+
 pub async fn predict_dev_buy_token_amount(
     rpc_url: &str,
     config: &NormalizedConfig,
 ) -> Result<Option<u64>, String> {
+    if config.quoteAsset.eq_ignore_ascii_case("usdc") {
+        return Ok(None);
+    }
     let global = fetch_global_state_cached(rpc_url).await?;
     Ok(resolve_dev_buy_quote(config, &global)?.map(|(_, token_amount)| token_amount))
 }
@@ -1702,6 +1846,7 @@ pub async fn predict_dev_buy_token_amount(
 #[allow(dead_code)]
 pub async fn quote_launch(
     rpc_url: &str,
+    quote_asset: &str,
     mode: &str,
     amount: &str,
 ) -> Result<Option<LaunchQuote>, String> {
@@ -1714,6 +1859,9 @@ pub async fn quote_launch(
         return Err(format!(
             "Unsupported dev buy quote mode: {mode}. Expected sol or tokens."
         ));
+    }
+    if quote_asset.trim().eq_ignore_ascii_case("usdc") {
+        return Ok(None);
     }
     let global = fetch_global_state_cached(rpc_url).await?;
     if trimmed_mode == "sol" {
@@ -2050,6 +2198,7 @@ async fn finalize_usdc_follow_buy_transaction(
         &user_usdc_account,
         &user_base_account,
         min_tokens_out,
+        8,
         wrapper_fee_bps,
     )?;
     let instructions = vec![
@@ -2079,6 +2228,7 @@ fn build_pump_usdc_buy_from_sol_route_instruction(
     user_usdc_account: &Pubkey,
     user_base_account: &Pubkey,
     min_tokens_out: u64,
+    pump_input_patch_offset: u16,
     fee_bps: u16,
 ) -> Result<Instruction, String> {
     let route_wsol_account = route_wsol_pda(user, 0);
@@ -2138,7 +2288,7 @@ fn build_pump_usdc_buy_from_sol_route_instruction(
                 accounts_len: pump_accounts_len,
                 input_source: SwapLegInputSource::PreviousTokenDelta,
                 input_amount: conversion.min_out,
-                input_patch_offset: 8,
+                input_patch_offset: pump_input_patch_offset,
                 output_account_index: pump_output_index,
                 ix_data: pump_ix.data,
             },
@@ -2873,12 +3023,6 @@ fn build_launch_instructions(
     agent_authority: Option<&Pubkey>,
     global: Option<&PumpGlobalState>,
 ) -> Result<Vec<Instruction>, String> {
-    if config.quoteAsset.eq_ignore_ascii_case("usdc") {
-        return Err(
-            "Pump USDC quote-asset creation is not enabled yet; LaunchDeck keeps quoteAsset=usdc gated until Pump publishes the create-v2 USDC account/data shape."
-                .to_string(),
-        );
-    }
     let mut instructions = vec![build_create_v2_instruction(
         &mint,
         &creator,
@@ -2888,6 +3032,7 @@ fn build_launch_instructions(
         &config.token.uri,
         config.token.mayhemMode,
         config.mode == "cashback",
+        config.quoteAsset.eq_ignore_ascii_case("usdc"),
     )?];
     let mut launch_dev_buy_fee_transfer = None;
     if let Some(global) = global {
@@ -2933,6 +3078,157 @@ fn build_launch_instructions(
     Ok(instructions)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn build_usdc_launch_instructions(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+    mint: Pubkey,
+    creator: Pubkey,
+    launch_creator: Pubkey,
+    agent_authority: Option<&Pubkey>,
+    global: Option<&PumpGlobalState>,
+) -> Result<Vec<Instruction>, String> {
+    let mut instructions = vec![build_create_v2_instruction(
+        &mint,
+        &creator,
+        &launch_creator,
+        &config.token.name,
+        &config.token.symbol,
+        &config.token.uri,
+        config.token.mayhemMode,
+        config.mode == "cashback",
+        true,
+    )?];
+    if let Some(global) = global {
+        if config.devBuy.is_some() {
+            let buy_slippage_bps = slippage_bps_from_percent(&config.execution.buySlippagePercent)?;
+            let (conversion_slippage_bps, pump_slippage_bps) =
+                split_two_leg_slippage_bps(buy_slippage_bps);
+            let dev_buy = config
+                .devBuy
+                .as_ref()
+                .ok_or_else(|| "devBuy config disappeared while building Pump USDC launch.".to_string())?;
+            let token_2022 = token_2022_program_id()?;
+            let token_program = token_program_id()?;
+            let usdc = usdc_mint()?;
+            let route_wsol_account = route_wsol_pda(&creator, 0);
+            let user_usdc_account =
+                get_associated_token_address_with_program_id(&creator, &usdc, &token_program);
+            let user_base_account =
+                get_associated_token_address_with_program_id(&creator, &mint, &token_2022);
+            let synthetic_curve = initial_bonding_curve_for_quote(global, &launch_creator, &usdc);
+            let token_target = if dev_buy.mode == "tokens" {
+                Some(parse_decimal_u64(
+                    &dev_buy.amount,
+                    TOKEN_DECIMALS,
+                    "devBuy.amount",
+                )?)
+            } else {
+                None
+            };
+            let sol_amount = if let Some(token_amount) = token_target {
+                if token_amount == 0 {
+                    return Err("Pump USDC launch dev-buy token amount resolved to zero.".to_string());
+                }
+                let required_usdc = quote_buy_quote_from_tokens(&synthetic_curve, global, token_amount);
+                quote_sol_input_for_usdc_output(
+                    rpc_url,
+                    &config.execution.commitment,
+                    &creator,
+                    &route_wsol_account,
+                    &user_usdc_account,
+                    required_usdc,
+                    conversion_slippage_bps,
+                    parse_decimal_u64("100", 9, "Pump USDC token-target dev-buy maximum SOL budget")?,
+                    config.wrapperDefaultFeeBps,
+                )
+                .await?
+            } else {
+                parse_decimal_u64(&dev_buy.amount, 9, "devBuy.amount")?
+            };
+            let net_sol_amount = wrapper_net_sol_input(sol_amount, config.wrapperDefaultFeeBps)?;
+            let conversion = build_trusted_raydium_clmm_swap_exact_in(
+                rpc_url,
+                RAYDIUM_SOL_USDC_POOL,
+                &config.execution.commitment,
+                &creator,
+                &route_wsol_account,
+                &user_usdc_account,
+                &wsol_mint()?,
+                &usdc,
+                net_sol_amount,
+                conversion_slippage_bps,
+            )
+            .await?;
+            let (pump_ix, min_tokens_out, pump_input_patch_offset) = {
+                let min_tokens_out = if let Some(token_amount) = token_target {
+                    token_amount
+                } else {
+                    let token_amount =
+                        quote_buy_tokens_from_curve(&synthetic_curve, global, conversion.min_out);
+                    if token_amount == 0 {
+                        return Err("Pump USDC launch dev-buy quote resolved to zero tokens.".to_string());
+                    }
+                    apply_buy_token_slippage(token_amount, pump_slippage_bps)
+                };
+                (
+                    build_buy_exact_quote_in_v2_instruction(
+                        global,
+                        &mint,
+                        &launch_creator,
+                        &creator,
+                        conversion.min_out,
+                        min_tokens_out,
+                        &token_2022,
+                        &usdc,
+                        &token_program,
+                        config.token.mayhemMode,
+                    )?,
+                    min_tokens_out,
+                    8,
+                )
+            };
+            instructions.push(build_extend_account_instruction(
+                &bonding_curve_pda(&mint)?,
+                &creator,
+            )?);
+            instructions.push(build_create_token_ata_instruction(
+                &creator,
+                &usdc,
+                &token_program,
+            )?);
+            instructions.push(build_create_token_ata_instruction(
+                &creator,
+                &mint,
+                &token_2022,
+            )?);
+            instructions.push(build_pump_usdc_buy_from_sol_route_instruction(
+                &creator,
+                sol_amount,
+                net_sol_amount,
+                conversion,
+                pump_ix,
+                &user_usdc_account,
+                &user_base_account,
+                min_tokens_out,
+                pump_input_patch_offset,
+                config.wrapperDefaultFeeBps,
+            )?);
+        }
+    }
+    if config.mode == "agent-custom" && !config.agent.splitAgentInit {
+        let authority = agent_authority
+            .ok_or_else(|| format!("agent authority is required for {} mode.", config.mode))?;
+        instructions.push(build_agent_initialize_instruction(
+            &mint,
+            &creator,
+            authority,
+            config.agent.buybackBps.unwrap_or(0) as u16,
+        )?);
+    }
+    Ok(instructions)
+}
+
 fn encode_borsh_string(buffer: &mut Vec<u8>, value: &str) {
     buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
     buffer.extend_from_slice(value.as_bytes());
@@ -2947,9 +3243,11 @@ fn build_create_v2_instruction(
     uri: &str,
     mayhem_mode: bool,
     cashback_enabled: bool,
+    usdc_quote: bool,
 ) -> Result<Instruction, String> {
     let pump_program = pump_program_id()?;
     let token_2022 = token_2022_program_id()?;
+    let bonding_curve = bonding_curve_pda(mint)?;
     let associated_bonding_curve =
         get_associated_token_address_with_program_id(&bonding_curve_pda(mint)?, mint, &token_2022);
     let sol_vault = sol_vault_pda()?;
@@ -2965,26 +3263,41 @@ fn build_create_v2_instruction(
     data.push(u8::from(mayhem_mode));
     data.push(u8::from(cashback_enabled));
 
+    let mut accounts = vec![
+        AccountMeta::new(*mint, true),
+        AccountMeta::new_readonly(mint_authority_pda()?, false),
+        AccountMeta::new(bonding_curve, false),
+        AccountMeta::new(associated_bonding_curve, false),
+        AccountMeta::new_readonly(global_pda()?, false),
+        AccountMeta::new(*user, true),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(token_2022, false),
+        AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+        AccountMeta::new(mayhem_program_id()?, false),
+        AccountMeta::new_readonly(global_params_pda()?, false),
+        AccountMeta::new(sol_vault, false),
+        AccountMeta::new(mayhem_state, false),
+        AccountMeta::new(mayhem_token_vault, false),
+        AccountMeta::new_readonly(event_authority_pda(&pump_program), false),
+        AccountMeta::new_readonly(pump_program, false),
+    ];
+    if usdc_quote {
+        let quote_mint = usdc_mint()?;
+        let quote_token_program = token_program_id()?;
+        accounts.push(AccountMeta::new_readonly(quote_mint, false));
+        accounts.push(AccountMeta::new(
+            get_associated_token_address_with_program_id(
+                &bonding_curve,
+                &quote_mint,
+                &quote_token_program,
+            ),
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(quote_token_program, false));
+    }
     let instruction = Instruction {
         program_id: pump_program,
-        accounts: vec![
-            AccountMeta::new(*mint, true),
-            AccountMeta::new_readonly(mint_authority_pda()?, false),
-            AccountMeta::new(bonding_curve_pda(mint)?, false),
-            AccountMeta::new(associated_bonding_curve, false),
-            AccountMeta::new_readonly(global_pda()?, false),
-            AccountMeta::new(*user, true),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(token_2022, false),
-            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
-            AccountMeta::new(mayhem_program_id()?, false),
-            AccountMeta::new_readonly(global_params_pda()?, false),
-            AccountMeta::new(sol_vault, false),
-            AccountMeta::new(mayhem_state, false),
-            AccountMeta::new(mayhem_token_vault, false),
-            AccountMeta::new_readonly(event_authority_pda(&pump_program), false),
-            AccountMeta::new_readonly(pump_program, false),
-        ],
+        accounts,
         data,
     };
     Ok(instruction)
@@ -3105,6 +3418,94 @@ fn build_buy_exact_sol_in_instruction(
         &token_program_id()?,
         mayhem_mode,
     )
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn build_buy_v2_instruction(
+    global: &PumpGlobalState,
+    mint: &Pubkey,
+    creator_vault_authority: &Pubkey,
+    user: &Pubkey,
+    base_amount_out: u64,
+    max_quote_cost: u64,
+    base_token_program: &Pubkey,
+    quote_mint: &Pubkey,
+    quote_token_program: &Pubkey,
+    mayhem_mode: bool,
+) -> Result<Instruction, String> {
+    let pump_program = pump_program_id()?;
+    let bonding_curve = bonding_curve_pda(mint)?;
+    let user_volume_accumulator = user_volume_accumulator_pda(user)?;
+    let associated_bonding_curve =
+        get_associated_token_address_with_program_id(&bonding_curve, mint, base_token_program);
+    let associated_user =
+        get_associated_token_address_with_program_id(user, mint, base_token_program);
+    let associated_quote_user =
+        get_associated_token_address_with_program_id(user, quote_mint, quote_token_program);
+    let associated_quote_bonding_curve = get_associated_token_address_with_program_id(
+        &bonding_curve,
+        quote_mint,
+        quote_token_program,
+    );
+    let fee_recipient = select_buy_fee_recipient(global, mayhem_mode);
+    let buyback_fee_recipient = select_buyback_fee_recipient(global);
+    let associated_quote_fee_recipient = get_associated_token_address_with_program_id(
+        &fee_recipient,
+        quote_mint,
+        quote_token_program,
+    );
+    let associated_quote_buyback_fee_recipient = get_associated_token_address_with_program_id(
+        &buyback_fee_recipient,
+        quote_mint,
+        quote_token_program,
+    );
+    let creator_vault = creator_vault_pda(creator_vault_authority)?;
+    let associated_creator_vault = get_associated_token_address_with_program_id(
+        &creator_vault,
+        quote_mint,
+        quote_token_program,
+    );
+    let associated_user_volume_accumulator = get_associated_token_address_with_program_id(
+        &user_volume_accumulator,
+        quote_mint,
+        quote_token_program,
+    );
+    let mut data = vec![184, 23, 238, 97, 103, 197, 211, 61];
+    data.extend_from_slice(&base_amount_out.to_le_bytes());
+    data.extend_from_slice(&max_quote_cost.to_le_bytes());
+    Ok(Instruction {
+        program_id: pump_program,
+        accounts: vec![
+            AccountMeta::new_readonly(global_pda()?, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(*quote_mint, false),
+            AccountMeta::new_readonly(*base_token_program, false),
+            AccountMeta::new_readonly(*quote_token_program, false),
+            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+            AccountMeta::new(fee_recipient, false),
+            AccountMeta::new(associated_quote_fee_recipient, false),
+            AccountMeta::new(buyback_fee_recipient, false),
+            AccountMeta::new(associated_quote_buyback_fee_recipient, false),
+            AccountMeta::new(bonding_curve, false),
+            AccountMeta::new(associated_bonding_curve, false),
+            AccountMeta::new(associated_quote_bonding_curve, false),
+            AccountMeta::new(*user, true),
+            AccountMeta::new(associated_user, false),
+            AccountMeta::new(associated_quote_user, false),
+            AccountMeta::new(creator_vault, false),
+            AccountMeta::new(associated_creator_vault, false),
+            AccountMeta::new(fee_sharing_config_pda(mint)?, false),
+            AccountMeta::new_readonly(global_volume_accumulator_pda()?, false),
+            AccountMeta::new(user_volume_accumulator, false),
+            AccountMeta::new(associated_user_volume_accumulator, false),
+            AccountMeta::new_readonly(fee_config_pda()?, false),
+            AccountMeta::new_readonly(pump_fee_program_id()?, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(event_authority_pda(&pump_program), false),
+            AccountMeta::new_readonly(pump_program, false),
+        ],
+        data,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4695,6 +5096,7 @@ mod tests {
             &user_usdc,
             &user_base,
             10_000,
+            8,
             10,
         )
         .expect("wrapper ix");
@@ -4714,6 +5116,57 @@ mod tests {
         );
         assert_eq!(request.legs[1].input_amount, 1_900);
         assert_eq!(request.legs[1].input_patch_offset, 8);
+    }
+
+    #[test]
+    fn pump_usdc_buy_v2_route_patches_max_quote_field() {
+        let user = Pubkey::new_unique();
+        let user_usdc = Pubkey::new_unique();
+        let user_base = Pubkey::new_unique();
+        let conversion_program = Pubkey::new_unique();
+        let pump_program = pump_program_id().expect("pump program");
+        let conversion_ix = Instruction {
+            program_id: conversion_program,
+            accounts: vec![
+                AccountMeta::new_readonly(user, true),
+                AccountMeta::new(route_wsol_pda(&user, 0), false),
+                AccountMeta::new(user_usdc, false),
+            ],
+            data: vec![0; 24],
+        };
+        let pump_ix = Instruction {
+            program_id: pump_program,
+            accounts: vec![
+                AccountMeta::new(user_usdc, false),
+                AccountMeta::new(user_base, false),
+            ],
+            data: vec![1; 24],
+        };
+        let wrapper_ix = build_pump_usdc_buy_from_sol_route_instruction(
+            &user,
+            1_000_000,
+            999_000,
+            TrustedRaydiumClmmSwap {
+                instruction: conversion_ix,
+                expected_out: 2_000,
+                min_out: 1_900,
+            },
+            pump_ix,
+            &user_usdc,
+            &user_base,
+            10_000,
+            16,
+            10,
+        )
+        .expect("wrapper ix");
+        let request = ExecuteSwapRouteRequest::try_from_slice(&wrapper_ix.data[1..])
+            .expect("decode route request");
+
+        assert_eq!(
+            request.legs[1].input_source,
+            SwapLegInputSource::PreviousTokenDelta
+        );
+        assert_eq!(request.legs[1].input_patch_offset, 16);
     }
 
     #[test]
@@ -4978,6 +5431,7 @@ mod tests {
             "ipfs://fixture",
             false,
             false,
+            false,
         )
         .expect("instruction");
         let metadata_payload_bytes =
@@ -5069,6 +5523,7 @@ mod tests {
             "ipfs://fixture",
             false,
             false,
+            false,
         )
         .expect("instruction");
 
@@ -5078,6 +5533,44 @@ mod tests {
             &instruction.data[..8],
             &[214, 144, 76, 236, 95, 139, 49, 180]
         );
+    }
+
+    #[test]
+    fn create_v2_usdc_instruction_appends_quote_remaining_accounts() {
+        let mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let instruction = build_create_v2_instruction(
+            &mint,
+            &user,
+            &creator,
+            "LaunchDeck",
+            "LDECK",
+            "ipfs://fixture",
+            false,
+            false,
+            true,
+        )
+        .expect("instruction");
+        let bonding_curve = bonding_curve_pda(&mint).expect("bonding curve");
+        let usdc = usdc_mint().expect("usdc mint");
+        let token_program = token_program_id().expect("token program");
+
+        assert_eq!(instruction.program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(instruction.accounts.len(), 19);
+        assert_eq!(instruction.accounts[16].pubkey, usdc);
+        assert!(!instruction.accounts[16].is_writable);
+        assert_eq!(
+            instruction.accounts[17].pubkey,
+            get_associated_token_address_with_program_id(
+                &bonding_curve,
+                &usdc,
+                &token_program,
+            )
+        );
+        assert!(instruction.accounts[17].is_writable);
+        assert_eq!(instruction.accounts[18].pubkey, token_program);
+        assert!(!instruction.accounts[18].is_writable);
     }
 
     #[test]
@@ -5136,6 +5629,43 @@ mod tests {
         assert_eq!(
             instruction.accounts[4].pubkey,
             token_program_id().expect("token program id")
+        );
+    }
+
+    #[test]
+    fn buy_v2_instruction_shape_matches_public_idl() {
+        let global = sample_global();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let token_2022 = token_2022_program_id().expect("token 2022 program id");
+        let usdc = usdc_mint().expect("usdc mint");
+        let token_program = token_program_id().expect("token program id");
+        let instruction = build_buy_v2_instruction(
+            &global,
+            &mint,
+            &creator,
+            &user,
+            1_000_000,
+            100_000_000,
+            &token_2022,
+            &usdc,
+            &token_program,
+            false,
+        )
+        .expect("buy v2 instruction");
+
+        assert_eq!(instruction.program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(instruction.accounts.len(), 27);
+        assert_eq!(&instruction.data[..8], &[184, 23, 238, 97, 103, 197, 211, 61]);
+        assert_eq!(&instruction.data[8..16], &1_000_000u64.to_le_bytes());
+        assert_eq!(&instruction.data[16..24], &100_000_000u64.to_le_bytes());
+        assert_eq!(instruction.accounts[2].pubkey, usdc);
+        assert_eq!(instruction.accounts[3].pubkey, token_2022);
+        assert_eq!(instruction.accounts[4].pubkey, token_program);
+        assert_eq!(
+            instruction.accounts[19].pubkey,
+            global_volume_accumulator_pda().expect("global volume")
         );
     }
 
@@ -5441,6 +5971,29 @@ mod tests {
 
         assert_eq!(instructions.len(), 4);
         assert_eq!(instructions[3].program_id.to_string(), PUMP_PROGRAM_ID);
+    }
+
+    #[test]
+    fn launch_instructions_for_pump_usdc_without_dev_buy_append_create_remaining_accounts_only() {
+        let mut config = regular_config();
+        config.quoteAsset = "usdc".to_string();
+        let mint = Pubkey::new_unique();
+        let instructions = build_launch_instructions(
+            &config,
+            mint,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            None,
+            None,
+        )
+        .expect("launch instructions");
+
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].accounts.len(), 19);
+        assert_eq!(
+            instructions[0].accounts[16].pubkey,
+            usdc_mint().expect("usdc mint")
+        );
     }
 
     #[test]

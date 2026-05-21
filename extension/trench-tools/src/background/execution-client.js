@@ -11,6 +11,8 @@ const ROUTE_TIMEOUT_MS = {
   canonicalConfig: 2500,
   saveCanonicalConfig: 4000,
   saveSettings: 4000,
+  quickTradePreferences: 2500,
+  saveQuickTradePreferences: 4000,
   listPresets: 2500,
   createPreset: 4000,
   updatePreset: 4000,
@@ -35,10 +37,17 @@ const ROUTE_TIMEOUT_MS = {
   walletStatus: 3500,
   setActiveMark: 1500,
   balancePresence: 1500,
-  resyncPnlHistory: 15000,
+  resyncPnlHistory: 180000,
   resetPnlHistory: 5000,
   exportPnlHistory: 10000,
   wipePnlHistory: 5000,
+  pnlCardState: 4000,
+  pnlCardProfile: 4000,
+  pnlCardSettings: 4000,
+  pnlCardMedia: 20000,
+  pnlCardMediaData: 20000,
+  pnlCardDeleteMedia: 4000,
+  pnlCardSolUsd: 5000,
   buy: 15000,
   sell: 15000,
   tokenSplit: 10000,
@@ -56,6 +65,7 @@ const SAFE_INFLIGHT_DEDUPE_ROUTES = new Set([
   "runtimeStatus",
   "settings",
   "canonicalConfig",
+  "quickTradePreferences",
   "listPresets",
   "listWallets",
   "listWalletGroups",
@@ -65,6 +75,8 @@ const SAFE_INFLIGHT_DEDUPE_ROUTES = new Set([
   "resolveToken",
   "previewBatch",
   "walletStatus",
+  "pnlCardState",
+  "pnlCardSolUsd",
   "batchStatus"
 ]);
 
@@ -437,6 +449,17 @@ export function saveSettings(payload) {
   });
 }
 
+export function fetchQuickTradePreferences() {
+  return requestJson("quickTradePreferences", "/api/extension/quick-trade-preferences");
+}
+
+export function saveQuickTradePreferencesPatch(payload) {
+  return requestJson("saveQuickTradePreferences", "/api/extension/quick-trade-preferences", {
+    method: "PATCH",
+    body: payload && typeof payload === "object" ? payload : {}
+  });
+}
+
 export function listPresets() {
   return requestJson("listPresets", "/api/extension/presets");
 }
@@ -614,6 +637,50 @@ export function wipePnlHistory() {
     method: "POST",
     body: {}
   });
+}
+
+export function fetchPnlCardState() {
+  return requestJson("pnlCardState", "/api/extension/pnl-card/state");
+}
+
+export function savePnlCardProfile(payload) {
+  return requestJson("pnlCardProfile", "/api/extension/pnl-card/profile", {
+    method: "POST",
+    body: payload || {}
+  });
+}
+
+export function savePnlCardSettings(payload) {
+  return requestJson("pnlCardSettings", "/api/extension/pnl-card/settings", {
+    method: "POST",
+    body: payload || {}
+  });
+}
+
+export function savePnlCardMedia(payload) {
+  return requestJson("pnlCardMedia", "/api/extension/pnl-card/media", {
+    method: "POST",
+    body: payload || {}
+  });
+}
+
+export function fetchPnlCardMediaData(mediaId) {
+  return requestJson(
+    "pnlCardMediaData",
+    `/api/extension/pnl-card/media/${encodeURIComponent(String(mediaId || ""))}/data`
+  );
+}
+
+export function deletePnlCardMedia(mediaId) {
+  return requestJson(
+    "pnlCardDeleteMedia",
+    `/api/extension/pnl-card/media/${encodeURIComponent(String(mediaId || ""))}`,
+    { method: "DELETE" }
+  );
+}
+
+export function fetchPnlCardSolUsd() {
+  return requestJson("pnlCardSolUsd", "/api/extension/pnl-card/sol-usd");
 }
 
 export function buy(payload) {

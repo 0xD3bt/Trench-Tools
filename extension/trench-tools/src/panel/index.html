@@ -26,7 +26,10 @@
               data-tooltip="Wallets"
               data-tooltip-position="bottom"
             >
-              <img class="wallet-button-icon" src="../../assets/wallet-icon.png" alt="" aria-hidden="true" />
+              <span class="window-button-icon-wrap">
+                <img class="wallet-button-icon" src="../../assets/wallet-icon.png" alt="" aria-hidden="true" />
+                <span id="wallet-button-count" class="window-button-badge is-hidden" aria-hidden="true">0</span>
+              </span>
             </button>
             <button
               id="settings-button"
@@ -52,6 +55,7 @@
         </div>
         <div id="settings-menu" class="panel-settings-menu hidden">
           <button id="toggle-fees-button" class="panel-settings-menu-item" type="button">Toggle PnL mode</button>
+          <button id="share-pnl-button" class="panel-settings-menu-item" type="button">Share PnL</button>
           <button id="resync-coin-button" class="panel-settings-menu-item" type="button">Resync this coin</button>
           <button id="reset-coin-button" class="panel-settings-menu-item" type="button">Reset PnL for this coin</button>
           <button id="open-global-settings-button" class="panel-settings-menu-item" type="button">Open global settings</button>
@@ -88,6 +92,13 @@
 
         <div class="section-divider" data-section-divider="wallet-group-chips" aria-hidden="true"></div>
 
+        <div id="buy-balance-row" class="panel-balance-row panel-balance-row-buy">
+          <span class="panel-balance-row-label">Bal</span>
+          <span class="panel-balance-row-value">
+            <img class="panel-balance-row-icon" src="../../assets/sol-icon-white.png" alt="" aria-hidden="true" />
+            <span id="buy-balance-sol">0</span>
+          </span>
+        </div>
         <div id="quick-buy-presets" class="quick-grid"></div>
         <div class="custom-action-row">
           <label class="compact-input-shell">
@@ -99,6 +110,10 @@
               class="compact-input has-lead-icon"
               type="text"
               inputmode="decimal"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
               placeholder=" "
               aria-label="Enter custom SOL amount"
             />
@@ -114,6 +129,18 @@
 
         <div class="section-divider" aria-hidden="true"></div>
 
+        <div id="sell-balance-row" class="panel-balance-row panel-balance-row-sell">
+          <span class="panel-balance-row-label">Bal</span>
+          <span class="panel-balance-row-value">
+            <span id="sell-balance-token">0</span>
+            <span id="sell-balance-ticker" class="panel-balance-row-ticker"></span>
+            <span id="sell-balance-separator" class="panel-balance-row-separator">•</span>
+            <span id="sell-balance-sol-wrapper" class="panel-balance-row-sol">
+              <img class="panel-balance-row-icon" src="../../assets/sol-icon-white.png" alt="" aria-hidden="true" />
+              <span id="sell-balance-value-sol">0</span>
+            </span>
+          </span>
+        </div>
         <div id="quick-sell-shortcuts" class="quick-grid"></div>
         <div class="sell-combo-row">
           <label class="compact-input-shell">
@@ -123,6 +150,10 @@
               class="compact-input has-lead-icon"
               type="text"
               inputmode="decimal"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
               placeholder="Sell %"
               aria-label="Enter custom percent sell"
             />
@@ -137,6 +168,10 @@
               class="compact-input has-lead-icon"
               type="text"
               inputmode="decimal"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
               placeholder="Sell SOL"
               aria-label="Enter custom SOL sell"
             />
@@ -172,8 +207,13 @@
               <div class="balance-stat-icon" aria-hidden="true"></div>
               <div class="balance-stat-label">PNL</div>
             </div>
-            <div id="balance-pnl" class="balance-stat-value">0.000</div>
-            <div id="balance-pnl-detail" class="balance-stat-detail">--%</div>
+            <div id="balance-pnl" class="balance-stat-value">
+              <span id="balance-pnl-text">0.000 (--%)</span>
+              <button id="balance-pnl-share" class="balance-pnl-share" type="button" aria-label="Share PnL card" title="Share PnL card">
+                <span class="balance-pnl-share-icon" aria-hidden="true"></span>
+              </button>
+            </div>
+            <div id="balance-pnl-detail" class="balance-stat-detail hidden"></div>
           </div>
         </div>
       </div>

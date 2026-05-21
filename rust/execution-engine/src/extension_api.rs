@@ -1,7 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -10,6 +10,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
+    extract::DefaultBodyLimit,
     extract::{Path, State},
     http::{Request, StatusCode, header},
     middleware::{self, Next},
@@ -83,6 +84,10 @@ use crate::rollout::family_execution_enabled;
 use crate::rollout::family_guard_warning;
 use crate::rpc_client::configured_rpc_url;
 use crate::shared_config::{SharedRpcConfig, shared_config_manager};
+use crate::sol_usd_daily_price::{
+    ensure_sol_usd_daily_prices_for_dates, sol_usd_daily_price_store_path, stored_prices_for_dates,
+    utc_date_from_unix_ms,
+};
 use crate::token_distribution::{
     TokenConsolidateRequest, TokenDistributionExecutionConfig, TokenDistributionResponse,
     TokenSplitRequest, execute_consolidate as execute_token_consolidate,
@@ -95,8 +100,8 @@ use crate::trade_ledger::{
     StoredEntryPreference, TradeLedgerPaths, aggregate_trade_ledger, append_confirmed_trade_event,
     append_force_close_marker, append_incomplete_balance_adjustment_marker, append_reset_marker,
     force_close_trade_ledger_position, load_trade_ledger, load_trade_ledger_known_event_ids,
-    persist_trade_ledger, platform_tag_from_label, read_journal_entries, record_confirmed_trade,
-    reset_trade_ledger_position, trade_ledger_paths,
+    persist_trade_ledger, platform_tag_from_label, read_confirmed_trade_events,
+    read_journal_entries, record_confirmed_trade, reset_trade_ledger_position, trade_ledger_paths,
 };
 use crate::trade_planner::{
     LifecycleAndCanonicalMarket, PlannerQuoteAsset, PlannerRuntimeBundle, TradeVenueFamily,
@@ -121,13 +126,25 @@ const HELLOMOON_BATCH_WALLET_TIMEOUT_MS: u64 = 10_000;
 const TOKEN_DISTRIBUTION_STALE_MS: u64 = 10_000;
 const DEFAULT_DATA_ROOT: &str = ".local/execution-engine";
 const DEFAULT_STATE_FILE: &str = "engine-state.json";
+const PNL_CARD_ROOT_DIR: &str = "pnl-cards";
+const PNL_CARD_PROFILE_FILE: &str = "profile.json";
+const PNL_CARD_SETTINGS_FILE: &str = "settings.json";
+const PNL_CARD_MEDIA_MANIFEST_FILE: &str = "media-manifest.json";
+const PNL_CARD_MEDIA_DIR: &str = "media";
+const PNL_CARD_THUMBNAILS_DIR: &str = "thumbnails";
+const PNL_CARD_MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024;
+const PNL_CARD_MAX_VIDEO_BYTES: usize = 50 * 1024 * 1024;
+const PNL_CARD_MAX_JSON_BODY_BYTES: usize = 72 * 1024 * 1024;
+const PNL_CARD_MAX_MEDIA_ITEMS: usize = 24;
+const PNL_CARD_MAX_TOTAL_MEDIA_BYTES: u64 = 256 * 1024 * 1024;
+const PNL_CARD_SOL_USD_CACHE_MS: u64 = 10 * 60 * 1000;
 const CURRENT_ENGINE_STATE_VERSION: &str = "0.3.0";
 const AUTH_SCHEME_BEARER: &str = "Bearer ";
 const CANONICAL_CONFIG_VERSION: &str = "v1";
 const MAX_TRANSACTION_DELAY_MS: u64 = 2_000;
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
-const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLCsAEpksdQSJNy2C";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 const TRADE_BALANCE_GATE_TIMEOUT_MS: u64 = 100;
 const TRADE_BALANCE_GATE_FRONTEND_REFRESH_WALLET_LIMIT: usize = 50;
@@ -136,14 +153,27 @@ const TRADE_BALANCE_GATE_FIXED_BUY_BUFFER_LAMPORTS: u64 = 10_000;
 const TRADE_BALANCE_GATE_FIRST_BUY_RENT_BUFFER_LAMPORTS: u64 = 2_100_000;
 
 const RPC_RESYNC_PAGE_SIZE: usize = 1000;
-const HELIUS_RESYNC_PAGE_SIZE: usize = 100;
-const RPC_RESYNC_MAX_PAGES: usize = 10;
-const RPC_RESYNC_MAX_SIGNATURES: usize = 10_000;
-const RPC_RESYNC_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
+const RPC_RESYNC_MAX_PAGES: usize = 25;
+const RPC_RESYNC_MAX_SIGNATURES: usize = 25_000;
+const RPC_RESYNC_OVERALL_TIMEOUT: Duration = Duration::from_secs(150);
 const RESYNC_WALLET_CONCURRENCY: usize = 4;
 const AUTO_RESYNC_COOLDOWN_MS: u64 = 5 * 60 * 1000;
 const FORCE_CLOSE_COOLDOWN_MS: u64 = 60 * 60 * 1000;
 const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+fn normalized_trench_tools_mode() -> String {
+    match std::env::var("TRENCH_TOOLS_MODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ee" => "ee".to_string(),
+        "ld" => "ld".to_string(),
+        "both" => "both".to_string(),
+        _ => "both".to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -857,6 +887,26 @@ fn build_router_with_state(state: AppState) -> Router {
         .route("/api/extension/pnl/reset", post(reset_pnl_history))
         .route("/api/extension/pnl/export", post(export_pnl_history))
         .route("/api/extension/pnl/wipe", post(wipe_pnl_history))
+        .route("/api/extension/pnl-card/state", get(get_pnl_card_state))
+        .route(
+            "/api/extension/pnl-card/profile",
+            post(save_pnl_card_profile),
+        )
+        .route(
+            "/api/extension/pnl-card/settings",
+            post(save_pnl_card_settings),
+        )
+        .route("/api/extension/pnl-card/media", post(save_pnl_card_media))
+        .route(
+            "/api/extension/pnl-card/media/{media_id}",
+            axum::routing::delete(delete_pnl_card_media),
+        )
+        .route(
+            "/api/extension/pnl-card/media/{media_id}/data",
+            get(get_pnl_card_media_data),
+        )
+        .route("/api/extension/pnl-card/sol-usd", get(get_pnl_card_sol_usd))
+        .layer(DefaultBodyLimit::max(PNL_CARD_MAX_JSON_BODY_BYTES))
         .route(
             "/api/extension/config",
             // Execution-owned compatibility surface used by the extension
@@ -866,6 +916,10 @@ fn build_router_with_state(state: AppState) -> Router {
         .route(
             "/api/extension/settings",
             get(get_settings).put(update_settings),
+        )
+        .route(
+            "/api/extension/quick-trade-preferences",
+            get(get_quick_trade_preferences).patch(update_quick_trade_preferences),
         )
         .route(
             "/api/extension/presets",
@@ -1065,6 +1119,7 @@ pub struct ExtensionHealthResponse {
     pub version: String,
     pub engine_version: String,
     pub runtime_mode: String,
+    pub trench_tools_mode: String,
     pub executor_route: String,
     pub execution_authority: String,
     pub status: String,
@@ -1081,6 +1136,7 @@ pub struct ExtensionRuntimeStatusResponse {
     pub version: String,
     pub engine_version: String,
     pub runtime_mode: String,
+    pub trench_tools_mode: String,
     pub executor_route: String,
     pub execution_authority: String,
     pub status: String,
@@ -1244,7 +1300,121 @@ struct PnlHistoryScopeRequest {
     #[serde(default)]
     wallet_group_id: Option<String>,
     mint: String,
+    #[serde(default)]
+    historical_usd_prefetch: bool,
 }
+
+#[derive(Debug, Clone)]
+struct PnlCardPaths {
+    root_dir: PathBuf,
+    media_dir: PathBuf,
+    thumbnails_dir: PathBuf,
+    profile_path: PathBuf,
+    settings_path: PathBuf,
+    media_manifest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlCardProfile {
+    #[serde(default)]
+    handle: String,
+    #[serde(default)]
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlCardSettings {
+    #[serde(default)]
+    defaults: Value,
+    #[serde(default)]
+    overrides: Value,
+    #[serde(default)]
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlCardMediaRecord {
+    id: String,
+    kind: String,
+    name: String,
+    content_type: String,
+    path: String,
+    #[serde(default)]
+    thumbnail_path: String,
+    size_bytes: u64,
+    created_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlCardMediaManifest {
+    #[serde(default)]
+    items: Vec<PnlCardMediaRecord>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlCardProfileSaveRequest {
+    #[serde(default)]
+    handle: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlCardSettingsSaveRequest {
+    #[serde(default)]
+    defaults: Value,
+    #[serde(default)]
+    overrides: Value,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PnlCardMediaSaveRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    content_type: String,
+    #[serde(default)]
+    data_url: String,
+    #[serde(default)]
+    thumbnail_data_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct DecodedPnlCardMedia {
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PnlCardSolUsdCache {
+    fetched_at_unix_ms: u64,
+    price: f64,
+    source: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HistoricalUsdPnl {
+    tracked_bought_usd: f64,
+    tracked_sold_usd: f64,
+    realized_pnl_usd: f64,
+    remaining_cost_basis_usd: f64,
+    explicit_fee_total_usd: f64,
+    required_dates: BTreeSet<chrono::NaiveDate>,
+    missing_dates: BTreeSet<chrono::NaiveDate>,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalUsdLot {
+    remaining_amount_raw: u64,
+    remaining_cost_basis_usd: f64,
+}
+
+static PNL_CARD_SOL_USD_CACHE: OnceLock<Mutex<Option<PnlCardSolUsdCache>>> = OnceLock::new();
+static PNL_CARD_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1397,6 +1567,80 @@ pub struct UpdateWalletRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ReorderWalletsRequest {
     pub wallet_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickTradePreferences {
+    #[serde(default)]
+    pub preset_id: String,
+    #[serde(default = "default_quick_trade_selection_source")]
+    pub selection_source: String,
+    #[serde(default)]
+    pub active_wallet_group_id: String,
+    #[serde(default)]
+    pub manual_wallet_keys: Vec<String>,
+    #[serde(default)]
+    pub selection_revision: u64,
+    #[serde(default)]
+    pub quick_buy_amount: String,
+    #[serde(default)]
+    pub quick_buy_amount2: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickTradePreferencesResponse {
+    #[serde(flatten)]
+    pub preferences: QuickTradePreferences,
+    pub has_saved_preferences: bool,
+}
+
+impl Default for QuickTradePreferences {
+    fn default() -> Self {
+        Self {
+            preset_id: String::new(),
+            selection_source: default_quick_trade_selection_source(),
+            active_wallet_group_id: String::new(),
+            manual_wallet_keys: Vec::new(),
+            selection_revision: 0,
+            quick_buy_amount: String::new(),
+            quick_buy_amount2: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickTradePreferencesPatch {
+    #[serde(default)]
+    pub preset_id: Option<String>,
+    #[serde(default)]
+    pub selection_source: Option<String>,
+    #[serde(default)]
+    pub active_wallet_group_id: Option<String>,
+    #[serde(default)]
+    pub manual_wallet_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub selection_revision: Option<u64>,
+    #[serde(default)]
+    pub quick_buy_amount: Option<String>,
+    #[serde(default)]
+    pub quick_buy_amount2: Option<String>,
+}
+
+fn default_quick_trade_selection_source() -> String {
+    "group".to_string()
+}
+
+fn quick_trade_preferences_response(
+    preferences: QuickTradePreferences,
+    has_saved_preferences: bool,
+) -> QuickTradePreferencesResponse {
+    QuickTradePreferencesResponse {
+        preferences: normalize_quick_trade_preferences(preferences),
+        has_saved_preferences,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2028,6 +2272,10 @@ struct StoredEngineState {
     settings: EngineSettings,
     #[serde(default)]
     config: Option<Value>,
+    #[serde(default)]
+    quick_trade_preferences: QuickTradePreferences,
+    #[serde(default)]
+    quick_trade_preferences_saved: bool,
     presets: Vec<PresetSummary>,
     wallets: Vec<WalletSummary>,
     wallet_groups: Vec<WalletGroupSummary>,
@@ -2292,6 +2540,7 @@ async fn get_health(State(state): State<AppState>) -> Json<ExtensionHealthRespon
         version: engine.version.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         runtime_mode: EXECUTION_RUNTIME_MODE.to_string(),
+        trench_tools_mode: normalized_trench_tools_mode(),
         executor_route: state.executor.route_name().to_string(),
         execution_authority: EXECUTION_AUTHORITY.to_string(),
         status: "ready".to_string(),
@@ -2323,6 +2572,7 @@ async fn get_runtime_status(State(state): State<AppState>) -> Json<ExtensionRunt
         version: engine.version.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         runtime_mode: EXECUTION_RUNTIME_MODE.to_string(),
+        trench_tools_mode: normalized_trench_tools_mode(),
         executor_route: state.executor.route_name().to_string(),
         execution_authority: EXECUTION_AUTHORITY.to_string(),
         status: "ready".to_string(),
@@ -2389,8 +2639,13 @@ async fn get_wallet_status(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let engine = state.engine.read().await.clone();
     let trade_ledger = state.trade_ledger.read().await.clone();
-    let (payload, drifted_wallet_keys) =
-        build_extension_wallet_status_payload(&engine, &trade_ledger, &request).await?;
+    let (payload, drifted_wallet_keys) = build_extension_wallet_status_payload(
+        &engine,
+        &trade_ledger,
+        &state.trade_ledger_paths,
+        &request,
+    )
+    .await?;
     if !request.read_only {
         maybe_spawn_auto_resync(
             &state,
@@ -2402,6 +2657,208 @@ async fn get_wallet_status(
         .await;
     }
     Ok(Json(payload))
+}
+
+async fn get_pnl_card_state(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let engine = state.engine.read().await.clone();
+    let paths = pnl_card_paths(&engine.data_root);
+    let _guard = lock_pnl_card_store()?;
+    Ok(Json(json!({
+        "ok": true,
+        "profile": load_pnl_card_profile(&paths)?,
+        "settings": load_pnl_card_settings(&paths)?,
+        "media": pnl_card_media_payload(&paths)?,
+    })))
+}
+
+async fn save_pnl_card_profile(
+    State(state): State<AppState>,
+    Json(request): Json<PnlCardProfileSaveRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let engine = state.engine.read().await.clone();
+    let paths = pnl_card_paths(&engine.data_root);
+    let _guard = lock_pnl_card_store()?;
+    ensure_pnl_card_dirs(&paths)?;
+    let profile = PnlCardProfile {
+        handle: normalize_pnl_card_handle(&request.handle),
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    write_json_file(&paths.profile_path, &profile)?;
+    Ok(Json(json!({ "ok": true, "profile": profile })))
+}
+
+async fn save_pnl_card_settings(
+    State(state): State<AppState>,
+    Json(request): Json<PnlCardSettingsSaveRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let engine = state.engine.read().await.clone();
+    let paths = pnl_card_paths(&engine.data_root);
+    let _guard = lock_pnl_card_store()?;
+    ensure_pnl_card_dirs(&paths)?;
+    let settings = PnlCardSettings {
+        defaults: sanitize_pnl_card_settings(request.defaults)?,
+        overrides: sanitize_pnl_card_settings_overrides(request.overrides)?,
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    write_json_file(&paths.settings_path, &settings)?;
+    Ok(Json(json!({ "ok": true, "settings": settings })))
+}
+
+async fn save_pnl_card_media(
+    State(state): State<AppState>,
+    Json(request): Json<PnlCardMediaSaveRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let engine = state.engine.read().await.clone();
+    let paths = pnl_card_paths(&engine.data_root);
+    let _guard = lock_pnl_card_store()?;
+    ensure_pnl_card_dirs(&paths)?;
+    let content_type = normalize_pnl_card_content_type(&request.content_type)?;
+    let kind = if content_type.starts_with("video/") {
+        "video"
+    } else {
+        "image"
+    };
+    let (extension, max_bytes) = pnl_card_extension_and_limit(&content_type)?;
+    let decoded = decode_pnl_card_data_url(&request.data_url, &content_type, max_bytes)?;
+    validate_pnl_card_media_bytes(&content_type, &decoded.bytes)?;
+    validate_pnl_card_media_quota(&paths, decoded.bytes.len() as u64)?;
+    let media_id = Uuid::new_v4().to_string();
+    let media_filename = format!("{media_id}.{extension}");
+    let media_path = paths.media_dir.join(&media_filename);
+    fs::write(&media_path, decoded.bytes).map_err(internal_error)?;
+
+    let mut thumbnail_path_value = String::new();
+    if let Ok((thumbnail_content_type, thumbnail)) =
+        decode_optional_pnl_card_thumbnail(&request.thumbnail_data_url)
+    {
+        let thumbnail_ext = if thumbnail_content_type == "image/webp" {
+            "webp"
+        } else if thumbnail_content_type == "image/jpeg" {
+            "jpg"
+        } else {
+            "png"
+        };
+        let thumbnail_filename = format!("{media_id}.{thumbnail_ext}");
+        let thumbnail_path = paths.thumbnails_dir.join(&thumbnail_filename);
+        fs::write(&thumbnail_path, thumbnail.bytes).map_err(internal_error)?;
+        thumbnail_path_value = format!("pnl-cards/thumbnails/{thumbnail_filename}");
+    }
+
+    let created_at_unix_ms = now_unix_ms();
+    let record = PnlCardMediaRecord {
+        id: media_id,
+        kind: kind.to_string(),
+        name: normalize_pnl_card_media_name(&request.name),
+        content_type,
+        path: format!("pnl-cards/media/{media_filename}"),
+        thumbnail_path: thumbnail_path_value,
+        size_bytes: fs::metadata(&media_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+        created_at_unix_ms,
+    };
+    let mut manifest = load_pnl_card_media_manifest(&paths)?;
+    manifest.items.retain(|item| item.id != record.id);
+    manifest.items.insert(0, record.clone());
+    prune_pnl_card_manifest(&paths, &mut manifest);
+    write_json_file(&paths.media_manifest_path, &manifest)?;
+    Ok(Json(json!({
+        "ok": true,
+        "media": pnl_card_media_record_payload(&paths, &record)?,
+        "items": pnl_card_media_payload(&paths)?
+    })))
+}
+
+async fn delete_pnl_card_media(
+    State(state): State<AppState>,
+    Path(media_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let engine = state.engine.read().await.clone();
+    let paths = pnl_card_paths(&engine.data_root);
+    let _guard = lock_pnl_card_store()?;
+    let normalized_id = media_id.trim();
+    if normalized_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "media id is required".to_string()));
+    }
+    let mut manifest = load_pnl_card_media_manifest(&paths)?;
+    let mut removed = Vec::new();
+    manifest.items.retain(|item| {
+        if item.id == normalized_id {
+            removed.push(item.clone());
+            false
+        } else {
+            true
+        }
+    });
+    for item in &removed {
+        remove_pnl_card_relative_file(&paths.root_dir, &item.path);
+        remove_pnl_card_relative_file(&paths.root_dir, &item.thumbnail_path);
+    }
+    write_json_file(&paths.media_manifest_path, &manifest)?;
+    Ok(Json(json!({
+        "ok": true,
+        "removed": removed.len(),
+        "items": pnl_card_media_payload(&paths)?
+    })))
+}
+
+async fn get_pnl_card_media_data(
+    State(state): State<AppState>,
+    Path(media_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let engine = state.engine.read().await.clone();
+    let paths = pnl_card_paths(&engine.data_root);
+    let _guard = lock_pnl_card_store()?;
+    let normalized_id = media_id.trim();
+    if normalized_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "media id is required".to_string()));
+    }
+    let manifest = load_pnl_card_media_manifest(&paths)?;
+    let record = manifest
+        .items
+        .iter()
+        .find(|item| item.id == normalized_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "PnL card media not found.".to_string(),
+        ))?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": record.id,
+        "dataUrl": pnl_card_record_data_url(&paths, &record.path, &record.content_type)?,
+    })))
+}
+
+async fn get_pnl_card_sol_usd() -> Result<Json<Value>, (StatusCode, String)> {
+    if let Some(cached) = read_cached_pnl_card_sol_usd() {
+        return Ok(Json(json!({
+            "ok": true,
+            "price": cached.price,
+            "source": cached.source,
+            "fetchedAtUnixMs": cached.fetched_at_unix_ms,
+            "cached": true
+        })));
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .map_err(internal_error)?;
+    let (price, source) = fetch_pnl_card_sol_usd_price(&client).await?;
+    let fetched_at_unix_ms = now_unix_ms();
+    write_cached_pnl_card_sol_usd(PnlCardSolUsdCache {
+        fetched_at_unix_ms,
+        price,
+        source: source.clone(),
+    });
+    Ok(Json(json!({
+        "ok": true,
+        "price": price,
+        "source": source,
+        "fetchedAtUnixMs": fetched_at_unix_ms,
+        "cached": false
+    })))
 }
 
 async fn maybe_spawn_auto_resync(
@@ -2496,6 +2953,7 @@ async fn run_auto_resync(state: AppState, mint: String, wallet_keys: Vec<String>
             wallet_keys: Some(wallet_keys.clone()),
             wallet_group_id: None,
             mint: mint.clone(),
+            historical_usd_prefetch: false,
         }),
     )
     .await;
@@ -2632,7 +3090,7 @@ async fn reset_pnl_history(
     State(state): State<AppState>,
     Json(request): Json<PnlHistoryScopeRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let mint = request.mint.trim().to_string();
+    let mint = resolve_pnl_history_mint(&request.mint).await?;
     if mint.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "mint is required".to_string()));
     }
@@ -2842,9 +3300,11 @@ async fn export_pnl_history(
 
 async fn resync_pnl_history(
     State(state): State<AppState>,
-    Json(request): Json<PnlHistoryScopeRequest>,
+    Json(mut request): Json<PnlHistoryScopeRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let mint = request.mint.trim().to_string();
+    let should_prefetch_historical_usd = request.historical_usd_prefetch;
+    request.historical_usd_prefetch = false;
+    let mint = resolve_pnl_history_mint(&request.mint).await?;
     if mint.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "mint is required".to_string()));
     }
@@ -2876,7 +3336,6 @@ async fn resync_pnl_history(
             public_key: public_key.clone(),
         })
         .collect::<Vec<_>>();
-    let helius_config = configured_helius_resync_config();
     let selected_wallet_keys = target.wallet_keys.iter().cloned().collect::<HashSet<_>>();
     let current_ledger = state.trade_ledger.read().await.clone();
     let reset_baselines_by_wallet = target
@@ -2929,7 +3388,6 @@ async fn resync_pnl_history(
         &mint,
         &reset_baselines_by_wallet,
         &known_wallets,
-        helius_config.as_ref(),
     )
     .await?;
     let mut seen_candidates = HashSet::new();
@@ -3091,12 +3549,40 @@ async fn resync_pnl_history(
         let _ = replay_resync_actions(&mut ledger, &resync_actions, false);
         persist_trade_ledger(&state.trade_ledger_paths, &ledger)?;
     }
+    let historical_usd_price_dates = if should_prefetch_historical_usd {
+        resync_actions
+            .iter()
+            .filter_map(|action| match action {
+                RpcResyncLedgerAction::Trade(event)
+                    if matches!(event.side, TradeSide::Buy | TradeSide::Sell) =>
+                {
+                    utc_date_from_unix_ms(event.confirmed_at_unix_ms)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let historical_usd_prices = if should_prefetch_historical_usd {
+        Some(
+            ensure_sol_usd_daily_prices_for_dates(&engine.data_root, historical_usd_price_dates)
+                .await,
+        )
+    } else {
+        None
+    };
     Ok(Json(json!({
         "ok": true,
         "mint": mint,
         "walletKeys": target.wallet_keys,
         "replayedEvents": resync_actions.len(),
         "appendedRpcEvents": appended_rpc_events,
+        "historicalUsdPrices": historical_usd_prices.as_ref().map(|outcome| json!({
+            "requestedDates": outcome.requested_dates.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "fetchedDates": outcome.fetched_dates.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "missingDates": outcome.missing_dates.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        })),
         "resyncedAtUnixMs": now_unix_ms(),
     })))
 }
@@ -3185,6 +3671,29 @@ async fn update_canonical_config(
             .await;
     });
     Ok(Json(build_launchdeck_settings_payload(&engine)))
+}
+
+async fn get_quick_trade_preferences(
+    State(state): State<AppState>,
+) -> Json<QuickTradePreferencesResponse> {
+    let engine = state.engine.read().await;
+    Json(quick_trade_preferences_response(
+        engine.quick_trade_preferences.clone(),
+        engine.quick_trade_preferences_saved,
+    ))
+}
+
+async fn update_quick_trade_preferences(
+    State(state): State<AppState>,
+    Json(patch): Json<QuickTradePreferencesPatch>,
+) -> Result<Json<QuickTradePreferencesResponse>, (StatusCode, String)> {
+    let mut engine = state.engine.write().await;
+    let next = apply_quick_trade_preferences_patch(engine.quick_trade_preferences.clone(), patch)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    engine.quick_trade_preferences = next.clone();
+    engine.quick_trade_preferences_saved = true;
+    persist_engine_state(&state.state_path, &engine)?;
+    Ok(Json(quick_trade_preferences_response(next, true)))
 }
 
 async fn record_launchdeck_confirmed_trades(
@@ -4113,7 +4622,7 @@ async fn prewarm_mint(
     let flight_mutex = shared_mint_warm_cache()
         .flight_lock(&flight_fingerprint)
         .await;
-    let _flight_guard = flight_mutex.lock().await;
+    let flight_guard = flight_mutex.lock().await;
 
     // Under the lock, re-check the cache: a concurrent prewarm that
     // was ahead of us may have populated the entry while we were
@@ -4121,28 +4630,59 @@ async fn prewarm_mint(
     let plan_result = if warm_enabled {
         if let Some(existing) = shared_mint_warm_cache().current(&flight_fingerprint).await {
             if let Some(cached_plan) = existing.plan.clone() {
-                Ok(crate::trade_dispatch::TradeDispatchPlan {
-                    adapter: crate::trade_dispatch::adapter_for_selector(&cached_plan.selector)
-                        .unwrap_or(crate::trade_dispatch::TradeAdapter::PumpNative),
-                    selector: cached_plan.selector,
-                    execution_backend: crate::rollout::preferred_execution_backend(),
-                    raw_address: preferred_input.clone(),
-                    resolved_input_kind: if existing
-                        .resolved_pair
-                        .as_deref()
-                        .is_some_and(|pair| pair == preferred_input)
-                    {
-                        crate::trade_dispatch::TradeInputKind::Pair
-                    } else {
-                        crate::trade_dispatch::TradeInputKind::Mint
-                    },
-                    resolved_mint: existing.mint.clone(),
-                    resolved_pinned_pool: cached_plan
-                        .resolved_pinned_pool
-                        .clone()
-                        .or_else(|| existing.resolved_pair.clone()),
-                    non_canonical: cached_plan.non_canonical,
-                })
+                match crate::trade_dispatch::guard_cached_route_for_request(
+                    &rpc_url,
+                    &runtime_request,
+                    &existing.mint,
+                    &cached_plan.selector,
+                )
+                .await
+                {
+                    crate::trade_dispatch::CachedRouteReuseDecision::UseCached => {
+                        Ok(crate::trade_dispatch::TradeDispatchPlan {
+                            adapter: crate::trade_dispatch::adapter_for_selector(
+                                &cached_plan.selector,
+                            )
+                            .unwrap_or(crate::trade_dispatch::TradeAdapter::PumpNative),
+                            selector: cached_plan.selector,
+                            execution_backend: crate::rollout::preferred_execution_backend(),
+                            raw_address: preferred_input.clone(),
+                            resolved_input_kind: if existing
+                                .resolved_pair
+                                .as_deref()
+                                .is_some_and(|pair| pair == preferred_input)
+                            {
+                                crate::trade_dispatch::TradeInputKind::Pair
+                            } else {
+                                crate::trade_dispatch::TradeInputKind::Mint
+                            },
+                            resolved_mint: existing.mint.clone(),
+                            resolved_pinned_pool: cached_plan
+                                .resolved_pinned_pool
+                                .clone()
+                                .or_else(|| existing.resolved_pair.clone()),
+                            non_canonical: cached_plan.non_canonical,
+                        })
+                    }
+                    crate::trade_dispatch::CachedRouteReuseDecision::ReplanMigrated => {
+                        let mut invalidation_request = runtime_request.clone();
+                        invalidation_request.warm_key = Some(existing.warm_key.clone());
+                        crate::trade_dispatch::invalidate_pre_migration_route_context(
+                            &rpc_url,
+                            &invalidation_request,
+                            &existing.mint,
+                        )
+                        .await;
+                        shared_mint_warm_cache()
+                            .invalidate_by_warm_key(&existing.warm_key)
+                            .await;
+                        shared_mint_warm_cache()
+                            .invalidate(&flight_fingerprint)
+                            .await;
+                        plan_trade_request_to_dispatch(&runtime_request).await
+                    }
+                    crate::trade_dispatch::CachedRouteReuseDecision::Reject(error) => Err(error),
+                }
             } else {
                 plan_trade_request_to_dispatch(&runtime_request).await
             }
@@ -4248,6 +4788,22 @@ async fn prewarm_mint(
         // Label is threaded through for future metrics wiring.
         let _ = venue_family_label(&entry.venue);
         shared_mint_warm_cache().insert(fingerprint, entry).await;
+        if flight_fingerprint
+            != build_fingerprint(
+                &resolved_mint,
+                resolved_pair.as_deref(),
+                &rpc_url,
+                &commitment,
+                &prewarm_route_policy,
+                allow_non_canonical,
+            )
+        {
+            let flight_entry =
+                prewarmed_from_plan(&flight_fingerprint, resolved_pair.clone(), plan);
+            shared_mint_warm_cache()
+                .insert(flight_fingerprint.clone(), flight_entry)
+                .await;
+        }
         if matches!(
             plan.selector.family,
             crate::trade_planner::TradeVenueFamily::MeteoraDbc
@@ -4352,6 +4908,11 @@ async fn prewarm_mint(
         "bonk": crate::rollout::family_warm_enabled_by_label("bonk"),
         "bags": crate::rollout::family_warm_enabled_by_label("bags"),
     });
+
+    drop(flight_guard);
+    shared_mint_warm_cache()
+        .finish_flight(&flight_fingerprint, &flight_mutex)
+        .await;
 
     Ok(Json(PrewarmResponse {
         ok: plan_for_cache.is_some(),
@@ -7661,25 +8222,16 @@ struct RpcResyncCandidate {
 }
 
 #[derive(Debug, Clone)]
-struct HeliusResyncConfig {
-    base_url: String,
-    api_key: String,
-}
-
-#[derive(Debug, Clone)]
 struct KnownWalletIdentity {
     wallet_key: String,
     public_key: String,
 }
 
-fn configured_helius_resync_config() -> Option<HeliusResyncConfig> {
+fn configured_helius_resync_api_key() -> Option<String> {
     if let Ok(value) = std::env::var("HELIUS_API_KEY") {
         let api_key = value.trim();
         if !api_key.is_empty() {
-            return Some(HeliusResyncConfig {
-                base_url: "https://api-mainnet.helius-rpc.com".to_string(),
-                api_key: api_key.to_string(),
-            });
+            return Some(api_key.to_string());
         }
     }
 
@@ -7687,12 +8239,13 @@ fn configured_helius_resync_config() -> Option<HeliusResyncConfig> {
     if !rpc_url.to_ascii_lowercase().contains("helius") {
         return None;
     }
-    let api_key = extract_query_param(&rpc_url, "api-key")
-        .or_else(|| extract_query_param(&rpc_url, "api_key"))?;
-    Some(HeliusResyncConfig {
-        base_url: "https://api-mainnet.helius-rpc.com".to_string(),
-        api_key,
-    })
+    extract_query_param(&rpc_url, "api-key").or_else(|| extract_query_param(&rpc_url, "api_key"))
+}
+
+fn configured_resync_rpc_url() -> String {
+    configured_helius_resync_api_key()
+        .map(|api_key| format!("https://mainnet.helius-rpc.com/?api-key={api_key}"))
+        .unwrap_or_else(configured_rpc_url)
 }
 
 fn extract_query_param(url: &str, name: &str) -> Option<String> {
@@ -7987,182 +8540,6 @@ fn maybe_trade_token_delta_from_meta(
     )))
 }
 
-fn helius_raw_token_amount(change: &Value, owner: &str, mint: &str) -> Result<i128, String> {
-    let raw = change
-        .get("rawTokenAmount")
-        .and_then(|value| value.get("tokenAmount"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            format!("Helius token balance change for wallet {owner} mint {mint} had no raw amount.")
-        })?;
-    raw.trim().parse::<i128>().map_err(|error| {
-        format!("Helius token balance change for wallet {owner} mint {mint} had invalid raw amount: {error}")
-    })
-}
-
-fn helius_token_decimals(change: &Value) -> Option<u8> {
-    change
-        .get("rawTokenAmount")
-        .and_then(|value| value.get("decimals"))
-        .and_then(Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
-}
-
-fn helius_token_delta_from_account_data(
-    account_data: &[Value],
-    owner: &str,
-    mint: &str,
-) -> Result<Option<(i128, Option<u8>)>, String> {
-    let mut total = 0i128;
-    let mut decimals = None;
-    let mut found = false;
-    for account in account_data {
-        let Some(changes) = account.get("tokenBalanceChanges").and_then(Value::as_array) else {
-            continue;
-        };
-        for change in changes {
-            let matches_owner = change
-                .get("userAccount")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == owner);
-            let matches_mint = change
-                .get("mint")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == mint);
-            if !matches_owner || !matches_mint {
-                continue;
-            }
-            found = true;
-            total = total.saturating_add(helius_raw_token_amount(change, owner, mint)?);
-            if decimals.is_none() {
-                decimals = helius_token_decimals(change);
-            }
-        }
-    }
-    Ok(found.then_some((total, decimals)))
-}
-
-fn helius_native_delta_from_account_data(account_data: &[Value], owner: &str) -> i64 {
-    account_data
-        .iter()
-        .find(|account| {
-            account
-                .get("account")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == owner)
-        })
-        .and_then(|account| account.get("nativeBalanceChange"))
-        .and_then(|value| match value {
-            Value::Number(number) => number
-                .as_i64()
-                .or_else(|| number.as_u64().and_then(|raw| i64::try_from(raw).ok())),
-            Value::String(raw) => raw.trim().parse::<i64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
-fn helius_explicit_fees(
-    transaction: &Value,
-    account_data: &[Value],
-    wallet_public_key: &str,
-    tracked_mint: &str,
-) -> ExplicitFeeBreakdown {
-    let fee_payer = transaction
-        .get("feePayer")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    ExplicitFeeBreakdown {
-        network_fee_lamports: if fee_payer == wallet_public_key {
-            transaction
-                .get("fee")
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-        } else {
-            0
-        },
-        tip_lamports: helius_tip_lamports(transaction, wallet_public_key),
-        rent_delta_lamports: helius_wallet_owned_token_account_rent_delta_lamports(
-            account_data,
-            wallet_public_key,
-            tracked_mint,
-        ),
-        ..ExplicitFeeBreakdown::default()
-    }
-}
-
-fn helius_tip_lamports(transaction: &Value, wallet_public_key: &str) -> u64 {
-    let Some(transfers) = transaction.get("nativeTransfers").and_then(Value::as_array) else {
-        return 0;
-    };
-    transfers.iter().fold(0u64, |sum, transfer| {
-        let from_wallet = transfer
-            .get("fromUserAccount")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value == wallet_public_key);
-        let to_tip_account = transfer
-            .get("toUserAccount")
-            .and_then(Value::as_str)
-            .is_some_and(|value| recognized_tip_accounts().contains(value));
-        if from_wallet && to_tip_account {
-            sum.saturating_add(value_as_u64_loose(transfer.get("amount")).unwrap_or_default())
-        } else {
-            sum
-        }
-    })
-}
-
-fn helius_wallet_owned_token_account_rent_delta_lamports(
-    account_data: &[Value],
-    owner: &str,
-    mint: &str,
-) -> i64 {
-    let mut total = 0i128;
-    for account in account_data {
-        let Some(account_key) = account.get("account").and_then(Value::as_str) else {
-            continue;
-        };
-        if account_key == owner {
-            continue;
-        }
-        let Some(native_delta) = account
-            .get("nativeBalanceChange")
-            .and_then(|value| match value {
-                Value::Number(number) => number
-                    .as_i64()
-                    .or_else(|| number.as_u64().and_then(|raw| i64::try_from(raw).ok())),
-                Value::String(raw) => raw.trim().parse::<i64>().ok(),
-                _ => None,
-            })
-        else {
-            continue;
-        };
-        let owns_relevant_mint = account
-            .get("tokenBalanceChanges")
-            .and_then(Value::as_array)
-            .is_some_and(|changes| {
-                changes.iter().any(|change| {
-                    change
-                        .get("userAccount")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value == owner)
-                        && change
-                            .get("mint")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| value == mint || value == USD1_MINT)
-                        && change
-                            .get("tokenAccount")
-                            .and_then(Value::as_str)
-                            .map_or(true, |value| value == account_key)
-                })
-            });
-        if owns_relevant_mint {
-            total = total.saturating_add(i128::from(native_delta));
-        }
-    }
-    total.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
-}
-
 fn push_selected_token_only_movement_action(
     actions: &mut Vec<RpcResyncLedgerAction>,
     movement: TokenOnlyMovement,
@@ -8244,64 +8621,6 @@ fn transfer_incomplete_signature(
         wallet_key.trim(),
         counterparty_wallet_key.trim()
     )
-}
-
-fn helius_candidate_from_transaction(
-    transaction: &Value,
-    wallet_key: &str,
-    wallet_public_key: &str,
-    mint: &str,
-) -> Result<Option<RpcResyncCandidate>, String> {
-    if transaction
-        .get("transactionError")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Ok(None);
-    }
-    let signature = transaction
-        .get("signature")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Helius transaction did not include a signature.".to_string())?;
-    let account_data = transaction
-        .get("accountData")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let Some((token_delta_raw, token_decimals)) =
-        helius_token_delta_from_account_data(&account_data, wallet_public_key, mint)?
-    else {
-        return Ok(None);
-    };
-    if token_delta_raw == 0 {
-        return Ok(None);
-    }
-    let usd1_delta_raw =
-        helius_token_delta_from_account_data(&account_data, wallet_public_key, USD1_MINT)?
-            .map(|(delta, _)| delta)
-            .unwrap_or(0);
-    Ok(Some(RpcResyncCandidate {
-        signature: signature.to_string(),
-        wallet_key: wallet_key.to_string(),
-        wallet_public_key: wallet_public_key.to_string(),
-        snapshot: ConfirmedTradeLedgerSnapshot {
-            lamport_delta: helius_native_delta_from_account_data(&account_data, wallet_public_key),
-            usd1_delta_raw,
-            token_delta_raw,
-            token_decimals,
-            slot: transaction.get("slot").and_then(Value::as_u64),
-            block_time_unix_ms: transaction
-                .get("timestamp")
-                .and_then(Value::as_i64)
-                .and_then(|value| u64::try_from(value).ok())
-                .map(|value| value.saturating_mul(1_000)),
-            explicit_fees: helius_explicit_fees(
-                transaction,
-                &account_data,
-                wallet_public_key,
-                mint,
-            ),
-        },
-    }))
 }
 
 fn value_as_u64_loose(value: Option<&Value>) -> Option<u64> {
@@ -9481,6 +9800,8 @@ async fn fetch_current_resync_balance_with_context(
     rpc_url: String,
     owner: String,
     mint: String,
+    ata: String,
+    token_program: Pubkey,
     min_context_slot: Option<u64>,
 ) -> Result<(u64, u64), String> {
     let mut config = serde_json::Map::new();
@@ -9489,13 +9810,33 @@ async fn fetch_current_resync_balance_with_context(
     if let Some(slot) = min_context_slot {
         config.insert("minContextSlot".to_string(), json!(slot));
     }
-    let result = crate::rpc_client::rpc_request_with_client(
+    let result = match crate::rpc_client::rpc_request_with_client(
         &client,
         &rpc_url,
         "getTokenAccountsByOwner",
-        json!([owner, { "mint": mint }, Value::Object(config)]),
+        json!([owner, { "programId": token_program.to_string() }, Value::Object(config)]),
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(error) if token_program != spl_token::id() => {
+            eprintln!(
+                "[execution-engine][pnl-resync] token-account owner scan failed for token-program={} owner={} mint={}: {}; falling back to derived ATA balance.",
+                token_program, owner, mint, error
+            );
+            let account_data =
+                fetch_multiple_account_data_with_client(&client, &rpc_url, &[ata], "confirmed")
+                    .await?;
+            let amount_raw = account_data
+                .first()
+                .and_then(Option::as_deref)
+                .map(parse_token_account_raw_balance)
+                .transpose()?
+                .unwrap_or(0);
+            return Ok((amount_raw, min_context_slot.unwrap_or(0)));
+        }
+        Err(error) => return Err(error),
+    };
     let context_slot = result
         .get("context")
         .and_then(|value| value.get("slot"))
@@ -9509,6 +9850,16 @@ async fn fetch_current_resync_balance_with_context(
 
     let mut total_raw = 0u128;
     for entry in accounts {
+        let account_mint = entry
+            .get("account")
+            .and_then(|value| value.get("data"))
+            .and_then(|value| value.get("parsed"))
+            .and_then(|value| value.get("info"))
+            .and_then(|value| value.get("mint"))
+            .and_then(Value::as_str);
+        if account_mint != Some(mint.as_str()) {
+            continue;
+        }
         let token_amount = entry
             .get("account")
             .and_then(|value| value.get("data"))
@@ -9538,7 +9889,11 @@ async fn fetch_current_resync_balances(
     min_context_slot: Option<u64>,
 ) -> Result<ResyncBalanceSnapshot, (StatusCode, String)> {
     let client = extension_wallet_rpc_client().map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
-    let rpc_url = configured_rpc_url();
+    let rpc_url = configured_resync_rpc_url();
+    let (_decimals, token_program) =
+        fetch_mint_metadata_with_client(&client, &rpc_url, mint, "confirmed")
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
     let mut snapshot = ResyncBalanceSnapshot::default();
     for wallet_key in wallet_keys {
         if !public_keys_by_wallet_key.contains_key(wallet_key) {
@@ -9568,15 +9923,36 @@ async fn fetch_current_resync_balances(
             let Some((wallet_key, public_key)) = pending.next() else {
                 break;
             };
+            let owner_pubkey = Pubkey::from_str(&public_key).map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid wallet public key {public_key}: {error}"),
+                )
+            })?;
+            let mint_pubkey = Pubkey::from_str(mint).map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid mint {mint}: {error}"),
+                )
+            })?;
+            let ata = get_associated_token_address_with_program_id(
+                &owner_pubkey,
+                &mint_pubkey,
+                &token_program,
+            )
+            .to_string();
             let mint = mint.to_string();
             let client = client.clone();
             let rpc_url = rpc_url.clone();
+            let token_program = token_program;
             tasks.spawn(async move {
                 let (amount_raw, context_slot) = fetch_current_resync_balance_with_context(
                     client,
                     rpc_url,
                     public_key,
                     mint,
+                    ata,
+                    token_program,
                     min_context_slot,
                 )
                 .await
@@ -9829,7 +10205,7 @@ async fn fetch_current_confirmed_slot() -> Result<u64, String> {
     let client = extension_wallet_rpc_client()?;
     let response = crate::rpc_client::rpc_request_with_client(
         &client,
-        &configured_rpc_url(),
+        &configured_resync_rpc_url(),
         "getSlot",
         json!([{ "commitment": "confirmed" }]),
     )
@@ -9839,53 +10215,12 @@ async fn fetch_current_confirmed_slot() -> Result<u64, String> {
         .ok_or_else(|| "RPC getSlot returned an invalid payload.".to_string())
 }
 
-async fn fetch_resync_candidates_for_wallet_mint(
-    wallet_key: &str,
-    wallet_public_key: &str,
-    mint: &str,
-    reset_baseline_unix_ms: u64,
-    reset_baseline_slot: Option<u64>,
-    known_wallets: &[KnownWalletIdentity],
-    helius_config: Option<&HeliusResyncConfig>,
-) -> Result<Vec<RpcResyncCandidate>, (StatusCode, String)> {
-    if let Some(config) = helius_config {
-        match fetch_helius_resync_candidates_for_wallet_mint(
-            config,
-            wallet_public_key,
-            mint,
-            reset_baseline_unix_ms,
-            reset_baseline_slot,
-            known_wallets,
-        )
-        .await
-        {
-            Ok(candidates) => return Ok(candidates),
-            Err((status, error)) => {
-                eprintln!(
-                    "[execution-engine][pnl-resync] Helius history failed for wallet={} mint={} status={} err={}; falling back to token-account RPC.",
-                    wallet_public_key, mint, status, error
-                );
-            }
-        }
-    }
-    fetch_rpc_resync_candidates_for_wallet_mint(
-        wallet_key,
-        wallet_public_key,
-        mint,
-        reset_baseline_unix_ms,
-        reset_baseline_slot,
-        known_wallets,
-    )
-    .await
-}
-
 async fn fetch_resync_candidates_for_wallets(
     wallet_keys: &[String],
     public_keys_by_wallet_key: &HashMap<String, String>,
     mint: &str,
     reset_baselines_by_wallet: &HashMap<String, (u64, Option<u64>)>,
     known_wallets: &[KnownWalletIdentity],
-    helius_config: Option<&HeliusResyncConfig>,
 ) -> Result<Vec<RpcResyncCandidate>, (StatusCode, String)> {
     let mut pending = wallet_keys
         .iter()
@@ -9917,16 +10252,14 @@ async fn fetch_resync_candidates_for_wallets(
             };
             let mint = mint.to_string();
             let known_wallets = known_wallets.to_vec();
-            let helius_config = helius_config.cloned();
             tasks.spawn(async move {
-                fetch_resync_candidates_for_wallet_mint(
+                fetch_token_account_resync_candidates_for_wallet_mint(
                     &wallet_key,
                     &wallet_public_key,
                     &mint,
                     reset_baseline_unix_ms,
                     reset_baseline_slot,
                     &known_wallets,
-                    helius_config.as_ref(),
                 )
                 .await
             });
@@ -9946,161 +10279,12 @@ async fn fetch_resync_candidates_for_wallets(
     Ok(candidates)
 }
 
-async fn fetch_helius_resync_candidates_for_wallet_mint(
-    config: &HeliusResyncConfig,
-    wallet_public_key: &str,
-    mint: &str,
-    reset_baseline_unix_ms: u64,
-    reset_baseline_slot: Option<u64>,
-    known_wallets: &[KnownWalletIdentity],
-) -> Result<Vec<RpcResyncCandidate>, (StatusCode, String)> {
-    let client = extension_wallet_rpc_client().map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
-    let endpoint = format!(
-        "{}/v0/addresses/{}/transactions",
-        config.base_url.trim_end_matches('/'),
-        wallet_public_key
-    );
-    let deadline = Instant::now() + RPC_RESYNC_OVERALL_TIMEOUT;
-    let mut before: Option<String> = None;
-    let mut candidates = Vec::new();
-    let mut pages_processed = 0usize;
-    let mut transactions_examined = 0usize;
-
-    loop {
-        if Instant::now() >= deadline {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "Helius enhanced transaction history timed out before reaching the resync boundary."
-                    .to_string(),
-            ));
-        }
-        if pages_processed >= RPC_RESYNC_MAX_PAGES
-            || transactions_examined >= RPC_RESYNC_MAX_SIGNATURES
-        {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "Helius enhanced transaction history hit the resync scan limit before reaching the resync boundary."
-                    .to_string(),
-            ));
-        }
-        pages_processed += 1;
-
-        let mut query = vec![
-            ("api-key".to_string(), config.api_key.clone()),
-            ("commitment".to_string(), "confirmed".to_string()),
-            ("token-accounts".to_string(), "balanceChanged".to_string()),
-            ("limit".to_string(), HELIUS_RESYNC_PAGE_SIZE.to_string()),
-        ];
-        if let Some(slot) = reset_baseline_slot {
-            query.push(("gte-slot".to_string(), slot.to_string()));
-        } else if reset_baseline_unix_ms > 0 {
-            query.push((
-                "gte-time".to_string(),
-                reset_baseline_unix_ms.saturating_div(1_000).to_string(),
-            ));
-        }
-        if let Some(before_signature) = before.clone() {
-            query.push(("before-signature".to_string(), before_signature));
-        }
-
-        let response = client
-            .get(&endpoint)
-            .query(&query)
-            .send()
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Helius enhanced transaction request failed: {error}"),
-                )
-            })?;
-        if !response.status().is_success() {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "Helius enhanced transaction request returned status {}.",
-                    response.status()
-                ),
-            ));
-        }
-        let transactions = response.json::<Vec<Value>>().await.map_err(|error| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Helius enhanced transaction response was invalid: {error}"),
-            )
-        })?;
-        if transactions.is_empty() {
-            break;
-        }
-
-        let mut page_has_candidate = false;
-        for transaction in &transactions {
-            if Instant::now() >= deadline || transactions_examined >= RPC_RESYNC_MAX_SIGNATURES {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    "Helius enhanced transaction history stopped mid-page before reaching the resync boundary."
-                        .to_string(),
-                ));
-            }
-            transactions_examined += 1;
-            let list_slot = transaction.get("slot").and_then(Value::as_u64);
-            let list_block_time_unix_ms = transaction
-                .get("timestamp")
-                .and_then(Value::as_i64)
-                .filter(|value| *value > 0)
-                .map(|value| (value as u64).saturating_mul(1_000));
-            if !crate::trade_ledger::trade_event_is_after_reset_baseline(
-                list_block_time_unix_ms.unwrap_or(0),
-                list_slot,
-                reset_baseline_unix_ms,
-                reset_baseline_slot,
-            ) {
-                continue;
-            }
-            page_has_candidate = true;
-            for identity in known_wallets {
-                let Some(candidate) = helius_candidate_from_transaction(
-                    transaction,
-                    &identity.wallet_key,
-                    &identity.public_key,
-                    mint,
-                )
-                .map_err(|error| (StatusCode::BAD_GATEWAY, error))?
-                else {
-                    continue;
-                };
-                candidates.push(candidate);
-            }
-        }
-
-        if reset_baseline_unix_ms > 0 && !page_has_candidate {
-            break;
-        }
-        if transactions.len() < HELIUS_RESYNC_PAGE_SIZE {
-            break;
-        }
-        before = transactions
-            .last()
-            .and_then(|item| item.get("signature"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if before.is_none() {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "Helius enhanced transaction history page did not include a pagination signature."
-                    .to_string(),
-            ));
-        }
-    }
-
-    Ok(candidates)
-}
-
 async fn fetch_rpc_token_accounts_for_owner_mint(
     client: &Client,
     rpc_url: &str,
     owner: &str,
     mint: &str,
+    token_program: &Pubkey,
 ) -> Result<Vec<String>, String> {
     let response = crate::rpc_client::rpc_request_with_client(
         client,
@@ -10108,7 +10292,7 @@ async fn fetch_rpc_token_accounts_for_owner_mint(
         "getTokenAccountsByOwner",
         json!([
             owner,
-            { "mint": mint },
+            { "programId": token_program.to_string() },
             { "encoding": "jsonParsed", "commitment": "confirmed" }
         ]),
     )
@@ -10117,15 +10301,29 @@ async fn fetch_rpc_token_accounts_for_owner_mint(
         .get("value")
         .and_then(Value::as_array)
         .ok_or_else(|| "RPC getTokenAccountsByOwner returned invalid account data.".to_string())?;
-    Ok(accounts
+    Ok(token_account_pubkeys_for_mint(accounts, mint))
+}
+
+fn token_account_pubkeys_for_mint(accounts: &[Value], mint: &str) -> Vec<String> {
+    accounts
         .iter()
         .filter_map(|entry| {
+            let account_mint = entry
+                .get("account")
+                .and_then(|value| value.get("data"))
+                .and_then(|value| value.get("parsed"))
+                .and_then(|value| value.get("info"))
+                .and_then(|value| value.get("mint"))
+                .and_then(Value::as_str);
+            if account_mint != Some(mint) {
+                return None;
+            }
             entry
                 .get("pubkey")
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .collect())
+        .collect()
 }
 
 async fn fetch_rpc_resync_candidates_for_signature(
@@ -10136,7 +10334,7 @@ async fn fetch_rpc_resync_candidates_for_signature(
 ) -> Result<Vec<RpcResyncCandidate>, String> {
     let result = crate::rpc_client::rpc_request_with_client(
         client,
-        &configured_rpc_url(),
+        &configured_resync_rpc_url(),
         "getTransaction",
         json!([
             tx_signature,
@@ -10251,8 +10449,8 @@ async fn fetch_rpc_resync_candidates_for_signature(
     Ok(candidates)
 }
 
-async fn fetch_rpc_resync_candidates_for_wallet_mint(
-    _wallet_key: &str,
+async fn fetch_token_account_resync_candidates_for_wallet_mint(
+    wallet_key: &str,
     wallet_public_key: &str,
     mint: &str,
     reset_baseline_unix_ms: u64,
@@ -10260,7 +10458,7 @@ async fn fetch_rpc_resync_candidates_for_wallet_mint(
     known_wallets: &[KnownWalletIdentity],
 ) -> Result<Vec<RpcResyncCandidate>, (StatusCode, String)> {
     let client = extension_wallet_rpc_client().map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
-    let rpc_url = configured_rpc_url();
+    let rpc_url = configured_resync_rpc_url();
     let (_decimals, token_program) =
         fetch_mint_metadata_with_client(&client, &rpc_url, mint, "confirmed")
             .await
@@ -10280,13 +10478,26 @@ async fn fetch_rpc_resync_candidates_for_wallet_mint(
     let ata =
         get_associated_token_address_with_program_id(&owner_pubkey, &mint_pubkey, &token_program)
             .to_string();
-    let mut token_accounts =
-        fetch_rpc_token_accounts_for_owner_mint(&client, &rpc_url, wallet_public_key, mint)
-            .await
-            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    let mut token_accounts = fetch_rpc_token_accounts_for_owner_mint(
+        &client,
+        &rpc_url,
+        wallet_public_key,
+        mint,
+        &token_program,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
     token_accounts.push(ata);
     token_accounts.sort();
     token_accounts.dedup();
+    if token_accounts.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Token-account resync found no token accounts for wallet={wallet_key} public_key={wallet_public_key} mint={mint} token_program={token_program}."
+            ),
+        ));
+    }
 
     let deadline = Instant::now() + RPC_RESYNC_OVERALL_TIMEOUT;
     let mut candidates = Vec::new();
@@ -10294,7 +10505,14 @@ async fn fetch_rpc_resync_candidates_for_wallet_mint(
     let mut pages_processed = 0usize;
     let mut signatures_examined = 0usize;
 
+    let token_account_count = token_accounts.len();
+    eprintln!(
+        "[execution-engine][pnl-resync] token-account scan start wallet_key={} wallet={} mint={} token_program={} token_accounts={}",
+        wallet_key, wallet_public_key, mint, token_program, token_account_count
+    );
+
     for token_account in token_accounts {
+        let account_signature_start = signatures_examined;
         let mut before: Option<String> = None;
         loop {
             if Instant::now() >= deadline {
@@ -10410,8 +10628,26 @@ async fn fetch_rpc_resync_candidates_for_wallet_mint(
                 ));
             }
         }
+        eprintln!(
+            "[execution-engine][pnl-resync] token-account scanned wallet_key={} wallet={} mint={} token_account={} signatures_examined={}",
+            wallet_key,
+            wallet_public_key,
+            mint,
+            token_account,
+            signatures_examined.saturating_sub(account_signature_start)
+        );
     }
 
+    eprintln!(
+        "[execution-engine][pnl-resync] token-account scan complete wallet_key={} wallet={} mint={} token_program={} token_accounts={} signatures_examined={} candidates={}",
+        wallet_key,
+        wallet_public_key,
+        mint,
+        token_program,
+        token_account_count,
+        signatures_examined,
+        candidates.len()
+    );
     Ok(candidates)
 }
 
@@ -10495,6 +10731,262 @@ fn format_decimal_units(amount: u64, decimals: u8) -> String {
 
 fn trade_ledger_lookup_key(wallet_key: &str, mint: &str) -> String {
     format!("{}::{}", wallet_key.trim(), mint.trim())
+}
+
+fn selected_trade_events_after_reset(
+    paths: &TradeLedgerPaths,
+    wallet_keys: &[String],
+    mint: &str,
+    trade_ledger: &HashMap<String, crate::trade_ledger::TradeLedgerEntry>,
+) -> Vec<crate::trade_ledger::ConfirmedTradeEvent> {
+    let selected_wallet_keys = wallet_keys.iter().cloned().collect::<HashSet<_>>();
+    read_confirmed_trade_events(paths)
+        .into_iter()
+        .filter(|event| event.mint == mint && selected_wallet_keys.contains(&event.wallet_key))
+        .filter(|event| {
+            let (reset_baseline_unix_ms, reset_baseline_slot) = trade_ledger
+                .get(&trade_ledger_lookup_key(&event.wallet_key, mint))
+                .map(|entry| (entry.reset_baseline_unix_ms, entry.reset_baseline_slot))
+                .unwrap_or((0, None));
+            crate::trade_ledger::trade_event_is_after_reset_baseline(
+                event.confirmed_at_unix_ms,
+                event.slot,
+                reset_baseline_unix_ms,
+                reset_baseline_slot,
+            )
+        })
+        .collect()
+}
+
+fn historical_usd_dates_from_events(
+    events: &[crate::trade_ledger::ConfirmedTradeEvent],
+) -> BTreeSet<chrono::NaiveDate> {
+    events
+        .iter()
+        .filter(|event| matches!(event.side, TradeSide::Buy | TradeSide::Sell))
+        .filter_map(|event| utc_date_from_unix_ms(event.confirmed_at_unix_ms))
+        .collect()
+}
+
+fn build_historical_usd_pnl(
+    data_root: &str,
+    paths: &TradeLedgerPaths,
+    wallet_keys: &[String],
+    mint: &str,
+    trade_ledger: &HashMap<String, crate::trade_ledger::TradeLedgerEntry>,
+) -> Option<HistoricalUsdPnl> {
+    let mut events = selected_trade_events_after_reset(paths, wallet_keys, mint, trade_ledger);
+    events.sort_by_key(|event| (event.confirmed_at_unix_ms, event.slot.unwrap_or(u64::MAX)));
+    if events.is_empty() {
+        return None;
+    }
+    let dates = historical_usd_dates_from_events(&events);
+    if dates.is_empty() {
+        return None;
+    }
+    let price_path = sol_usd_daily_price_store_path(data_root);
+    let prices = stored_prices_for_dates(&price_path, &dates);
+    let mut pnl = HistoricalUsdPnl {
+        required_dates: dates.clone(),
+        missing_dates: dates
+            .iter()
+            .filter(|date| !prices.contains_key(date))
+            .copied()
+            .collect(),
+        ..HistoricalUsdPnl::default()
+    };
+    if !pnl.missing_dates.is_empty() {
+        return Some(pnl);
+    }
+    let mut lots: Vec<HistoricalUsdLot> = Vec::new();
+    for event in &events {
+        let Some(date) = utc_date_from_unix_ms(event.confirmed_at_unix_ms) else {
+            continue;
+        };
+        let Some(price) = prices.get(&date).map(|entry| entry.close) else {
+            continue;
+        };
+        let trade_value_sol = event.trade_value_lamports as f64 / 1_000_000_000.0;
+        let trade_value_usd = trade_value_sol * price;
+        let explicit_fee_usd =
+            (event.explicit_fees.total_lamports() as f64 / 1_000_000_000.0) * price;
+        pnl.explicit_fee_total_usd += explicit_fee_usd;
+        match event.side {
+            TradeSide::Buy => {
+                pnl.tracked_bought_usd += trade_value_usd;
+                let amount_raw = if event.token_delta_raw > 0 {
+                    u64::try_from(event.token_delta_raw).unwrap_or(u64::MAX)
+                } else {
+                    0
+                };
+                if amount_raw > 0 {
+                    lots.push(HistoricalUsdLot {
+                        remaining_amount_raw: amount_raw,
+                        remaining_cost_basis_usd: trade_value_usd,
+                    });
+                }
+            }
+            TradeSide::Sell => {
+                pnl.tracked_sold_usd += trade_value_usd;
+                let mut remaining_to_match = if event.token_delta_raw < 0 {
+                    u64::try_from(-event.token_delta_raw).unwrap_or(u64::MAX)
+                } else {
+                    0
+                };
+                let mut matched_cost_basis = 0.0f64;
+                for lot in &mut lots {
+                    if remaining_to_match == 0 || lot.remaining_amount_raw == 0 {
+                        continue;
+                    }
+                    let matched_amount = remaining_to_match.min(lot.remaining_amount_raw);
+                    let matched_cost = proportional_f64(
+                        lot.remaining_cost_basis_usd,
+                        matched_amount,
+                        lot.remaining_amount_raw,
+                    );
+                    lot.remaining_amount_raw =
+                        lot.remaining_amount_raw.saturating_sub(matched_amount);
+                    lot.remaining_cost_basis_usd -= matched_cost;
+                    matched_cost_basis += matched_cost;
+                    remaining_to_match = remaining_to_match.saturating_sub(matched_amount);
+                }
+                lots.retain(|lot| lot.remaining_amount_raw > 0);
+                pnl.realized_pnl_usd += trade_value_usd - matched_cost_basis;
+            }
+        }
+    }
+    pnl.remaining_cost_basis_usd = lots
+        .iter()
+        .map(|lot| lot.remaining_cost_basis_usd)
+        .sum::<f64>();
+    Some(pnl)
+}
+
+fn proportional_f64(total: f64, numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    total * (numerator as f64 / denominator as f64)
+}
+
+async fn get_current_sol_usd_price_for_wallet_status() -> Option<PnlCardSolUsdCache> {
+    if let Some(cached) = read_cached_pnl_card_sol_usd() {
+        return Some(cached);
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .ok()?;
+    let (price, source) = fetch_pnl_card_sol_usd_price(&client).await.ok()?;
+    let fetched_at_unix_ms = now_unix_ms();
+    let cached = PnlCardSolUsdCache {
+        fetched_at_unix_ms,
+        price,
+        source,
+    };
+    write_cached_pnl_card_sol_usd(cached.clone());
+    Some(cached)
+}
+
+#[cfg(test)]
+mod historical_usd_tests {
+    use super::*;
+    use crate::trade_ledger::{ConfirmedTradeEvent, ExplicitFeeBreakdown};
+
+    fn test_data_root(label: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("tt-historical-usd-{label}-{}", now_unix_ms()))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn test_event(
+        signature: &str,
+        side: TradeSide,
+        confirmed_at_unix_ms: u64,
+        token_delta_raw: i128,
+        trade_value_lamports: u64,
+    ) -> ConfirmedTradeEvent {
+        ConfirmedTradeEvent {
+            schema_version: crate::trade_ledger::trade_ledger_schema_version(),
+            signature: signature.to_string(),
+            slot: Some(confirmed_at_unix_ms / 1_000),
+            confirmed_at_unix_ms,
+            wallet_key: "wallet-a".to_string(),
+            wallet_public_key: "wallet-a-pubkey".to_string(),
+            mint: "mint-a".to_string(),
+            side,
+            platform_tag: PlatformTag::Unknown,
+            provenance: EventProvenance::RpcResync,
+            settlement_asset: Some(TradeSettlementAsset::Sol),
+            token_delta_raw,
+            token_decimals: Some(6),
+            trade_value_lamports,
+            explicit_fees: ExplicitFeeBreakdown::default(),
+            client_request_id: None,
+            batch_id: None,
+        }
+    }
+
+    fn utc_midnight_ms(year: i32, month: u32, day: u32) -> u64 {
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .expect("valid date")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid time")
+            .and_utc()
+            .timestamp_millis() as u64
+    }
+
+    #[test]
+    fn historical_usd_pnl_uses_daily_prices_and_fifo_cost_basis() {
+        let data_root = test_data_root("fifo");
+        let paths = trade_ledger_paths(&data_root);
+        let price_path = sol_usd_daily_price_store_path(&data_root);
+        fs::create_dir_all(price_path.parent().expect("price parent")).expect("create price dir");
+        fs::write(
+            &price_path,
+            serde_json::json!({
+                "2026-02-14": { "close": 100.0, "source": "test", "fetchedAtUnixMs": 1 },
+                "2026-02-15": { "close": 200.0, "source": "test", "fetchedAtUnixMs": 1 }
+            })
+            .to_string(),
+        )
+        .expect("write price store");
+
+        let buy = test_event(
+            "sig-buy",
+            TradeSide::Buy,
+            utc_midnight_ms(2026, 2, 14),
+            100,
+            1_000_000_000,
+        );
+        let sell = test_event(
+            "sig-sell",
+            TradeSide::Sell,
+            utc_midnight_ms(2026, 2, 15),
+            -40,
+            800_000_000,
+        );
+        append_confirmed_trade_event(&paths, &buy).expect("append buy");
+        append_confirmed_trade_event(&paths, &sell).expect("append sell");
+
+        let result = build_historical_usd_pnl(
+            &data_root,
+            &paths,
+            &["wallet-a".to_string()],
+            "mint-a",
+            &HashMap::new(),
+        )
+        .expect("historical pnl");
+
+        assert!(result.missing_dates.is_empty());
+        assert_eq!(result.tracked_bought_usd, 100.0);
+        assert_eq!(result.tracked_sold_usd, 160.0);
+        assert_eq!(result.realized_pnl_usd, 120.0);
+        assert_eq!(result.remaining_cost_basis_usd, 60.0);
+
+        let _ = fs::remove_dir_all(PathBuf::from(data_root));
+    }
 }
 
 fn wallet_position_drifts_from_onchain(
@@ -12109,6 +12601,31 @@ fn parse_mint_decimals(data: &[u8]) -> Result<u8, String> {
     Ok(data[MINT_DECIMALS_OFFSET])
 }
 
+async fn resolve_pnl_history_mint(input: &str) -> Result<String, (StatusCode, String)> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(String::new());
+    }
+    match crate::trade_dispatch::classify_route_input(&configured_rpc_url(), input, "confirmed")
+        .await
+    {
+        Ok(Some(descriptor)) => Ok(descriptor.resolved_mint),
+        Ok(None) => Ok(input.to_string()),
+        Err(error) => Err((StatusCode::BAD_REQUEST, error)),
+    }
+}
+
+fn validate_supported_mint_token_program(mint: &str, token_program: &Pubkey) -> Result<(), String> {
+    let token_2022 = token_2022_program_id()?;
+    if *token_program == spl_token::id() || *token_program == token_2022 {
+        return Ok(());
+    }
+    Err(format!(
+        "Mint account {mint} is owned by unsupported program {token_program}; expected SPL Token {} or Token-2022 {token_2022}. The selected address is not a supported token mint.",
+        spl_token::id()
+    ))
+}
+
 async fn fetch_mint_metadata_with_client(
     _client: &Client,
     rpc_url: &str,
@@ -12119,6 +12636,7 @@ async fn fetch_mint_metadata_with_client(
         crate::rpc_client::fetch_account_owner_and_data(rpc_url, mint, commitment).await?;
     let (token_program, mint_data) =
         owner_and_data.ok_or_else(|| format!("Mint account {mint} was not found."))?;
+    validate_supported_mint_token_program(mint, &token_program)?;
     let decimals = parse_mint_decimals(&mint_data)
         .map_err(|error| format!("Mint account {mint} had invalid decimals data: {error}"))?;
     Ok((decimals, token_program))
@@ -12709,21 +13227,63 @@ fn wallet_status_quote_policy(
 async fn wallet_status_selector_from_warm_key(
     request: &ExtensionWalletStatusRequest,
     mint: &str,
-) -> Option<LifecycleAndCanonicalMarket> {
+    policy: &RuntimeExecutionPolicy,
+) -> Result<Option<LifecycleAndCanonicalMarket>, String> {
     if wallet_status_has_quote_policy_context(request) {
-        return None;
+        return Ok(None);
     }
-    let warm_key = request.warm_key.as_deref()?.trim();
+    let Some(warm_key) = request.warm_key.as_deref().map(str::trim) else {
+        return Ok(None);
+    };
     if warm_key.is_empty() {
-        return None;
+        return Ok(None);
     }
     let warm = crate::mint_warm_cache::shared_mint_warm_cache()
         .current_by_warm_key(warm_key)
-        .await?;
+        .await;
+    let Some(warm) = warm else {
+        return Ok(None);
+    };
     if warm.mint.trim() != mint {
-        return None;
+        return Ok(None);
     }
-    warm.plan.map(|plan| plan.selector)
+    let Some(plan) = warm.plan else {
+        return Ok(None);
+    };
+    let rpc_url = configured_rpc_url();
+    let runtime_request = TradeRuntimeRequest {
+        side: TradeSide::Buy,
+        mint: mint.to_string(),
+        buy_amount_sol: None,
+        sell_intent: None,
+        policy: policy.clone(),
+        platform_label: request.source.clone(),
+        planned_route: None,
+        planned_trade: None,
+        pinned_pool: plan.resolved_pinned_pool.clone(),
+        warm_key: Some(warm.warm_key.clone()),
+        fallback_mint_hint: None,
+    };
+    match crate::trade_dispatch::guard_cached_route_for_request(
+        &rpc_url,
+        &runtime_request,
+        &warm.mint,
+        &plan.selector,
+    )
+    .await
+    {
+        crate::trade_dispatch::CachedRouteReuseDecision::UseCached => Ok(Some(plan.selector)),
+        crate::trade_dispatch::CachedRouteReuseDecision::ReplanMigrated => {
+            crate::trade_dispatch::invalidate_pre_migration_route_context(
+                &rpc_url,
+                &runtime_request,
+                &warm.mint,
+            )
+            .await;
+            Ok(None)
+        }
+        crate::trade_dispatch::CachedRouteReuseDecision::Reject(error) => Err(error),
+    }
 }
 
 async fn resolve_wallet_status_quote_selector(
@@ -12731,7 +13291,8 @@ async fn resolve_wallet_status_quote_selector(
     request: &ExtensionWalletStatusRequest,
     mint: &str,
 ) -> Result<LifecycleAndCanonicalMarket, String> {
-    if let Some(selector) = wallet_status_selector_from_warm_key(request, mint).await {
+    let policy = wallet_status_quote_policy(engine, request)?;
+    if let Some(selector) = wallet_status_selector_from_warm_key(request, mint, &policy).await? {
         validate_wallet_status_quote_selector(&selector, request)?;
         return Ok(selector);
     }
@@ -12748,7 +13309,6 @@ async fn resolve_wallet_status_quote_selector(
         .unwrap_or(mint);
     let companion_pair =
         route_companion_pair(request.pair.as_deref(), None).map_err(|(_, error)| error)?;
-    let policy = wallet_status_quote_policy(engine, request)?;
     let runtime_request = TradeRuntimeRequest {
         side: TradeSide::Buy,
         mint: route_input.to_string(),
@@ -13439,6 +13999,7 @@ fn merge_wallet_status_primary_fallback(
 async fn build_extension_wallet_status_payload(
     engine: &StoredEngineState,
     trade_ledger: &HashMap<String, crate::trade_ledger::TradeLedgerEntry>,
+    trade_ledger_paths: &TradeLedgerPaths,
     request: &ExtensionWalletStatusRequest,
 ) -> Result<(Value, Vec<String>), (StatusCode, String)> {
     let effective_wallets = build_effective_wallets(engine);
@@ -13710,6 +14271,26 @@ async fn build_extension_wallet_status_payload(
         Some(value) if tracked_bought_sol > 0.0 => Some((value / tracked_bought_sol) * 100.0),
         _ => None,
     };
+    let historical_usd_pnl = requested_mint.as_deref().and_then(|mint| {
+        build_historical_usd_pnl(
+            &engine.data_root,
+            trade_ledger_paths,
+            &target.wallet_keys,
+            mint,
+            trade_ledger,
+        )
+    });
+    let current_sol_usd = if requested_mint.is_some() && holding_value_sol.unwrap_or(0.0) > 0.0 {
+        get_current_sol_usd_price_for_wallet_status().await
+    } else {
+        None
+    };
+    let holding_value_usd_current = holding_value_sol.and_then(|value| {
+        current_sol_usd
+            .as_ref()
+            .map(|price| value * price.price)
+            .filter(|value| value.is_finite())
+    });
     let bootstrap = build_bootstrap_response(engine);
     let wallet_payloads = wallets
         .iter()
@@ -13910,6 +14491,90 @@ async fn build_extension_wallet_status_payload(
     payload.insert("pnlNet".to_string(), json!(pnl_net_value));
     payload.insert("pnlPercentGross".to_string(), json!(pnl_percent_gross));
     payload.insert("pnlPercentNet".to_string(), json!(pnl_percent_net));
+    if let Some(historical) = historical_usd_pnl.as_ref() {
+        let historical_complete =
+            !historical.required_dates.is_empty() && historical.missing_dates.is_empty();
+        let coverage = if historical.required_dates.is_empty() {
+            "unavailable"
+        } else if historical.missing_dates.is_empty() {
+            "complete"
+        } else if historical.missing_dates.len() < historical.required_dates.len() {
+            "partial"
+        } else {
+            "unavailable"
+        };
+        payload.insert(
+            "usdPriceMode".to_string(),
+            Value::String("historical-daily".to_string()),
+        );
+        payload.insert(
+            "usdHistoricalCoverage".to_string(),
+            Value::String(coverage.to_string()),
+        );
+        payload.insert(
+            "usdHistoricalRequiredDates".to_string(),
+            json!(
+                historical
+                    .required_dates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            ),
+        );
+        payload.insert(
+            "usdHistoricalMissingDates".to_string(),
+            json!(
+                historical
+                    .missing_dates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            ),
+        );
+        payload.insert(
+            "holdingValueUsdCurrent".to_string(),
+            json!(holding_value_usd_current),
+        );
+        if let Some(price) = current_sol_usd.as_ref() {
+            payload.insert("currentSolUsd".to_string(), json!(price.price));
+            payload.insert("currentSolUsdSource".to_string(), json!(price.source));
+            payload.insert(
+                "currentSolUsdFetchedAtUnixMs".to_string(),
+                json!(price.fetched_at_unix_ms),
+            );
+        }
+        if historical_complete {
+            let pnl_gross_usd = holding_value_usd_current
+                .map(|holding| {
+                    historical.realized_pnl_usd + holding - historical.remaining_cost_basis_usd
+                })
+                .unwrap_or(historical.tracked_sold_usd - historical.tracked_bought_usd);
+            let pnl_net_usd = pnl_gross_usd - historical.explicit_fee_total_usd;
+            payload.insert(
+                "trackedBoughtUsdHistorical".to_string(),
+                json!(historical.tracked_bought_usd),
+            );
+            payload.insert(
+                "trackedSoldUsdHistorical".to_string(),
+                json!(historical.tracked_sold_usd),
+            );
+            payload.insert(
+                "realizedPnlUsdHistorical".to_string(),
+                json!(historical.realized_pnl_usd),
+            );
+            payload.insert("pnlGrossUsdHistorical".to_string(), json!(pnl_gross_usd));
+            payload.insert("pnlNetUsdHistorical".to_string(), json!(pnl_net_usd));
+            payload.insert(
+                "positionValueUsdMixed".to_string(),
+                json!(historical.tracked_sold_usd + holding_value_usd_current.unwrap_or(0.0)),
+            );
+        }
+    } else {
+        payload.insert(
+            "usdHistoricalCoverage".to_string(),
+            Value::String("unavailable".to_string()),
+        );
+    }
     payload.insert(
         "pnlRequiresQuote".to_string(),
         Value::Bool(pnl_requires_quote),
@@ -14262,6 +14927,8 @@ fn sample_engine_state() -> StoredEngineState {
         data_root: DEFAULT_DATA_ROOT.to_string(),
         settings: settings.clone(),
         config: Some(canonical_config_from_legacy(&settings, &presets)),
+        quick_trade_preferences: QuickTradePreferences::default(),
+        quick_trade_preferences_saved: false,
         presets,
         wallets: vec![
             WalletSummary {
@@ -14314,6 +14981,528 @@ fn state_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(DEFAULT_DATA_ROOT)
         .join(DEFAULT_STATE_FILE)
+}
+
+fn data_root_path(data_root: &str) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(data_root)
+}
+
+fn pnl_card_paths(data_root: &str) -> PnlCardPaths {
+    let root_dir = data_root_path(data_root).join(PNL_CARD_ROOT_DIR);
+    PnlCardPaths {
+        media_dir: root_dir.join(PNL_CARD_MEDIA_DIR),
+        thumbnails_dir: root_dir.join(PNL_CARD_THUMBNAILS_DIR),
+        profile_path: root_dir.join(PNL_CARD_PROFILE_FILE),
+        settings_path: root_dir.join(PNL_CARD_SETTINGS_FILE),
+        media_manifest_path: root_dir.join(PNL_CARD_MEDIA_MANIFEST_FILE),
+        root_dir,
+    }
+}
+
+fn ensure_pnl_card_dirs(paths: &PnlCardPaths) -> Result<(), (StatusCode, String)> {
+    fs::create_dir_all(&paths.media_dir).map_err(internal_error)?;
+    fs::create_dir_all(&paths.thumbnails_dir).map_err(internal_error)?;
+    Ok(())
+}
+
+fn lock_pnl_card_store() -> Result<std::sync::MutexGuard<'static, ()>, (StatusCode, String)> {
+    PNL_CARD_STORE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PnL card store lock is poisoned.".to_string(),
+            )
+        })
+}
+
+fn read_json_file<T>(path: &FsPath, fallback: T) -> Result<T, (StatusCode, String)>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents).map_err(internal_error),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(fallback),
+        Err(error) => Err(internal_error(error)),
+    }
+}
+
+fn write_json_file<T>(path: &FsPath, value: &T) -> Result<(), (StatusCode, String)>
+where
+    T: Serialize,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(internal_error)?;
+    }
+    let contents = serde_json::to_string_pretty(value).map_err(internal_error)?;
+    let temp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("json")
+    ));
+    fs::write(&temp_path, contents).map_err(internal_error)?;
+    fs::rename(temp_path, path).map_err(internal_error)
+}
+
+fn load_pnl_card_profile(paths: &PnlCardPaths) -> Result<PnlCardProfile, (StatusCode, String)> {
+    read_json_file(&paths.profile_path, PnlCardProfile::default())
+}
+
+fn load_pnl_card_settings(paths: &PnlCardPaths) -> Result<PnlCardSettings, (StatusCode, String)> {
+    read_json_file(&paths.settings_path, PnlCardSettings::default())
+}
+
+fn load_pnl_card_media_manifest(
+    paths: &PnlCardPaths,
+) -> Result<PnlCardMediaManifest, (StatusCode, String)> {
+    read_json_file(&paths.media_manifest_path, PnlCardMediaManifest::default())
+}
+
+fn pnl_card_media_payload(paths: &PnlCardPaths) -> Result<Vec<Value>, (StatusCode, String)> {
+    load_pnl_card_media_manifest(paths)?
+        .items
+        .iter()
+        .map(|record| pnl_card_media_record_payload(paths, record))
+        .collect()
+}
+
+fn pnl_card_media_record_payload(
+    paths: &PnlCardPaths,
+    record: &PnlCardMediaRecord,
+) -> Result<Value, (StatusCode, String)> {
+    let thumbnail_data_url = if record.thumbnail_path.trim().is_empty() {
+        String::new()
+    } else {
+        pnl_card_record_data_url(
+            paths,
+            &record.thumbnail_path,
+            pnl_card_content_type_from_path(&record.thumbnail_path),
+        )
+        .unwrap_or_default()
+    };
+    Ok(json!({
+        "id": record.id,
+        "kind": record.kind,
+        "name": record.name,
+        "contentType": record.content_type,
+        "path": record.path,
+        "thumbnailPath": record.thumbnail_path,
+        "thumbnailDataUrl": thumbnail_data_url,
+        "sizeBytes": record.size_bytes,
+        "createdAtUnixMs": record.created_at_unix_ms
+    }))
+}
+
+fn pnl_card_record_data_url(
+    paths: &PnlCardPaths,
+    relative_path: &str,
+    content_type: &str,
+) -> Result<String, (StatusCode, String)> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    let media_path = pnl_card_relative_path(&paths.root_dir, relative_path)?;
+    let bytes = fs::read(media_path).map_err(internal_error)?;
+    Ok(format!(
+        "data:{};base64,{}",
+        content_type,
+        BASE64.encode(bytes)
+    ))
+}
+
+fn normalize_pnl_card_handle(value: &str) -> String {
+    let normalized = value.trim().trim_start_matches('@');
+    if normalized.is_empty() {
+        String::new()
+    } else {
+        let handle = normalized
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+            .take(32)
+            .collect::<String>();
+        if handle.is_empty() {
+            String::new()
+        } else {
+            format!("@{handle}")
+        }
+    }
+}
+
+fn pnl_card_content_type_from_path(path: &str) -> &'static str {
+    let lower = path.trim().to_ascii_lowercase();
+    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/png"
+    }
+}
+
+fn normalize_pnl_card_media_name(value: &str) -> String {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return "Uploaded media".to_string();
+    }
+    normalized
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(128)
+        .collect()
+}
+
+fn normalize_pnl_card_content_type(value: &str) -> Result<String, (StatusCode, String)> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "image/png" | "image/jpeg" | "image/webp" | "video/mp4" | "video/webm" => Ok(normalized),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "Unsupported PnL card media type.".to_string(),
+        )),
+    }
+}
+
+fn pnl_card_extension_and_limit(
+    content_type: &str,
+) -> Result<(&'static str, usize), (StatusCode, String)> {
+    match content_type {
+        "image/png" => Ok(("png", PNL_CARD_MAX_IMAGE_BYTES)),
+        "image/jpeg" => Ok(("jpg", PNL_CARD_MAX_IMAGE_BYTES)),
+        "image/webp" => Ok(("webp", PNL_CARD_MAX_IMAGE_BYTES)),
+        "video/mp4" => Ok(("mp4", PNL_CARD_MAX_VIDEO_BYTES)),
+        "video/webm" => Ok(("webm", PNL_CARD_MAX_VIDEO_BYTES)),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "Unsupported PnL card media type.".to_string(),
+        )),
+    }
+}
+
+fn decode_pnl_card_data_url(
+    data_url: &str,
+    expected_content_type: &str,
+    max_bytes: usize,
+) -> Result<DecodedPnlCardMedia, (StatusCode, String)> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    let prefix = format!("data:{expected_content_type};base64,");
+    let payload = data_url.trim().strip_prefix(&prefix).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Expected a base64 data URL for PnL card media.".to_string(),
+    ))?;
+    let bytes = BASE64.decode(payload).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid media data URL: {error}"),
+        )
+    })?;
+    if bytes.len() > max_bytes {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "PnL card media file is too large.".to_string(),
+        ));
+    }
+    Ok(DecodedPnlCardMedia { bytes })
+}
+
+fn decode_optional_pnl_card_thumbnail(
+    data_url: &str,
+) -> Result<(String, DecodedPnlCardMedia), (StatusCode, String)> {
+    let trimmed = data_url.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "thumbnail is empty".to_string()));
+    }
+    for content_type in ["image/png", "image/jpeg", "image/webp"] {
+        if trimmed.starts_with(&format!("data:{content_type};base64,")) {
+            let decoded =
+                decode_pnl_card_data_url(trimmed, content_type, PNL_CARD_MAX_IMAGE_BYTES)?;
+            validate_pnl_card_media_bytes(content_type, &decoded.bytes)?;
+            return Ok((content_type.to_string(), decoded));
+        }
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        "Unsupported thumbnail media type.".to_string(),
+    ))
+}
+
+fn validate_pnl_card_media_bytes(
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<(), (StatusCode, String)> {
+    let ok = match content_type {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "video/mp4" => bytes.len() >= 12 && &bytes[4..8] == b"ftyp",
+        "video/webm" => bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "PnL card media bytes do not match the declared type.".to_string(),
+        ))
+    }
+}
+
+fn validate_pnl_card_media_quota(
+    paths: &PnlCardPaths,
+    next_size_bytes: u64,
+) -> Result<(), (StatusCode, String)> {
+    let manifest = load_pnl_card_media_manifest(paths)?;
+    if manifest.items.len() >= PNL_CARD_MAX_MEDIA_ITEMS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("PnL card media limit is {PNL_CARD_MAX_MEDIA_ITEMS} uploads."),
+        ));
+    }
+    let total_size = manifest
+        .items
+        .iter()
+        .map(|item| item.size_bytes)
+        .sum::<u64>()
+        .saturating_add(next_size_bytes);
+    if total_size > PNL_CARD_MAX_TOTAL_MEDIA_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "PnL card media storage quota exceeded.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_pnl_card_settings(value: Value) -> Result<Value, (StatusCode, String)> {
+    let object = value.as_object().cloned().unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    if let Some(value) = object.get("templateId").and_then(Value::as_str) {
+        out.insert(
+            "templateId".to_string(),
+            json!(value.chars().take(64).collect::<String>()),
+        );
+    }
+    if let Some(value) = object.get("mediaId").and_then(Value::as_str) {
+        let normalized = value.trim();
+        if !normalized.is_empty() {
+            Uuid::parse_str(normalized).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid PnL card media id in settings.".to_string(),
+                )
+            })?;
+        }
+        out.insert("mediaId".to_string(), json!(normalized));
+    }
+    let display_currency = match object.get("displayCurrency").and_then(Value::as_str) {
+        Some("SOL") => "SOL",
+        _ => "USD",
+    };
+    out.insert("displayCurrency".to_string(), json!(display_currency));
+    if let Some(value) = object.get("handle").and_then(Value::as_str) {
+        out.insert(
+            "handle".to_string(),
+            json!(normalize_pnl_card_handle(value)),
+        );
+    }
+    for (key, fallback) in [
+        ("mainTextColor", "#ffffff"),
+        ("positivePnlColor", "#2fe3ac"),
+        ("negativePnlColor", "#ec397a"),
+        ("rectangleTextColor", "#020307"),
+    ] {
+        let color = object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| is_pnl_card_hex_color(value))
+            .unwrap_or(fallback);
+        out.insert(key.to_string(), json!(color));
+    }
+    for key in ["bold", "shadow", "rectangle", "muted"] {
+        if let Some(value) = object.get(key).and_then(Value::as_bool) {
+            out.insert(key.to_string(), json!(value));
+        }
+    }
+    let volume = object
+        .get("volume")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.7)
+        .clamp(0.0, 1.0);
+    out.insert("volume".to_string(), json!(volume));
+    let video_export_fps = match object.get("videoExportFps").and_then(Value::as_u64) {
+        Some(60) => 60,
+        _ => 30,
+    };
+    out.insert("videoExportFps".to_string(), json!(video_export_fps));
+    let video_export_size = match object.get("videoExportSize").and_then(Value::as_str) {
+        Some("full-hd") => "full-hd",
+        _ => "hd",
+    };
+    out.insert("videoExportSize".to_string(), json!(video_export_size));
+    let video_section_offset = object
+        .get("videoSectionOffset")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .clamp(-100, 100);
+    out.insert(
+        "videoSectionOffset".to_string(),
+        json!(video_section_offset),
+    );
+    Ok(Value::Object(out))
+}
+
+fn sanitize_pnl_card_settings_overrides(value: Value) -> Result<Value, (StatusCode, String)> {
+    if value.is_null() || value.as_object().is_some_and(|object| object.is_empty()) {
+        return Ok(json!({}));
+    }
+    if value.to_string().len() > 8192 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "PnL card settings overrides are too large.".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+fn is_pnl_card_hex_color(value: &str) -> bool {
+    let text = value.trim();
+    text.len() == 7
+        && text.starts_with('#')
+        && text.chars().skip(1).all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn remove_pnl_card_relative_file(root_dir: &FsPath, relative_path: &str) {
+    if let Ok(path) = pnl_card_relative_path(root_dir, relative_path) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn prune_pnl_card_manifest(paths: &PnlCardPaths, manifest: &mut PnlCardMediaManifest) {
+    let mut removed = Vec::new();
+    let mut total_size = 0u64;
+    let mut retained = Vec::new();
+    for item in manifest.items.drain(..) {
+        let keep = retained.len() < PNL_CARD_MAX_MEDIA_ITEMS
+            && total_size.saturating_add(item.size_bytes) <= PNL_CARD_MAX_TOTAL_MEDIA_BYTES;
+        if keep {
+            total_size = total_size.saturating_add(item.size_bytes);
+            retained.push(item);
+        } else {
+            removed.push(item);
+        }
+    }
+    manifest.items = retained;
+    for item in removed {
+        remove_pnl_card_relative_file(&paths.root_dir, &item.path);
+        remove_pnl_card_relative_file(&paths.root_dir, &item.thumbnail_path);
+    }
+}
+
+fn pnl_card_relative_path(
+    root_dir: &FsPath,
+    relative_path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let normalized = relative_path.trim().replace('\\', "/");
+    let prefix = format!("{PNL_CARD_ROOT_DIR}/");
+    let inner_path = normalized.strip_prefix(&prefix).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Invalid PnL card media path.".to_string(),
+    ))?;
+    let path = FsPath::new(inner_path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid PnL card media path.".to_string(),
+        ));
+    }
+    Ok(root_dir.join(path))
+}
+
+fn read_cached_pnl_card_sol_usd() -> Option<PnlCardSolUsdCache> {
+    let cache = PNL_CARD_SOL_USD_CACHE.get_or_init(|| Mutex::new(None));
+    let guard = cache.lock().ok()?;
+    let cached = guard.clone()?;
+    let age_ms = now_unix_ms().saturating_sub(cached.fetched_at_unix_ms);
+    if age_ms <= PNL_CARD_SOL_USD_CACHE_MS {
+        Some(cached)
+    } else {
+        None
+    }
+}
+
+fn write_cached_pnl_card_sol_usd(value: PnlCardSolUsdCache) {
+    let cache = PNL_CARD_SOL_USD_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(value);
+    }
+}
+
+async fn fetch_pnl_card_sol_usd_price(
+    client: &Client,
+) -> Result<(f64, String), (StatusCode, String)> {
+    let providers = [
+        (
+            "jupiter",
+            "https://api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112",
+        ),
+        (
+            "coingecko",
+            "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+        ),
+        (
+            "binance",
+            "https://data-api.binance.vision/api/v3/ticker/price?symbol=SOLUSDT",
+        ),
+    ];
+    let mut last_error = String::new();
+    for (source, url) in providers {
+        match client.get(url).send().await {
+            Ok(response) => match response.json::<Value>().await {
+                Ok(payload) => {
+                    if let Some(price) = parse_pnl_card_sol_usd_price(source, &payload) {
+                        return Ok((price, source.to_string()));
+                    }
+                    last_error = format!("{source} returned no SOL/USD price");
+                }
+                Err(error) => last_error = format!("{source} JSON error: {error}"),
+            },
+            Err(error) => last_error = format!("{source} request error: {error}"),
+        }
+    }
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("Unable to resolve SOL/USD price. {last_error}"),
+    ))
+}
+
+fn parse_pnl_card_sol_usd_price(source: &str, payload: &Value) -> Option<f64> {
+    let price = match source {
+        "jupiter" => payload
+            .get("So11111111111111111111111111111111111111112")
+            .and_then(|value| value.get("usdPrice"))
+            .and_then(Value::as_f64),
+        "coingecko" => payload
+            .get("solana")
+            .and_then(|value| value.get("usd"))
+            .and_then(Value::as_f64),
+        "binance" => payload
+            .get("price")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<f64>().ok()),
+        _ => None,
+    }?;
+    if price.is_finite() && price > 0.0 {
+        Some(price)
+    } else {
+        None
+    }
 }
 
 fn load_engine_state(path: &PathBuf) -> Option<StoredEngineState> {
@@ -14448,6 +15637,10 @@ fn normalize_resource_state(engine: &mut StoredEngineState) -> Result<(), String
         engine.settings.allow_non_canonical_pool_trades,
     );
     crate::rollout::set_wrapper_default_fee_bps(engine.settings.wrapper_default_fee_bps);
+    engine.quick_trade_preferences =
+        normalize_quick_trade_preferences(engine.quick_trade_preferences.clone());
+    engine.quick_trade_preferences_saved = engine.quick_trade_preferences_saved
+        || quick_trade_preferences_has_value(&engine.quick_trade_preferences);
     let mut canonical_config = canonical_config;
     if engine.presets.is_empty() {
         if let Some(defaults) = canonical_config
@@ -14684,6 +15877,132 @@ fn normalize_wallet_groups(groups: &mut [WalletGroupSummary]) {
         group.batch_policy = normalize_wallet_group_batch_policy(group.batch_policy.clone());
         group.emoji = group.emoji.trim().to_string();
     }
+}
+
+fn normalize_quick_buy_amount_input(value: &str) -> String {
+    let mut output = String::new();
+    let mut saw_dot = false;
+    for character in value.trim().chars() {
+        match character {
+            ',' | '.' if !saw_dot => {
+                output.push('.');
+                saw_dot = true;
+            }
+            '0'..='9' => output.push(character),
+            _ => {}
+        }
+    }
+    if output.is_empty() {
+        return output;
+    }
+    if output.starts_with('.') {
+        output.insert(0, '0');
+    }
+    if let Some((whole, fractional)) = output.split_once('.') {
+        let trimmed_whole = whole.trim_start_matches('0');
+        let normalized_whole = if trimmed_whole.is_empty() {
+            "0"
+        } else {
+            trimmed_whole
+        };
+        format!("{normalized_whole}.{fractional}")
+    } else {
+        let trimmed = output.trim_start_matches('0');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+}
+
+fn normalize_quick_trade_selection_source(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "manual" => "manual".to_string(),
+        _ => "group".to_string(),
+    }
+}
+
+fn normalize_quick_trade_preferences(mut value: QuickTradePreferences) -> QuickTradePreferences {
+    value.preset_id = value.preset_id.trim().to_string();
+    value.selection_source = normalize_quick_trade_selection_source(&value.selection_source);
+    value.active_wallet_group_id = value.active_wallet_group_id.trim().to_string();
+    value.manual_wallet_keys = normalize_wallet_key_list(value.manual_wallet_keys);
+    value.quick_buy_amount = normalize_quick_buy_amount_input(&value.quick_buy_amount);
+    value.quick_buy_amount2 = normalize_quick_buy_amount_input(&value.quick_buy_amount2);
+    value
+}
+
+fn quick_trade_preferences_has_value(value: &QuickTradePreferences) -> bool {
+    !value.preset_id.trim().is_empty()
+        || !value.active_wallet_group_id.trim().is_empty()
+        || !value.manual_wallet_keys.is_empty()
+        || !value.quick_buy_amount.trim().is_empty()
+        || !value.quick_buy_amount2.trim().is_empty()
+}
+
+fn normalize_wallet_key_list(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for value in values {
+        let key = value.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        if seen.insert(key.clone()) {
+            normalized.push(key);
+        }
+    }
+    normalized
+}
+
+fn apply_quick_trade_preferences_patch(
+    current: QuickTradePreferences,
+    patch: QuickTradePreferencesPatch,
+) -> Result<QuickTradePreferences, String> {
+    let mut next = normalize_quick_trade_preferences(current);
+    let mut selection_changed = false;
+
+    if let Some(preset_id) = patch.preset_id {
+        next.preset_id = preset_id.trim().to_string();
+    }
+    if let Some(selection_source) = patch.selection_source {
+        let normalized = normalize_quick_trade_selection_source(&selection_source);
+        if normalized != next.selection_source {
+            selection_changed = true;
+        }
+        next.selection_source = normalized;
+    }
+    if let Some(active_wallet_group_id) = patch.active_wallet_group_id {
+        let normalized = active_wallet_group_id.trim().to_string();
+        if normalized != next.active_wallet_group_id {
+            selection_changed = true;
+        }
+        next.active_wallet_group_id = normalized;
+    }
+    if let Some(manual_wallet_keys) = patch.manual_wallet_keys {
+        let normalized = normalize_wallet_key_list(manual_wallet_keys);
+        if normalized != next.manual_wallet_keys {
+            selection_changed = true;
+        }
+        next.manual_wallet_keys = normalized;
+    }
+    if let Some(quick_buy_amount) = patch.quick_buy_amount {
+        next.quick_buy_amount = normalize_quick_buy_amount_input(&quick_buy_amount);
+    }
+    if let Some(quick_buy_amount2) = patch.quick_buy_amount2 {
+        next.quick_buy_amount2 = normalize_quick_buy_amount_input(&quick_buy_amount2);
+    }
+    if let Some(selection_revision) = patch.selection_revision {
+        if selection_changed && selection_revision <= next.selection_revision {
+            return Err("stale wallet selection update".to_string());
+        }
+        next.selection_revision = selection_revision.max(next.selection_revision);
+    } else if selection_changed {
+        return Err("selectionRevision required for wallet selection updates".to_string());
+    }
+
+    Ok(normalize_quick_trade_preferences(next))
 }
 
 fn normalize_wallet_group_batch_policy(
@@ -15023,6 +16342,65 @@ mod tests {
         assert!(!is_hellomoon_provider("helius-sender"));
     }
 
+    #[test]
+    fn token_2022_program_id_is_canonical() {
+        assert_eq!(
+            token_2022_program_id().expect("token-2022 program id"),
+            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+                .expect("canonical token-2022 program id")
+        );
+    }
+
+    #[test]
+    fn validate_supported_mint_token_program_rejects_non_token_owner() {
+        let system_program =
+            Pubkey::from_str(SYSTEM_PROGRAM_ID).expect("canonical system program id");
+        let error = validate_supported_mint_token_program("Mint111", &system_program)
+            .expect_err("system program is not a token mint owner");
+
+        assert!(error.contains("unsupported program"));
+        assert!(error.contains("not a supported token mint"));
+    }
+
+    #[test]
+    fn token_account_pubkeys_for_mint_filters_program_owner_scan_results() {
+        let accounts = vec![
+            json!({
+                "pubkey": "matching-token-account",
+                "account": {
+                    "data": {
+                        "parsed": {
+                            "info": {
+                                "mint": "Mint111"
+                            }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "pubkey": "other-mint-token-account",
+                "account": {
+                    "data": {
+                        "parsed": {
+                            "info": {
+                                "mint": "OtherMint111"
+                            }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "pubkey": "missing-parsed-data",
+                "account": {}
+            }),
+        ];
+
+        assert_eq!(
+            token_account_pubkeys_for_mint(&accounts, "Mint111"),
+            vec!["matching-token-account".to_string()]
+        );
+    }
+
     fn sell_balance_gate_request(intent: Option<RuntimeSellIntent>) -> TradeRuntimeRequest {
         TradeRuntimeRequest {
             side: TradeSide::Sell,
@@ -15132,6 +16510,59 @@ mod tests {
         assert_eq!(quote.value_lamports, 0);
         assert_eq!(quote.source, "zero-balance");
         assert_eq!(quote.quote_asset, "SOL");
+    }
+
+    #[tokio::test]
+    async fn wallet_status_warm_key_pre_migration_runs_route_guard() {
+        let policy = wallet_status_default_quote_policy(&sample_engine_state());
+        let fingerprint = crate::mint_warm_cache::build_fingerprint(
+            "not-a-pubkey",
+            None,
+            &configured_rpc_url(),
+            &policy.commitment,
+            "buy:sol_only",
+            false,
+        );
+        let selector = LifecycleAndCanonicalMarket {
+            lifecycle: crate::trade_planner::TradeLifecycle::PreMigration,
+            family: TradeVenueFamily::PumpBondingCurve,
+            canonical_market_key: "BondingCurve111".to_string(),
+            quote_asset: PlannerQuoteAsset::Sol,
+            verification_source: crate::trade_planner::PlannerVerificationSource::OnchainDerived,
+            wrapper_action: crate::trade_planner::WrapperAction::PumpBondingCurveBuy,
+            wrapper_accounts: vec!["BondingCurve111".to_string()],
+            market_subtype: Some("bonding-curve".to_string()),
+            direct_protocol_target: Some("pump-bonding".to_string()),
+            input_amount_hint: None,
+            minimum_output_hint: None,
+            runtime_bundle: None,
+        };
+        let plan = crate::trade_dispatch::TradeDispatchPlan {
+            adapter: crate::trade_dispatch::TradeAdapter::PumpNative,
+            selector: selector.clone(),
+            execution_backend: crate::rollout::TradeExecutionBackend::Native,
+            raw_address: "not-a-pubkey".to_string(),
+            resolved_input_kind: crate::trade_dispatch::TradeInputKind::Mint,
+            resolved_mint: "not-a-pubkey".to_string(),
+            resolved_pinned_pool: None,
+            non_canonical: false,
+        };
+        crate::mint_warm_cache::shared_mint_warm_cache()
+            .insert(
+                fingerprint.clone(),
+                crate::mint_warm_cache::prewarmed_from_plan(&fingerprint, None, &plan),
+            )
+            .await;
+        let request = ExtensionWalletStatusRequest {
+            warm_key: Some(fingerprint.as_warm_key()),
+            ..ExtensionWalletStatusRequest::default()
+        };
+
+        let error = wallet_status_selector_from_warm_key(&request, "not-a-pubkey", &policy)
+            .await
+            .expect_err("pre-migration warm key should be guarded");
+
+        assert!(error.contains("Invalid Pump bonding route mint"));
     }
 
     #[test]
@@ -15396,6 +16827,111 @@ mod tests {
 
         assert!(message.contains("ledger-applicable"));
         assert!(message.contains("execution remains confirmed"));
+    }
+
+    #[test]
+    fn quick_trade_preferences_default_and_normalize() {
+        let preferences = normalize_quick_trade_preferences(QuickTradePreferences {
+            preset_id: " preset-a ".to_string(),
+            selection_source: "manual".to_string(),
+            active_wallet_group_id: " group-a ".to_string(),
+            manual_wallet_keys: vec![
+                " wallet-a ".to_string(),
+                "wallet-a".to_string(),
+                "".to_string(),
+                "wallet-b".to_string(),
+            ],
+            selection_revision: 7,
+            quick_buy_amount: "001,250x".to_string(),
+            quick_buy_amount2: ".5".to_string(),
+        });
+
+        assert_eq!(preferences.preset_id, "preset-a");
+        assert_eq!(preferences.selection_source, "manual");
+        assert_eq!(preferences.active_wallet_group_id, "group-a");
+        assert_eq!(preferences.manual_wallet_keys, vec!["wallet-a", "wallet-b"]);
+        assert_eq!(preferences.selection_revision, 7);
+        assert_eq!(preferences.quick_buy_amount, "1.250");
+        assert_eq!(preferences.quick_buy_amount2, "0.5");
+    }
+
+    #[test]
+    fn quick_trade_preferences_patch_preserves_unrelated_fields() {
+        let current = QuickTradePreferences {
+            preset_id: "preset-a".to_string(),
+            selection_source: "group".to_string(),
+            active_wallet_group_id: "group-a".to_string(),
+            manual_wallet_keys: vec!["wallet-a".to_string()],
+            selection_revision: 3,
+            quick_buy_amount: "0.1".to_string(),
+            quick_buy_amount2: "0.2".to_string(),
+        };
+
+        let next = apply_quick_trade_preferences_patch(
+            current,
+            QuickTradePreferencesPatch {
+                quick_buy_amount: Some("000.300".to_string()),
+                ..QuickTradePreferencesPatch::default()
+            },
+        )
+        .expect("quickbuy patch should apply");
+
+        assert_eq!(next.preset_id, "preset-a");
+        assert_eq!(next.selection_source, "group");
+        assert_eq!(next.active_wallet_group_id, "group-a");
+        assert_eq!(next.manual_wallet_keys, vec!["wallet-a"]);
+        assert_eq!(next.selection_revision, 3);
+        assert_eq!(next.quick_buy_amount, "0.300");
+        assert_eq!(next.quick_buy_amount2, "0.2");
+    }
+
+    #[test]
+    fn quick_trade_preferences_rejects_stale_selection_revision() {
+        let current = QuickTradePreferences {
+            selection_source: "group".to_string(),
+            active_wallet_group_id: "group-a".to_string(),
+            selection_revision: 4,
+            ..QuickTradePreferences::default()
+        };
+
+        let error = apply_quick_trade_preferences_patch(
+            current,
+            QuickTradePreferencesPatch {
+                active_wallet_group_id: Some("group-b".to_string()),
+                selection_revision: Some(4),
+                ..QuickTradePreferencesPatch::default()
+            },
+        )
+        .expect_err("stale selection update should fail");
+
+        assert!(error.contains("stale wallet selection update"));
+    }
+
+    #[test]
+    fn quick_trade_preferences_response_exposes_saved_marker() {
+        let response = quick_trade_preferences_response(
+            QuickTradePreferences {
+                preset_id: " preset-a ".to_string(),
+                quick_buy_amount: "001.25".to_string(),
+                ..QuickTradePreferences::default()
+            },
+            true,
+        );
+
+        assert!(response.has_saved_preferences);
+        assert_eq!(response.preferences.preset_id, "preset-a");
+        assert_eq!(response.preferences.quick_buy_amount, "1.25");
+    }
+
+    #[test]
+    fn quick_trade_preferences_has_value_ignores_default_source_only() {
+        assert!(!quick_trade_preferences_has_value(
+            &QuickTradePreferences::default()
+        ));
+        assert!(quick_trade_preferences_has_value(&QuickTradePreferences {
+            active_wallet_group_id: "group-a".to_string(),
+            ..QuickTradePreferences::default()
+        }));
     }
 
     #[test]
@@ -16793,169 +18329,6 @@ mod tests {
         sort_resync_actions(&mut actions);
 
         assert_eq!(actions[0].signature(), "sig-sell");
-    }
-
-    #[test]
-    fn helius_parser_uses_user_account_token_deltas_and_wallet_native_delta() {
-        let transaction = json!({
-            "signature": "sig-helius",
-            "slot": 77,
-            "timestamp": 123,
-            "fee": 5000,
-            "feePayer": "other-wallet",
-            "transactionError": null,
-            "nativeTransfers": [
-                {
-                    "fromUserAccount": "wallet-public",
-                    "toUserAccount": "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-                    "amount": 7
-                },
-                {
-                    "fromUserAccount": "other-wallet",
-                    "toUserAccount": "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-                    "amount": 999
-                }
-            ],
-            "accountData": [
-                {
-                    "account": "wallet-public",
-                    "nativeBalanceChange": -2000,
-                    "tokenBalanceChanges": [
-                        {
-                            "userAccount": "wallet-public",
-                            "tokenAccount": "token-account",
-                            "mint": "Mint111",
-                            "rawTokenAmount": { "tokenAmount": "100", "decimals": 6 }
-                        },
-                        {
-                            "userAccount": "wallet-public",
-                            "tokenAccount": "usd1-account",
-                            "mint": USD1_MINT,
-                            "rawTokenAmount": { "tokenAmount": "-50", "decimals": 6 }
-                        },
-                        {
-                            "userAccount": "other-wallet",
-                            "tokenAccount": "other-token-account",
-                            "mint": "Mint111",
-                            "rawTokenAmount": { "tokenAmount": "999", "decimals": 6 }
-                        }
-                    ]
-                },
-                {
-                    "account": "other-wallet",
-                    "nativeBalanceChange": -999999,
-                    "tokenBalanceChanges": []
-                }
-            ]
-        });
-
-        let candidate =
-            helius_candidate_from_transaction(&transaction, "wallet-6", "wallet-public", "Mint111")
-                .expect("parse helius transaction")
-                .expect("candidate");
-
-        assert_eq!(candidate.signature, "sig-helius");
-        assert_eq!(candidate.snapshot.token_delta_raw, 100);
-        assert_eq!(candidate.snapshot.token_decimals, Some(6));
-        assert_eq!(candidate.snapshot.usd1_delta_raw, -50);
-        assert_eq!(candidate.snapshot.lamport_delta, -2000);
-        assert_eq!(candidate.snapshot.slot, Some(77));
-        assert_eq!(candidate.snapshot.block_time_unix_ms, Some(123_000));
-        assert_eq!(candidate.snapshot.explicit_fees.network_fee_lamports, 0);
-        assert_eq!(candidate.snapshot.explicit_fees.tip_lamports, 7);
-    }
-
-    #[test]
-    fn helius_parser_rejects_malformed_matching_raw_token_amount() {
-        let transaction = json!({
-            "signature": "sig-helius-bad",
-            "slot": 77,
-            "timestamp": 123,
-            "transactionError": null,
-            "accountData": [
-                {
-                    "account": "wallet-public",
-                    "nativeBalanceChange": 0,
-                    "tokenBalanceChanges": [
-                        {
-                            "userAccount": "wallet-public",
-                            "tokenAccount": "token-account",
-                            "mint": "Mint111",
-                            "rawTokenAmount": { "tokenAmount": "not-a-number", "decimals": 6 }
-                        }
-                    ]
-                }
-            ]
-        });
-
-        let error =
-            helius_candidate_from_transaction(&transaction, "wallet-6", "wallet-public", "Mint111")
-                .expect_err("matching malformed raw amount should fail");
-
-        assert!(error.contains("invalid raw amount"));
-    }
-
-    #[test]
-    fn helius_rent_delta_tracks_wallet_owned_token_account_lamports() {
-        let account_data = vec![
-            json!({
-                "account": "wallet-public",
-                "nativeBalanceChange": -999,
-                "tokenBalanceChanges": []
-            }),
-            json!({
-                "account": "token-account",
-                "nativeBalanceChange": -2_039_280,
-                "tokenBalanceChanges": [{
-                    "userAccount": "wallet-public",
-                    "tokenAccount": "token-account",
-                    "mint": "Mint111",
-                    "rawTokenAmount": { "tokenAmount": "100", "decimals": 6 }
-                }]
-            }),
-            json!({
-                "account": "other-token-account",
-                "nativeBalanceChange": -2_039_280,
-                "tokenBalanceChanges": [{
-                    "userAccount": "other-wallet",
-                    "tokenAccount": "other-token-account",
-                    "mint": "Mint111",
-                    "rawTokenAmount": { "tokenAmount": "100", "decimals": 6 }
-                }]
-            }),
-        ];
-
-        assert_eq!(
-            helius_wallet_owned_token_account_rent_delta_lamports(
-                &account_data,
-                "wallet-public",
-                "Mint111"
-            ),
-            -2_039_280
-        );
-    }
-
-    #[test]
-    fn helius_rent_delta_includes_wallet_owned_usd1_token_account_lamports() {
-        let account_data = vec![json!({
-            "account": "usd1-token-account",
-            "nativeBalanceChange": -2_039_280,
-            "tokenBalanceChanges": [{
-                "userAccount": "wallet-public",
-                "tokenAccount": "usd1-token-account",
-                "mint": USD1_MINT,
-                "rawTokenAmount": { "tokenAmount": "-100", "decimals": 6 }
-            }]
-        })];
-
-        assert_eq!(
-            helius_wallet_owned_token_account_rent_delta_lamports(
-                &account_data,
-                "wallet-public",
-                "Mint111"
-            ),
-            -2_039_280
-        );
     }
 
     #[test]

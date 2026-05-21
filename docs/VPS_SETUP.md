@@ -1,6 +1,6 @@
 # VPS Setup
 
-This guide walks through a fresh Ubuntu VPS setup for Trench Tools. With a VPS provider account, the startup script, and Helius Developer tier ready, the install can be up and running in about 5 minutes.
+This guide walks through a fresh Ubuntu VPS setup for Trench Tools. From a clean start, including the quick account, payment, SSH key, firewall, startup script, and Helius steps, the install can be up and running in about 5-10 minutes.
 
 Recommended pattern:
 
@@ -10,22 +10,24 @@ Recommended pattern:
 - access browser-facing ports through SSH forwards
 - use the extension locally against loopback unless you intentionally set up HTTPS remote access
 
-AI help is fine here. Cursor, Codex, Claude, and similar tools can walk you through SSH, package installs, `.env` editing, `systemctl`, and logs. Do not paste real private keys, API keys, server secrets, or auth tokens into any AI/chat tool.
+If you are not technical, use [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI), Codex, Claude Computer Use, or another trusted computer assistant to walk through this guide with you. These tools are good at checking SSH commands, editing config files, following provider dashboards, and reading logs.
 
 ## Fast Path
 
 If you want the shortest working path, do this:
 
-1. Create a Vultr account or log in.
-2. Create an SSH key on the computer where you run your browser.
+1. Create a Vultr account, confirm your email, and add a payment method.
+2. Create or find an SSH key on the computer where you run your browser.
 3. Add the public key at [Vultr SSH Keys](https://console.vultr.com/sshkeys/).
 4. Add the bootstrap script at [Vultr Startup Scripts](https://console.vultr.com/startup/).
-5. Deploy Ubuntu `24.04` with the SSH key and startup script selected.
-6. Put your wallet, Helius RPC, and Helius websocket values into `/opt/launchdeck/.env`.
-7. Restart with `systemctl restart launchdeck`.
-8. Connect with SSH port forwards, then paste the shared token into the extension.
+5. Create a firewall group at [Vultr Firewall](https://console.vultr.com/firewall/) that allows SSH on port `22` and drops other inbound traffic.
+6. Deploy Ubuntu `24.04` with the SSH key, startup script, and firewall group selected.
+7. Add an SSH config entry with local forwards for `8788` and `8789`, then connect with `ssh Trenchtools-vps`.
+8. Put your wallet, Helius RPC, and Helius websocket values into `/root/trench.tools/.env`.
+9. Restart with `systemctl restart trenchtools`.
+10. Copy the shared token, install the extension on your local PC, paste the token into extension Options, and test the connection.
 
-That is the path that should get most users running in about 5 minutes after the VPS boots. The rest of this guide explains each step.
+That is the path that should get most users running in about 5-10 minutes after the VPS boots. The rest of this guide explains each step.
 
 ## What Runs On The VPS
 
@@ -38,10 +40,10 @@ The default `.env` value `TRENCH_TOOLS_MODE=` means `both`. `TRENCH_TOOLS_MODE=b
 The shared auth token lives at:
 
 ```text
-/opt/launchdeck/.local/trench-tools/default-engine-token.txt
+/root/trench.tools/.local/trench-tools/default-engine-token.txt
 ```
 
-The default install path and service name still use `launchdeck` for upgrade compatibility. The product is Trench Tools.
+The default install path is `/root/trench.tools`. The default service name is `trenchtools`.
 
 ## Recommended Location
 
@@ -50,7 +52,8 @@ Place the VPS near the provider endpoints and RPCs you actually plan to use.
 Good starting points:
 
 - EU: Frankfurt or Amsterdam
-- US: New York / Newark area or Salt Lake City area
+- US East: New York / Newark area
+- US West / central fallback: Salt Lake City area
 - Asia: Singapore or Tokyo
 
 If you use a grouped `USER_REGION` like `us` or `asia`, remember those metros are far apart. In practice, pick a server near the side you care about and use the exact metro token (`ewr`, `slc`, `sg`, `tyo`, etc.).
@@ -60,6 +63,8 @@ If you use a grouped `USER_REGION` like `us` or `asia`, remember those metros ar
 Start simple:
 
 - Ubuntu `24.04`
+- Dedicated CPU type with the CPU Optimized plan category for real trading
+- shared CPU only for testing, learning, or very light use
 - 2 vCPU minimum
 - 4 GB RAM minimum
 - enough SSD for Rust builds, `node_modules`, uploads, logs, and reports
@@ -75,28 +80,20 @@ Helius Developer tier, about $50/month, is strongly recommended if you care abou
 
 ## VPS Provider
 
-This guide uses [Vultr](https://www.vultr.com/?ref=9589308) as the worked example because it is easy to deploy quickly across a wide range of regions, supports normal card/fiat-style payments as well as crypto, and has been reliable in long-term use.
+This guide uses Vultr as the worked example because it is easy to deploy quickly across a wide range of regions, supports normal card/fiat-style payments as well as crypto, and has been reliable in long-term use.
 
-If you use Vultr, please use [my referral link](https://www.vultr.com/?ref=9589308). Any other VPS provider is fine as long as you place the server close to the provider endpoints and RPCs you actually plan to use.
+If you use Vultr, use the referral link in [Create Or Prepare The Vultr Account](#21-create-or-prepare-the-vultr-account). Any other VPS provider is fine as long as you place the server close to the provider endpoints and RPCs you actually plan to use.
 
-Recommended Vultr flow:
-
-1. create or log in to your Vultr account
-2. create your SSH key on your own computer
-3. add the public key in Vultr at [SSH Keys](https://console.vultr.com/sshkeys/)
-4. add the Trench Tools bootstrap in Vultr at [Startup Scripts](https://console.vultr.com/startup/)
-5. deploy the server and select both the SSH key and startup script during deploy
-
-This is the easiest path. The SSH key lets you log in afterward, and the startup script boots the Trench Tools install automatically in about 5 minutes on a normal fresh VPS.
+The detailed steps below create those provider-level items before deploy: SSH key, startup script, and firewall group. That is the easiest path because the server starts installing Trench Tools automatically as soon as it boots.
 
 Personal note: I have used Vultr for 5+ years and have not had issues with it.
 
-## 1. Create An SSH Key
+## 1. Create Or Find An SSH Key
 
 SSH is how your computer proves it is allowed to log in to the VPS. You use the same SSH connection for three things:
 
 - logging in to install and update Trench Tools
-- opening the server in Cursor Remote SSH, if you use Cursor for editing
+- opening the server in [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI) Remote SSH, if you use [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI) for editing
 - forwarding private VPS ports back to your local browser so Chrome/Edge can talk to `127.0.0.1:8788` and `127.0.0.1:8789`
 
 An SSH key has two files:
@@ -104,13 +101,33 @@ An SSH key has two files:
 - private key: stays on your computer, usually `~/.ssh/id_ed25519`
 - public key: safe to paste into the VPS provider, usually `~/.ssh/id_ed25519.pub`
 
-Create the key on the computer where you run your browser and Cursor.
+Create or choose the key on the computer where you run your browser and [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI).
 
-Linux/macOS:
+1. Open a terminal on your own computer.
+
+On Windows, open PowerShell. On Linux, open Terminal.
+
+2. Check whether you already have an Ed25519 SSH key.
+
+Windows PowerShell:
+
+```powershell
+Test-Path $env:USERPROFILE\.ssh\id_ed25519.pub
+Get-ChildItem $env:USERPROFILE\.ssh
+```
+
+Linux:
 
 ```bash
-ssh-keygen -t ed25519 -C "you@example.com"
+test -f ~/.ssh/id_ed25519.pub && echo "SSH key exists"
+ls -la ~/.ssh
 ```
+
+3. Decide whether to use the existing key or create a new one.
+
+If `id_ed25519.pub` already exists and you recognize it, use that key and skip to step 5. If it does not exist, or you are not sure what it is, create a new one in step 4.
+
+4. Create a new SSH key if you need one.
 
 Windows PowerShell:
 
@@ -118,44 +135,88 @@ Windows PowerShell:
 ssh-keygen -t ed25519 -C "you@example.com"
 ```
 
-Show the public key:
+Linux:
+
+```bash
+ssh-keygen -t ed25519 -C "you@example.com"
+```
+
+When `ssh-keygen` asks where to save the key, press `Enter` to accept the default path. When it asks for a passphrase, you can press `Enter` for no passphrase or set one if you know you want that.
+
+5. Copy the public key to your clipboard.
+
+Windows PowerShell:
+
+```powershell
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | Set-Clipboard
+```
+
+Linux:
 
 ```bash
 cat ~/.ssh/id_ed25519.pub
 ```
 
-Windows PowerShell:
+Copy the full line manually.
 
-```powershell
-Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
-```
+6. Check what you copied before pasting it into [Vultr SSH Keys](https://console.vultr.com/sshkeys/).
 
-Do not share the private key.
-
-Copy the full public key line. It starts with `ssh-ed25519` and ends with the label you used, for example `you@example.com`.
+It should be one line that starts with `ssh-ed25519` and ends with the label you used, for example `you@example.com`. Only copy the `.pub` public key. Do not copy or share the private key.
 
 ## 2. Create The VPS
 
-For Vultr, set up the account-level SSH key and startup script before creating the server. Then both will appear as selectable options on the deploy page.
+For Vultr, create the account-level SSH key, startup script, and firewall group before creating the server. Then they appear as selectable options on the deploy page.
 
-First, add the SSH key:
+### 2.1 Create Or Prepare The Vultr Account
 
-1. open [Vultr SSH Keys](https://console.vultr.com/sshkeys/)
-2. click `Add SSH Key`
-3. paste the full public key line from `id_ed25519.pub`
-4. give it a recognizable name like `trench-tools-laptop`
-5. save it
+What this does: the VPS cannot be deployed until the account is active and has billing set up.
 
-Only the public key goes into Vultr. The private key stays on your computer and is used automatically by `ssh`, Cursor Remote SSH, and any tunnels you open.
+1. Open [Vultr](https://www.vultr.com/?ref=9589308).
+2. Sign up or log in.
+3. Confirm the email address on the account.
+4. Add a payment method.
+5. Keep the dashboard open.
 
-Second, add the optional startup script. We highly recommend this because it boots the install automatically instead of making the user copy commands after deploy.
+If Vultr does not show deploy options yet, the account email or payment method is usually not finished.
 
-1. open [Vultr Startup Scripts](https://console.vultr.com/startup/)
-2. click `Add Startup Script`
-3. choose a boot-time script type, if Vultr asks
-4. name it `trench-tools-bootstrap`
-5. paste the script below
-6. save it
+### 2.2 Add Your SSH Key To Vultr
+
+What this does: this lets your computer log in to the VPS as `root` without using a password. Vultr only needs your public key. Your private key stays on your computer.
+
+1. On your local computer, copy your public key again if it is not already copied.
+
+Windows PowerShell:
+
+```powershell
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | Set-Clipboard
+```
+
+Linux:
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+Copy the full line manually.
+
+If the file does not exist, go back to [Create Or Find An SSH Key](#1-create-or-find-an-ssh-key), create the key, then return here.
+
+2. Open [Vultr SSH Keys](https://console.vultr.com/sshkeys/).
+3. Click `Add SSH Key`.
+4. Paste your copied public key into the `SSH Key` field.
+5. Confirm it starts with `ssh-ed25519`.
+6. Put `trench-tools` in the name/label field.
+7. Save the SSH key.
+
+### 2.3 Add The Startup Script
+
+What this does: when the VPS boots for the first time, Vultr runs this script automatically. The script downloads the real Trench Tools bootstrap script and starts the install, so you do not have to manually paste install commands after deploying.
+
+1. Open [Vultr Startup Scripts](https://console.vultr.com/startup/).
+2. Click `Add Startup Script`.
+3. If Vultr asks for a script type, choose the boot-time/startup option.
+4. Name the script `trench-tools-bootstrap`.
+5. Paste this exact script into the script/body field:
 
 ```bash
 #!/usr/bin/env bash
@@ -166,27 +227,72 @@ curl -fsSL https://raw.githubusercontent.com/0xD3bt/Trench-Tools/master/scripts/
 bash /root/vps-bootstrap.sh
 ```
 
-Now deploy the server from the normal Vultr deploy page:
+6. Save the startup script.
 
-1. choose Cloud Compute or equivalent
-2. choose Ubuntu `24.04`
-3. choose at least `2 vCPU / 4 GB RAM`
-4. choose the region closest to your target RPC/provider endpoints
-5. in the deploy settings, select the SSH key you added
-6. in the startup script/user-data option, select `trench-tools-bootstrap`
-7. create the server
+### 2.4 Create The Firewall Group
+
+What this does: the firewall keeps the VPS closed to the public internet except for SSH. Trench Tools ports stay private and are reached later through your SSH tunnel.
+
+1. Open [Vultr Firewall](https://console.vultr.com/firewall/).
+2. Create a new firewall group.
+3. Name it `trench-tools-ssh-only`.
+4. Add one inbound IPv4 rule with these values:
+
+```text
+Action: accept
+Protocol: SSH
+Port: 22
+Source: Anywhere
+Value: 0.0.0.0/0
+```
+
+5. Add the same SSH-only rule under IPv6 too:
+
+```text
+Action: accept
+Protocol: SSH
+Port: 22
+Source: Anywhere
+Value: ::/0
+```
+
+6. Leave the default inbound rule as `drop any 0-65535`.
+7. Do not add public rules for `8788`, `8789`, or `8790`.
+
+Only SSH port `22` should be open in the Vultr firewall. The Trench Tools browser ports `8788`, `8789`, and `8790` stay private on the VPS and are reached later through SSH local forwards from your own computer.
+
+### 2.5 Deploy The Server
+
+What this does: this creates the actual VPS and attaches the SSH key, startup script, and firewall group you prepared above.
+
+1. Open the [Vultr deploy page](https://console.vultr.com/deploy-beta/).
+2. In `Choose Type`, choose `Dedicated CPU`.
+3. In the plans table, choose the `CPU Optimized` category.
+4. Use shared CPU only for testing or very light use.
+5. Choose Ubuntu `24.04`.
+6. Choose at least `2 vCPU / 4 GB RAM`.
+7. Choose the region closest to your target RPC/provider endpoints.
+8. For EU, start with Frankfurt or Amsterdam.
+9. For US East, start with New York / Newark.
+10. For US West or central fallback, start with Salt Lake City.
+11. In the SSH key section, select `trench-tools`.
+12. In the startup script/user-data section, select `trench-tools-bootstrap`.
+13. In the firewall section, select `trench-tools-ssh-only`.
+14. Create/deploy the server.
 
 If you skip the startup script, the server still works, but you will need to run the bootstrap commands manually after first SSH login.
 
 If you forgot to select the SSH key while deploying, the easiest fix is usually to destroy the empty fresh server and redeploy with the key selected. Advanced users can add the public key later to `/root/.ssh/authorized_keys`.
 
-After the server finishes booting, SSH in and continue at [Fill `.env`](#4-fill-env). If your VPS provider does not support startup scripts, skip the startup-script part and run the bootstrap manually in the next section.
+If you forgot to attach the firewall group, attach it from the server's settings before you start using the VPS. The only inbound port that needs to be open publicly is SSH `22`.
 
-## 3. Bootstrap The Server
+After the server finishes booting, continue with [Connect To The VPS](#3-connect-to-the-vps). If your VPS provider does not support startup scripts, skip the startup-script part and run the bootstrap manually in that section.
 
-After the VPS is ready, copy its public IP from the provider dashboard.
+## 3. Connect To The VPS
 
-First test direct SSH from your local machine:
+After the VPS is ready, copy its public IP from the provider dashboard. You can do this section from any terminal, or you can connect with VS Code Remote SSH, [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI) Remote SSH, Codex, or another computer assistant if you want help editing files and reading logs.
+
+1. Test direct SSH from your local machine:
 
 ```bash
 ssh root@YOUR_SERVER_IP
@@ -194,14 +300,32 @@ ssh root@YOUR_SERVER_IP
 
 If SSH says `Permission denied (publickey)`, the provider did not receive or attach the public key you generated. Go back to the provider `SSH Keys` setting and make sure the public key is added and selected for the server.
 
-Recommended: add a named host to your local SSH config so you can reconnect by name and automatically forward the browser ports. This is the most important quality-of-life step for VPS use.
+2. Add a named host to your local SSH config.
+
+This lets you reconnect by name and automatically forward the browser ports. It is the most important quality-of-life step for VPS use.
 
 SSH config location:
 
 - Windows: `C:\Users\<user>\.ssh\config`
-- macOS/Linux: `~/.ssh/config`
+- Linux: `~/.ssh/config`
 
-Create the file if it does not exist.
+On Windows, run this in PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force $env:USERPROFILE\.ssh
+notepad $env:USERPROFILE\.ssh\config
+```
+
+On Linux, run this:
+
+```bash
+mkdir -p ~/.ssh
+nano ~/.ssh/config
+```
+
+3. Paste this block into the SSH config file.
+
+Replace `YOUR_SERVER_IP` with the VPS IPv4 address from Vultr.
 
 ```sshconfig
 Host Trenchtools-vps
@@ -215,15 +339,24 @@ Host Trenchtools-vps
   ServerAliveInterval 30
 ```
 
-After saving the config, connect with:
+4. Save the SSH config file.
+
+In Notepad, use `File` -> `Save`. In `nano`, press `Ctrl+O`, press `Enter`, then press `Ctrl+X`.
+
+5. Connect with the named host:
 
 ```bash
 ssh Trenchtools-vps
 ```
 
-Cursor Remote SSH can use the same `Host Trenchtools-vps` entry. In Cursor, choose Remote SSH and select `Trenchtools-vps`. When Cursor connects, SSH opens the same local forwards, so your browser can reach the private VPS services at `127.0.0.1:8788` and `127.0.0.1:8789`.
+That one command logs in and opens both browser-facing ports on your computer:
 
-Keep one SSH/Cursor connection open while using the extension or LaunchDeck. The local forwards exist only while the SSH session is connected.
+- local `127.0.0.1:8788` forwards to the VPS execution engine
+- local `127.0.0.1:8789` forwards to the VPS LaunchDeck engine
+
+[Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI) Remote SSH can use the same `Host Trenchtools-vps` entry. In [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI), choose Remote SSH and select `Trenchtools-vps`. When [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI) connects, SSH opens the same local forwards, so your browser can reach the private VPS services at `127.0.0.1:8788` and `127.0.0.1:8789`.
+
+Keep one SSH/[Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI) connection open while using the extension or LaunchDeck. The local forwards exist only while the SSH session is connected.
 
 If you did not use the deploy-time startup script, run the bootstrap manually:
 
@@ -237,8 +370,8 @@ bash /root/vps-bootstrap.sh
 If you did use the deploy-time startup script, check that it completed:
 
 ```bash
-systemctl status launchdeck
-journalctl -u launchdeck -n 100 --no-pager
+systemctl status trenchtools
+journalctl -u trenchtools -n 100 --no-pager
 ```
 
 What the script does:
@@ -246,7 +379,7 @@ What the script does:
 - installs base packages
 - installs Rust stable
 - installs Node.js 20
-- clones the repo to `/opt/launchdeck`
+- clones the repo to `/root/trench.tools`
 - runs `npm install`
 - copies `.env.example` to `.env` if needed
 - installs and enables a `systemd` service
@@ -256,20 +389,20 @@ What the script does:
 Optional overrides:
 
 ```bash
-LAUNCHDECK_REPO_BRANCH=master \
-LAUNCHDECK_DIR=/opt/launchdeck \
-LAUNCHDECK_SERVICE_NAME=launchdeck \
+TRENCH_TOOLS_REPO_BRANCH=master \
+TRENCH_TOOLS_DIR=/root/trench.tools \
+TRENCH_TOOLS_SERVICE_NAME=trenchtools \
 bash /root/vps-bootstrap.sh
 ```
 
-Those env names are kept for compatibility.
+Older `LAUNCHDECK_*` override names still work for existing automation, but new setups should use `TRENCH_TOOLS_*`.
 
 ## 4. Fill `.env`
 
-On the VPS:
+If you are using a terminal on the VPS:
 
 ```bash
-cd /opt/launchdeck
+cd /root/trench.tools
 nano .env
 ```
 
@@ -295,48 +428,62 @@ WARM_RPC_URL=https://rpc.shyft.to?api_key=YOUR_SHYFT_API_KEY
 WARM_WS_URL=wss://rpc.shyft.to?api_key=YOUR_SHYFT_API_KEY
 ```
 
-Restart after editing:
+After saving `.env`, restart Trench Tools:
 
 ```bash
-systemctl restart launchdeck
+systemctl restart trenchtools
 ```
 
-The bootstrap installs a `systemd` service so the VPS can start Trench Tools automatically after reboots. That service runs `npm start`, and `npm start` reads `TRENCH_TOOLS_MODE` from `.env`.
-
-For manual control inside the repo, use:
+Then copy the shared access token. You will paste this into the browser extension on your local PC in the next step.
 
 ```bash
-cd /opt/launchdeck
-npm start
-npm stop
-npm restart
+cat /root/trench.tools/.local/trench-tools/default-engine-token.txt
 ```
 
-You can still override the mode for a one-off manual run:
+## 5. Install The Extension And Add The Token
 
-```bash
-cd /opt/launchdeck
-./trench-tools-start.sh --mode both
+Do this on the local PC that runs Chrome/Edge, not inside the VPS.
+
+1. Download `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest).
+2. Unzip it locally.
+3. Load the unzipped `trench-tools-extension` folder as an unpacked Chrome/Edge extension.
+4. Open the Trench Tools extension Options page.
+5. Open `Global settings`.
+6. Paste the token from the VPS into `Shared access token`.
+7. Use these host URLs:
+
+```text
+Execution host URL: http://127.0.0.1:8788
+LaunchDeck host URL: http://127.0.0.1:8789
 ```
 
-Modes:
+8. Click `Save token`.
+9. Click `Test execution host`.
+10. Click `Test LaunchDeck connection` if you are running `both` or `ld`.
+11. Reload the supported trading site.
 
-- `ee` - only `execution-engine` on `8788`; extension trading and PnL
-- `ld` - LaunchDeck engine and follow daemon on `8789/8790`
-- `both` - all services; normal VPS mode
+At this point the normal setup is done. Keep the `ssh Trenchtools-vps` connection open while using the extension or LaunchDeck.
 
-For the easiest VPS setup, set `TRENCH_TOOLS_MODE` in `.env`, use `systemctl restart launchdeck` after `.env` changes, and let the service own startup. Use the direct start script only when you are testing a one-off mode in an SSH session.
+Even though Trench Tools runs on a VPS, the extension host fields still use `127.0.0.1` because the SSH tunnel makes those VPS services appear local to your browser. See [EXTENSION.md](EXTENSION.md) for the full extension install guide.
 
-## 5. Check The Service
+## Troubleshooting And Reference
+
+The normal setup is complete after the extension connects. Use the sections below only if something does not work, or when updating/debugging later.
+
+### Optional Service Check
+
+If setup worked and the extension connects, you can skip this section. Use it if the service does not seem to start or you want to inspect logs.
 
 ```bash
-systemctl status launchdeck
-journalctl -u launchdeck -n 100 --no-pager
+systemctl status trenchtools
+journalctl -u trenchtools -n 100 --no-pager
 ```
 
 The first start may take a while because Rust builds release binaries. Later restarts should be faster.
 
-## 6. Open Browser Ports Through SSH
+The bootstrap installs a `systemd` service so the VPS can start Trench Tools automatically after reboots. That service runs `npm start`, and `npm start` reads `TRENCH_TOOLS_MODE` from `.env`.
+
+### Optional SSH Tunnel Check
 
 If Chrome/Edge runs on your own computer and Trench Tools runs on the VPS, your browser cannot see the VPS's `127.0.0.1` by itself. `127.0.0.1` always means "this computer".
 
@@ -346,7 +493,7 @@ The fix is an SSH tunnel:
 your browser -> 127.0.0.1 on your computer -> SSH tunnel -> 127.0.0.1 on the VPS
 ```
 
-That is why the SSH config above includes `LocalForward` lines.
+The SSH config in [Connect To The VPS](#3-connect-to-the-vps) already opens this tunnel with `LocalForward` lines. If you added that config and connect with `ssh Trenchtools-vps`, you do not need to run more port commands. Use this section only for verification, daily reconnects, or the manual fallback if you skipped the SSH config.
 
 Port meanings:
 
@@ -356,7 +503,7 @@ Port meanings:
 
 Recommended daily flow:
 
-1. start or reconnect SSH/Cursor:
+1. start or reconnect SSH/[Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI):
 
 ```bash
 ssh Trenchtools-vps
@@ -370,7 +517,7 @@ http://127.0.0.1:8788
 http://127.0.0.1:8789
 ```
 
-Manual fallback if you did not add `LocalForward` to SSH config:
+Only use this manual fallback if you did not add `LocalForward` to SSH config:
 
 ```bash
 ssh -L 8788:127.0.0.1:8788 -L 8789:127.0.0.1:8789 root@YOUR_SERVER_IP
@@ -391,7 +538,7 @@ Test-NetConnection 127.0.0.1 -Port 8788
 Test-NetConnection 127.0.0.1 -Port 8789
 ```
 
-Verify from macOS/Linux on the same machine as the browser:
+Verify from Linux on the same machine as the browser:
 
 ```bash
 curl http://127.0.0.1:8788/api/extension/auth/bootstrap
@@ -400,61 +547,64 @@ curl http://127.0.0.1:8789/health
 
 If `8788` works but `8789` fails, extension trading can work while LaunchDeck is offline. Add or fix the `LocalForward 8789 127.0.0.1:8789` line and reconnect SSH.
 
-## 7. Connect The Extension
+### Optional Manual Runtime Commands
 
-Install or update the browser extension on the local PC that runs Chrome/Edge. The simplest path is to download `trench-tools-extension.zip` from the `extension-latest` GitHub release, unzip it locally, and load the unzipped `trench-tools-extension` folder as an unpacked extension. You can also pull the full repo or only `extension/trench-tools` with git. See [EXTENSION.md](EXTENSION.md).
+For manual control inside the repo, use:
 
-Open the Trench Tools extension Options page, then open `Global settings`.
-
-Use these values when you are using SSH forwards:
-
-```text
-Execution host URL: http://127.0.0.1:8788
-LaunchDeck host URL: http://127.0.0.1:8789
-Shared access token: contents of /opt/launchdeck/.local/trench-tools/default-engine-token.txt
+```bash
+cd /root/trench.tools
+npm start
+npm stop
+npm restart
 ```
 
-Then:
+You can still override the mode for a one-off manual run:
 
-1. click `Save token`
-2. click `Test execution host`
-3. click `Test LaunchDeck connection` if you are running `both` or `ld`
-4. reload the supported trading site
+```bash
+cd /root/trench.tools
+./trench-tools-start.sh --mode both
+```
 
-Even though Trench Tools runs on a VPS, the extension host fields still use `127.0.0.1` because the SSH tunnel makes those VPS services appear local to your browser.
+Modes:
+
+- `ee` - only `execution-engine` on `8788`; extension trading and PnL
+- `ld` - LaunchDeck engine and follow daemon on `8789/8790`
+- `both` - all services; normal VPS mode
+
+For the easiest VPS setup, set `TRENCH_TOOLS_MODE` in `.env`, use `systemctl restart trenchtools` after `.env` changes, and let the service own startup. Use the direct start script only when you are testing a one-off mode in an SSH session.
 
 Do not expose plain HTTP `8788`, `8789`, or `8790` to the public internet. Use SSH tunnels unless you intentionally manage your own HTTPS reverse proxy and access controls.
 
-## Auth Token
+### Auth Token
 
 Default VPS token path:
 
 ```text
-/opt/launchdeck/.local/trench-tools/default-engine-token.txt
+/root/trench.tools/.local/trench-tools/default-engine-token.txt
 ```
 
 Use it in extension Options -> Global settings -> `Shared access token`.
 
 Never paste a real token into docs, screenshots, public issues, Discord, or support messages.
 
-## Verification Checklist
+### Verification Checklist
 
-- `systemctl status launchdeck` is healthy
-- `/opt/launchdeck/.env` is filled with placeholder-free values
-- token file exists at `/opt/launchdeck/.local/trench-tools/default-engine-token.txt`
+- `systemctl status trenchtools` is healthy
+- `/root/trench.tools/.env` is filled with placeholder-free values
+- token file exists at `/root/trench.tools/.local/trench-tools/default-engine-token.txt`
 - SSH config or a manual tunnel forwards `8788` and `8789` to your local browser machine
 - LaunchDeck opens locally at `http://127.0.0.1:8789`
 - extension Options -> Global settings tests the expected host(s)
 - first trade/launch uses a small test amount and `Helius Sender` or `Hello Moon`
 
-## Updating Later
+### Updating Later
 
 ```bash
-cd /opt/launchdeck
+cd /root/trench.tools
 git pull --ff-only
 npm install
-systemctl restart launchdeck
-systemctl status launchdeck
+systemctl restart trenchtools
+systemctl status trenchtools
 ```
 
 If you use the browser extension, reload the unpacked extension in Chrome/Edge after updating:
@@ -464,35 +614,35 @@ If you use the browser extension, reload the unpacked extension in Chrome/Edge a
 3. click reload
 4. re-test Options -> Global settings
 
-If you installed from the packaged zip, download the newest `trench-tools-extension.zip` on your local PC, unzip it over or beside the old extension folder, then reload Trench Tools in Chrome/Edge. If you loaded `extension/trench-tools` from a git checkout, update that checkout with `git pull --ff-only` first.
+If you installed from the packaged zip, download the newest `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest) on your local PC, unzip it over or beside the old extension folder, then reload Trench Tools in Chrome/Edge. If you loaded `extension/trench-tools` from a git checkout, update that checkout with `git pull --ff-only` first.
 
-## Useful Commands
+### Useful Commands
 
 Status:
 
 ```bash
-systemctl status launchdeck
+systemctl status trenchtools
 ```
 
 Restart:
 
 ```bash
-systemctl restart launchdeck
+systemctl restart trenchtools
 ```
 
 Logs:
 
 ```bash
-journalctl -u launchdeck -f
+journalctl -u trenchtools -f
 ```
 
 Stop:
 
 ```bash
-systemctl stop launchdeck
+systemctl stop trenchtools
 ```
 
-## Security Notes
+### Security Notes
 
 - do not share `.env`
 - do not open `8788`, `8789`, or `8790` directly to the public internet

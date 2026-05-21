@@ -17,8 +17,12 @@
 
   removePreloadClones();
 
-  if (/pulse/i.test(window.location.href) || document.getElementById(STYLE_ID)) {
+  if (isPulsePath() || document.getElementById(STYLE_ID)) {
     return;
+  }
+
+  function isPulsePath() {
+    return /\/pulse\b/i.test(window.location.pathname || "");
   }
 
   function readJson(key) {
@@ -133,7 +137,7 @@
         div:has(> div#instant-trade) > div:not(#instant-trade) {
           width: ${size.width}px !important;
         }
-        .trench-tools-axiom-token-detail-bloom-clone {
+        .trench-tools-axiom-token-detail-clone {
           border: 1px solid #EEA7ED !important;
           color: #EEA7ED !important;
           z-index: 1000;

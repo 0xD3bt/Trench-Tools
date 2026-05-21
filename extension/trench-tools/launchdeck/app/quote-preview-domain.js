@@ -121,9 +121,10 @@
 
   function normalizeShape(shape) {
     const value = shape && typeof shape === "object" ? shape : {};
+    const rawQuoteAsset = String(value.quoteAsset || "").trim().toLowerCase();
     return {
       launchpad: String(value.launchpad || "").trim().toLowerCase(),
-      quoteAsset: String(value.quoteAsset || "").trim().toLowerCase() === "usd1" ? "usd1" : "sol",
+      quoteAsset: rawQuoteAsset === "usd1" || rawQuoteAsset === "usdc" ? rawQuoteAsset : "sol",
       launchMode: String(value.launchMode || "").trim().toLowerCase(),
       mode: String(value.mode || "").trim().toLowerCase(),
       amount: String(value.amount || "").trim(),
@@ -168,6 +169,7 @@
     const basis = {
       initialVirtualTokenReserves: bigintStringOrEmpty(source.initialVirtualTokenReserves),
       initialVirtualSolReserves: bigintStringOrEmpty(source.initialVirtualSolReserves),
+      initialVirtualQuoteReserves: bigintStringOrEmpty(source.initialVirtualQuoteReserves),
       initialRealTokenReserves: bigintStringOrEmpty(source.initialRealTokenReserves),
       feeBasisPoints: bigintStringOrEmpty(source.feeBasisPoints),
       creatorFeeBasisPoints: bigintStringOrEmpty(source.creatorFeeBasisPoints),
@@ -261,6 +263,14 @@
         placeholder: "Preview unavailable until Pump warm state is ready.",
       };
     }
+    const quoteAsset = shape.quoteAsset === "usdc" ? "usdc" : "sol";
+    if (quoteAsset === "usdc") {
+      return {
+        quote: null,
+        placeholder: "Pump USDC preview uses the live SOL/USDC route and will be shown by the launch compiler.",
+      };
+    }
+    const quoteAssetLabel = "SOL";
     const initialVirtualTokenReserves = BigInt(basis.initialVirtualTokenReserves);
     const initialVirtualSolReserves = BigInt(basis.initialVirtualSolReserves);
     const initialRealTokenReserves = BigInt(basis.initialRealTokenReserves);
@@ -283,8 +293,8 @@
           estimatedTokens: formatDecimal(tokensOut, PUMP_TOKEN_DECIMALS, 6),
           estimatedSol: formatDecimal(spendableSol, 9, 6),
           estimatedQuoteAmount: formatDecimal(spendableSol, 9, 6),
-          quoteAsset: "sol",
-          quoteAssetLabel: "SOL",
+          quoteAsset,
+          quoteAssetLabel,
           estimatedSupplyPercent: formatSupplyPercent(tokensOut, PUMP_TOTAL_SUPPLY_RAW),
         },
       };
@@ -305,8 +315,8 @@
           estimatedTokens: formatDecimal(tokenAmount, PUMP_TOKEN_DECIMALS, 6),
           estimatedSol: formatDecimal(totalSol, 9, 6),
           estimatedQuoteAmount: formatDecimal(totalSol, 9, 6),
-          quoteAsset: "sol",
-          quoteAssetLabel: "SOL",
+          quoteAsset,
+          quoteAssetLabel,
           estimatedSupplyPercent: formatSupplyPercent(tokenAmount, PUMP_TOTAL_SUPPLY_RAW),
         },
       };

@@ -13,10 +13,12 @@ use crate::{
         submit_independent_transactions_for_transport,
     },
     trade_dispatch::{
-        CompiledAdapterTrade, TradeDispatchPlan, TransactionDependencyMode, adapter_for_selector,
-        compile_trade_for_adapter, resolve_trade_plan, resolve_trade_plan_fresh,
+        CachedRouteReuseDecision, CompiledAdapterTrade, TradeDispatchPlan,
+        TransactionDependencyMode, adapter_for_selector, compile_trade_for_adapter,
+        guard_cached_route_for_request, invalidate_pre_migration_route_context, resolve_trade_plan,
+        resolve_trade_plan_fresh,
     },
-    trade_planner::{LifecycleAndCanonicalMarket, TradeVenueFamily},
+    trade_planner::{LifecycleAndCanonicalMarket, TradeLifecycle, TradeVenueFamily},
     transport::{ExecutionTransportConfig, TransportPlan, build_transport_plan},
     wallet_store::load_solana_wallet_by_env_key,
     warming_service::shared_warming_service,
@@ -1351,20 +1353,39 @@ async fn reuse_or_refresh_planned_selector(
         .await
     {
         if !cached.is_stale(now_unix_ms()) && cached.selector.same_route_as(&selector) {
-            return Ok(crate::trade_dispatch::TradeDispatchPlan {
-                adapter: adapter_for_selector(&selector)?,
-                selector,
-                execution_backend: crate::rollout::preferred_execution_backend(),
-                raw_address: request.mint.clone(),
-                resolved_input_kind: crate::trade_dispatch::TradeInputKind::Mint,
-                resolved_mint: request.mint.clone(),
-                resolved_pinned_pool: request.pinned_pool.clone(),
-                non_canonical: false,
-            });
+            match guard_cached_route_for_request(rpc_url, request, &cached.mint, &cached.selector)
+                .await
+            {
+                CachedRouteReuseDecision::UseCached => {
+                    return Ok(crate::trade_dispatch::TradeDispatchPlan {
+                        adapter: adapter_for_selector(&selector)?,
+                        selector,
+                        execution_backend: crate::rollout::preferred_execution_backend(),
+                        raw_address: request.mint.clone(),
+                        resolved_input_kind: crate::trade_dispatch::TradeInputKind::Mint,
+                        resolved_mint: cached.mint,
+                        resolved_pinned_pool: cached.pinned_pool,
+                        non_canonical: false,
+                    });
+                }
+                CachedRouteReuseDecision::ReplanMigrated => {
+                    invalidate_pre_migration_route_context(rpc_url, request, &cached.mint).await;
+                }
+                CachedRouteReuseDecision::Reject(error) => return Err(error),
+            }
         }
     }
     let refreshed = resolve_trade_plan(request).await?;
     if !refreshed.selector.same_route_as(&selector) {
+        if migration_refresh_allowed(request, &selector, &refreshed) {
+            eprintln!(
+                "[execution-engine][trade-runtime] [stale_route_reclassified] address={} old_market={} new_market={}",
+                request.mint,
+                selector.canonical_market_key,
+                refreshed.selector.canonical_market_key
+            );
+            return Ok(refreshed);
+        }
         return Err(format!(
             "[stale_route_reclassified] Planner output changed during send-time freshness check for address {}.",
             request.mint
@@ -1393,28 +1414,36 @@ async fn reuse_or_refresh_planned_route(
     {
         if !cached.is_stale(now_unix_ms()) && cached.selector.same_route_as(&planned_route.selector)
         {
-            let mut reused = planned_route;
-            reused.selector = cached.selector;
-            return Ok(reused);
+            match guard_cached_route_for_request(
+                rpc_url,
+                &normalized_request,
+                &planned_route.resolved_mint,
+                &cached.selector,
+            )
+            .await
+            {
+                CachedRouteReuseDecision::UseCached => {
+                    let mut reused = planned_route;
+                    reused.selector = cached.selector;
+                    return Ok(reused);
+                }
+                CachedRouteReuseDecision::ReplanMigrated => {
+                    invalidate_pre_migration_route_context(
+                        rpc_url,
+                        &normalized_request,
+                        &planned_route.resolved_mint,
+                    )
+                    .await;
+                }
+                CachedRouteReuseDecision::Reject(error) => return Err(error),
+            }
         }
     }
     let refreshed = resolve_trade_plan(request).await?;
     if refreshed.selector.same_route_as(&planned_route.selector) {
         return Ok(refreshed);
     }
-    let migration_refresh_allowed = matches!(
-        planned_route.selector.lifecycle,
-        crate::trade_planner::TradeLifecycle::PreMigration
-    ) && matches!(
-        refreshed.selector.lifecycle,
-        crate::trade_planner::TradeLifecycle::PostMigration
-    ) && request
-        .pinned_pool
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none();
-    if migration_refresh_allowed {
+    if migration_refresh_allowed(request, &planned_route.selector, &refreshed) {
         eprintln!(
             "[execution-engine][trade-runtime] [stale_route_reclassified] address={} old_market={} new_market={}",
             request.mint,
@@ -1427,6 +1456,33 @@ async fn reuse_or_refresh_planned_route(
         "[stale_route_reclassified] Planner output changed during send-time freshness check for address {}.",
         request.mint
     ))
+}
+
+fn migration_refresh_allowed(
+    request: &TradeRuntimeRequest,
+    previous_selector: &LifecycleAndCanonicalMarket,
+    refreshed: &TradeDispatchPlan,
+) -> bool {
+    if !matches!(previous_selector.lifecycle, TradeLifecycle::PreMigration)
+        || !matches!(refreshed.selector.lifecycle, TradeLifecycle::PostMigration)
+    {
+        return false;
+    }
+    let Some(pinned_pool) = request
+        .pinned_pool
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    let refreshed_pool = refreshed
+        .resolved_pinned_pool
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| refreshed.selector.canonical_market_key.trim());
+    !refreshed_pool.is_empty() && refreshed_pool != pinned_pool
 }
 
 fn side_label(side: &TradeSide) -> &'static str {
@@ -1737,6 +1793,19 @@ mod tests {
             input_amount_hint: Some("0.5".to_string()),
             minimum_output_hint: None,
             runtime_bundle: None,
+        }
+    }
+
+    fn sample_dispatch_plan(selector: LifecycleAndCanonicalMarket) -> TradeDispatchPlan {
+        TradeDispatchPlan {
+            adapter: adapter_for_selector(&selector).expect("sample selector adapter"),
+            selector,
+            execution_backend: crate::rollout::TradeExecutionBackend::Native,
+            raw_address: "Mint111".to_string(),
+            resolved_input_kind: crate::trade_dispatch::TradeInputKind::Mint,
+            resolved_mint: "Mint111".to_string(),
+            resolved_pinned_pool: None,
+            non_canonical: false,
         }
     }
 
@@ -2334,5 +2403,25 @@ mod tests {
         assert!(reroute.planned_trade.is_none());
         assert!(reroute.warm_key.is_none());
         assert_eq!(reroute.pinned_pool.as_deref(), Some("Pair111"));
+    }
+
+    #[test]
+    fn migration_refresh_allows_pre_to_post_when_unpinned_or_pin_changes() {
+        let mut request = sample_runtime_request();
+        request.pinned_pool = None;
+        let mut previous = sample_selector();
+        previous.lifecycle = TradeLifecycle::PreMigration;
+        previous.family = TradeVenueFamily::BonkLaunchpad;
+        previous.wrapper_action = WrapperAction::BonkLaunchpadUsd1Buy;
+        previous.direct_protocol_target = Some("bonk-launchpad".to_string());
+        let refreshed = sample_dispatch_plan(sample_selector());
+
+        assert!(migration_refresh_allowed(&request, &previous, &refreshed));
+
+        request.pinned_pool = Some("Pool111".to_string());
+        assert!(migration_refresh_allowed(&request, &previous, &refreshed));
+
+        request.pinned_pool = Some("pool-1".to_string());
+        assert!(!migration_refresh_allowed(&request, &previous, &refreshed));
     }
 }

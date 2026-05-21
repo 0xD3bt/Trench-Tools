@@ -42,6 +42,7 @@
       serializeAgentSplitDraft,
       normalizeAutoSellTriggerFamily,
       normalizeAutoSellTriggerMode,
+      normalizeDecimalInput = (value) => String(value || "").trim(),
     } = config;
 
     function readForm() {
@@ -135,7 +136,7 @@
         buybackPercent:
           mode === "agent-custom"
             ? agentBuyback ? String(agentBuyback.shareBps / 100) : ""
-            : values.agentUnlockedBuybackPercent || "",
+            : normalizeDecimalInput(values.agentUnlockedBuybackPercent || "", 2),
         agentSplitRecipients,
         devBuyMode: devBuyAmount ? getDevBuyMode() : "",
         devBuyAmount,
@@ -187,7 +188,7 @@
         sniperConfigJson: sniperSupported ? (getNamedValue("sniperConfigJson") || "[]") : "[]",
         automaticSniperSellEnabled,
         automaticDevSellEnabled,
-        automaticDevSellPercent: autoSellSupported ? (getNamedValue("automaticDevSellPercent") || "0") : "0",
+        automaticDevSellPercent: autoSellSupported ? (normalizeDecimalInput(getNamedValue("automaticDevSellPercent") || "0", 2) || "0") : "0",
         automaticDevSellTriggerFamily: autoSellSupported ? getAutoSellTriggerFamily() : "time",
         automaticDevSellTriggerMode: autoSellSupported ? getAutoSellTriggerMode() : "block-offset",
         automaticDevSellDelayMs: autoSellSupported ? String(getAutoSellDelayMs()) : "0",
@@ -298,7 +299,7 @@
         ? {
           enabled: Boolean(f.automaticDevSellEnabled),
           sniperEnabled: Boolean(f.automaticSniperSellEnabled),
-          percent: Number(f.automaticDevSellPercent || 100),
+          percent: Number(normalizeDecimalInput(f.automaticDevSellPercent || 100, 2) || 100),
           triggerFamily: normalizeAutoSellTriggerFamily(f.automaticDevSellTriggerFamily),
           triggerMode: normalizeAutoSellTriggerMode(f.automaticDevSellTriggerMode),
           delayMs: Number(f.automaticDevSellDelayMs || 0),

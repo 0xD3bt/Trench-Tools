@@ -4,6 +4,12 @@ export const PULSE_VAMP_MODES = Object.freeze(["prefill", "insta"]);
 export const VAMP_ICON_MODES = Object.freeze(["both", "pulse", "token", "off"]);
 export const DEXSCREENER_ICON_MODES = Object.freeze(["both", "pulse", "token", "off"]);
 export const AXIOM_INSTANT_TRADE_BUTTON_MODE_COUNTS = Object.freeze([1, 2, 3]);
+export const AXIOM_PULSE_QUICK_BUY_BUTTON_COUNTS = Object.freeze([1, 2]);
+export const AXIOM_PULSE_SECOND_BUTTON_TABLES = Object.freeze([
+  "new_pairs",
+  "final_stretch",
+  "migrated"
+]);
 export const AXIOM_POST_DEPLOY_ACTIONS = Object.freeze([
   "close_modal_toast",
   "toast_only",
@@ -32,6 +38,30 @@ function normalizeAxiomInstantTradeButtonModeCount(value, fallback = 3) {
   return AXIOM_INSTANT_TRADE_BUTTON_MODE_COUNTS.includes(count) ? count : fallback;
 }
 
+function normalizeAxiomPulseQuickBuyButtonCount(value, fallback = 1) {
+  const count = Number(value);
+  return AXIOM_PULSE_QUICK_BUY_BUTTON_COUNTS.includes(count) ? count : fallback;
+}
+
+function defaultPulseSecondButtonTables() {
+  return AXIOM_PULSE_SECOND_BUTTON_TABLES.reduce((accumulator, tableId) => {
+    accumulator[tableId] = true;
+    return accumulator;
+  }, {});
+}
+
+function normalizeAxiomPulseSecondButtonTables(value) {
+  const defaults = defaultPulseSecondButtonTables();
+  if (!value || typeof value !== "object") {
+    return defaults;
+  }
+  const result = {};
+  for (const tableId of AXIOM_PULSE_SECOND_BUTTON_TABLES) {
+    result[tableId] = value[tableId] === undefined ? defaults[tableId] : Boolean(value[tableId]);
+  }
+  return result;
+}
+
 function normalizeAxiomPostDeployAction(value, fallback = "close_modal_toast") {
   const action = String(value || "").trim().toLowerCase();
   return AXIOM_POST_DEPLOY_ACTIONS.includes(action) ? action : fallback;
@@ -54,6 +84,8 @@ export function defaultSiteFeatures() {
       pulsePanel: true,
       pulseVamp: true,
       pulseVampMode: "prefill",
+      pulseQuickBuyButtonCount: 1,
+      pulseSecondButtonTables: defaultPulseSecondButtonTables(),
       instantTradeButtonModeCount: 3,
       vampIconMode: "both",
       dexScreenerIconMode: "both",
@@ -88,6 +120,13 @@ export function normalizeSiteFeatures(value) {
       pulsePanel: value?.axiom?.pulsePanel ?? defaults.axiom.pulsePanel,
       pulseVamp: value?.axiom?.pulseVamp ?? defaults.axiom.pulseVamp,
       pulseVampMode: normalizePulseVampMode(value?.axiom?.pulseVampMode, defaults.axiom.pulseVampMode),
+      pulseQuickBuyButtonCount: normalizeAxiomPulseQuickBuyButtonCount(
+        value?.axiom?.pulseQuickBuyButtonCount,
+        defaults.axiom.pulseQuickBuyButtonCount
+      ),
+      pulseSecondButtonTables: normalizeAxiomPulseSecondButtonTables(
+        value?.axiom?.pulseSecondButtonTables
+      ),
       instantTradeButtonModeCount: normalizeAxiomInstantTradeButtonModeCount(
         value?.axiom?.instantTradeButtonModeCount,
         defaults.axiom.instantTradeButtonModeCount

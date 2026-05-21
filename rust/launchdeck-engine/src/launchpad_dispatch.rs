@@ -402,7 +402,7 @@ pub async fn quote_launch_for_launchpad(
     amount: &str,
 ) -> Result<Option<LaunchQuote>, String> {
     match launchpad {
-        "pump" => quote_pump_launch(rpc_url, mode, amount).await,
+        "pump" => quote_pump_launch(rpc_url, quote_asset, mode, amount).await,
         "bonk" => quote_bonk_launch(rpc_url, quote_asset, launch_mode, mode, amount).await,
         "bagsapp" => quote_bags_launch(rpc_url, launch_mode, mode, amount).await,
         _ => Ok(None),

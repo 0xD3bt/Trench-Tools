@@ -6,7 +6,7 @@
 
   runtime.registerPlatformAdapter("axiom", {
     matchesHost(hostname) {
-      return hostname === "axiom.trade";
+      return hostname === "axiom.trade" || hostname === "backup.axiom.trade";
     },
 
     createAdapter(helpers) {
@@ -43,6 +43,7 @@
       const AXIOM_TOKEN_DETAIL_WALLET_MENU_MAX_HEIGHT = 520;
       const PULSE_PANEL_OWNER_CLASS = "trench-tools-pulse-panel-owner";
       let queuedDomOperationTimer = 0;
+      let queuedDomOperationRafHandle = 0;
       const queuedDomOperations = new Map();
       let overridesInjected = false;
       const targetedObservers = new Map();
@@ -67,12 +68,22 @@
       let axiomTokenDetailFloatingPresetRefreshRoot = null;
       let axiomTokenDetailFloatingPresetRefreshObserver = null;
       let axiomTokenDetailFloatingPresetRefreshRoute = null;
+      let axiomTokenDetailFloatingPresetNativeTradeCleanup = null;
       let axiomTokenDetailHardpanelRefreshRoot = null;
       let axiomTokenDetailHardpanelRefreshCleanup = null;
       let axiomTokenDetailHardpanelRefreshObserver = null;
+      let axiomTokenDetailNativeTradeRefreshLastAt = 0;
 
       function isExtensionContextInvalid(error) {
         return /Extension context invalidated/i.test(String(error?.message || error || ""));
+      }
+
+      function isExpectedLaunchShellError(error) {
+        const code = String(error?.code || "").trim().toUpperCase();
+        const message = String(error?.message || error || "");
+        return code === "LAUNCHDECK_NOT_CONFIGURED" ||
+          code === "EXTENSION_RELOADED" ||
+          /LaunchDeck.*disabled|LaunchDeck host.*not reachable|LaunchDeck host.*requires|No LaunchDeck deploy preset|Extension connection lost/i.test(message);
       }
 
       function safeRuntimeGetUrl(path) {
@@ -123,10 +134,17 @@
         (document.head || root).appendChild(script);
       }
 
+      let axiomPulseRescanRafHandle = 0;
       function requestAxiomPulseMetadataRescan() {
-        try {
-          document.dispatchEvent(new Event("trench-tools:axiom-pulse-rescan"));
-        } catch (_error) {}
+        if (axiomPulseRescanRafHandle) {
+          return;
+        }
+        axiomPulseRescanRafHandle = window.requestAnimationFrame(() => {
+          axiomPulseRescanRafHandle = 0;
+          try {
+            document.dispatchEvent(new Event("trench-tools:axiom-pulse-rescan"));
+          } catch (_error) {}
+        });
       }
 
       function getObserverOptions() {
@@ -138,38 +156,53 @@
         };
       }
 
+      function drainQueuedDomOperations() {
+        queuedDomOperationTimer = 0;
+        queuedDomOperationRafHandle = 0;
+        const operations = Array.from(queuedDomOperations.values());
+        queuedDomOperations.clear();
+        operations
+          .sort((left, right) => (left.priority === "urgent" && right.priority !== "urgent" ? -1 : 1))
+          .forEach(({ operation: queuedOperation }) => {
+            try {
+              queuedOperation();
+            } catch (error) {
+              if (isExtensionContextInvalid(error)) {
+                return;
+              }
+              console.error("Axiom DOM operation failed:", error);
+            }
+          });
+      }
+
       function queueDomOperation(key, operation, priority = "normal") {
         const existing = queuedDomOperations.get(key);
         if (!existing || priority === "urgent" || existing.priority !== "urgent") {
           queuedDomOperations.set(key, { operation, priority });
         }
-        if (queuedDomOperationTimer) {
+        if (priority === "urgent" && queuedDomOperationTimer) {
+          window.clearTimeout(queuedDomOperationTimer);
+          queuedDomOperationTimer = 0;
+        }
+        if (priority === "urgent") {
+          if (queuedDomOperationRafHandle) {
+            return;
+          }
+          queuedDomOperationRafHandle = window.requestAnimationFrame(drainQueuedDomOperations);
           return;
         }
-        queuedDomOperationTimer = window.setTimeout(
-          () => {
-            const operations = Array.from(queuedDomOperations.values());
-            queuedDomOperations.clear();
-            queuedDomOperationTimer = 0;
-            operations
-              .sort((left, right) => (left.priority === "urgent" && right.priority !== "urgent" ? -1 : 1))
-              .forEach(({ operation: queuedOperation }) => {
-                try {
-                  queuedOperation();
-                } catch (error) {
-                  if (isExtensionContextInvalid(error)) {
-                    return;
-                  }
-                  console.error("Axiom DOM operation failed:", error);
-                }
-              });
-          },
-          priority === "urgent" ? 0 : 16
-        );
+        if (queuedDomOperationTimer || queuedDomOperationRafHandle) {
+          return;
+        }
+        queuedDomOperationTimer = window.setTimeout(drainQueuedDomOperations, 16);
       }
 
       function isPulseUrl(url) {
-        return /pulse/i.test(String(url));
+        try {
+          return /\/pulse\b/i.test(new URL(String(url || ""), window.location.href).pathname || "");
+        } catch (_error) {
+          return /\/pulse\b/i.test(window.location.pathname || "");
+        }
       }
 
       function getAxiomSurfaceState(
@@ -178,7 +211,7 @@
       ) {
         const pulse = isPulseUrl(window.location.href);
         const tokenDetail = Boolean(pageAddress && !pulse);
-        const deferredListSurface = !pulse;
+        const deferredListSurface = true;
         const likelyListSurface = isAxiomListSurface();
         const likelyWalletTrackerSurface = isAxiomWalletTrackerSurface();
         const likelyWatchlistSurface = isAxiomWatchlistSurface();
@@ -243,9 +276,10 @@
               console.error("Axiom targeted observer failed:", error);
             }
           });
+          const observePulseList = targetInfo.key.startsWith("pulse-list:");
           observer.observe(targetInfo.target, {
             childList: true,
-            characterData: true,
+            characterData: !observePulseList,
             subtree: true
           });
           targetedObservers.set(targetInfo.key, observer);
@@ -346,13 +380,18 @@
         return target instanceof HTMLElement ? [target] : [];
       }
 
+      function getAxiomSurfaceNavText() {
+        const header = document.querySelector("header");
+        const source = header instanceof HTMLElement ? header : document.body;
+        return String(source?.textContent || "").slice(0, 4000);
+      }
+
       function isAxiomListSurface() {
         const path = window.location.pathname || "";
         if (/portfolio|wallet|tracker|watchlist/i.test(path)) {
           return true;
         }
-        const pageText = String(document.body?.innerText || "").slice(0, 4000);
-        return /\b(portfolio|wallet tracker|watchlist)\b/i.test(pageText);
+        return /\b(portfolio|wallet tracker|watchlist)\b/i.test(getAxiomSurfaceNavText());
       }
 
       function isAxiomWalletTrackerSurface() {
@@ -360,8 +399,7 @@
         if (/portfolio|wallet|tracker/i.test(path)) {
           return true;
         }
-        const pageText = String(document.body?.innerText || "").slice(0, 4000);
-        return /\b(portfolio|wallet tracker|tracked wallets?|wallets bought)\b/i.test(pageText);
+        return /\b(portfolio|wallet tracker|tracked wallets?|wallets bought)\b/i.test(getAxiomSurfaceNavText());
       }
 
       function isAxiomWatchlistSurface() {
@@ -369,8 +407,7 @@
         if (/watchlist/i.test(path)) {
           return true;
         }
-        const pageText = String(document.body?.innerText || "").slice(0, 4000);
-        return /\bwatchlist\b/i.test(pageText);
+        return /\bwatchlist\b/i.test(getAxiomSurfaceNavText());
       }
 
       function resolveObservedAddress(...candidates) {
@@ -512,6 +549,31 @@
         return resolveObservedAddress(helpers.extractMintFromUrl(window.location.href));
       }
 
+      function resolveCurrentTokenDetailRouteFallback(control = null) {
+        const anchor = findAxiomTokenDetailHeaderActionAnchor();
+        const mint = String(
+          control?.getAttribute?.("data-mint") ||
+          extractAxiomTokenDetailHeaderMint(anchor) ||
+          helpers.extractMintFromUrl(window.location.href) ||
+          ""
+        ).trim();
+        const address = String(
+          control?.getAttribute?.("data-route-key") ||
+          resolveCurrentPageAddress() ||
+          mint
+        ).trim();
+        if (!address) {
+          return null;
+        }
+        return {
+          address,
+          ...(mint ? { mint } : {}),
+          source: "page",
+          surface: "token_detail",
+          url: control?.getAttribute?.("data-route-url") || window.location.href
+        };
+      }
+
       function getCurrentTokenCandidate() {
         const surface = isPulseUrl(window.location.href) ? "pulse" : "token_detail";
         const directAddress = resolveCurrentPageAddress();
@@ -567,7 +629,9 @@
           helpers.removeInjectedControls("[data-trench-tools-pulse-dex-inline]");
           helpers.removeInjectedControls("[data-trench-tools-wallet-tracker-inline]");
           helpers.removeInjectedControls("[data-trench-tools-axiom-watchlist-inline]");
+          helpers.removeInjectedControls("[data-trench-tools-axiom-search-inline]");
           helpers.removeInjectedControls("[data-trench-tools-launchdeck-shell]");
+          restoreAxiomPulseClusterParentLayoutWithin(document);
           return;
         }
         ensureAxiomPageOverrides();
@@ -578,12 +642,16 @@
         }
         if (!instantTradeEnabled) {
           cleanupAxiomTokenDetailManualBuyButtons();
+          helpers.removeInjectedControls("[data-trench-tools-axiom-search-inline]");
         }
         if (!axiomFeatures.pulseButton) {
           helpers.removeInjectedControls("[data-trench-tools-pulse-inline]");
         }
         if (!axiomFeatures.pulsePanel) {
           helpers.removeInjectedControls("[data-trench-tools-pulse-panel-inline]");
+        }
+        if (!axiomFeatures.pulseButton && !axiomFeatures.pulsePanel) {
+          restoreAxiomPulseClusterParentLayoutWithin(document);
         }
         if (!shouldShowAxiomVampIcon("pulse")) {
           helpers.removeInjectedControls("[data-trench-tools-pulse-vamp-inline]");
@@ -645,6 +713,46 @@
         } else if (!surfaceState.watchlist || !axiomFeatures.watchlist) {
           helpers.removeInjectedControls("[data-trench-tools-axiom-watchlist-inline]");
         }
+        if (instantTradeEnabled) {
+          mountAxiomSearchQuickButtons();
+        }
+      }
+
+      function teardown() {
+        disconnectAxiomTargetedObserver();
+        window.clearTimeout(queuedDomOperationTimer);
+        queuedDomOperationTimer = 0;
+        if (queuedDomOperationRafHandle) {
+          window.cancelAnimationFrame(queuedDomOperationRafHandle);
+          queuedDomOperationRafHandle = 0;
+        }
+        if (axiomPulseRescanRafHandle) {
+          window.cancelAnimationFrame(axiomPulseRescanRafHandle);
+          axiomPulseRescanRafHandle = 0;
+        }
+        queuedDomOperations.clear();
+
+        cleanupAxiomTokenDetailManualBuyButtons();
+        cleanupAxiomTokenDetailHeaderActions();
+        cleanupAxiomTokenDetailWalletSelector();
+        disconnectAxiomTokenDetailSellHoverMonitor();
+
+        helpers.removeInjectedControls("[data-trench-tools-token-detail-action-inline]");
+        helpers.removeInjectedControls("[data-trench-tools-pulse-inline]");
+        helpers.removeInjectedControls("[data-trench-tools-pulse-panel-inline]");
+        helpers.removeInjectedControls("[data-trench-tools-pulse-vamp-inline]");
+        helpers.removeInjectedControls("[data-trench-tools-pulse-dex-inline]");
+        helpers.removeInjectedControls("[data-trench-tools-wallet-tracker-inline]");
+        helpers.removeInjectedControls("[data-trench-tools-axiom-watchlist-inline]");
+        helpers.removeInjectedControls("[data-trench-tools-axiom-search-inline]");
+        helpers.removeInjectedControls("[data-trench-tools-launchdeck-shell]");
+        document.querySelectorAll(".trench-tools-pulse-panel-open-card").forEach((element) => {
+          element._trenchToolsPulsePanelResume?.();
+        });
+        document.querySelectorAll(`.${PULSE_PANEL_OWNER_CLASS}`).forEach((element) => {
+          element.classList.remove(PULSE_PANEL_OWNER_CLASS);
+        });
+        restoreAxiomPulseClusterParentLayoutWithin(document);
       }
 
       function mountAxiomPulseQuickButtons() {
@@ -656,6 +764,10 @@
       function findAxiomPulseCardFromCopyButton(copyButton) {
         if (!(copyButton instanceof HTMLElement)) {
           return null;
+        }
+        const closestPulseCard = copyButton.closest(PULSE_CARD_SELECTOR);
+        if (closestPulseCard instanceof HTMLElement) {
+          return closestPulseCard;
         }
         let current = copyButton;
         while (current && current !== document.body) {
@@ -829,15 +941,19 @@
                 return;
               }
               helpers.showToast?.(error?.message || "Action failed.", "error");
-              console.error("Axiom launch shell action failed:", error);
+              if (!isExpectedLaunchShellError(error)) {
+                console.error("Axiom launch shell action failed:", error);
+              }
             });
         });
         return button;
       }
 
       function findAxiomLaunchShellMountTarget() {
+        const header = document.querySelector("header");
+        const scope = header instanceof HTMLElement ? header : document;
         const displayRow = Array.from(
-          document.querySelectorAll(LAUNCH_SHELL_ROW_SELECTOR)
+          scope.querySelectorAll(LAUNCH_SHELL_ROW_SELECTOR)
         ).find((row) => {
           const trigger = row.querySelector("button span");
           if (trigger?.textContent?.trim() === "Display") {
@@ -847,6 +963,12 @@
         });
         if (displayRow instanceof HTMLElement) {
           return displayRow;
+        }
+        if (header instanceof HTMLElement) {
+          const headerFallback = header.querySelector("div.flex.flex-row.gap-4.items-center");
+          if (headerFallback instanceof HTMLElement) {
+            return headerFallback;
+          }
         }
         return document.querySelector("header div.flex.flex-row.gap-4.items-center");
       }
@@ -987,100 +1109,644 @@
         }
         const cardId = getAxiomPulseCardId(card);
 
-        const copyButton = card.querySelector("button.group\\/copy");
+        const copyButton = resolveAxiomPulseCopyButton(card);
         if (!(copyButton instanceof HTMLElement)) {
           teardownAxiomPulseCardControls(card);
           return;
         }
 
-        const tokenUrl = findPulseRouteLink(card)?.href || window.location.href;
+        const axiomFeatures = helpers.state.siteFeatures?.axiom || {};
+        const renderInline = Boolean(axiomFeatures.pulseButton);
+        const renderPanel = Boolean(axiomFeatures.pulsePanel);
+        const willRenderTrenchToolsButtons = renderInline || renderPanel;
 
-        const targets = findAxiomPulseMountTargets(card);
-        if (!targets.length) {
+        const needsTableId =
+          renderInline && Number(axiomFeatures.pulseQuickBuyButtonCount) === 2;
+        const tableId = needsTableId ? getCachedAxiomPulseTable(card) : "";
+        const requestedSlots = renderInline
+          ? resolveAxiomPulseActiveSlots(axiomFeatures, tableId)
+          : [];
+        const cluster = resolveAxiomPulseNativeCluster(card);
+        if (!cluster?.parent || !(cluster.anchor instanceof HTMLElement)) {
           teardownAxiomPulseCardControls(card);
           return;
         }
+        const expectedInline = requestedSlots.length;
+        const expectedPanel = renderPanel ? 1 : 0;
+        const wantsVampIcon = shouldShowAxiomVampIcon("pulse") || shouldShowAxiomDexScreenerIcon("pulse");
+        const designRevision = Number(helpers.state?.axiomQuickBuyDesignRevision || 0) || 0;
+        const nativeSignature = resolveAxiomPulseNativeStyleSignature(cluster);
+        const labelSignature = requestedSlots.map((slot) => helpers.quickBuyLabel(slot)).join("|");
+        const expectedHash = `${expectedInline}|${expectedPanel}|${wantsVampIcon ? 1 : 0}|${tableId || ""}|${designRevision}|${nativeSignature}|${labelSignature}`;
 
-        targets.forEach((target) => {
-          if (!target.dataset.trenchToolsPulseAnchorId) {
-            target.dataset.trenchToolsPulseAnchorId = `pulse-anchor-${Math.random().toString(36).slice(2, 10)}`;
+        if (card.dataset.trenchToolsPulseMountedHash === expectedHash) {
+          const inlineCount = card.querySelectorAll("[data-trench-tools-pulse-inline]").length;
+          const panelCount = card.querySelectorAll("[data-trench-tools-pulse-panel-inline]").length;
+          const mountedParentIsCurrent =
+            !willRenderTrenchToolsButtons ||
+            Array.from(
+              card.querySelectorAll("[data-trench-tools-pulse-inline], [data-trench-tools-pulse-panel-inline]")
+            ).every((element) => element.parentElement === cluster.parent);
+          if (inlineCount === expectedInline && panelCount === expectedPanel && mountedParentIsCurrent) {
+            if (wantsVampIcon) {
+              ensureAxiomPulseVampIcon(card);
+            } else {
+              removeAxiomPulseVampIcon(card);
+            }
+            if (willRenderTrenchToolsButtons && !card._trenchToolsUltraResizeObserver) {
+              const fastCluster = resolveAxiomPulseNativeCluster(card);
+              if (fastCluster) {
+                scheduleAxiomPulseUltraHeightSync(card, fastCluster);
+              }
+            }
+            return;
           }
-        });
+        }
 
-        cleanupAxiomPulseInlineControls(card, targets);
-        targets.forEach((target) => {
-          if (helpers.state.siteFeatures?.axiom?.pulseButton) {
-            ensureAxiomPulseInlineControl(card, target, tokenUrl);
-          }
-          if (helpers.state.siteFeatures?.axiom?.pulsePanel) {
-            ensureAxiomPulsePanelControl(card, target, tokenUrl, cardId);
-          }
-        });
+        const tokenUrl = findPulseRouteLink(card)?.href || window.location.href;
 
-        if (shouldShowAxiomVampIcon("pulse") || shouldShowAxiomDexScreenerIcon("pulse")) {
+        if (!cluster.anchor.dataset.trenchToolsPulseAnchorId) {
+          cluster.anchor.dataset.trenchToolsPulseAnchorId = `pulse-anchor-${Math.random().toString(36).slice(2, 10)}`;
+        }
+        const anchorId = cluster.anchor.dataset.trenchToolsPulseAnchorId;
+
+        cleanupAxiomPulseInlineControls(card, anchorId, requestedSlots);
+        restoreAxiomPulseClusterParentLayoutWithin(card, cluster.parent);
+
+        if (willRenderTrenchToolsButtons) {
+          applyAxiomPulseClusterParentLayout(cluster);
+        }
+
+        let lastInserted = cluster.anchor;
+        if (renderInline) {
+          for (const slot of requestedSlots) {
+            const button = ensureAxiomPulseInlineControl(
+              card,
+              cluster,
+              slot,
+              anchorId,
+              tokenUrl,
+              lastInserted
+            );
+            if (button instanceof HTMLElement) {
+              lastInserted = button;
+            }
+          }
+        }
+        if (renderPanel) {
+          const panelButton = ensureAxiomPulsePanelControl(
+            card,
+            cluster,
+            anchorId,
+            tokenUrl,
+            cardId,
+            lastInserted
+          );
+          if (panelButton instanceof HTMLElement) {
+            lastInserted = panelButton;
+          }
+        }
+
+        if (wantsVampIcon) {
           ensureAxiomPulseVampIcon(card);
         } else {
           removeAxiomPulseVampIcon(card);
         }
+
+        scheduleAxiomPulseUltraHeightSync(card, cluster);
+
+        card.dataset.trenchToolsPulseMountedHash = expectedHash;
       }
 
-      function findAxiomPulseMountTargets(card) {
-        const visibleMountTarget = (element) => {
-          if (!(element instanceof HTMLElement)) {
-            return false;
+      function scheduleAxiomPulseUltraHeightSync(card, cluster) {
+        if (!card || !cluster) {
+          return;
+        }
+        const shape = cluster.shape;
+        if (shape !== "ultra-direct-button" && shape !== "ultra-wrapper-tile") {
+          return;
+        }
+        const sample = resolveAxiomPulseUltraNativeButton(cluster);
+        if (!(sample instanceof HTMLElement)) {
+          return;
+        }
+        const sync = () => {
+          if (!card.isConnected || !sample.isConnected) {
+            return;
           }
-          const rect = element.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0;
+          const px = sample.getBoundingClientRect().height;
+          if (px < 30) {
+            return;
+          }
+          const newHeight = `${px.toFixed(3)}px`;
+          if (card.dataset.trenchToolsPulseUltraSyncedHeight === newHeight) {
+            return;
+          }
+          card.dataset.trenchToolsPulseUltraSyncedHeight = newHeight;
+          card
+            .querySelectorAll(
+              "[data-trench-tools-pulse-inline], [data-trench-tools-pulse-panel-inline]"
+            )
+            .forEach((el) => {
+              if (!(el instanceof HTMLElement)) {
+                return;
+              }
+              if (el.style.height !== newHeight) {
+                el.style.height = newHeight;
+              }
+              if (el.style.minHeight !== "0px") {
+                el.style.minHeight = "0px";
+              }
+            });
         };
+        const scheduleCoalescedSync = () => {
+          if (card._trenchToolsUltraSyncPending) {
+            return;
+          }
+          card._trenchToolsUltraSyncPending = true;
+          window.requestAnimationFrame(() => {
+            card._trenchToolsUltraSyncPending = false;
+            sync();
+          });
+        };
+        scheduleCoalescedSync();
+        window.setTimeout(scheduleCoalescedSync, 120);
+        if (!card._trenchToolsUltraResizeObserver && typeof ResizeObserver !== "undefined") {
+          try {
+            const observer = new ResizeObserver(scheduleCoalescedSync);
+            observer.observe(sample);
+            card._trenchToolsUltraResizeObserver = observer;
+          } catch {}
+        }
+      }
+
+      function getCachedAxiomPulseTable(card) {
+        if (!(card instanceof HTMLElement)) {
+          return "";
+        }
+        if (typeof card.dataset.trenchToolsPulseTable === "string") {
+          return card.dataset.trenchToolsPulseTable;
+        }
+        const tableId = resolveAxiomPulseTable(card) || "";
+        card.dataset.trenchToolsPulseTable = tableId;
+        return tableId;
+      }
+
+      function resolveAxiomPulseCopyButton(card) {
+        if (!(card instanceof HTMLElement)) {
+          return null;
+        }
+        const cached = card._trenchToolsCopyButton;
+        if (
+          cached instanceof HTMLElement &&
+          cached.isConnected &&
+          card.contains(cached)
+        ) {
+          return cached;
+        }
+        const found = card.querySelector("button.group\\/copy");
+        card._trenchToolsCopyButton = found instanceof HTMLElement ? found : null;
+        return card._trenchToolsCopyButton;
+      }
+
+      function resolveAxiomPulseActiveSlots(axiomFeatures, tableId) {
+        const slots = [1];
+        const count = Number(axiomFeatures.pulseQuickBuyButtonCount) === 2 ? 2 : 1;
+        if (count !== 2) {
+          return slots;
+        }
+        const tables = axiomFeatures.pulseSecondButtonTables || {};
+        if (!tableId || tables[tableId] !== false) {
+          slots.unshift(2);
+        }
+        return slots;
+      }
+
+      function isVisibleAxiomPulseMountTarget(element) {
+        if (!(element instanceof HTMLElement)) {
+          return false;
+        }
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      }
+
+      function isTrenchToolsPulseInjectedNode(element) {
+        if (!(element instanceof HTMLElement)) {
+          return false;
+        }
+        return element.hasAttribute("data-trench-tools-pulse-inline") ||
+          element.hasAttribute("data-trench-tools-pulse-panel-inline") ||
+          element.closest("[data-trench-tools-pulse-inline], [data-trench-tools-pulse-panel-inline]") instanceof HTMLElement;
+      }
+
+      function resolveAxiomPulseNativeStyleSignature(cluster) {
+        if (!cluster?.anchor) {
+          return "";
+        }
+        const anchor = cluster.anchor;
+        const parent = cluster.parent;
+        const nativeCount = Array.isArray(cluster.nativeUnits) ? cluster.nativeUnits.length : 0;
+        const anchorRect = anchor.getBoundingClientRect();
+        const parentRect = parent instanceof HTMLElement ? parent.getBoundingClientRect() : null;
+        const height = Math.round(anchorRect.height * 10) / 10;
+        const width = Math.round(anchorRect.width * 10) / 10;
+        const parentWidth = parentRect ? Math.round(parentRect.width * 10) / 10 : 0;
+        const isUltra = cluster.shape === "ultra-direct-button" || cluster.shape === "ultra-wrapper-tile";
+        const ultraMode = isUltra
+          ? resolveAxiomPulseUltraNativeShadowParts(cluster).hasInsetBorder
+            ? "border"
+            : "regular"
+          : "";
+        return `${cluster.shape || ""}:${nativeCount}:${height}:${width}:${parentWidth}:${ultraMode}`;
+      }
+
+      function resolveAxiomPulseNativeCluster(card) {
+        if (!(card instanceof HTMLElement)) {
+          return null;
+        }
 
         const pumpBadge = card.querySelector('img[src="https://axiom.trade/images/pump.svg"]');
         const isPumpCard = Boolean(pumpBadge && pumpBadge.closest("div.bg-primaryBlue"));
         if (isPumpCard) {
-          const targets = Array.from(
+          const pumpTargets = Array.from(
             card.querySelectorAll(
               "img[src*='pump-grad.svg'], img[src*='virtual-curve-grad.svg'], img[src*='bonk-grad.svg'], img[src*='boop-grad.svg']"
             )
           )
             .map((image) => image.closest("div.relative"))
-            .filter(visibleMountTarget);
-          if (targets.length) {
-            return [Array.from(new Set(targets))[0]];
+            .filter(isVisibleAxiomPulseMountTarget);
+          if (pumpTargets.length) {
+            const anchor = pumpTargets[0];
+            return {
+              parent: anchor.parentElement,
+              nativeUnits: [anchor],
+              shape: "compact",
+              anchor
+            };
           }
         }
 
-        const quickBuyTargets = Array.from(card.querySelectorAll("button.group\\/quickBuyButton")).filter(
-          visibleMountTarget
-        );
-        if (quickBuyTargets.length) {
-          return [quickBuyTargets[0]];
+        const nativeButtons = Array.from(card.querySelectorAll("button.group\\/quickBuyButton"))
+          .filter((button) => !isTrenchToolsPulseInjectedNode(button))
+          .filter(isVisibleAxiomPulseMountTarget);
+        if (nativeButtons.length) {
+          const parent = nativeButtons[0].parentElement;
+          const sameParent = nativeButtons.filter((button) => button.parentElement === parent);
+          sameParent.sort((a, b) =>
+            a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+          );
+          const anchor = sameParent[sameParent.length - 1] || nativeButtons[0];
+          const cardRect = card.getBoundingClientRect();
+          const anchorRect = anchor.getBoundingClientRect();
+          let shape = "compact";
+          if (cardRect.height && anchorRect.height >= cardRect.height * 0.85) {
+            shape = "ultra-direct-button";
+          } else if (anchorRect.height >= 50) {
+            shape = "large-pill";
+          }
+          return {
+            parent,
+            nativeUnits: sameParent,
+            shape,
+            anchor
+          };
         }
-        const copyButton = card.querySelector("button.group\\/copy");
+
+        const visibleSolButtons = Array.from(card.querySelectorAll("button"))
+          .filter((button) => !isTrenchToolsPulseInjectedNode(button))
+          .filter(isVisibleAxiomPulseMountTarget)
+          .filter((button) => /^\d+(?:\.\d+)?\s*SOL$/i.test(String(button.textContent || "").trim()));
+        if (visibleSolButtons.length) {
+          const cardRect = card.getBoundingClientRect();
+          const visibleSolTiles = visibleSolButtons
+            .map((button) => {
+              let current = button.parentElement;
+              while (current instanceof HTMLElement && current !== card) {
+                const currentRect = current.getBoundingClientRect();
+                const currentStyle = window.getComputedStyle(current);
+                const currentClass = String(current.className || "");
+                if (
+                  cardRect.height &&
+                  currentRect.height >= cardRect.height * 0.85 &&
+                  (currentClass.includes("absolute") || currentStyle.position === "absolute")
+                ) {
+                  return current;
+                }
+                current = current.parentElement;
+              }
+              return null;
+            })
+            .filter((tile) => tile instanceof HTMLElement && !isTrenchToolsPulseInjectedNode(tile));
+          if (visibleSolTiles.length) {
+            const parentAnchor = visibleSolTiles[visibleSolTiles.length - 1];
+            const parentAnchorRect = parentAnchor.getBoundingClientRect();
+            if (parentAnchorRect.width < 120) {
+              return null;
+            }
+            const nativeChild = Array.from(parentAnchor.children).find((child) => {
+              if (!(child instanceof HTMLElement)) return false;
+              if (isTrenchToolsPulseInjectedNode(child)) return false;
+              return child.querySelector("button") instanceof HTMLElement;
+            });
+            if (nativeChild instanceof HTMLElement) {
+              const nativeRow = nativeChild.querySelector("div[class*='flex-row'][class*='gap-']");
+              const nativeRowChildren = nativeRow instanceof HTMLElement
+                ? Array.from(nativeRow.children).filter((child) => {
+                  if (!(child instanceof HTMLElement)) return false;
+                  if (isTrenchToolsPulseInjectedNode(child)) return false;
+                  return child.querySelector("button") instanceof HTMLElement;
+                })
+                : [];
+              if (nativeRow instanceof HTMLElement && nativeRowChildren.length > 1) {
+                return {
+                  parent: nativeRow,
+                  nativeUnits: nativeRowChildren,
+                  shape: "ultra-wrapper-tile",
+                  anchor: nativeRowChildren[nativeRowChildren.length - 1]
+                };
+              }
+              return {
+                parent: parentAnchor,
+                nativeUnits: [nativeChild],
+                shape: "ultra-wrapper-tile",
+                anchor: nativeChild
+              };
+            }
+          }
+        }
+
+        const wrapperTiles = Array.from(card.querySelectorAll("div"))
+          .filter((div) => {
+            if (!isVisibleAxiomPulseMountTarget(div)) return false;
+            const text = String(div.textContent || "").trim();
+            if (!/^\d+(?:\.\d+)?\s*SOL$/i.test(text)) return false;
+            const buttonInside = div.querySelector("button");
+            if (!(buttonInside instanceof HTMLElement)) return false;
+            const cardRect = card.getBoundingClientRect();
+            const divRect = div.getBoundingClientRect();
+            return cardRect.height && divRect.height >= cardRect.height * 0.85;
+          })
+          .filter((div) => !isTrenchToolsPulseInjectedNode(div));
+        if (wrapperTiles.length) {
+          const cardRect = card.getBoundingClientRect();
+          const overlayTiles = wrapperTiles
+            .map((tile) => {
+              if (window.getComputedStyle(tile).position === "absolute") {
+                return tile;
+              }
+              const parent = tile.parentElement;
+              return parent instanceof HTMLElement ? parent : null;
+            })
+            .filter((tile) => {
+              if (!(tile instanceof HTMLElement)) return false;
+              const tileRect = tile.getBoundingClientRect();
+              const tileClass = String(tile.className || "");
+              const tileStyle = window.getComputedStyle(tile);
+              return (
+                cardRect.height &&
+                tileRect.height >= cardRect.height * 0.85 &&
+                (tileClass.includes("absolute") || tileStyle.position === "absolute")
+              );
+            });
+          const candidates = overlayTiles.length ? overlayTiles : wrapperTiles;
+          const parent = candidates[0];
+          const sameParent = candidates.filter((tile) => tile.parentElement === parent.parentElement);
+          sameParent.sort((a, b) =>
+            a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+          );
+          const parentAnchor = sameParent[sameParent.length - 1] || parent;
+          const nativeChild = Array.from(parentAnchor.children).find((child) => {
+            if (!(child instanceof HTMLElement)) return false;
+            if (isTrenchToolsPulseInjectedNode(child)) return false;
+            const text = String(child.textContent || "").trim();
+            return (
+              /^\d+(?:\.\d+)?\s*SOL$/i.test(text) &&
+              child.querySelector("button") instanceof HTMLElement
+            );
+          });
+          if (!(nativeChild instanceof HTMLElement)) {
+            return null;
+          }
+          const nativeRow = nativeChild.querySelector("div[class*='flex-row'][class*='gap-']");
+          const nativeRowChildren = nativeRow instanceof HTMLElement
+            ? Array.from(nativeRow.children).filter((child) => {
+              if (!(child instanceof HTMLElement)) return false;
+              if (isTrenchToolsPulseInjectedNode(child)) return false;
+              return child.querySelector("button") instanceof HTMLElement;
+            })
+            : [];
+          if (nativeRow instanceof HTMLElement && nativeRowChildren.length > 1) {
+            return {
+              parent: nativeRow,
+              nativeUnits: nativeRowChildren,
+              shape: "ultra-wrapper-tile",
+              anchor: nativeRowChildren[nativeRowChildren.length - 1]
+            };
+          }
+          return {
+            parent: parentAnchor,
+            nativeUnits: [nativeChild],
+            shape: "ultra-wrapper-tile",
+            anchor: nativeChild
+          };
+        }
+
+        const copyButton = resolveAxiomPulseCopyButton(card);
         if (copyButton instanceof HTMLElement) {
-          return [copyButton];
+          return {
+            parent: copyButton.parentElement,
+            nativeUnits: [],
+            shape: "compact",
+            anchor: copyButton
+          };
         }
         const tokenLink = card.querySelector("a[href*='/meme/']");
         if (tokenLink instanceof HTMLElement) {
-          return [tokenLink];
+          return {
+            parent: tokenLink.parentElement,
+            nativeUnits: [],
+            shape: "compact",
+            anchor: tokenLink
+          };
         }
-        return [];
+        return null;
       }
 
-      function cleanupAxiomPulseInlineControls(card, targets) {
-        const activeAnchorIds = new Set(
-          targets
-            .map((target) => target.dataset.trenchToolsPulseAnchorId)
-            .filter(Boolean)
-        );
+      function applyAxiomPulseClusterParentLayout(cluster) {
+        const parent = cluster?.parent;
+        if (!(parent instanceof HTMLElement)) {
+          return;
+        }
+        const nativeUnits = Array.isArray(cluster.nativeUnits) ? cluster.nativeUnits : [];
+        if (nativeUnits.length === 0) {
+          return;
+        }
+        const shape = cluster.shape || "compact";
+        const isCompact = shape === "compact";
+        const isUltra = shape === "ultra-direct-button" || shape === "ultra-wrapper-tile";
 
+        if (parent.dataset.trenchToolsPulseParentManaged !== "true") {
+          parent.dataset.trenchToolsPulseParentManaged = "true";
+          parent.dataset.trenchToolsPulseParentPrevDisplay = parent.style.display || "";
+          parent.dataset.trenchToolsPulseParentPrevFlexWrap = parent.style.flexWrap || "";
+          parent.dataset.trenchToolsPulseParentPrevAlignItems = parent.style.alignItems || "";
+          parent.dataset.trenchToolsPulseParentPrevGap = parent.style.gap || "";
+          parent.dataset.trenchToolsPulseParentPrevWidth = parent.style.width || "";
+          parent.dataset.trenchToolsPulseParentPrevMaxWidth = parent.style.maxWidth || "";
+          parent.dataset.trenchToolsPulseParentPrevMarginBottom = parent.style.marginBottom || "";
+        }
+
+        const gap = isCompact ? "2px" : "4px";
+        const widthValue = isUltra ? "" : "max-content";
+        const maxWidthValue = isUltra ? "" : "none";
+        const marginBottomValue = isCompact ? "-4px" : "";
+
+        if (parent.style.display !== "flex") parent.style.display = "flex";
+        if (parent.style.flexWrap !== "nowrap") parent.style.flexWrap = "nowrap";
+        if (parent.style.alignItems !== "center") parent.style.alignItems = "center";
+        if (parent.style.gap !== gap) parent.style.gap = gap;
+        if (parent.style.width !== widthValue) parent.style.width = widthValue;
+        if (parent.style.maxWidth !== maxWidthValue) parent.style.maxWidth = maxWidthValue;
+        if (isCompact) {
+          if (parent.style.marginBottom !== marginBottomValue) {
+            parent.style.marginBottom = marginBottomValue;
+          }
+        }
+
+        if (isUltra) {
+          nativeUnits.forEach((unit) => applyAxiomPulseUltraNativeFlex(unit));
+        }
+      }
+
+      function applyAxiomPulseUltraNativeFlex(element) {
+        if (!(element instanceof HTMLElement)) {
+          return;
+        }
+        if (element.dataset.trenchToolsPulseNativeManaged !== "true") {
+          element.dataset.trenchToolsPulseNativeManaged = "true";
+          element.dataset.trenchToolsPulseNativePrevFlex = element.style.flex || "";
+          element.dataset.trenchToolsPulseNativePrevWidth = element.style.width || "";
+          element.dataset.trenchToolsPulseNativePrevMinWidth = element.style.minWidth || "";
+          element.dataset.trenchToolsPulseNativePrevOverflow = element.style.overflow || "";
+          element.dataset.trenchToolsPulseNativePrevPadding = element.style.padding || "";
+        }
+        if (element.style.flex !== "1 1 0") element.style.flex = "1 1 0";
+        if (element.style.width !== "auto") element.style.width = "auto";
+        if (element.style.minWidth !== "0px") element.style.minWidth = "0px";
+        if (element.style.overflow !== "hidden") element.style.overflow = "hidden";
+        if (element.tagName === "BUTTON" && element.style.padding !== "0px 0px 16px") {
+          element.style.padding = "0px 0px 16px";
+        }
+        const nativeButton = element.tagName === "BUTTON" ? element : element.querySelector("button");
+        if (nativeButton instanceof HTMLElement && nativeButton !== element) {
+          if (nativeButton.dataset.trenchToolsPulseNativeButtonManaged !== "true") {
+            nativeButton.dataset.trenchToolsPulseNativeButtonManaged = "true";
+            nativeButton.dataset.trenchToolsPulseNativeButtonPrevWidth = nativeButton.style.width || "";
+            nativeButton.dataset.trenchToolsPulseNativeButtonPrevMinWidth = nativeButton.style.minWidth || "";
+          }
+          if (nativeButton.style.width !== "100%") nativeButton.style.width = "100%";
+          if (nativeButton.style.minWidth !== "0px") nativeButton.style.minWidth = "0px";
+        }
+      }
+
+      function restoreAxiomPulseClusterParentLayoutWithin(scope, exceptElement = null) {
+        if (!(scope instanceof Element || scope === document)) {
+          return;
+        }
+        const managed = scope.querySelectorAll('[data-trench-tools-pulse-parent-managed="true"]');
+        managed.forEach((element) => {
+          if (!(element instanceof HTMLElement)) return;
+          if (exceptElement instanceof HTMLElement && element === exceptElement) return;
+          element.style.display = element.dataset.trenchToolsPulseParentPrevDisplay || "";
+          element.style.flexWrap = element.dataset.trenchToolsPulseParentPrevFlexWrap || "";
+          element.style.alignItems = element.dataset.trenchToolsPulseParentPrevAlignItems || "";
+          element.style.gap = element.dataset.trenchToolsPulseParentPrevGap || "";
+          element.style.width = element.dataset.trenchToolsPulseParentPrevWidth || "";
+          element.style.maxWidth = element.dataset.trenchToolsPulseParentPrevMaxWidth || "";
+          element.style.marginBottom = element.dataset.trenchToolsPulseParentPrevMarginBottom || "";
+          delete element.dataset.trenchToolsPulseParentManaged;
+          delete element.dataset.trenchToolsPulseParentPrevDisplay;
+          delete element.dataset.trenchToolsPulseParentPrevFlexWrap;
+          delete element.dataset.trenchToolsPulseParentPrevAlignItems;
+          delete element.dataset.trenchToolsPulseParentPrevGap;
+          delete element.dataset.trenchToolsPulseParentPrevWidth;
+          delete element.dataset.trenchToolsPulseParentPrevMaxWidth;
+          delete element.dataset.trenchToolsPulseParentPrevMarginBottom;
+        });
+        const managedNatives = scope.querySelectorAll('[data-trench-tools-pulse-native-managed="true"]');
+        managedNatives.forEach((element) => {
+          if (!(element instanceof HTMLElement)) return;
+          if (exceptElement instanceof HTMLElement && element === exceptElement) return;
+          element.style.flex = element.dataset.trenchToolsPulseNativePrevFlex || "";
+          element.style.width = element.dataset.trenchToolsPulseNativePrevWidth || "";
+          element.style.minWidth = element.dataset.trenchToolsPulseNativePrevMinWidth || "";
+          element.style.overflow = element.dataset.trenchToolsPulseNativePrevOverflow || "";
+          element.style.padding = element.dataset.trenchToolsPulseNativePrevPadding || "";
+          delete element.dataset.trenchToolsPulseNativeManaged;
+          delete element.dataset.trenchToolsPulseNativePrevFlex;
+          delete element.dataset.trenchToolsPulseNativePrevWidth;
+          delete element.dataset.trenchToolsPulseNativePrevMinWidth;
+          delete element.dataset.trenchToolsPulseNativePrevOverflow;
+          delete element.dataset.trenchToolsPulseNativePrevPadding;
+        });
+        const managedNativeButtons = scope.querySelectorAll('[data-trench-tools-pulse-native-button-managed="true"]');
+        managedNativeButtons.forEach((element) => {
+          if (!(element instanceof HTMLElement)) return;
+          if (exceptElement instanceof HTMLElement && element === exceptElement) return;
+          element.style.width = element.dataset.trenchToolsPulseNativeButtonPrevWidth || "";
+          element.style.minWidth = element.dataset.trenchToolsPulseNativeButtonPrevMinWidth || "";
+          delete element.dataset.trenchToolsPulseNativeButtonManaged;
+          delete element.dataset.trenchToolsPulseNativeButtonPrevWidth;
+          delete element.dataset.trenchToolsPulseNativeButtonPrevMinWidth;
+        });
+      }
+
+      function resolveAxiomPulseTable(card) {
+        if (!(card instanceof HTMLElement)) {
+          return "";
+        }
+        let current = card.parentElement;
+        for (let depth = 0; depth < 14 && current && current !== document.body; depth += 1) {
+          const headingCandidates = current.querySelectorAll(
+            ":scope > div h2, :scope > div h3, :scope > div h4, :scope > h2, :scope > h3, :scope > h4, :scope > header span"
+          );
+          for (const heading of headingCandidates) {
+            const text = String(heading.textContent || "").trim().toLowerCase();
+            if (text === "new pairs" || text.startsWith("new pairs")) {
+              return "new_pairs";
+            }
+            if (text === "final stretch" || text.startsWith("final stretch")) {
+              return "final_stretch";
+            }
+            if (text === "migrated" || text.startsWith("migrated")) {
+              return "migrated";
+            }
+          }
+          current = current.parentElement;
+        }
+        return "";
+      }
+
+      function cleanupAxiomPulseInlineControls(card, anchorId, activeSlots = [1]) {
+        const allowedSlots = new Set(activeSlots.map((slot) => String(slot)));
         card
           .querySelectorAll(
             "[data-trench-tools-pulse-inline], [data-trench-tools-pulse-panel-inline]"
           )
           .forEach((element) => {
-            const anchorId = element.getAttribute("data-anchor-id") || "";
-            if (!anchorId || !activeAnchorIds.has(anchorId)) {
+            const elementAnchorId = element.getAttribute("data-anchor-id") || "";
+            const slotAttr = element.getAttribute("data-trench-tools-pulse-slot");
+            const isPanel = element.hasAttribute("data-trench-tools-pulse-panel-inline");
+            if (!elementAnchorId || elementAnchorId !== anchorId) {
               helpers.teardownInlineSizeSync(element);
               element.remove();
+              return;
+            }
+            if (!isPanel) {
+              if (!slotAttr || !allowedSlots.has(slotAttr)) {
+                helpers.teardownInlineSizeSync(element);
+                element.remove();
+              }
             }
           });
 
@@ -1104,6 +1770,16 @@
         card.querySelectorAll("span[data-trench-tools-inline]").forEach((element) => {
           element.remove();
         });
+        restoreAxiomPulseClusterParentLayoutWithin(card);
+        if (card._trenchToolsUltraResizeObserver) {
+          try { card._trenchToolsUltraResizeObserver.disconnect(); } catch {}
+          delete card._trenchToolsUltraResizeObserver;
+        }
+        delete card._trenchToolsUltraSyncPending;
+        delete card._trenchToolsCopyButton;
+        delete card.dataset.trenchToolsPulseUltraSyncedHeight;
+        delete card.dataset.trenchToolsPulseUltraCachedHeight;
+        delete card.dataset.trenchToolsPulseMountedHash;
       }
 
       function getAxiomPulseCardId(card) {
@@ -1260,7 +1936,7 @@
         if (datasetRoute) {
           return datasetRoute;
         }
-        const copyButton = card.querySelector("button.group\\/copy");
+        const copyButton = resolveAxiomPulseCopyButton(card);
         const parts = pulseCopyParts(copyButton);
         if (parts) {
           const pulseEntry = lookupPulseCacheEntry("", parts.prefix, parts.suffix);
@@ -1297,7 +1973,7 @@
         if (acceptedPrimaryRoute?.address) {
           return acceptedPrimaryRoute;
         }
-        const copyButton = card instanceof HTMLElement ? card.querySelector("button.group\\/copy") : null;
+        const copyButton = resolveAxiomPulseCopyButton(card);
         const parts = pulseCopyParts(copyButton);
         const copiedAddress = await readAxiomPulseCopyButtonAddress(copyButton, parts);
         if (!copiedAddress) {
@@ -1383,28 +2059,25 @@
         control.setAttribute("data-route-url", tokenUrl || window.location.href);
       }
 
-      function ensureAxiomPulseInlineControl(card, target, tokenUrl = window.location.href) {
-        if (!(target instanceof HTMLElement)) {
-          return;
+      function ensureAxiomPulseInlineControl(
+        card,
+        cluster,
+        slot,
+        anchorId,
+        tokenUrl = window.location.href,
+        insertAfter = cluster?.anchor
+      ) {
+        if (!cluster?.parent || !(insertAfter instanceof HTMLElement)) {
+          return null;
         }
 
-        const parent = target.parentElement;
-        if (parent instanceof HTMLElement) {
-          Object.assign(parent.style, {
-            display: "flex",
-            alignItems: "center",
-            gap: "2px",
-            marginBottom: "-4px"
-          });
-        }
-
-        const anchorId = target.dataset.trenchToolsPulseAnchorId;
+        const parent = cluster.parent;
         const currentRoute = normalizePulseRoute(resolvePulseTradeRouteForCard(card));
         const currentTokenUrl = findPulseRouteLink(card)?.href || tokenUrl;
-        let inlineButton =
-          (parent instanceof HTMLElement &&
-            parent.querySelector(`[data-trench-tools-pulse-inline][data-anchor-id="${anchorId}"]`)) ||
-          null;
+        const slotIndex = Number(slot) === 2 ? 2 : 1;
+        let inlineButton = parent.querySelector(
+          `[data-trench-tools-pulse-inline][data-anchor-id="${anchorId}"][data-trench-tools-pulse-slot="${slotIndex}"]`
+        );
         if (!(inlineButton instanceof HTMLButtonElement)) {
           inlineButton = helpers.buildInlineButton(
             async () => {
@@ -1418,15 +2091,16 @@
               }
               await helpers.handleInlineTradeRequest("buy", liveRoute, "pulse", {
                 ...helpers.state.preferences,
-                buyAmountSol: helpers.resolveQuickBuyAmount()
+                buyAmountSol: helpers.resolveQuickBuyAmount(slotIndex)
               }, liveTokenUrl, {
                 skipBlockingPrewarm: true
               });
             },
-            pulseQuickBuyStyles(target)
+            pulseQuickBuyStyles(cluster, slotIndex)
           );
           inlineButton.setAttribute("data-trench-tools-pulse-inline", "true");
           inlineButton.setAttribute("data-anchor-id", anchorId);
+          inlineButton.setAttribute("data-trench-tools-pulse-slot", String(slotIndex));
         }
 
         bindPulseRouteToControl(inlineButton, currentRoute, currentTokenUrl);
@@ -1439,29 +2113,35 @@
           });
         }
         attachAxiomIntentPrewarm(inlineButton, "pulse", { url: currentTokenUrl, side: "buy" });
-        helpers.setInlineButtonStyleSet(inlineButton, pulseQuickBuyStyles(target));
-        helpers.setInlineButtonLabel(inlineButton, helpers.quickBuyLabel());
-        if (target.nextElementSibling !== inlineButton) {
-          target.insertAdjacentElement("afterend", inlineButton);
+        const inlineStyles = pulseQuickBuyStyles(cluster, slotIndex);
+        helpers.setInlineButtonStyleSet(inlineButton, inlineStyles);
+        helpers.setInlineButtonLabel(inlineButton, helpers.quickBuyLabel(slotIndex));
+        applyAxiomPulseUltraButtonAttributes(inlineButton, inlineStyles);
+        if (insertAfter.nextElementSibling !== inlineButton) {
+          insertAfter.insertAdjacentElement("afterend", inlineButton);
         }
+        return inlineButton;
       }
 
-      function ensureAxiomPulsePanelControl(card, target, tokenUrl = window.location.href, cardId = "") {
-        if (!(target instanceof HTMLElement)) {
-          return;
+      function ensureAxiomPulsePanelControl(
+        card,
+        cluster,
+        anchorId,
+        tokenUrl = window.location.href,
+        cardId = "",
+        insertAfter = cluster?.anchor
+      ) {
+        if (!cluster?.parent || !(insertAfter instanceof HTMLElement) || !anchorId) {
+          return null;
         }
 
-        const parent = target.parentElement;
-        const anchorId = target.dataset.trenchToolsPulseAnchorId;
-        if (!(parent instanceof HTMLElement) || !anchorId) {
-          return;
-        }
+        const parent = cluster.parent;
         const currentRoute = normalizePulseRoute(resolvePulseTradeRouteForCard(card));
         const currentTokenUrl = findPulseRouteLink(card)?.href || tokenUrl;
 
-        let panelButton =
-          parent.querySelector(`[data-trench-tools-pulse-panel-inline][data-anchor-id="${anchorId}"]`) ||
-          null;
+        let panelButton = parent.querySelector(
+          `[data-trench-tools-pulse-panel-inline][data-anchor-id="${anchorId}"]`
+        );
         if (!(panelButton instanceof HTMLButtonElement)) {
           panelButton = helpers.buildInlineIconButton(
             async () => {
@@ -1482,7 +2162,7 @@
                 onOpen: () => pauseAxiomPulsePanelRow(liveCard)
               });
             },
-            pulsePanelButtonStyles(target)
+            pulsePanelButtonStyles(cluster)
           );
           panelButton.setAttribute("data-trench-tools-pulse-panel-inline", "true");
           panelButton.setAttribute("data-anchor-id", anchorId);
@@ -1500,12 +2180,13 @@
           });
         }
         attachAxiomIntentPrewarm(panelButton, "pulse", { url: currentTokenUrl });
-        helpers.setInlineButtonStyleSet(panelButton, pulsePanelButtonStyles(target));
-        const quickBuyButton =
-          parent.querySelector(`[data-trench-tools-pulse-inline][data-anchor-id="${anchorId}"]`) || target;
-        if (quickBuyButton.nextElementSibling !== panelButton) {
-          quickBuyButton.insertAdjacentElement("afterend", panelButton);
+        const panelStyles = pulsePanelButtonStyles(cluster);
+        helpers.setInlineButtonStyleSet(panelButton, panelStyles);
+        applyAxiomPulseUltraButtonAttributes(panelButton, panelStyles);
+        if (insertAfter.nextElementSibling !== panelButton) {
+          insertAfter.insertAdjacentElement("afterend", panelButton);
         }
+        return panelButton;
       }
 
       function pulseVampIconUrl() {
@@ -2187,6 +2868,8 @@
           !(anchor instanceof HTMLAnchorElement) ||
           anchor.classList.contains("group/token") ||
           isTrenchToolsActionAnchor(anchor) ||
+          isInsideAxiomWithdrawPanel(anchor) ||
+          isInsideAxiomSearchPanel(anchor) ||
           anchor.closest(".w-full.pointer-events-none:not(.absolute)") ||
           anchor.closest("div#instant-trade")
         ) {
@@ -2203,7 +2886,40 @@
         if (pageAddress && routeKey === pageAddress && !isAxiomListSurface()) {
           return false;
         }
-        return anchor.classList.contains("group") || isAxiomWatchlistSurface() || (!pageAddress && isAxiomListSurface());
+        if (isPulseUrl(window.location.href) && !isAxiomWatchlistTickerAnchor(anchor)) {
+          return false;
+        }
+        if (isAxiomTickerPillAnchor(anchor) && !isAxiomWatchlistTickerAnchor(anchor)) {
+          return false;
+        }
+        return (
+          anchor.classList.contains("group") ||
+          isAxiomWatchlistTickerAnchor(anchor) ||
+          isAxiomWatchlistSurface() ||
+          (!pageAddress && isAxiomListSurface())
+        );
+      }
+
+      function isAxiomTickerPillAnchor(anchor) {
+        if (!(anchor instanceof HTMLAnchorElement)) {
+          return false;
+        }
+        const rect = anchor.getBoundingClientRect();
+        if (rect.height > 0 && rect.height < 32) {
+          return true;
+        }
+        const cls = anchor.className || "";
+        if (typeof cls === "string" && /\bh-\[2[0-9]px\]|\bmax-h-\[2[0-9]px\]/.test(cls)) {
+          return true;
+        }
+        return false;
+      }
+
+      function isAxiomWatchlistTickerAnchor(anchor) {
+        return Boolean(
+          anchor instanceof HTMLAnchorElement &&
+          anchor.closest('section[aria-label="Ticker list"]') instanceof HTMLElement
+        );
       }
 
       function isTrenchToolsActionAnchor(anchor) {
@@ -2304,6 +3020,223 @@
         }
       }
 
+      function isInsideAxiomWithdrawPanel(element) {
+        if (!(element instanceof HTMLElement)) {
+          return false;
+        }
+        let current = element;
+        for (let depth = 0; current && current !== document.body && depth < 8; depth += 1) {
+          if (current.querySelector?.('input[placeholder*="destination wallet" i]') instanceof HTMLInputElement) {
+            return true;
+          }
+          current = current.parentElement;
+        }
+        return false;
+      }
+
+      function mountAxiomSearchQuickButtons() {
+        document.querySelectorAll("[data-trench-tools-axiom-search-inline]").forEach((element) => {
+          const row = findAxiomSearchResultRow(element);
+          const anchor = row instanceof HTMLElement ? findAxiomSearchAnchorForRow(row) : null;
+          if (!(anchor instanceof HTMLAnchorElement) || !isAxiomSearchAnchor(anchor)) {
+            helpers.teardownInlineSizeSync?.(element);
+            element.remove();
+          }
+        });
+
+        findAxiomSearchAnchors().forEach((anchor) => reconcileAxiomSearchAnchor(anchor));
+      }
+
+      function reconcileAxiomSearchAnchor(anchor) {
+        if (!(anchor instanceof HTMLAnchorElement)) {
+          return;
+        }
+        const row = findAxiomSearchResultRow(anchor);
+        const existingButton = row?.querySelector("[data-trench-tools-axiom-search-inline]");
+        if (!isAxiomSearchAnchor(anchor)) {
+          existingButton?.remove();
+          return;
+        }
+        ensureAxiomSearchQuickButton(anchor);
+      }
+
+      function isAxiomSearchInput(input) {
+        return input instanceof HTMLInputElement && /search/i.test(String(input.getAttribute("placeholder") || ""));
+      }
+
+      function findAxiomSearchPanelRoot(element) {
+        if (!(element instanceof HTMLElement)) {
+          return null;
+        }
+        const panel = element.closest(".fixed");
+        if (!(panel instanceof HTMLElement)) {
+          return null;
+        }
+        return Array.from(panel.querySelectorAll("input")).some(isAxiomSearchInput) ? panel : null;
+      }
+
+      function isInsideAxiomSearchPanel(element) {
+        return findAxiomSearchPanelRoot(element) instanceof HTMLElement;
+      }
+
+      function findAxiomSearchAnchors(root = document) {
+        const anchors = new Set();
+        const panels = new Set();
+        const addPanel = (candidate) => {
+          const panel = findAxiomSearchPanelRoot(candidate);
+          if (panel instanceof HTMLElement) {
+            panels.add(panel);
+          }
+        };
+        if (root instanceof HTMLElement) {
+          addPanel(root);
+          root.querySelectorAll?.(".fixed").forEach(addPanel);
+        } else {
+          document.querySelectorAll(".fixed").forEach(addPanel);
+        }
+        panels.forEach((panel) => {
+          panel.querySelectorAll(MEME_LINK_SELECTOR).forEach((anchor) => {
+            if (anchor instanceof HTMLAnchorElement && isAxiomSearchAnchor(anchor)) {
+              anchors.add(anchor);
+            }
+          });
+        });
+        return Array.from(anchors);
+      }
+
+      function isAxiomSearchAnchor(anchor) {
+        return (
+          anchor instanceof HTMLAnchorElement &&
+          Boolean(helpers.extractMintFromUrl(anchor.href)) &&
+          findAxiomSearchPanelRoot(anchor) instanceof HTMLElement &&
+          findAxiomSearchResultRow(anchor) instanceof HTMLElement
+        );
+      }
+
+      function findAxiomSearchResultRow(element) {
+        if (!(element instanceof HTMLElement)) {
+          return null;
+        }
+        let row = element.closest(".group.relative");
+        if (!(row instanceof HTMLElement)) {
+          row = element.closest("div[class*='group'][class*='relative']");
+        }
+        return row instanceof HTMLElement &&
+          findAxiomSearchPanelRoot(row) instanceof HTMLElement &&
+          row.querySelector(MEME_LINK_SELECTOR) instanceof HTMLAnchorElement &&
+          findAxiomSearchActionSlot(row) instanceof HTMLElement
+          ? row
+          : null;
+      }
+
+      function findAxiomSearchAnchorForRow(row) {
+        if (!(row instanceof HTMLElement)) {
+          return null;
+        }
+        return Array.from(row.querySelectorAll(MEME_LINK_SELECTOR)).find((anchor) =>
+          anchor instanceof HTMLAnchorElement && isAxiomSearchAnchor(anchor)
+        ) || null;
+      }
+
+      function findAxiomSearchActionSlot(row) {
+        if (!(row instanceof HTMLElement)) {
+          return null;
+        }
+        return row.querySelector(".hidden.sm\\:flex") ||
+          Array.from(row.querySelectorAll("div")).find((element) =>
+            element instanceof HTMLElement &&
+            element.classList.contains("hidden") &&
+            element.classList.contains("sm:flex")
+          ) ||
+          null;
+      }
+
+      function cleanupAxiomSearchLegacyButtons(row) {
+        if (!(row instanceof HTMLElement)) {
+          return;
+        }
+        row.querySelectorAll("[data-trench-tools-wallet-tracker-inline], [data-trench-tools-axiom-watchlist-inline]").forEach((element) => {
+          helpers.teardownInlineSizeSync?.(element);
+          element.remove();
+        });
+      }
+
+      function ensureAxiomSearchQuickButton(anchor) {
+        const row = findAxiomSearchResultRow(anchor);
+        const actionSlot = row instanceof HTMLElement ? findAxiomSearchActionSlot(row) : null;
+        if (!(row instanceof HTMLElement) || !(actionSlot instanceof HTMLElement)) {
+          return;
+        }
+
+        cleanupAxiomSearchLegacyButtons(row);
+
+        const route = buildAxiomPairRouteReferenceFromElement(anchor.href, "search", row);
+        const pairAddress = String(route?.pairAddress || route?.address || "").trim();
+        const tokenMint = String(route?.mint || "").trim();
+        if (!pairAddress) {
+          return;
+        }
+
+        let button = row.querySelector("[data-trench-tools-axiom-search-inline]");
+        if (
+          button instanceof HTMLButtonElement &&
+          (
+            button.getAttribute("data-route-key") !== pairAddress ||
+            String(button.getAttribute("data-mint") || "") !== tokenMint ||
+            String(button.getAttribute("data-pair") || "") !== ""
+          )
+        ) {
+          button.remove();
+          button = null;
+        }
+
+        if (!(button instanceof HTMLButtonElement)) {
+          button = helpers.buildInlineButton(
+            async () => {
+              const liveRoute = routePayloadFromButton(button, {
+                address: pairAddress,
+                mint: tokenMint,
+                pair: "",
+                surface: "search",
+                url: anchor.href
+              });
+              if (!liveRoute?.address) {
+                throw new Error("Token not found.");
+              }
+              await helpers.handleInlineTradeRequest("buy", liveRoute, "search", {
+                ...helpers.state.preferences,
+                buyAmountSol: helpers.resolveQuickBuyAmount()
+              }, anchor.href);
+            },
+            axiomSearchQuickBuyStyles()
+          );
+          button.setAttribute("data-trench-tools-axiom-search-inline", "true");
+        }
+
+        button.setAttribute("data-route-key", pairAddress);
+        if (tokenMint) {
+          button.setAttribute("data-mint", tokenMint);
+        } else {
+          button.removeAttribute("data-mint");
+        }
+        button.removeAttribute("data-pair");
+        attachAxiomIntentPrewarm(button, "search", {
+          address: pairAddress,
+          mint: tokenMint,
+          url: anchor.href,
+          side: "buy"
+        });
+        helpers.setInlineButtonStyleSet(button, axiomSearchQuickBuyStyles());
+        helpers.setInlineButtonLabel(button, helpers.quickBuyLabel());
+
+        const firstAction = actionSlot.querySelector("div");
+        if (firstAction instanceof HTMLElement && firstAction.previousElementSibling !== button) {
+          actionSlot.insertBefore(button, firstAction);
+        } else if (!(firstAction instanceof HTMLElement) && button.parentElement !== actionSlot) {
+          actionSlot.appendChild(button);
+        }
+      }
+
       function mountAxiomWalletTrackerQuickButtons() {
         findAxiomWalletTrackerRows().forEach((row) => {
           reconcileAxiomWalletTrackerRow(row);
@@ -2360,6 +3293,7 @@
         return (
           row instanceof HTMLElement &&
           row.matches(WALLET_ROW_SELECTOR) &&
+          !isInsideAxiomSearchPanel(row) &&
           findAxiomWalletTrackerActionSlot(row) instanceof HTMLElement &&
           row.querySelector(MEME_LINK_SELECTOR) instanceof HTMLAnchorElement
         );
@@ -2478,8 +3412,9 @@
           routeOrAddress && typeof routeOrAddress === "object"
             ? routeOrAddress
             : buildObservedCandidate(routeOrAddress, "token_detail", window.location.href);
-        const routeKey = String(route?.address || routeOrAddress || "").trim();
         const anchor = findAxiomTokenDetailHeaderActionAnchor();
+        const fallbackRoute = resolveCurrentTokenDetailRouteFallback();
+        const routeKey = String(route?.address || routeOrAddress || fallbackRoute?.address || "").trim();
         if (!routeKey || !(anchor instanceof HTMLElement)) {
           cleanupAxiomTokenDetailHeaderActions();
           return;
@@ -2487,7 +3422,7 @@
 
         cleanupAxiomTokenDetailHeaderActions(anchor);
 
-        const tokenMint = String(route?.mint || extractAxiomTokenDetailHeaderMint(anchor) || "").trim();
+        const tokenMint = String(route?.mint || fallbackRoute?.mint || extractAxiomTokenDetailHeaderMint(anchor) || "").trim();
         const companionPair = String(route?.pair || "").trim();
 
         if (shouldShowAxiomVampIcon("token")) {
@@ -2516,6 +3451,15 @@
           }
         } else {
           anchor.querySelector(":scope > [data-trench-tools-token-detail-dex-inline]")?.remove();
+        }
+
+        let pnlCardButton = anchor.querySelector(":scope > [data-trench-tools-token-detail-pnl-card-inline]");
+        if (!(pnlCardButton instanceof HTMLButtonElement)) {
+          pnlCardButton = buildAxiomTokenDetailPnlCardButton();
+        }
+        bindAxiomTokenDetailActionRoute(pnlCardButton, routeKey, tokenMint, companionPair);
+        if (pnlCardButton.parentElement !== anchor) {
+          anchor.appendChild(pnlCardButton);
         }
       }
 
@@ -2603,6 +3547,123 @@
           }
         }
         return "";
+      }
+
+      function extractAxiomTokenDetailHeaderTicker(root = findAxiomTokenDetailHeaderActionAnchor()) {
+        if (!(root instanceof Element)) {
+          return "";
+        }
+        const imageTicker = String(
+          root.querySelector("img[alt]:not([alt=''])")?.getAttribute("alt") ||
+          document.querySelector("img[alt='Token Banner']")?.closest("[class]")?.querySelector("img[alt]:not([alt='Token Banner'])")?.getAttribute("alt") ||
+          ""
+        ).trim();
+        if (imageTicker) {
+          return imageTicker;
+        }
+        const titleTicker = String(document.title || "")
+          .split("|")[0]
+          .split(/[↓↑]/)[0]
+          .trim();
+        if (titleTicker) {
+          return titleTicker;
+        }
+        const tooltip = root.closest("#pair-name-tooltip") || document.getElementById("pair-name-tooltip") || root;
+        const text = String(tooltip.textContent || "").replace(/\s+/g, " ").trim();
+        const candidates = text.match(/\$?[A-Za-z][A-Za-z0-9_]{1,15}/g) || [];
+        const ignored = new Set(["pump", "fun", "search", "twitter", "create", "pnl", "card"]);
+        for (const candidate of candidates) {
+          const ticker = candidate.replace(/^\$/, "");
+          if (!ignored.has(ticker.toLowerCase())) {
+            return ticker;
+          }
+        }
+        return "";
+      }
+
+      function extractAxiomTokenDetailVisibleTicker() {
+        const quoteOrUi = new Set([
+          "sol",
+          "wsol",
+          "usdc",
+          "usdt",
+          "usd1",
+          "usds",
+          "usde",
+          "dai",
+          "pnl",
+          "card",
+          "raydium",
+          "pump"
+        ]);
+        const normalize = (value) => String(value || "").replace(/^\$/, "").trim();
+        const isValid = (value) => {
+          const ticker = normalize(value);
+          return /^[A-Za-z][A-Za-z0-9_.]{1,24}$/.test(ticker) && !quoteOrUi.has(ticker.toLowerCase());
+        };
+        const pairTooltip = document.getElementById("pair-name-tooltip");
+        const detailRoot = pairTooltip?.closest?.("div.flex.max-h-\\[64px\\].min-h-\\[64px\\].flex-1") ||
+          pairTooltip?.closest?.("div.relative.flex.max-h-\\[64px\\].min-h-\\[64px\\]") ||
+          pairTooltip?.closest?.("section") ||
+          document;
+        const candidates = Array.from(
+          detailRoot.querySelectorAll("span.text-\\[16px\\].font-medium.leading-\\[21px\\]")
+        )
+          .flatMap((span) => Array.from(span.querySelectorAll("div.min-w-0.overflow-hidden.truncate.whitespace-nowrap")))
+          .filter((node) => node instanceof HTMLElement);
+        for (const node of candidates) {
+          if (pairTooltip instanceof Element && pairTooltip.contains(node)) {
+            continue;
+          }
+          const rect = node.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) {
+            continue;
+          }
+          const ticker = normalize(node.textContent);
+          if (isValid(ticker)) {
+            return ticker;
+          }
+        }
+        return "";
+      }
+
+      function normalizeAxiomTokenDetailTicker(value) {
+        const cleaned = String(value || "")
+          .replace(/^\$/, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        const match = cleaned.match(/[A-Za-z][A-Za-z0-9_.]{1,24}/);
+        return match ? match[0] : "";
+      }
+
+      function isAxiomTokenDetailQuoteOrUiTicker(value) {
+        const lower = String(value || "").toLowerCase().replace(/^\$/, "");
+        return new Set([
+          "sol",
+          "wsol",
+          "usdc",
+          "usdt",
+          "usd1",
+          "usds",
+          "usde",
+          "dai",
+          "pnl",
+          "card",
+          "buy",
+          "sell",
+          "token",
+          "raydium",
+          "pump",
+          "fun"
+        ]).has(lower);
+      }
+
+      function cleanAxiomTokenDetailTickerCandidate(value) {
+        const ticker = normalizeAxiomTokenDetailTicker(value);
+        if (!ticker || isAxiomTokenDetailQuoteOrUiTicker(ticker)) {
+          return "";
+        }
+        return ticker;
       }
 
       function buildAxiomTokenDetailVampIcon() {
@@ -2697,6 +3758,44 @@
         return link;
       }
 
+      function buildAxiomTokenDetailPnlCardButton() {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "flex items-center";
+        button.setAttribute("data-trench-tools-token-detail-pnl-card-inline", "true");
+        button.setAttribute("aria-label", "Create PnL card");
+        button.title = "Create PnL card";
+        Object.assign(button.style, {
+          border: "0",
+          background: "transparent",
+          color: "#ffffff",
+          cursor: "pointer",
+          padding: "0",
+          fontSize: "12px",
+          fontWeight: "700",
+          lineHeight: "16px",
+          opacity: "0.78"
+        });
+        button.textContent = "PnL Card";
+        button.addEventListener("mouseenter", () => {
+          button.style.opacity = "1";
+        });
+        button.addEventListener("mouseleave", () => {
+          button.style.opacity = "0.78";
+        });
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void handleAxiomTokenDetailPnlCardClick(button).catch((error) => {
+            if (isExtensionContextInvalid(error)) {
+              return;
+            }
+            helpers.showToast?.(error?.message || "PnL card failed.", "error");
+          });
+        });
+        return button;
+      }
+
       async function resolveTokenDetailRouteFromControl(control) {
         const route = routePayloadFromButton(control, {
           address: control?.getAttribute?.("data-route-key") || resolveCurrentPageAddress(),
@@ -2704,7 +3803,7 @@
           pair: control?.getAttribute?.("data-pair") || "",
           surface: "token_detail",
           url: control?.getAttribute?.("data-route-url") || window.location.href
-        });
+        }) || resolveCurrentTokenDetailRouteFallback(control);
         if (!route?.address) {
           return null;
         }
@@ -2734,6 +3833,90 @@
         }
         const mint = await resolveMintForExternalLink(route, "token_detail", route.url || window.location.href);
         openDexScreenerLink(mint, pendingTab);
+      }
+
+      async function handleAxiomTokenDetailPnlCardClick(control) {
+        const route = await resolveTokenDetailRouteFromControl(control);
+        const mint = String(
+          route?.mint ||
+          control?.getAttribute?.("data-mint") ||
+          extractAxiomTokenDetailHeaderMint(findAxiomTokenDetailHeaderActionAnchor()) ||
+          ""
+        ).trim();
+        const routeAddress = String(
+          route?.routeAddress ||
+          route?.rawAddress ||
+          route?.address ||
+          route?.pairAddress ||
+          route?.pair ||
+          ""
+        ).trim();
+        const address = routeAddress || mint;
+        if (!address) {
+          throw new Error("Token not found.");
+        }
+        const pairAddress = String(
+          route?.pairAddress ||
+          route?.pair ||
+          (mint && routeAddress && routeAddress !== mint ? routeAddress : "")
+        ).trim();
+        const symbol = String(
+          extractAxiomTokenDetailVisibleTicker() ||
+          axiomTokenDetailSellTokenTicker() ||
+          route?.symbol ||
+          extractAxiomTokenDetailBaseTicker() ||
+          cleanAxiomTokenDetailTickerCandidate(extractAxiomTokenDetailHeaderTicker()) ||
+          ""
+        ).trim();
+        helpers.openPnlCardEditorForMint?.({
+          ...(route || {}),
+          address,
+          ...(mint ? { mint } : {}),
+          symbol,
+          routeAddress: address,
+          pair: pairAddress,
+          pairAddress
+        }, "token_detail", route?.url || window.location.href, control);
+      }
+
+      function extractAxiomTokenDetailBaseTicker() {
+        const ignored = new Set([
+          "usdc",
+          "usdt",
+          "usd1",
+          "usds",
+          "usde",
+          "dai",
+          "sol",
+          "wsol",
+          "trumpcoin"
+        ]);
+        const isQuoteTicker = (ticker) => {
+          const lower = String(ticker || "").toLowerCase().replace(/^\$/, "");
+          return ignored.has(lower);
+        };
+        const anchor = findAxiomTokenDetailHeaderActionAnchor();
+        if (anchor instanceof Element) {
+          const images = Array.from(anchor.querySelectorAll("img[alt]"))
+            .map((image) => String(image.getAttribute("alt") || "").trim())
+            .filter(Boolean);
+          for (const ticker of images) {
+            if (!isQuoteTicker(ticker)) {
+              return ticker;
+            }
+          }
+        }
+        const title = String(document.title || "").split("|")[0].split(/[↓↑]/)[0].trim();
+        const titleTickers = title
+          .split(/[\s/•·,]+/)
+          .map((part) => part.trim().replace(/^\$/, ""))
+          .filter(Boolean);
+        for (const ticker of titleTickers) {
+          if (!isQuoteTicker(ticker)) {
+            return ticker;
+          }
+        }
+        return "";
       }
 
       function mountAxiomTokenDetailQuickButton(routeOrAddress) {
@@ -2766,6 +3949,7 @@
         } else {
           cleanupAxiomTokenDetailFloatingPresetButtons();
         }
+        helpers.syncActiveWalletStatusSurface?.();
         mountAxiomTokenDetailHardpanelManualActions(mountRoute);
       }
 
@@ -2823,7 +4007,7 @@
           return;
         }
         ensureAxiomTokenDetailFloatingPresetRefreshBridge(instantTrade, route);
-        ensureAxiomTokenDetailBloomCloneStyles();
+        ensureAxiomTokenDetailCloneStyles();
         document.querySelectorAll("[data-trench-tools-token-detail-panel]").forEach((element) => element.remove());
         document.querySelectorAll("[data-trench-tools-token-detail-preload-inline]").forEach((element) => element.remove());
         const mountedButtons = new Set();
@@ -2842,6 +4026,7 @@
             .filter((entry) => entry.action);
           actions.forEach((entry) => {
             installAxiomTokenDetailNativeSellHoverSummaryBridge(entry.nativeControl, entry.action);
+            installAxiomTokenDetailNativeTradeRefreshBridge(entry.nativeControl, entry.action, route);
           });
           const existingButtons = Array.from(row.querySelectorAll(":scope > [data-trench-tools-token-detail-inline]"))
             .filter((element) => element instanceof HTMLElement);
@@ -2935,6 +4120,7 @@
             return;
           }
           element._trenchAxiomNativeSellHoverCleanup?.();
+          element._trenchAxiomNativeTradeRefreshCleanup?.();
           const originalMinWidth =
             element.getAttribute("data-trench-tools-token-detail-native-original-min-width") || "";
           if (originalMinWidth) {
@@ -4322,6 +5508,11 @@
             document.removeEventListener("mousedown", handleAxiomTokenDetailWalletMenuOutsideClick, true);
             return;
           }
+          helpers.scheduleActiveWalletStatusRefresh?.(helpers.state.tokenContext || null, {
+            reason: "axiom-wallet-menu",
+            delays: [0],
+            staleAfterMs: 7000
+          });
           if (isAxiomTokenDetailTrenchOnlyMode()) {
             event.preventDefault();
             event.stopPropagation();
@@ -5349,6 +6540,24 @@
         }
       }
 
+      function handleAxiomTokenDetailExternalWalletStatusRefresh() {
+        const instantTrade = findAxiomTokenDetailInstantTradePanel();
+        if (!(instantTrade instanceof HTMLElement) || !isVisibleAxiomNode(instantTrade)) {
+          return;
+        }
+        queueDomOperation("token-detail-external-wallet-refresh", () => {
+          const panel = findAxiomTokenDetailInstantTradePanel();
+          if (!(panel instanceof HTMLElement) || !isVisibleAxiomNode(panel)) {
+            return;
+          }
+          ensureAxiomTokenDetailWalletSelector(panel);
+          refreshAxiomTokenDetailOpenWalletMenu();
+        }, "urgent");
+        window.requestAnimationFrame(() => {
+          refreshAxiomTokenDetailOpenWalletMenu();
+        });
+      }
+
       function mountAxiomTokenDetailStandaloneWalletMenu(nativeWalletControl) {
         if (!(nativeWalletControl instanceof HTMLElement) || !document.contains(nativeWalletControl)) {
           cleanupAxiomTokenDetailWalletSelector();
@@ -6291,12 +7500,12 @@
         });
       }
 
-      function ensureAxiomTokenDetailBloomCloneStyles() {
-        if (document.getElementById("trench-tools-axiom-token-detail-bloom-clone-style")) {
+      function ensureAxiomTokenDetailCloneStyles() {
+        if (document.getElementById("trench-tools-axiom-token-detail-clone-style")) {
           return;
         }
         const style = document.createElement("style");
-        style.id = "trench-tools-axiom-token-detail-bloom-clone-style";
+        style.id = "trench-tools-axiom-token-detail-clone-style";
         style.textContent = `
           [data-trench-tools-token-detail-native-hidden="true"] {
             display: none !important;
@@ -6445,14 +7654,14 @@
           div#instant-trade[data-trench-tools-token-detail-button-mode="axiom"] [data-trench-tools-token-detail-setting-row] {
             display: none !important;
           }
-          .trench-tools-axiom-token-detail-bloom-clone {
+          .trench-tools-axiom-token-detail-clone {
             border: 1px solid #EEA7ED;
             color: #EEA7ED;
             pointer-events: auto !important;
             position: relative;
             z-index: 1000;
           }
-          .trench-tools-axiom-token-detail-bloom-clone:hover {
+          .trench-tools-axiom-token-detail-clone:hover {
             background-color: #EEA7ED;
             color: hsl(var(--twc-grey-900) / var(--twc-grey-900-opacity, var(--tw-text-opacity)));
           }
@@ -6934,6 +8143,18 @@
         return instantTrade instanceof HTMLElement ? instantTrade : null;
       }
 
+      function getAxiomTokenDetailActiveWalletStatusTokenContext() {
+        if (!helpers.state.siteFeatures?.axiom?.instantTrade) {
+          return null;
+        }
+        const instantTrade = findAxiomTokenDetailInstantTradePanel();
+        if (!(instantTrade instanceof HTMLElement) || !isVisibleAxiomNode(instantTrade)) {
+          return null;
+        }
+        const tokenContext = helpers.state.tokenContext;
+        return String(tokenContext?.surface || "").trim() === "token_detail" ? tokenContext : null;
+      }
+
       function findAxiomTokenDetailControlRows() {
         const instantTrade = findAxiomTokenDetailInstantTradePanel();
         const candidates = instantTrade instanceof HTMLElement
@@ -7006,6 +8227,24 @@
         return element.matches("div.rounded-full") && !String(element.className || "").includes("group/wallets");
       }
 
+      function normalizeAxiomTokenDetailTradeAmount(value) {
+        let normalized = String(value || "")
+          .replace(/\s+/g, "")
+          .replace(/%/g, "")
+          .replace(/,/g, ".")
+          .replace(/[^\d.]/g, "");
+        const firstDotIndex = normalized.indexOf(".");
+        if (firstDotIndex >= 0) {
+          normalized =
+            normalized.slice(0, firstDotIndex + 1) +
+            normalized.slice(firstDotIndex + 1).replace(/\./g, "");
+        }
+        if (normalized.startsWith(".")) {
+          normalized = `0${normalized}`;
+        }
+        return normalized;
+      }
+
       function readAxiomTokenDetailAction(control, row = null, rowSide = null) {
         const editableInput = findAxiomTokenDetailEditablePresetInput(control);
         const text = String(
@@ -7016,7 +8255,7 @@
         if (!text && !(editableInput instanceof HTMLInputElement)) {
           return null;
         }
-        const amount = text.replace("%", "").trim();
+        const amount = normalizeAxiomTokenDetailTradeAmount(text);
         if ((!amount || !Number.isFinite(Number(amount))) && !(editableInput instanceof HTMLInputElement)) {
           return null;
         }
@@ -7151,7 +8390,7 @@
 
       function buildAxiomTokenDetailCloneButton(nativeControl, action) {
         const button = nativeControl.cloneNode(true);
-        button.classList.add("trench-tools-axiom-token-detail-bloom-clone");
+        button.classList.add("trench-tools-axiom-token-detail-clone");
         button.setAttribute("data-trench-tools-token-detail-inline", "true");
         button.removeAttribute("data-trench-tools-token-detail-native-control");
         button.removeAttribute("data-trench-tools-token-detail-native-hidden");
@@ -7235,7 +8474,9 @@
             helpers.showToast?.("Token not found.", "error");
             return;
           }
-          const amount = String(action.amount || button.getAttribute("data-amount") || "").trim();
+          const amount = normalizeAxiomTokenDetailTradeAmount(
+            action.amount || button.getAttribute("data-amount") || ""
+          );
           if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
             helpers.showToast?.("Invalid amount.", "error");
             return;
@@ -7313,15 +8554,15 @@
           if (cloneInput.value !== nativeInput.value) {
             cloneInput.value = nativeInput.value;
           }
-          const value = String(nativeInput.value || "").trim();
+          const value = normalizeAxiomTokenDetailTradeAmount(nativeInput.value);
           button.setAttribute("data-amount", value);
           action.amount = value;
         };
         const syncNativeFromClone = (event) => {
           event?.stopPropagation?.();
-          const value = String(cloneInput.value || "").trim();
+          const value = normalizeAxiomTokenDetailTradeAmount(cloneInput.value);
           button.setAttribute("data-amount", value);
-          setAxiomTokenDetailNativeInputValue(nativeInput, cloneInput.value);
+          setAxiomTokenDetailNativeInputValue(nativeInput, value);
           dispatchAxiomTokenDetailInputEvent(nativeInput, "input");
           if (event?.type === "change") {
             dispatchAxiomTokenDetailInputEvent(nativeInput, "change");
@@ -7408,6 +8649,46 @@
         };
       }
 
+      function installAxiomTokenDetailNativeTradeRefreshBridge(nativeControl, action, route = {}) {
+        if (!(nativeControl instanceof HTMLElement) || (action?.side !== "buy" && action?.side !== "sell")) {
+          nativeControl?._trenchAxiomNativeTradeRefreshCleanup?.();
+          return;
+        }
+        nativeControl._trenchAxiomNativeTradeRefreshCleanup?.();
+        const scheduleRefresh = (event) => {
+          if (isAxiomTokenDetailEditableEventTarget(event?.target)) {
+            return;
+          }
+          scheduleAxiomTokenDetailNativeTradeWalletRefresh(route);
+        };
+        nativeControl.addEventListener("click", scheduleRefresh);
+        nativeControl._trenchAxiomNativeTradeRefreshCleanup = () => {
+          nativeControl.removeEventListener("click", scheduleRefresh);
+          delete nativeControl._trenchAxiomNativeTradeRefreshCleanup;
+        };
+      }
+
+      function scheduleAxiomTokenDetailNativeTradeWalletRefresh(route = {}) {
+        const now = Date.now();
+        if (now - axiomTokenDetailNativeTradeRefreshLastAt < 250) {
+          return;
+        }
+        axiomTokenDetailNativeTradeRefreshLastAt = now;
+        const liveRoute = routePayloadFromButton(null, {
+          address: route.routeKey || resolveCurrentPageAddress(),
+          mint: route.tokenMint || "",
+          pair: route.companionPair || "",
+          surface: "token_detail",
+          url: window.location.href
+        });
+        const tokenContext = liveRoute
+          ? helpers.setInlineTokenContext?.(liveRoute, "token_detail", liveRoute.url || window.location.href)
+          : null;
+        helpers.scheduleExternalWalletStatusRefresh?.(tokenContext || helpers.state.tokenContext || null, {
+          reason: "axiom-native-trade"
+        });
+      }
+
       function isAxiomTokenDetailEditableEventTarget(target) {
         return target instanceof HTMLElement &&
           (target.matches("input, textarea, select") || Boolean(target.closest("[contenteditable='true']")));
@@ -7470,14 +8751,59 @@
             characterData: true,
             subtree: true
           });
+          installAxiomTokenDetailFloatingNativeTradeCaptureBridge(instantTrade);
         }
       }
 
       function disconnectAxiomTokenDetailFloatingPresetRefreshBridge() {
         axiomTokenDetailFloatingPresetRefreshObserver?.disconnect();
         axiomTokenDetailFloatingPresetRefreshObserver = null;
+        axiomTokenDetailFloatingPresetNativeTradeCleanup?.();
+        axiomTokenDetailFloatingPresetNativeTradeCleanup = null;
         axiomTokenDetailFloatingPresetRefreshRoot = null;
         axiomTokenDetailFloatingPresetRefreshRoute = null;
+      }
+
+      function installAxiomTokenDetailFloatingNativeTradeCaptureBridge(instantTrade) {
+        if (!(instantTrade instanceof HTMLElement)) {
+          return;
+        }
+        const scheduleNativeRefresh = (event) => {
+          if (!isAxiomTokenDetailFloatingNativeTradeEvent(event)) {
+            return;
+          }
+          scheduleAxiomTokenDetailNativeTradeWalletRefresh(axiomTokenDetailFloatingPresetRefreshRoute || {});
+        };
+        instantTrade.addEventListener("pointerdown", scheduleNativeRefresh, true);
+        instantTrade.addEventListener("click", scheduleNativeRefresh, true);
+        axiomTokenDetailFloatingPresetNativeTradeCleanup = () => {
+          instantTrade.removeEventListener("pointerdown", scheduleNativeRefresh, true);
+          instantTrade.removeEventListener("click", scheduleNativeRefresh, true);
+        };
+      }
+
+      function isAxiomTokenDetailFloatingNativeTradeEvent(event) {
+        const target = event?.target;
+        if (!(target instanceof Element)) {
+          return false;
+        }
+        if (isAxiomTokenDetailEditableEventTarget(target)) {
+          return false;
+        }
+        if (target.closest([
+          "[data-trench-tools-token-detail-inline]",
+          "[data-trench-tools-token-detail-preload-inline]",
+          "[data-trench-tools-token-detail-setting-row]",
+          "[data-trench-tools-token-detail-setting-tooltip]",
+          "[data-trench-tools-token-detail-compact-toggle]",
+          "[data-trench-tools-token-detail-wallet-selector]",
+          "[data-trench-tools-token-detail-wallet-menu]",
+          "[data-trench-tools-token-detail-wallet-summary]"
+        ].join(", "))) {
+          return false;
+        }
+        const nativeControl = target.closest("[data-trench-tools-token-detail-native-control]");
+        return nativeControl instanceof HTMLElement && nativeControl.closest("div#instant-trade") instanceof HTMLElement;
       }
 
       function isAxiomTokenDetailFloatingPresetNativeMutation(mutations) {
@@ -7585,12 +8911,19 @@
           if (event?.target instanceof Element && event.target.closest("[data-trench-tools-token-detail-hardpanel-action-wrapper]")) {
             return;
           }
+          if (event?.target instanceof Element) {
+            const submitButton = findAxiomTokenDetailHardpanelSubmitButton(hardpanel);
+            if (submitButton instanceof HTMLElement && submitButton.contains(event.target)) {
+              scheduleAxiomTokenDetailNativeTradeWalletRefresh(route);
+            }
+          }
           window.setTimeout(() => {
             if (document.contains(hardpanel)) {
               mountAxiomTokenDetailHardpanelManualActions(route);
             }
           }, 80);
         };
+        hardpanel.addEventListener("pointerdown", scheduleRefresh, true);
         hardpanel.addEventListener("click", scheduleRefresh, true);
         hardpanel.addEventListener("input", scheduleRefresh, true);
         hardpanel.addEventListener("change", scheduleRefresh, true);
@@ -7606,6 +8939,7 @@
           subtree: true
         });
         axiomTokenDetailHardpanelRefreshCleanup = () => {
+          hardpanel.removeEventListener("pointerdown", scheduleRefresh, true);
           hardpanel.removeEventListener("click", scheduleRefresh, true);
           hardpanel.removeEventListener("input", scheduleRefresh, true);
           hardpanel.removeEventListener("change", scheduleRefresh, true);
@@ -7907,7 +9241,7 @@
       function handleAxiomTokenDetailHardpanelActionClick(button) {
         const hardpanel = findAxiomTokenDetailHardpanelRoot();
         const state = resolveAxiomHardpanelSideAndAmount(hardpanel);
-        const amount = String(state?.amount || "").trim();
+        const amount = normalizeAxiomTokenDetailTradeAmount(state?.amount);
         const amountValue = Number(amount);
         if (!state?.side) {
           helpers.showToast?.("Axiom trade panel not found.", "error");
@@ -7958,18 +9292,21 @@
         const processTokenDetail = surfaceState.tokenDetail;
         const processWatchlist = axiomFeatures.watchlist;
         const processWalletTracker = axiomFeatures.walletTracker;
+        const processSearch = Boolean(axiomFeatures.instantTrade);
         const pulseCards = new Set();
         const watchlistAnchors = new Set();
         const walletRows = new Set();
+        const searchAnchors = new Set();
         let tokenDetailDirty = false;
         let launchShellDirty = false;
 
         const queueTokenDetailMount = (priority = "normal") => {
           queueDomOperation("token-detail", () => {
-            const latestPageAddress = resolveCurrentPageAddress();
+            const fallbackRoute = resolveCurrentTokenDetailRouteFallback();
+            const latestPageAddress = resolveCurrentPageAddress() || fallbackRoute?.address || "";
             if (latestPageAddress && !isPulseUrl(window.location.href)) {
               const tokenDetailRoute =
-                buildObservedCandidate(latestPageAddress, "token_detail", window.location.href) || latestPageAddress;
+                buildObservedCandidate(latestPageAddress, "token_detail", window.location.href) || fallbackRoute || latestPageAddress;
               mountAxiomTokenDetailHeaderActions(tokenDetailRoute);
               if (helpers.state.siteFeatures?.axiom?.instantTrade) {
                 mountAxiomTokenDetailQuickButton(tokenDetailRoute);
@@ -7978,7 +9315,7 @@
           }, priority);
         };
 
-        function addMutationTargets(node) {
+        function addMutationTargets(node, skipPulse = false) {
           const element =
             node instanceof HTMLElement
               ? node
@@ -7999,7 +9336,7 @@
             }
           }
 
-          if (processPulse) {
+          if (processPulse && !skipPulse) {
             const closestPulseCard = element.closest(PULSE_CARD_SELECTOR);
             if (closestPulseCard instanceof HTMLElement) {
               pulseCards.add(closestPulseCard);
@@ -8055,6 +9392,16 @@
             });
           }
 
+          if (processSearch) {
+            const closestSearchAnchor = element.closest(MEME_LINK_SELECTOR);
+            if (closestSearchAnchor instanceof HTMLAnchorElement && isAxiomSearchAnchor(closestSearchAnchor)) {
+              searchAnchors.add(closestSearchAnchor);
+            }
+            findAxiomSearchAnchors(element).forEach((anchor) => {
+              searchAnchors.add(anchor);
+            });
+          }
+
           if (processTokenDetail) {
             if (element.closest("div#instant-trade") || element.matches("div#instant-trade")) {
               tokenDetailDirty = true;
@@ -8074,7 +9421,8 @@
         }
 
         mutations.forEach((mutation) => {
-          addMutationTargets(mutation.target);
+          const isCharacterData = mutation.type === "characterData";
+          addMutationTargets(mutation.target, isCharacterData);
           mutation.addedNodes.forEach((node) => addMutationTargets(node));
           mutation.removedNodes.forEach(() => addMutationTargets(mutation.target));
         });
@@ -8100,6 +9448,14 @@
             const rowId = getTrackedNodeId(row, "trenchToolsWalletRowId", "wallet-row");
             queueDomOperation(`wallet:${rowId}`, () => {
               reconcileAxiomWalletTrackerRow(row);
+            }, "urgent");
+          });
+        }
+        if (searchAnchors.size) {
+          searchAnchors.forEach((anchor) => {
+            const anchorId = getTrackedNodeId(anchor, "trenchToolsSearchAnchorId", "search-anchor");
+            queueDomOperation(`search:${anchorId}`, () => {
+              reconcileAxiomSearchAnchor(anchor);
             }, "urgent");
           });
         }
@@ -8300,14 +9656,322 @@
         };
       }
 
-      function pulseQuickBuyStyles(target) {
+      function splitBoxShadowParts(value) {
+        const parts = [];
+        let depth = 0;
+        let current = "";
+        const text = String(value || "");
+        for (let i = 0; i < text.length; i += 1) {
+          const ch = text[i];
+          if (ch === "(") depth += 1;
+          else if (ch === ")") depth -= 1;
+          if (ch === "," && depth === 0) {
+            if (current.trim()) parts.push(current.trim());
+            current = "";
+            continue;
+          }
+          current += ch;
+        }
+        if (current.trim()) parts.push(current.trim());
+        return parts;
+      }
+
+      function parseColorToRgba(value) {
+        const text = String(value || "").trim();
+        if (!text) return null;
+        const hexMatch = text.match(/^#([0-9a-f]{3,8})$/i);
+        if (hexMatch) {
+          let hex = hexMatch[1];
+          if (hex.length === 3) hex = hex.split("").map((c) => c + c).join("");
+          if (hex.length === 4) {
+            hex = hex
+              .split("")
+              .map((c) => c + c)
+              .join("");
+          }
+          if (hex.length === 6) hex = hex + "ff";
+          if (hex.length !== 8) return null;
+          return {
+            r: parseInt(hex.slice(0, 2), 16),
+            g: parseInt(hex.slice(2, 4), 16),
+            b: parseInt(hex.slice(4, 6), 16),
+            a: parseInt(hex.slice(6, 8), 16) / 255
+          };
+        }
+        const rgbMatch = text.match(
+          /^rgba?\(\s*([\d.]+)\s*[, ]\s*([\d.]+)\s*[, ]\s*([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i
+        );
+        if (rgbMatch) {
+          let alpha = 1;
+          if (rgbMatch[4]) {
+            const aText = rgbMatch[4];
+            alpha = aText.endsWith("%")
+              ? parseFloat(aText) / 100
+              : parseFloat(aText);
+          }
+          return {
+            r: parseFloat(rgbMatch[1]),
+            g: parseFloat(rgbMatch[2]),
+            b: parseFloat(rgbMatch[3]),
+            a: Number.isFinite(alpha) ? alpha : 1
+          };
+        }
+        return null;
+      }
+
+      function colorWithAlpha(value, alpha) {
+        const parsed = parseColorToRgba(value);
+        if (!parsed) return value;
+        const a = Math.max(0, Math.min(1, alpha));
+        return `rgba(${Math.round(parsed.r)}, ${Math.round(parsed.g)}, ${Math.round(parsed.b)}, ${a})`;
+      }
+
+      function resolveAxiomPulseUltraNativeShadowParts(cluster) {
+        if (!cluster) return { outer: [], hasInsetBorder: false };
+        if (cluster._cachedUltraShadowParts !== undefined) {
+          return cluster._cachedUltraShadowParts;
+        }
+        const sample = resolveAxiomPulseUltraNativeButton(cluster);
+        const parts = { outer: [], hasInsetBorder: false };
+        if (sample instanceof HTMLElement) {
+          let nativeShadow = "";
+          let nativeBorder = 0;
+          try {
+            const cs = window.getComputedStyle(sample);
+            nativeShadow = String(cs.boxShadow || "");
+            const widths = [
+              parseFloat(cs.borderTopWidth) || 0,
+              parseFloat(cs.borderRightWidth) || 0,
+              parseFloat(cs.borderBottomWidth) || 0,
+              parseFloat(cs.borderLeftWidth) || 0
+            ];
+            nativeBorder = widths.every((width) => width >= 0.5) ? Math.max(...widths) : 0;
+          } catch {
+            nativeShadow = "";
+          }
+          if (nativeBorder >= 0.5) {
+            parts.hasInsetBorder = true;
+          }
+          if (nativeShadow && nativeShadow !== "none") {
+            const all = splitBoxShadowParts(nativeShadow);
+            parts.outer = all.filter((part) => !/\binset\b/i.test(part));
+            if (
+              all.some((part) => /\binset\b/i.test(part) && /0px 0px 0px 0?\.?[0-9]+(?:\.\d+)?px/i.test(part))
+            ) {
+              parts.hasInsetBorder = true;
+            }
+          }
+        }
+        cluster._cachedUltraShadowParts = parts;
+        return parts;
+      }
+
+      function resolveAxiomPulseUltraNativeOuterShadows(cluster) {
+        return resolveAxiomPulseUltraNativeShadowParts(cluster).outer;
+      }
+
+      function buildAxiomPulseUltraBoxShadow(cluster, borderColor, options = {}) {
+        const insetColor = borderColor || "rgba(255, 255, 255, 0.5)";
+        const parsed = parseColorToRgba(insetColor);
+        const baseAlpha = parsed ? parsed.a : 0.5;
+        const glowAlpha = Math.min(0.6, Math.max(0.15, baseAlpha * 0.65));
+        const glowColor = colorWithAlpha(insetColor, glowAlpha);
+        const innerSheen = "rgba(255, 255, 255, 0.024)";
+        const parts = resolveAxiomPulseUltraNativeShadowParts(cluster);
+        const wantBorder = options.forceBorder ?? parts.hasInsetBorder;
+        const layered = [];
+        if (wantBorder) {
+          layered.push(`${insetColor} 0px 0px 0px 1px inset`);
+        }
+        layered.push(`${innerSheen} 0px 0px 0px 1.25px inset`);
+        if (parts.outer.length > 0) {
+          layered.push(`${glowColor} 0px 0px 6px 0px`);
+          return [...layered, ...parts.outer].join(", ");
+        }
+        if (wantBorder) {
+          layered.push(`${glowColor} 0px 0px 6px 0px`);
+        }
+        return layered.join(", ");
+      }
+
+      function buildAxiomPulseUltraSeparatorShadow(cluster) {
+        const separatorColor = "rgba(255, 255, 255, 0.12)";
+        const layered = [
+          `${separatorColor} 1px 0px 0px 0px inset`
+        ];
+        const outerParts = resolveAxiomPulseUltraNativeOuterShadows(cluster);
+        return outerParts.length ? [...layered, ...outerParts].join(", ") : layered.join(", ");
+      }
+
+      function resolveAxiomPulseUltraNativeWrapperStyle(cluster) {
+        if (!cluster) {
+          return {
+            backgroundColor: "transparent",
+            hoverBackgroundColor: "rgba(255, 255, 255, 0.05)",
+            border: "1.25px solid rgba(158, 158, 158, 0.024)",
+            borderColor: "rgba(158, 158, 158, 0.024)",
+            hasVisualLayer: false,
+            transition: "background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease"
+          };
+        }
+        if (cluster._cachedUltraWrapperStyle !== undefined) {
+          return cluster._cachedUltraWrapperStyle;
+        }
+        const sample = resolveAxiomPulseUltraNativeButton(cluster);
+        const wrapper = sample instanceof HTMLElement ? sample.parentElement : null;
+        let style = {
+          backgroundColor: "transparent",
+          hoverBackgroundColor: "rgba(255, 255, 255, 0.05)",
+          border: "1.25px solid rgba(158, 158, 158, 0.024)",
+          borderColor: "rgba(158, 158, 158, 0.024)",
+          hasVisualLayer: false,
+          transition: "background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease"
+        };
+        if (wrapper instanceof HTMLElement) {
+          try {
+            const cs = window.getComputedStyle(wrapper);
+            const backgroundColor = String(cs.backgroundColor || "").trim();
+            const border = String(cs.borderTop || "").trim();
+            const borderColor = String(cs.borderTopColor || "").trim();
+            const transition = String(cs.transition || "").trim();
+            const parsedBackground = parseColorToRgba(backgroundColor);
+            const parsedBorder = parseColorToRgba(borderColor);
+            const hasVisualLayer =
+              Boolean(parsedBackground && parsedBackground.a > 0.001) ||
+              Boolean(parsedBorder && parsedBorder.a > 0.001);
+            style = {
+              backgroundColor: parsedBackground && parsedBackground.a > 0.001
+                ? backgroundColor
+                : style.backgroundColor,
+              hoverBackgroundColor: colorWithAlpha(
+                parsedBackground && parsedBackground.a > 0.001 ? backgroundColor : "rgba(255, 255, 255, 1)",
+                0.05
+              ),
+              border: parsedBorder && parsedBorder.a > 0.001 ? border : style.border,
+              borderColor: parsedBorder && parsedBorder.a > 0.001 ? borderColor : style.borderColor,
+              hasVisualLayer,
+              transition: transition && transition !== "all" ? transition : style.transition
+            };
+          } catch {}
+        }
+        cluster._cachedUltraWrapperStyle = style;
+        return style;
+      }
+
+      function applyAxiomPulseUltraTransparency(styleSet, cluster, slot = 1) {
+        if (!styleSet || typeof styleSet !== "object") {
+          return styleSet;
+        }
+        const design =
+          typeof helpers.resolveQuickBuyButtonDesign === "function"
+            ? helpers.resolveQuickBuyButtonDesign(slot)
+            : null;
+        const userBorder = design?.borderColor || "rgba(255, 255, 255, 0.5)";
+        const parts = resolveAxiomPulseUltraNativeShadowParts(cluster);
+        const nativeHasBorder = parts.hasInsetBorder;
+        const wrapperStyle = resolveAxiomPulseUltraNativeWrapperStyle(cluster);
+        const baseShadow = nativeHasBorder
+          ? buildAxiomPulseUltraBoxShadow(cluster, userBorder, { forceBorder: true })
+          : "none";
+        const borderHoverShadow = buildAxiomPulseUltraBoxShadow(cluster, userBorder, {
+          forceBorder: true
+        });
+        const separatorHoverShadow = buildAxiomPulseUltraSeparatorShadow(cluster);
+        const baseBackground = nativeHasBorder && wrapperStyle.backgroundColor === "transparent"
+          ? "rgba(255, 255, 255, 0.024)"
+          : wrapperStyle.backgroundColor;
+        const hoverBackground = nativeHasBorder ? "rgba(255, 255, 255, 0.069)" : wrapperStyle.hoverBackgroundColor;
+        const transition =
+          wrapperStyle.transition || "background-color 0.15s ease, backdrop-filter 0.15s ease, color 0.15s ease, box-shadow 0.15s ease";
+        if (styleSet.base) {
+          styleSet.base.backgroundColor = baseBackground;
+          styleSet.base.border = !nativeHasBorder && wrapperStyle.hasVisualLayer ? wrapperStyle.border : "0";
+          styleSet.base.borderColor = !nativeHasBorder && wrapperStyle.hasVisualLayer
+            ? wrapperStyle.borderColor
+            : "transparent";
+          styleSet.base.boxShadow = baseShadow;
+          styleSet.base.backdropFilter = "none";
+          styleSet.base.webkitBackdropFilter = "none";
+          styleSet.base.transition = transition;
+        }
+        if (styleSet.hover) {
+          styleSet.hover.backgroundColor = hoverBackground;
+          styleSet.hover.border = !nativeHasBorder && wrapperStyle.hasVisualLayer ? wrapperStyle.border : "0";
+          styleSet.hover.borderColor = !nativeHasBorder && wrapperStyle.hasVisualLayer
+            ? wrapperStyle.borderColor
+            : "transparent";
+          styleSet.hover.boxShadow = baseShadow;
+          styleSet.hover.backdropFilter = "blur(0.65px)";
+          styleSet.hover.webkitBackdropFilter = "blur(0.65px)";
+          styleSet.hover.transition = transition;
+        }
+        styleSet.ultraMode = nativeHasBorder ? "border" : "regular";
+        styleSet.ultraHoverShadow = nativeHasBorder
+          ? borderHoverShadow
+          : separatorHoverShadow;
+        return styleSet;
+      }
+
+      function ensureAxiomPulseUltraStylesheet() {
+        if (document.getElementById("trench-tools-axiom-pulse-ultra-style")) {
+          return;
+        }
+        const style = document.createElement("style");
+        style.id = "trench-tools-axiom-pulse-ultra-style";
+        style.textContent = `
+          [data-trench-tools-pulse-card-id]:hover [data-trench-tools-pulse-inline][data-trench-tools-ultra-mode="regular"],
+          [data-trench-tools-pulse-card-id]:hover [data-trench-tools-pulse-panel-inline][data-trench-tools-ultra-mode="regular"] {
+            box-shadow: var(--tt-ultra-card-hover-shadow, none) !important;
+          }
+        `.replace(/\s+/g, " ");
+        (document.head || document.documentElement).appendChild(style);
+      }
+
+      function applyAxiomPulseUltraButtonAttributes(button, styleSet) {
+        if (!(button instanceof HTMLElement) || !styleSet) {
+          return;
+        }
+        const mode = styleSet.ultraMode;
+        if (mode === "regular" || mode === "border") {
+          if (button.dataset.trenchToolsUltraMode !== mode) {
+            button.dataset.trenchToolsUltraMode = mode;
+          }
+          if (mode === "regular" && typeof styleSet.ultraHoverShadow === "string") {
+            button.style.setProperty("--tt-ultra-card-hover-shadow", styleSet.ultraHoverShadow);
+          } else {
+            button.style.removeProperty("--tt-ultra-card-hover-shadow");
+          }
+          ensureAxiomPulseUltraStylesheet();
+        } else if (button.dataset.trenchToolsUltraMode) {
+          delete button.dataset.trenchToolsUltraMode;
+          button.style.removeProperty("--tt-ultra-card-hover-shadow");
+        }
+      }
+
+      function pulseQuickBuyStyles(clusterOrTarget, slot = 1) {
+        const cluster = isPulseClusterShape(clusterOrTarget) ? clusterOrTarget : null;
+        const target = cluster ? cluster.anchor : clusterOrTarget;
+        const shape = cluster?.shape || "compact";
+
+        if (shape === "ultra-direct-button" || shape === "ultra-wrapper-tile") {
+          const styles = ultraPulseQuickBuyStyleSet(cluster);
+          helpers.applyQuickBuyButtonDesign(styles, slot);
+          applyAxiomPulseUltraTransparency(styles, cluster, slot);
+          return styles;
+        }
+        if (shape === "large-pill") {
+          const styles = nativePulseQuickBuyStyleSet(cluster);
+          helpers.applyQuickBuyButtonDesign(styles, slot);
+          return styles;
+        }
+
         const styles = helpers.getQuickBuyBaseStyles();
         const metrics = resolveSyncedTargetMetrics(target);
         const targetFontSize = metrics.computed?.fontSize || "13px";
         const targetFontWeight = metrics.computed?.fontWeight || "500";
         const logoSize = `${Math.max(17, Math.min(20, Math.round(metrics.targetHeightPx * 0.76)))}px`;
 
-        return {
+        const styleSet = {
           base: {
             ...styles.base,
             display: "inline-flex",
@@ -8348,14 +10012,58 @@
           logoSize,
           logoGap: "4px"
         };
+        helpers.applyQuickBuyButtonDesign(styleSet, slot);
+        return styleSet;
       }
 
-      function pulsePanelButtonStyles(target) {
+      function pulsePanelButtonStyles(clusterOrTarget) {
+        const cluster = isPulseClusterShape(clusterOrTarget) ? clusterOrTarget : null;
+        const target = cluster ? cluster.anchor : clusterOrTarget;
+        const shape = cluster?.shape || "compact";
+        const isUltraShape = shape === "ultra-direct-button" || shape === "ultra-wrapper-tile";
+
+        if (isUltraShape) {
+          const baseStyles = helpers.getQuickBuyBaseStyles();
+          const tileHeight = resolveAxiomPulseUltraTileHeight(cluster);
+          const tilePixelHeight = Number.parseFloat(tileHeight);
+          const heightForLogo = Number.isFinite(tilePixelHeight) && tilePixelHeight > 0
+            ? tilePixelHeight
+            : 36;
+          const logoSize = `${Math.max(18, Math.min(20, Math.round(heightForLogo * 0.8)))}px`;
+          const shared = {
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: "auto",
+            minWidth: "0px",
+            flex: "0 0 auto",
+            height: tileHeight,
+            minHeight: "0",
+            alignSelf: "center",
+            marginLeft: "0px",
+            marginRight: "0px",
+            marginBottom: "0px",
+            padding: "0px 4px",
+            borderRadius: "4px",
+            lineHeight: "1",
+            overflow: "hidden"
+          };
+          const styleSet = {
+            base: { ...baseStyles.base, ...shared },
+            hover: { ...baseStyles.base, ...baseStyles.hover, ...shared },
+            logoSize,
+            logoGap: "0px"
+          };
+          helpers.applyQuickBuyButtonDesign(styleSet, 1);
+          applyAxiomPulseUltraTransparency(styleSet, cluster, 1);
+          return styleSet;
+        }
+
         const styles = helpers.getQuickBuyBaseStyles();
         const metrics = resolveSyncedTargetMetrics(target);
         const logoSize = `${Math.max(18, Math.min(20, Math.round(metrics.targetHeightPx * 0.8)))}px`;
 
-        return {
+        const styleSet = {
           base: {
             ...styles.base,
             display: "inline-flex",
@@ -8391,6 +10099,141 @@
           },
           logoSize,
           logoGap: "0px"
+        };
+        helpers.applyQuickBuyButtonDesign(styleSet, 1);
+        return styleSet;
+      }
+
+      function isPulseClusterShape(value) {
+        return Boolean(value && typeof value === "object" && "shape" in value && "anchor" in value);
+      }
+
+      function nativePulseQuickBuyStyleSet(cluster) {
+        const styles = helpers.getQuickBuyBaseStyles();
+        const metrics = resolveSyncedTargetMetrics(cluster?.anchor);
+        const fontSize = metrics.computed?.fontSize || "13px";
+        const fontWeight = metrics.computed?.fontWeight || "500";
+        const logoSize = `${Math.max(17, Math.min(22, Math.round(metrics.targetHeightPx * 0.4)))}px`;
+        return {
+          base: {
+            ...styles.base,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            height: metrics.targetHeight,
+            minHeight: metrics.targetHeight,
+            width: "auto",
+            minWidth: "0",
+            padding: "0px 14px",
+            marginLeft: "4px",
+            marginRight: "0px",
+            marginBottom: "0px",
+            borderRadius: metrics.borderRadius,
+            fontSize,
+            fontWeight,
+            lineHeight: "1"
+          },
+          hover: {
+            ...styles.base,
+            ...styles.hover,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            height: metrics.targetHeight,
+            minHeight: metrics.targetHeight,
+            width: "auto",
+            minWidth: "0",
+            padding: "0px 14px",
+            marginLeft: "4px",
+            marginRight: "0px",
+            marginBottom: "0px",
+            borderRadius: metrics.borderRadius,
+            fontSize,
+            fontWeight,
+            lineHeight: "1"
+          },
+          logoSize,
+          logoGap: "6px"
+        };
+      }
+
+      function resolveAxiomPulseUltraNativeButton(cluster) {
+        if (!cluster) return null;
+        if (cluster._cachedUltraNativeButton !== undefined) {
+          return cluster._cachedUltraNativeButton;
+        }
+        const sample = cluster.nativeUnits?.[0];
+        let resolved = null;
+        if (sample instanceof HTMLElement) {
+          if (sample.tagName === "BUTTON") {
+            resolved = sample;
+          } else {
+            const inside = sample.querySelector("button");
+            resolved = inside instanceof HTMLElement ? inside : sample;
+          }
+        }
+        cluster._cachedUltraNativeButton = resolved;
+        return resolved;
+      }
+
+      function resolveAxiomPulseUltraTileHeight(cluster) {
+        if (cluster && cluster._cachedUltraTileHeight !== undefined) {
+          return cluster._cachedUltraTileHeight;
+        }
+        const target = resolveAxiomPulseUltraNativeButton(cluster);
+        const card = cluster?.parent instanceof HTMLElement
+          ? cluster.parent.closest(PULSE_CARD_SELECTOR) || cluster.parent.closest("[data-trench-tools-pulse-card-id]")
+          : null;
+        let value = "100%";
+        if (target instanceof HTMLElement) {
+          const px = target.getBoundingClientRect().height;
+          if (px >= 30) {
+            value = `${px.toFixed(3)}px`;
+          }
+        }
+        if (value === "100%" && card instanceof HTMLElement) {
+          const cachedHeight = Number(card.dataset.trenchToolsPulseUltraCachedHeight || 0);
+          if (cachedHeight >= 30) {
+            value = `${cachedHeight.toFixed(3)}px`;
+          }
+        } else if (value !== "100%" && card instanceof HTMLElement) {
+          card.dataset.trenchToolsPulseUltraCachedHeight = value.replace(/px$/i, "");
+        }
+        if (cluster) cluster._cachedUltraTileHeight = value;
+        return value;
+      }
+
+      function ultraPulseQuickBuyStyleSet(cluster) {
+        const styles = helpers.getQuickBuyBaseStyles();
+        const fontSize = "13px";
+        const fontWeight = "600";
+        const logoSize = "20px";
+        const tileHeight = resolveAxiomPulseUltraTileHeight(cluster);
+        const shared = {
+          display: "flex",
+          alignItems: "flex-end",
+          justifyContent: "flex-end",
+          height: tileHeight,
+          minHeight: "0",
+          width: "auto",
+          minWidth: "0px",
+          alignSelf: "center",
+          flex: "1 1 0",
+          padding: "0px 4px 16px 0px",
+          marginLeft: "0px",
+          marginRight: "0px",
+          marginBottom: "0px",
+          borderRadius: "4px",
+          fontSize,
+          fontWeight,
+          lineHeight: "1",
+          overflow: "hidden"
+        };
+        return {
+          base: { ...styles.base, ...shared },
+          hover: { ...styles.base, ...styles.hover, ...shared },
+          logoSize,
+          logoGap: "6px"
         };
       }
 
@@ -8434,6 +10277,52 @@
             lineHeight: "1"
           },
           logoSize: "16px",
+          logoGap: "4px"
+        };
+      }
+
+      function axiomSearchQuickBuyStyles() {
+        const styles = helpers.getQuickBuyBaseStyles();
+
+        return {
+          base: {
+            ...styles.base,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            height: "30px",
+            minHeight: "30px",
+            borderRadius: "999px",
+            marginLeft: "4px",
+            marginRight: "0px",
+            marginBottom: "0px",
+            padding: "0px 8px",
+            fontSize: "13px",
+            fontWeight: "500",
+            zIndex: "10",
+            lineHeight: "1",
+            flexShrink: "0"
+          },
+          hover: {
+            ...styles.base,
+            ...styles.hover,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            height: "30px",
+            minHeight: "30px",
+            borderRadius: "999px",
+            marginLeft: "4px",
+            marginRight: "0px",
+            marginBottom: "0px",
+            padding: "0px 8px",
+            fontSize: "13px",
+            fontWeight: "500",
+            zIndex: "10",
+            lineHeight: "1",
+            flexShrink: "0"
+          },
+          logoSize: "14px",
           logoGap: "4px"
         };
       }
@@ -8518,9 +10407,23 @@
         getQuotedPriceHint,
         handleMutations,
         handleWalletStatusChange: refreshAxiomTokenDetailOpenWalletMenu,
+        handleExternalWalletStatusRefresh: handleAxiomTokenDetailExternalWalletStatusRefresh,
+        getActiveWalletStatusTokenContext: getAxiomTokenDetailActiveWalletStatusTokenContext,
         getObserverOptions,
         getCurrentTokenCandidate,
-        mount
+        getCurrentTokenSymbol() {
+          try {
+            return String(
+              extractAxiomTokenDetailVisibleTicker() ||
+              axiomTokenDetailSellTokenTicker() ||
+              ""
+            ).trim();
+          } catch (_error) {
+            return "";
+          }
+        },
+        mount,
+        teardown
       };
     }
   });

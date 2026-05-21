@@ -82,6 +82,19 @@
     const bagsFeeSplitLookupState = new Map();
     let agentSplitClearAllRestoreSnapshot = null;
 
+    function normalizeRecipientShare(value) {
+      return normalizeDecimalInput(value, 2);
+    }
+
+    function recipientShareValue(row) {
+      return normalizeRecipientShare(row?.querySelector(".recipient-share")?.value || "");
+    }
+
+    function recipientShareNumber(row) {
+      const value = Number(recipientShareValue(row) || 0);
+      return Number.isFinite(value) ? value : 0;
+    }
+
     function normalizeRecipientType(type, options = {}) {
       return typeof feeRouting.normalizeRecipientType === "function"
         ? feeRouting.normalizeRecipientType(type, options)
@@ -472,7 +485,7 @@
       bagsFeeSplitSummary.hidden = !showSummary;
       if (!showSummary) return;
       const rows = getFeeSplitRows();
-      const total = rows.reduce((sum, row) => sum + (Number(row.querySelector(".recipient-share")?.value || 0) || 0), 0);
+      const total = rows.reduce((sum, row) => sum + recipientShareNumber(row), 0);
       const creatorShare = Math.max(0, Number((100 - total).toFixed(2)));
       const shared = Math.max(0, total);
       if (feeSplitSummaryPrimaryLabel) {
@@ -1092,7 +1105,7 @@
             <button type="button" class="recipient-lock-toggle">Set</button>
           </div>
           <div class="recipient-share-box">
-            <input class="recipient-share" type="number" min="0" max="100" step="0.01" placeholder="0">
+            <input class="recipient-share" type="text" inputmode="decimal" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="0">
             <span>%</span>
           </div>
         </div>
@@ -1154,13 +1167,13 @@
         if (!row) return false;
         if (!agentCustom && row.dataset.defaultReceiver === "true") return false;
         if (agentCustom && row.dataset.locked === "true") {
-          return Number(row.querySelector(".recipient-share")?.value || 0) > 0;
+          return recipientShareNumber(row) > 0;
         }
         return true;
       });
       return configuredRows.filter((row) => {
         const value = row.querySelector(".recipient-target")?.value.trim();
-        const share = Number(row.querySelector(".recipient-share")?.value || 0);
+        const share = recipientShareNumber(row);
         return row.dataset.locked === "true" || Boolean(value) || (Number.isFinite(share) && share > 0);
       }).length;
     }
@@ -1201,7 +1214,7 @@
     function syncFeeSplitTotals() {
       const rows = getFeeSplitRows();
       const total = rows.reduce((sum, row) => {
-        const value = Number(row.querySelector(".recipient-share")?.value || 0);
+        const value = recipientShareNumber(row);
         return sum + (Number.isFinite(value) ? value : 0);
       }, 0);
       if (feeSplitTotal) {
@@ -1230,7 +1243,7 @@
       const gradientStops = [];
       const legendItems = [];
       rows.forEach((row, index) => {
-        const share = Number(row.querySelector(".recipient-share")?.value || 0);
+        const share = recipientShareNumber(row);
         const color = splitColors[index % splitColors.length];
         const targetValue = row.querySelector(".recipient-target")?.value.trim();
         const label = formatLegendRecipientLabel(
@@ -1416,7 +1429,7 @@
           targetLocked: Boolean(row.targetLocked),
         }));
       const implicitCreatorSharePercent = !defaultReceiverRow && usesImplicitCreatorShareMode("regular", getLaunchpad())
-        ? formatPercentNumber(Math.max(0, 100 - carriedRows.reduce((sum, row) => sum + (Number(row.sharePercent) || 0), 0)))
+        ? formatPercentNumber(Math.max(0, 100 - carriedRows.reduce((sum, row) => sum + (Number(normalizeRecipientShare(row.sharePercent)) || 0), 0)))
         : "";
       if (!defaultReceiverRow && carriedRows.length === 0) {
         if (shouldSeedImplicitPumpCreator) {
@@ -1554,7 +1567,7 @@
           <div class="fee-split-row-main">
             <input class="recipient-target" type="text" value="Agent fee split receiver (derived)" disabled>
             <div class="recipient-share-box">
-              <input class="recipient-share" type="number" min="0" max="100" step="0.01" placeholder="0">
+              <input class="recipient-share" type="text" inputmode="decimal" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="0">
               <span>%</span>
             </div>
           </div>
@@ -1576,7 +1589,7 @@
               <button type="button" class="recipient-lock-toggle">Set</button>
             </div>
             <div class="recipient-share-box">
-              <input class="recipient-share" type="number" min="0" max="100" step="0.01" placeholder="0">
+              <input class="recipient-share" type="text" inputmode="decimal" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="0">
               <span>%</span>
             </div>
           </div>
@@ -1594,7 +1607,7 @@
     function syncAgentSplitTotals() {
       const rows = getAgentSplitRows();
       const total = rows.reduce((sum, row) => {
-        const value = Number(row.querySelector(".recipient-share")?.value || 0);
+        const value = recipientShareNumber(row);
         return sum + (Number.isFinite(value) ? value : 0);
       }, 0);
       if (agentSplitTotal) {
@@ -1618,7 +1631,7 @@
       const gradientStops = [];
       const legendItems = [];
       rows.forEach((row, index) => {
-        const share = Number(row.querySelector(".recipient-share")?.value || 0);
+        const share = recipientShareNumber(row);
         const color = splitColors[index % splitColors.length];
         const targetValue = row.querySelector(".recipient-target")?.value.trim();
         const label = row.dataset.locked
@@ -1662,8 +1675,8 @@
       }
 
       if (afterAdd && otherRows.length === 1) {
-        const currentAgentShare = Number(agentShareInput.value || 0);
-        const currentOtherShare = Number(otherRows[0].querySelector(".recipient-share")?.value || 0);
+        const currentAgentShare = Number(normalizeRecipientShare(agentShareInput.value) || 0);
+        const currentOtherShare = recipientShareNumber(otherRows[0]);
         if (Math.abs(currentAgentShare - 100) < 0.001 && Math.abs(currentOtherShare) < 0.001) {
           agentShareInput.value = "50";
           agentSliderInput.value = "50";
@@ -1726,7 +1739,7 @@
     function collectAgentSplitRecipients() {
       return getAgentSplitRows().map((row) => {
         if (row.dataset.locked) {
-          const sharePercent = row.querySelector(".recipient-share")?.value.trim() || "";
+          const sharePercent = recipientShareValue(row);
           const numericShare = Number(sharePercent);
           return {
             type: "agent",
@@ -1737,7 +1750,7 @@
         const value = row.querySelector(".recipient-target")?.value.trim() || "";
         const githubUserId = String(row.dataset.githubUserId || "").trim();
         const parsedGithubTarget = parseGithubRecipientTarget(value);
-        const sharePercent = row.querySelector(".recipient-share")?.value.trim() || "";
+        const sharePercent = recipientShareValue(row);
         if (!value && !sharePercent) return null;
         const numericShare = Number(sharePercent);
         return {
@@ -1807,7 +1820,7 @@
           const value = row.querySelector(".recipient-target")?.value.trim() || "";
           const githubUserId = String(row.dataset.githubUserId || "").trim();
           const parsedGithubTarget = parseGithubRecipientTarget(value);
-          const sharePercent = row.querySelector(".recipient-share")?.value.trim() || "";
+          const sharePercent = recipientShareValue(row);
           if (!value && !sharePercent) return null;
           const numericShare = Number(sharePercent);
           const descriptor = isSocialRecipientType(type) ? buildFeeSplitLookupDescriptor(row) : null;
@@ -1957,13 +1970,13 @@
         .map((row) => ({
           type: row.dataset.type || "wallet",
           value: row.querySelector(".recipient-target")?.value.trim() || "",
-          sharePercent: row.querySelector(".recipient-share")?.value.trim() || "",
+          sharePercent: recipientShareValue(row),
           targetLocked: row.dataset.targetLocked === "true",
         }))
         .filter((entry) => entry.value || entry.sharePercent);
       const agentSharePercent = defaultReceiverRow
-        ? (defaultReceiverRow.querySelector(".recipient-share")?.value.trim() || "0")
-        : formatPercentNumber(Math.max(0, 100 - carriedRows.reduce((sum, row) => sum + (Number(row.sharePercent) || 0), 0)));
+        ? (recipientShareValue(defaultReceiverRow) || "0")
+        : formatPercentNumber(Math.max(0, 100 - carriedRows.reduce((sum, row) => sum + (Number(normalizeRecipientShare(row.sharePercent)) || 0), 0)));
 
       agentSplitList.innerHTML = "";
       agentSplitList.appendChild(createAgentSplitRow({ locked: true, sharePercent: agentSharePercent }));

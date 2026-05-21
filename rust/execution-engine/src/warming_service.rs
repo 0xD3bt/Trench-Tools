@@ -12,7 +12,7 @@ use tokio::{
 use crate::{
     mint_warm_cache::warm_ttl_ms_for_lifecycle,
     rpc_client::{fetch_block_height, fetch_latest_blockhash_fresh_or_recent},
-    trade_planner::LifecycleAndCanonicalMarket,
+    trade_planner::{LifecycleAndCanonicalMarket, TradeLifecycle},
 };
 
 const DEFAULT_COMMITMENT: &str = "confirmed";
@@ -23,6 +23,7 @@ const BLOCKHASH_REFRESH_INTERVAL_MS: u64 = 5_000;
 /// margin.
 const BLOCKHASH_STALE_AFTER_MS: u64 = 20_000;
 const SELECTOR_STALE_AFTER_MS: u64 = 4_000;
+const SELECTOR_LRU_CAP: usize = 256;
 const WALLET_STATE_STALE_AFTER_MS: u64 = 8_000;
 /// LaunchDeck-style runway check: if fewer than this many blocks remain
 /// before `lastValidBlockHeight`, force-refresh the blockhash before compile.
@@ -52,6 +53,7 @@ impl CachedBlockhash {
 pub struct CachedTradeSelector {
     pub selector: LifecycleAndCanonicalMarket,
     pub fetched_at_unix_ms: u64,
+    pub last_used_at_unix_ms: u64,
     pub rpc_url: String,
     pub commitment: String,
     pub side: String,
@@ -237,9 +239,11 @@ impl WarmingService {
         allow_non_canonical: bool,
         selector: LifecycleAndCanonicalMarket,
     ) {
+        let now = now_unix_ms();
         let entry = CachedTradeSelector {
             selector,
-            fetched_at_unix_ms: now_unix_ms(),
+            fetched_at_unix_ms: now,
+            last_used_at_unix_ms: now,
             rpc_url: rpc_url.trim().to_string(),
             commitment: normalize_commitment(commitment),
             side: normalize_side(side),
@@ -248,7 +252,9 @@ impl WarmingService {
             pinned_pool: normalize_optional(pinned_pool),
             allow_non_canonical,
         };
-        self.selector_entries.write().await.insert(
+        let mut entries = self.selector_entries.write().await;
+        entries.retain(|_, entry| !entry.is_stale(now));
+        entries.insert(
             selector_cache_key(
                 rpc_url,
                 commitment,
@@ -260,6 +266,15 @@ impl WarmingService {
             ),
             entry,
         );
+        if entries.len() > SELECTOR_LRU_CAP {
+            if let Some(victim_key) = entries
+                .iter()
+                .min_by_key(|(_, value)| value.last_used_at_unix_ms)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&victim_key);
+            }
+        }
     }
 
     pub async fn current_selector(
@@ -272,19 +287,24 @@ impl WarmingService {
         pinned_pool: Option<&str>,
         allow_non_canonical: bool,
     ) -> Option<CachedTradeSelector> {
-        self.selector_entries
-            .read()
-            .await
-            .get(&selector_cache_key(
-                rpc_url,
-                commitment,
-                side,
-                route_policy,
-                mint,
-                pinned_pool,
-                allow_non_canonical,
-            ))
-            .cloned()
+        let now = now_unix_ms();
+        let key = selector_cache_key(
+            rpc_url,
+            commitment,
+            side,
+            route_policy,
+            mint,
+            pinned_pool,
+            allow_non_canonical,
+        );
+        let mut entries = self.selector_entries.write().await;
+        let entry = entries.get_mut(&key)?;
+        if entry.is_stale(now) {
+            entries.remove(&key);
+            return None;
+        }
+        entry.last_used_at_unix_ms = now;
+        Some(entry.clone())
     }
 
     pub async fn invalidate_selector(
@@ -315,17 +335,33 @@ impl WarmingService {
         &self,
         rpc_url: &str,
         commitment: &str,
-        side: &str,
+        _side: &str,
         mint: &str,
     ) {
         let normalized_rpc = rpc_url.trim().to_string();
         let normalized_commitment = normalize_commitment(commitment);
-        let normalized_side = normalize_side(side);
         let normalized_mint = mint.trim().to_string();
         self.selector_entries.write().await.retain(|_, entry| {
             !(entry.rpc_url == normalized_rpc
                 && entry.commitment == normalized_commitment
-                && entry.side == normalized_side
+                && entry.mint == normalized_mint)
+        });
+    }
+
+    pub async fn invalidate_pre_migration_selectors_for_mint(
+        &self,
+        rpc_url: &str,
+        commitment: &str,
+        _side: &str,
+        mint: &str,
+    ) {
+        let normalized_rpc = rpc_url.trim().to_string();
+        let normalized_commitment = normalize_commitment(commitment);
+        let normalized_mint = mint.trim().to_string();
+        self.selector_entries.write().await.retain(|_, entry| {
+            !(entry.selector.lifecycle == TradeLifecycle::PreMigration
+                && entry.rpc_url == normalized_rpc
+                && entry.commitment == normalized_commitment
                 && entry.mint == normalized_mint)
         });
     }
@@ -655,6 +691,80 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pre_migration_selector_expires_by_age() {
+        let mut selector = sample_selector();
+        selector.lifecycle = TradeLifecycle::PreMigration;
+        let mut entry = CachedTradeSelector {
+            selector,
+            fetched_at_unix_ms: now_unix_ms(),
+            last_used_at_unix_ms: now_unix_ms(),
+            rpc_url: "https://rpc".to_string(),
+            commitment: "confirmed".to_string(),
+            side: "buy".to_string(),
+            route_policy: "buy:sol_only".to_string(),
+            mint: "Mint111".to_string(),
+            pinned_pool: None,
+            allow_non_canonical: false,
+        };
+        assert!(!entry.is_stale(now_unix_ms()));
+
+        entry.fetched_at_unix_ms = 1;
+        assert!(entry.is_stale(now_unix_ms()));
+
+        entry.selector.lifecycle = TradeLifecycle::PostMigration;
+        assert!(entry.is_stale(now_unix_ms()));
+    }
+
+    #[tokio::test]
+    async fn current_selector_updates_last_used_without_extending_age() {
+        let service = WarmingService::default();
+        service
+            .cache_selector(
+                "https://rpc",
+                "confirmed",
+                "buy",
+                "buy:sol_only",
+                "Mint111",
+                None,
+                false,
+                sample_selector(),
+            )
+            .await;
+        let key = selector_cache_key(
+            "https://rpc",
+            "confirmed",
+            "buy",
+            "buy:sol_only",
+            "Mint111",
+            None,
+            false,
+        );
+        let fetched_before = now_unix_ms();
+        {
+            let mut entries = service.selector_entries.write().await;
+            let entry = entries.get_mut(&key).expect("cached selector");
+            entry.fetched_at_unix_ms = fetched_before;
+            entry.last_used_at_unix_ms = 1;
+        }
+
+        let cached = service
+            .current_selector(
+                "https://rpc",
+                "confirmed",
+                "buy",
+                "buy:sol_only",
+                "Mint111",
+                None,
+                false,
+            )
+            .await
+            .expect("selector hit");
+
+        assert_eq!(cached.fetched_at_unix_ms, fetched_before);
+        assert!(cached.last_used_at_unix_ms > 1);
     }
 
     #[tokio::test]

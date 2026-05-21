@@ -129,6 +129,7 @@
       applyLaunchpadTokenMetadata,
       getQuoteAsset,
       setStoredBonkQuoteAsset,
+      setStoredPumpQuoteAsset,
       syncBonkQuoteAssetUI,
       queueQuoteUpdate,
       syncTickerFromName,
@@ -168,6 +169,7 @@
       getBuyProvider,
       ensureStandardRpcSlippageDefault,
       getSellProvider,
+      normalizeDecimalInput = (value) => String(value || "").trim(),
       showFeeSplitModal,
       hideSettingsModal,
       toggleWalletDropdown,
@@ -418,9 +420,14 @@
 
       if (bonkQuoteAssetToggle) {
         bonkQuoteAssetToggle.addEventListener("click", () => {
-          const asset = getQuoteAsset() === "usd1" ? "sol" : "usd1";
+          const launchpad = getLaunchpad();
+          const current = getQuoteAsset();
+          const asset = launchpad === "pump"
+            ? (current === "usdc" ? "sol" : "usdc")
+            : (current === "usd1" ? "sol" : "usd1");
           if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = asset;
-          setStoredBonkQuoteAsset(asset);
+          if (launchpad === "pump") setStoredPumpQuoteAsset(asset);
+          else setStoredBonkQuoteAsset(asset);
           syncBonkQuoteAssetUI();
           queueQuoteUpdate();
         });
@@ -849,7 +856,9 @@
             row.querySelector(".recipient-share").value = event.target.value;
           }
           if (event.target.classList.contains("recipient-share")) {
-            row.querySelector(".recipient-slider").value = event.target.value || "0";
+            const normalizedShare = normalizeDecimalInput(event.target.value, 2);
+            event.target.value = normalizedShare;
+            row.querySelector(".recipient-slider").value = normalizedShare || "0";
           }
           updateFeeSplitRowValidationUi(row);
           syncFeeSplitTotals();
@@ -976,7 +985,9 @@
             row.querySelector(".recipient-share").value = event.target.value;
           }
           if (event.target.classList.contains("recipient-share")) {
-            row.querySelector(".recipient-slider").value = event.target.value || "0";
+            const normalizedShare = normalizeDecimalInput(event.target.value, 2);
+            event.target.value = normalizedShare;
+            row.querySelector(".recipient-slider").value = normalizedShare || "0";
           }
           if (event.target.classList.contains("recipient-target") && row.dataset.defaultReceiver === "true") {
             delete row.dataset.defaultReceiver;
@@ -992,6 +1003,9 @@
         if (!input) return;
         input.addEventListener("blur", () => validateFieldByName(name));
         input.addEventListener("input", () => {
+          if (input.name === "agentUnlockedBuybackPercent") {
+            input.value = normalizeDecimalInput(input.value, 2);
+          }
           if (input.classList.contains("input-error")) validateFieldByName(name);
         });
       });

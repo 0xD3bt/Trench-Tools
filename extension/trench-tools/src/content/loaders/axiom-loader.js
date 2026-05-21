@@ -309,6 +309,8 @@
       "[data-trench-tools-token-detail-inline]",
       "[data-trench-tools-pulse-inline]",
       "[data-trench-tools-pulse-panel-inline]",
+      "[data-trench-tools-pulse-vamp-inline]",
+      "[data-trench-tools-pulse-dex-inline]",
       "[data-trench-tools-wallet-tracker-inline]",
       "[data-trench-tools-axiom-watchlist-inline]",
       "[data-trench-tools-launchdeck-shell]"
@@ -324,16 +326,68 @@
     clearMarker("[data-trench-tools-pulse-card-id]", "data-trench-tools-pulse-card-id");
     clearMarker("[data-trench-tools-watchlist-anchor-id]", "data-trench-tools-watchlist-anchor-id");
     clearMarker("[data-trench-tools-wallet-row-id]", "data-trench-tools-wallet-row-id");
+
+    document
+      .querySelectorAll('[data-trench-tools-pulse-parent-managed="true"]')
+      .forEach((element) => {
+        if (!(element instanceof HTMLElement)) return;
+        element.style.display = element.dataset.trenchToolsPulseParentPrevDisplay || "";
+        element.style.flexWrap = element.dataset.trenchToolsPulseParentPrevFlexWrap || "";
+        element.style.alignItems = element.dataset.trenchToolsPulseParentPrevAlignItems || "";
+        element.style.gap = element.dataset.trenchToolsPulseParentPrevGap || "";
+        element.style.width = element.dataset.trenchToolsPulseParentPrevWidth || "";
+        element.style.maxWidth = element.dataset.trenchToolsPulseParentPrevMaxWidth || "";
+        element.style.marginBottom = element.dataset.trenchToolsPulseParentPrevMarginBottom || "";
+        delete element.dataset.trenchToolsPulseParentManaged;
+        delete element.dataset.trenchToolsPulseParentPrevDisplay;
+        delete element.dataset.trenchToolsPulseParentPrevFlexWrap;
+        delete element.dataset.trenchToolsPulseParentPrevAlignItems;
+        delete element.dataset.trenchToolsPulseParentPrevGap;
+        delete element.dataset.trenchToolsPulseParentPrevWidth;
+        delete element.dataset.trenchToolsPulseParentPrevMaxWidth;
+        delete element.dataset.trenchToolsPulseParentPrevMarginBottom;
+      });
+    document
+      .querySelectorAll('[data-trench-tools-pulse-native-managed="true"]')
+      .forEach((element) => {
+        if (!(element instanceof HTMLElement)) return;
+        element.style.flex = element.dataset.trenchToolsPulseNativePrevFlex || "";
+        element.style.width = element.dataset.trenchToolsPulseNativePrevWidth || "";
+        element.style.minWidth = element.dataset.trenchToolsPulseNativePrevMinWidth || "";
+        element.style.overflow = element.dataset.trenchToolsPulseNativePrevOverflow || "";
+        element.style.padding = element.dataset.trenchToolsPulseNativePrevPadding || "";
+        delete element.dataset.trenchToolsPulseNativeManaged;
+        delete element.dataset.trenchToolsPulseNativePrevFlex;
+        delete element.dataset.trenchToolsPulseNativePrevWidth;
+        delete element.dataset.trenchToolsPulseNativePrevMinWidth;
+        delete element.dataset.trenchToolsPulseNativePrevOverflow;
+        delete element.dataset.trenchToolsPulseNativePrevPadding;
+      });
+    document
+      .querySelectorAll('[data-trench-tools-pulse-native-button-managed="true"]')
+      .forEach((element) => {
+        if (!(element instanceof HTMLElement)) return;
+        element.style.width = element.dataset.trenchToolsPulseNativeButtonPrevWidth || "";
+        element.style.minWidth = element.dataset.trenchToolsPulseNativeButtonPrevMinWidth || "";
+        delete element.dataset.trenchToolsPulseNativeButtonManaged;
+        delete element.dataset.trenchToolsPulseNativeButtonPrevWidth;
+        delete element.dataset.trenchToolsPulseNativeButtonPrevMinWidth;
+      });
   }
 
   try {
     cleanupStaleArtifacts();
     scheduleReconnectFallback();
     const backgroundRpc = await importModule("src/shared/background-rpc.js");
+    const runtimeMode = await importModule("src/shared/runtime-mode.js");
+    const tradePreferences = await importModule("src/shared/trade-preferences.js");
     const launchdeckShell = await importModule("src/content/launchdeck-shell.js");
     window.__trenchToolsContentModules = {
       callBackground: backgroundRpc.callBackground,
-      createLaunchdeckShellController: launchdeckShell.createLaunchdeckShellController
+      tradePreferences,
+      createLaunchdeckShellController: launchdeckShell.createLaunchdeckShellController,
+      isEeOnlyTrenchToolsMode: runtimeMode.isEeOnlyTrenchToolsMode,
+      isLdOnlyTrenchToolsMode: runtimeMode.isLdOnlyTrenchToolsMode
     };
     await loadModule("src/content/runtime.js");
     await loadModule("src/content/platforms/axiom.js");

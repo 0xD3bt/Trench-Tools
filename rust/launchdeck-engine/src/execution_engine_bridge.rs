@@ -128,15 +128,26 @@ fn configured_execution_engine_port() -> u16 {
         .unwrap_or(8788)
 }
 
+fn trench_tools_mode_is_ld_only() -> bool {
+    std::env::var("TRENCH_TOOLS_MODE")
+        .ok()
+        .map(|value| value.trim().eq_ignore_ascii_case("ld"))
+        .unwrap_or(false)
+}
+
 fn configured_execution_engine_base_url() -> Option<String> {
-    normalized_base_url_from_env("LAUNCHDECK_EXECUTION_ENGINE_BASE_URL")
-        .or_else(|| normalized_base_url_from_env("EXECUTION_ENGINE_BASE_URL"))
-        .or_else(|| {
-            Some(format!(
-                "http://127.0.0.1:{}",
-                configured_execution_engine_port()
-            ))
-        })
+    if let Some(base_url) = normalized_base_url_from_env("LAUNCHDECK_EXECUTION_ENGINE_BASE_URL") {
+        return Some(base_url);
+    }
+    if trench_tools_mode_is_ld_only() {
+        return None;
+    }
+    normalized_base_url_from_env("EXECUTION_ENGINE_BASE_URL").or_else(|| {
+        Some(format!(
+            "http://127.0.0.1:{}",
+            configured_execution_engine_port()
+        ))
+    })
 }
 
 fn execution_engine_bridge_enabled() -> bool {
@@ -918,3 +929,87 @@ fn restrict_file_permissions(path: &Path) {
 
 #[cfg(not(unix))]
 fn restrict_file_permissions(_path: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn with_bridge_env<F>(test: F)
+    where
+        F: FnOnce(),
+    {
+        static ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock env guard");
+        unsafe {
+            std::env::remove_var("TRENCH_TOOLS_MODE");
+            std::env::remove_var("LAUNCHDECK_EXECUTION_ENGINE_BASE_URL");
+            std::env::remove_var("EXECUTION_ENGINE_BASE_URL");
+            std::env::remove_var("EXECUTION_ENGINE_PORT");
+        }
+        test();
+        unsafe {
+            std::env::remove_var("TRENCH_TOOLS_MODE");
+            std::env::remove_var("LAUNCHDECK_EXECUTION_ENGINE_BASE_URL");
+            std::env::remove_var("EXECUTION_ENGINE_BASE_URL");
+            std::env::remove_var("EXECUTION_ENGINE_PORT");
+        }
+    }
+
+    #[test]
+    fn ld_mode_disables_implicit_execution_engine_bridge() {
+        with_bridge_env(|| {
+            unsafe {
+                std::env::set_var("TRENCH_TOOLS_MODE", "ld");
+                std::env::set_var("EXECUTION_ENGINE_BASE_URL", "http://127.0.0.1:8788");
+            }
+
+            assert_eq!(configured_execution_engine_base_url(), None);
+            assert!(!execution_engine_bridge_enabled());
+        });
+    }
+
+    #[test]
+    fn explicit_launchdeck_bridge_url_wins_in_ld_mode() {
+        with_bridge_env(|| {
+            unsafe {
+                std::env::set_var("TRENCH_TOOLS_MODE", "ld");
+                std::env::set_var(
+                    "LAUNCHDECK_EXECUTION_ENGINE_BASE_URL",
+                    "http://127.0.0.1:9876/",
+                );
+            }
+
+            assert_eq!(
+                configured_execution_engine_base_url(),
+                Some("http://127.0.0.1:9876".to_string())
+            );
+            assert!(execution_engine_bridge_enabled());
+        });
+    }
+
+    #[test]
+    fn both_and_unset_modes_keep_implicit_execution_engine_bridge() {
+        with_bridge_env(|| {
+            assert_eq!(
+                configured_execution_engine_base_url(),
+                Some("http://127.0.0.1:8788".to_string())
+            );
+            assert!(execution_engine_bridge_enabled());
+
+            unsafe {
+                std::env::set_var("TRENCH_TOOLS_MODE", "both");
+                std::env::set_var("EXECUTION_ENGINE_BASE_URL", "http://127.0.0.1:9999/");
+            }
+
+            assert_eq!(
+                configured_execution_engine_base_url(),
+                Some("http://127.0.0.1:9999".to_string())
+            );
+            assert!(execution_engine_bridge_enabled());
+        });
+    }
+}

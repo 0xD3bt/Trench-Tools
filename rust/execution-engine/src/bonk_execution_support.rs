@@ -288,6 +288,8 @@ pub struct BonkPoolAddressClassification {
     pub pool_id: String,
     pub family: String,
     #[serde(default)]
+    pub status: u8,
+    #[serde(default)]
     pub quote_asset: String,
     #[serde(default)]
     pub creator: String,
@@ -955,6 +957,7 @@ pub fn classify_bonk_pool_address(
             mint: pool.mint_a.to_string(),
             pool_id: pool_id.to_string(),
             family: "launchpad".to_string(),
+            status: pool.status,
             quote_asset: quote_asset.to_string(),
             creator: pool.creator.to_string(),
             platform_id: pool.platform_id.to_string(),
@@ -984,6 +987,7 @@ pub fn classify_bonk_pool_address(
             mint,
             pool_id: pool_id.to_string(),
             family: "raydium".to_string(),
+            status: 1,
             quote_asset: quote_asset.asset.to_string(),
             creator: String::new(),
             platform_id: String::new(),
@@ -1013,6 +1017,7 @@ pub fn classify_bonk_pool_address(
             mint,
             pool_id: pool_id.to_string(),
             family: "raydium".to_string(),
+            status: 1,
             quote_asset: quote_asset.asset.to_string(),
             creator: String::new(),
             platform_id: String::new(),
@@ -10615,8 +10620,11 @@ mod tests {
         offset += 32;
         data[offset..offset + 32].copy_from_slice(mint.as_ref());
         offset += 32;
-        data[offset..offset + 32]
-            .copy_from_slice(Pubkey::from_str(BONK_USD1_QUOTE_MINT).expect("usd1 mint").as_ref());
+        data[offset..offset + 32].copy_from_slice(
+            Pubkey::from_str(BONK_USD1_QUOTE_MINT)
+                .expect("usd1 mint")
+                .as_ref(),
+        );
         offset += 32;
         offset += 64;
         data[offset..offset + 32].copy_from_slice(creator.as_ref());

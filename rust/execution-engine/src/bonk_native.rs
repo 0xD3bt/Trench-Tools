@@ -24,6 +24,7 @@ use crate::{
 };
 
 const BONK_IMPORT_CONTEXT_TTL: Duration = Duration::from_millis(2_500);
+const BONK_IMPORT_CONTEXT_LRU_CAP: usize = 256;
 
 pub type BonkImportContext = launchdeck_bonk::BonkImportContext;
 pub type BonkPoolAddressClassification = launchdeck_bonk::BonkPoolAddressClassification;
@@ -38,6 +39,7 @@ enum ImportContextCacheMode {
 struct CachedBonkImportContext {
     context: launchdeck_bonk::BonkImportContext,
     fetched_at: Instant,
+    last_used_at: Instant,
 }
 
 fn bonk_import_context_cache() -> &'static Mutex<HashMap<String, CachedBonkImportContext>> {
@@ -118,13 +120,25 @@ async fn cached_bonk_import_context(
 ) -> Option<launchdeck_bonk::BonkImportContext> {
     let key = bonk_import_context_cache_key(rpc_url, &request.mint, request.pinned_pool.as_deref());
     let mut cache = bonk_import_context_cache().lock().await;
-    if let Some(entry) = cache.get(&key) {
+    if let Some(entry) = cache.get_mut(&key) {
         if entry.fetched_at.elapsed() <= BONK_IMPORT_CONTEXT_TTL {
+            entry.last_used_at = Instant::now();
             return Some(entry.context.clone());
         }
     }
     cache.remove(&key);
     None
+}
+
+pub(crate) async fn invalidate_bonk_import_contexts_for_mint(rpc_url: &str, mint: &str) {
+    let normalized_rpc = rpc_url.trim().to_string();
+    let normalized_mint = mint.trim().to_string();
+    bonk_import_context_cache().lock().await.retain(|key, _| {
+        let mut parts = key.split('|');
+        let key_rpc = parts.next().unwrap_or_default();
+        let key_mint = parts.next().unwrap_or_default();
+        key_rpc != normalized_rpc || key_mint != normalized_mint
+    });
 }
 
 async fn warmed_bonk_import_context(
@@ -146,18 +160,53 @@ async fn warmed_bonk_import_context(
     }
 }
 
+pub(crate) async fn cached_bonk_launchpad_route_is_active(
+    rpc_url: &str,
+    mint: &str,
+    market_key: &str,
+    commitment: &str,
+) -> Result<bool, String> {
+    let market_key = market_key.trim();
+    if market_key.is_empty() {
+        return Ok(false);
+    }
+    let Some((owner, data)) =
+        crate::rpc_client::fetch_account_owner_and_data(rpc_url, market_key, commitment).await?
+    else {
+        return Ok(false);
+    };
+    let Some(classified) = classify_bonk_pool_address(market_key, &owner, &data)? else {
+        return Ok(false);
+    };
+    if classified.family != "launchpad" || classified.mint != mint.trim() {
+        return Ok(false);
+    }
+    Ok(classified.status == 0)
+}
+
 async fn cache_bonk_import_context(
     rpc_url: &str,
     request: &TradeRuntimeRequest,
     context: &launchdeck_bonk::BonkImportContext,
 ) {
-    bonk_import_context_cache().lock().await.insert(
+    let mut cache = bonk_import_context_cache().lock().await;
+    cache.retain(|_, entry| entry.fetched_at.elapsed() <= BONK_IMPORT_CONTEXT_TTL);
+    cache.insert(
         bonk_import_context_cache_key(rpc_url, &request.mint, request.pinned_pool.as_deref()),
         CachedBonkImportContext {
             context: context.clone(),
             fetched_at: Instant::now(),
+            last_used_at: Instant::now(),
         },
     );
+    if cache.len() > BONK_IMPORT_CONTEXT_LRU_CAP
+        && let Some(victim_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&victim_key);
+    }
 }
 
 async fn bonk_import_context_from_pinned_pool(
@@ -261,11 +310,11 @@ async fn load_bonk_import_context(
     request: &TradeRuntimeRequest,
     cache_mode: ImportContextCacheMode,
 ) -> Result<Option<launchdeck_bonk::BonkImportContext>, String> {
-    if let Some(context) = warmed_bonk_import_context(request).await {
-        cache_bonk_import_context(rpc_url, request, &context).await;
-        return Ok(Some(context));
-    }
     if matches!(cache_mode, ImportContextCacheMode::AllowCached) {
+        if let Some(context) = warmed_bonk_import_context(request).await {
+            cache_bonk_import_context(rpc_url, request, &context).await;
+            return Ok(Some(context));
+        }
         if let Some(context) = cached_bonk_import_context(rpc_url, request).await {
             return Ok(Some(context));
         }
@@ -819,51 +868,147 @@ fn is_raydium_detection_source(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn sample_request(mint: &str, warm_key: Option<String>) -> TradeRuntimeRequest {
+        TradeRuntimeRequest {
+            side: TradeSide::Buy,
+            mint: mint.to_string(),
+            buy_amount_sol: Some("0.5".to_string()),
+            sell_intent: None,
+            policy: crate::trade_runtime::RuntimeExecutionPolicy {
+                slippage_percent: "10".to_string(),
+                mev_mode: crate::extension_api::MevMode::Off,
+                auto_tip_enabled: false,
+                fee_sol: "0".to_string(),
+                tip_sol: "0".to_string(),
+                provider: String::new(),
+                endpoint_profile: String::new(),
+                commitment: "processed".to_string(),
+                skip_preflight: false,
+                track_send_block_height: false,
+                buy_funding_policy: crate::extension_api::BuyFundingPolicy::SolOnly,
+                sell_settlement_policy: crate::extension_api::SellSettlementPolicy::AlwaysToSol,
+                sell_settlement_asset: crate::extension_api::TradeSettlementAsset::Sol,
+            },
+            platform_label: None,
+            planned_route: None,
+            planned_trade: None,
+            pinned_pool: None,
+            warm_key,
+            fallback_mint_hint: None,
+        }
+    }
+
+    fn sample_context(pool_id: &str) -> launchdeck_bonk::BonkImportContext {
+        launchdeck_bonk::BonkImportContext {
+            launchpad: "bonk".to_string(),
+            mode: "regular".to_string(),
+            quoteAsset: "usd1".to_string(),
+            creator: "creator".to_string(),
+            platformId: String::new(),
+            configId: "config".to_string(),
+            poolId: pool_id.to_string(),
+            detectionSource: "raydium-launchpad".to_string(),
+        }
+    }
+
+    fn now_unix_ms_for_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or_default()
+    }
+
     #[test]
     fn maps_launchpad_context_to_pre_migration_selector() {
-        let selector = map_bonk_context_to_selector(
-            &TradeRuntimeRequest {
-                side: TradeSide::Buy,
-                mint: "mint".to_string(),
-                buy_amount_sol: Some("0.5".to_string()),
-                sell_intent: None,
-                policy: crate::trade_runtime::RuntimeExecutionPolicy {
-                    slippage_percent: "10".to_string(),
-                    mev_mode: crate::extension_api::MevMode::Off,
-                    auto_tip_enabled: false,
-                    fee_sol: "0".to_string(),
-                    tip_sol: "0".to_string(),
-                    provider: String::new(),
-                    endpoint_profile: String::new(),
-                    commitment: "processed".to_string(),
-                    skip_preflight: false,
-                    track_send_block_height: false,
-                    buy_funding_policy: crate::extension_api::BuyFundingPolicy::SolOnly,
-                    sell_settlement_policy: crate::extension_api::SellSettlementPolicy::AlwaysToSol,
-                    sell_settlement_asset: crate::extension_api::TradeSettlementAsset::Sol,
-                },
-                platform_label: None,
-                planned_route: None,
-                planned_trade: None,
-                pinned_pool: None,
-                warm_key: None,
-                fallback_mint_hint: None,
-            },
-            launchdeck_bonk::BonkImportContext {
-                launchpad: "bonk".to_string(),
-                mode: "regular".to_string(),
-                quoteAsset: "usd1".to_string(),
-                creator: "creator".to_string(),
-                platformId: String::new(),
-                configId: "config".to_string(),
-                poolId: "pool".to_string(),
-                detectionSource: "raydium-launchpad".to_string(),
-            },
-        )
-        .expect("selector");
+        let selector =
+            map_bonk_context_to_selector(&sample_request("mint", None), sample_context("pool"))
+                .expect("selector");
         assert_eq!(selector.family, TradeVenueFamily::BonkLaunchpad);
         assert_eq!(selector.lifecycle, TradeLifecycle::PreMigration);
         assert_eq!(selector.wrapper_action, WrapperAction::BonkLaunchpadUsd1Buy);
+    }
+
+    #[tokio::test]
+    async fn cached_bonk_import_context_updates_last_used_and_invalidates_by_mint() {
+        let request = sample_request("MintBonkCache111", None);
+        let key = bonk_import_context_cache_key("https://rpc-bonk-cache", &request.mint, None);
+        let context = sample_context("PoolBonkCache111");
+        {
+            let mut cache = bonk_import_context_cache().lock().await;
+            cache.remove(&key);
+            let old = Instant::now() - Duration::from_secs(1);
+            cache.insert(
+                key.clone(),
+                CachedBonkImportContext {
+                    context: context.clone(),
+                    fetched_at: Instant::now(),
+                    last_used_at: old,
+                },
+            );
+        }
+
+        let cached = cached_bonk_import_context("https://rpc-bonk-cache", &request)
+            .await
+            .expect("cached context");
+        assert_eq!(cached.poolId, context.poolId);
+        {
+            let cache = bonk_import_context_cache().lock().await;
+            let entry = cache.get(&key).expect("cache entry");
+            assert!(entry.last_used_at > entry.fetched_at - Duration::from_millis(500));
+        }
+
+        invalidate_bonk_import_contexts_for_mint("https://rpc-bonk-cache", &request.mint).await;
+        assert!(
+            cached_bonk_import_context("https://rpc-bonk-cache", &request)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_cached_bonk_import_context_ignores_warm_key_context() {
+        let warm_key = "bonk-bypass-warm-key";
+        let context = sample_context("WarmPoolShouldNotReturn");
+        let fingerprint = crate::mint_warm_cache::build_fingerprint(
+            "MintBonkBypass111",
+            None,
+            "bad-rpc-url",
+            "processed",
+            "buy:sol_only",
+            false,
+        );
+        let mut request = sample_request("MintBonkBypass111", Some(warm_key.to_string()));
+        crate::mint_warm_cache::shared_mint_warm_cache()
+            .insert(
+                fingerprint,
+                crate::mint_warm_cache::PrewarmedMint {
+                    mint: request.mint.clone(),
+                    resolved_pair: None,
+                    warm_key: warm_key.to_string(),
+                    allow_non_canonical: false,
+                    plan: None,
+                    venue: crate::mint_warm_cache::VenueWarmData::Bonk {
+                        quote_asset: Some("USD1".to_string()),
+                        import_context: Some(context),
+                    },
+                    warmed_at_unix_ms: now_unix_ms_for_test(),
+                    last_used_at_unix_ms: now_unix_ms_for_test(),
+                },
+            )
+            .await;
+        request.pinned_pool = None;
+
+        let bypassed = load_bonk_import_context(
+            "bad-rpc-url",
+            &request,
+            ImportContextCacheMode::BypassCached,
+        )
+        .await;
+        assert!(!matches!(
+            bypassed,
+            Ok(Some(launchdeck_bonk::BonkImportContext { poolId, .. }))
+                if poolId == "WarmPoolShouldNotReturn"
+        ));
     }
 
     #[test]

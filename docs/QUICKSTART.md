@@ -1,8 +1,8 @@
 # Quickstart
 
-Use this guide when you want to run Trench Tools on a local Windows or Linux machine. If you are starting from a fresh VPS, use [VPS_SETUP.md](VPS_SETUP.md) instead; the VPS path can be up in about 5 minutes with the startup script and a Helius Developer tier plan.
+Use this guide when you want to run Trench Tools on a local Windows or Linux machine. If you are starting from a fresh VPS, use [VPS_SETUP.md](VPS_SETUP.md) instead; the VPS path can be up in about 5-10 minutes with the startup script and a Helius Developer tier plan.
 
-If setup feels annoying, it is completely fine to use an AI coding assistant to help. Cursor, Codex, Claude, and similar tools can walk through dependency installs, `.env` editing, startup commands, and log errors. Do not paste real private keys, API keys, or auth tokens into any AI/chat tool.
+If setup feels annoying, it is completely fine to use an AI coding assistant to help. [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI), Codex, Claude, and similar tools can walk through dependency installs, `.env` editing, startup commands, and log errors.
 
 ## What You Are Starting
 
@@ -132,7 +132,7 @@ The first startup can take a few minutes while Rust builds the binaries. Later s
 
 If Trench Tools runs on a VPS but Chrome/Edge runs on your own computer, your browser cannot directly see the VPS loopback ports. `127.0.0.1` in the browser means your computer, not the VPS.
 
-That VPS setup is the recommended real trading path because it keeps services private and lets you run closer to RPC/provider endpoints. Follow [VPS_SETUP.md](VPS_SETUP.md) for the full 5-minute startup-script flow.
+That VPS setup is the recommended real trading path because it keeps services private and lets you run closer to RPC/provider endpoints. Follow [VPS_SETUP.md](VPS_SETUP.md) for the full 5-10 minute startup-script flow.
 
 Minimum tunnel command:
 
@@ -152,7 +152,7 @@ Test-NetConnection 127.0.0.1 -Port 8788
 Test-NetConnection 127.0.0.1 -Port 8789
 ```
 
-macOS/Linux:
+Linux:
 
 ```bash
 curl http://127.0.0.1:8788/api/extension/auth/bootstrap
@@ -182,7 +182,7 @@ Follow [EXTENSION.md](EXTENSION.md) for the full guide. Short version:
 1. Open Chrome or Edge.
 2. Open `chrome://extensions` or `edge://extensions`.
 3. Enable Developer mode.
-4. Download `trench-tools-extension.zip` from the latest extension release, unzip it on the PC running Chrome/Edge, or get the extension folder by pulling this repo with git.
+4. Download `trench-tools-extension.zip` from the [latest extension release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest), unzip it on the PC running Chrome/Edge, or get the extension folder by pulling this repo with git.
 5. Click `Load unpacked`.
 6. Select the unzipped `trench-tools-extension` folder. If you are using a git checkout, select `extension/trench-tools`.
 7. Open the extension Options page and fill the host URLs and shared access token.

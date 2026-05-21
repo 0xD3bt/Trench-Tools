@@ -29,6 +29,7 @@ pub mod route_provenance;
 pub mod rpc_client;
 pub(crate) mod sell_target_sizing;
 pub mod shared_config;
+pub mod sol_usd_daily_price;
 pub mod stable_native;
 pub mod token_distribution;
 pub mod trade_dispatch;

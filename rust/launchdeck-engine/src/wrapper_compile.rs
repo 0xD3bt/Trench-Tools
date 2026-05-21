@@ -57,6 +57,7 @@ const RAYDIUM_CPMM_SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 
 const PUMP_BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const PUMP_BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
 const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
+const PUMP_BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
 const PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR: [u8; 8] = [194, 171, 28, 70, 104, 77, 91, 47];
 const BONK_BUY_EXACT_IN_DISCRIMINATOR: [u8; 8] = [250, 234, 13, 123, 213, 156, 19, 236];
 const BONK_SELL_EXACT_IN_DISCRIMINATOR: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
@@ -963,6 +964,13 @@ fn infer_sol_in_lamports_from_venue_instruction(instruction: &Instruction) -> Op
         buf.copy_from_slice(data.get(8..16)?);
         return Some(u64::from_le_bytes(buf));
     }
+    if instruction.program_id == parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id").ok()?
+        && data.get(0..8)? == PUMP_BUY_V2_DISCRIMINATOR
+    {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(data.get(16..24)?);
+        return Some(u64::from_le_bytes(buf));
+    }
     if instruction.program_id == parse_pubkey(BONK_LAUNCHPAD_PROGRAM_ID, "Bonk program id").ok()?
         && data.get(0..8)? == BONK_BUY_EXACT_IN_DISCRIMINATOR
     {
@@ -1026,10 +1034,19 @@ fn patch_amm_wsol_input_amount(
             && patched.get(0..8) == Some(PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR.as_slice()))
         || (pump_program == Some(inner_program)
             && patched.get(0..8) == Some(PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.as_slice()))
+        || (pump_program == Some(inner_program)
+            && patched.get(0..8) == Some(PUMP_BUY_V2_DISCRIMINATOR.as_slice()))
         || ((inner_program == bags_dbc_program_id() || inner_program == bags_damm_v2_program_id())
             && patched.get(0..8) == Some(BAGS_SWAP_DISCRIMINATOR.as_slice()));
-    if supports_amount_patch && patched.len() >= 16 {
-        patched[8..16].copy_from_slice(&net_input_lamports.to_le_bytes());
+    let offset = if pump_program == Some(inner_program)
+        && patched.get(0..8) == Some(PUMP_BUY_V2_DISCRIMINATOR.as_slice())
+    {
+        16
+    } else {
+        8
+    };
+    if supports_amount_patch && patched.len() >= offset + 8 {
+        patched[offset..offset + 8].copy_from_slice(&net_input_lamports.to_le_bytes());
     }
     patched
 }
@@ -1075,6 +1092,11 @@ fn sol_in_amount_patch_offset(instruction: &Instruction) -> Option<usize> {
         && data.get(0..8)? == PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR
     {
         return Some(8);
+    }
+    if instruction.program_id == parse_pubkey(PUMP_PROGRAM_ID, "PUMP program id").ok()?
+        && data.get(0..8)? == PUMP_BUY_V2_DISCRIMINATOR
+    {
+        return Some(16);
     }
     if instruction.program_id == parse_pubkey(BONK_LAUNCHPAD_PROGRAM_ID, "Bonk program id").ok()?
         && data.get(0..8)? == BONK_BUY_EXACT_IN_DISCRIMINATOR
@@ -1194,6 +1216,7 @@ fn is_pump_bonding_v2_wsol_quote_instruction(
         return false;
     };
     if discriminator != PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR
+        && discriminator != PUMP_BUY_V2_DISCRIMINATOR
         && discriminator != PUMP_SELL_V2_DISCRIMINATOR
     {
         return false;
@@ -1213,6 +1236,9 @@ fn read_pump_bonding_v2_amounts(data: &[u8]) -> Option<([u8; 8], u64, u64)> {
 
 fn pump_bonding_v2_expected_account_layout(discriminator: &[u8; 8]) -> Option<(usize, usize)> {
     match discriminator {
+        &PUMP_BUY_V2_DISCRIMINATOR => {
+            Some((PUMP_V2_BUY_ACCOUNT_COUNT, PUMP_V2_BUY_PROGRAM_INDEX))
+        }
         &PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR => {
             Some((PUMP_V2_BUY_ACCOUNT_COUNT, PUMP_V2_BUY_PROGRAM_INDEX))
         }
@@ -1278,6 +1304,33 @@ fn try_build_pump_bonding_v2_wrapper_instruction(
         );
     }
     let wrapper_request = match (request.route_kind, discriminator) {
+        (WrapperRouteKind::SolIn, PUMP_BUY_V2_DISCRIMINATOR) => {
+            let expected_max_quote = request
+                .gross_sol_in_lamports
+                .checked_sub(estimate_sol_in_fee_lamports(
+                    request.gross_sol_in_lamports,
+                    request.fee_bps,
+                ))
+                .ok_or_else(|| {
+                    "Pump bonding v2 wrapper fee exceeds gross quote input".to_string()
+                })?;
+            if limit != expected_max_quote {
+                return Err(format!(
+                    "Pump bonding v2 wrapper buy max quote {limit} did not match net quote input {expected_max_quote}"
+                ));
+            }
+            ExecutePumpBondingV2Request {
+                version: ABI_VERSION,
+                side: PumpBondingV2Side::Buy,
+                quote_fee_mode: PumpBondingV2QuoteFeeMode::Wsol,
+                fee_bps: request.fee_bps,
+                gross_quote_in_amount: request.gross_sol_in_lamports,
+                min_base_out_amount: amount,
+                base_amount_in: 0,
+                gross_min_quote_out_amount: 0,
+                net_min_quote_out_amount: 0,
+            }
+        }
         (WrapperRouteKind::SolIn, PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR) => {
             let expected_amount = request
                 .gross_sol_in_lamports
@@ -2298,6 +2351,21 @@ mod tests {
         let patched_bags =
             patch_amm_wsol_input_amount(bags_damm_v2_program_id(), &bags_data, net_lamports);
         assert_eq!(&patched_bags[8..16], &net_lamports.to_le_bytes());
+
+        let pump_program = parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap();
+        let mut pump_buy_v2_data = PUMP_BUY_V2_DISCRIMINATOR.to_vec();
+        pump_buy_v2_data.extend_from_slice(&123u64.to_le_bytes());
+        pump_buy_v2_data.extend_from_slice(&456u64.to_le_bytes());
+        let patched_pump_buy_v2 =
+            patch_amm_wsol_input_amount(pump_program, &pump_buy_v2_data, net_lamports);
+        assert_eq!(&patched_pump_buy_v2[8..16], &123u64.to_le_bytes());
+        assert_eq!(&patched_pump_buy_v2[16..24], &net_lamports.to_le_bytes());
+
+        let mut short_pump_buy_v2_data = PUMP_BUY_V2_DISCRIMINATOR.to_vec();
+        short_pump_buy_v2_data.extend_from_slice(&123u64.to_le_bytes());
+        let patched_short_pump_buy_v2 =
+            patch_amm_wsol_input_amount(pump_program, &short_pump_buy_v2_data, net_lamports);
+        assert_eq!(patched_short_pump_buy_v2, short_pump_buy_v2_data);
     }
 
     #[test]
@@ -2399,6 +2467,23 @@ mod tests {
         data.extend_from_slice(&PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR);
         data.extend_from_slice(&456u64.to_le_bytes());
         data.extend_from_slice(&123u64.to_le_bytes());
+        let instruction = Instruction {
+            program_id: parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap(),
+            accounts: vec![],
+            data,
+        };
+        assert_eq!(
+            infer_sol_in_lamports_from_venue_instruction(&instruction),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn infers_token_mode_pump_buy_v2_max_quote_from_inner_data() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&PUMP_BUY_V2_DISCRIMINATOR);
+        data.extend_from_slice(&123u64.to_le_bytes());
+        data.extend_from_slice(&456u64.to_le_bytes());
         let instruction = Instruction {
             program_id: parse_pubkey(PUMP_PROGRAM_ID, "pump").unwrap(),
             accounts: vec![],

@@ -250,6 +250,27 @@ fn descriptor_json(descriptor: RouteDescriptor) -> serde_json::Value {
     })
 }
 
+async fn plan_attempt_json(request: &TradeRuntimeRequest) -> serde_json::Value {
+    match resolve_trade_plan(request).await {
+        Ok(plan) => json!({
+            "ok": true,
+            "plan": {
+                "adapter": plan.adapter.label(),
+                "rawAddress": plan.raw_address,
+                "inputKind": plan.resolved_input_kind.label(),
+                "resolvedMint": plan.resolved_mint,
+                "resolvedPinnedPool": plan.resolved_pinned_pool,
+                "nonCanonical": plan.non_canonical,
+                "selector": plan.selector,
+            }
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "error": error,
+        }),
+    }
+}
+
 async fn account_summary(
     rpc_url: &str,
     address: Option<&str>,
@@ -301,38 +322,67 @@ async fn main() -> Result<(), String> {
         &request.policy.commitment,
     )
     .await;
-    let planned = resolve_trade_plan(&request).await;
-    let output = match planned {
-        Ok(plan) => json!({
-            "ok": true,
+    let repeat = arg_value(&args, "--repeat")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let mut attempts = Vec::with_capacity(repeat);
+    for attempt in 0..repeat {
+        attempts.push(json!({
+            "attempt": attempt + 1,
+            "result": plan_attempt_json(&request).await,
+        }));
+    }
+    let ok = attempts
+        .last()
+        .and_then(|attempt| attempt.get("result"))
+        .and_then(|result| result.get("ok"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let classified = classified.map(descriptor_json);
+    let output = if repeat == 1 {
+        let result = attempts
+            .into_iter()
+            .next()
+            .and_then(|attempt| attempt.get("result").cloned())
+            .unwrap_or_else(|| json!({ "ok": false, "error": "route probe attempt missing" }));
+        if ok {
+            json!({
+                "ok": true,
+                "request": {
+                    "mint": request.mint,
+                    "pool": request.pinned_pool,
+                },
+                "classified": classified,
+                "account": raw_account,
+                "pinnedPoolAccount": pool_account,
+                "plan": result.get("plan").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        } else {
+            json!({
+                "ok": false,
+                "request": {
+                    "mint": request.mint,
+                    "pool": request.pinned_pool,
+                },
+                "classified": classified,
+                "account": raw_account,
+                "pinnedPoolAccount": pool_account,
+                "error": result.get("error").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        }
+    } else {
+        json!({
+            "ok": ok,
             "request": {
                 "mint": request.mint,
                 "pool": request.pinned_pool,
             },
-            "classified": classified.map(descriptor_json),
+            "classified": classified,
             "account": raw_account,
             "pinnedPoolAccount": pool_account,
-            "plan": {
-                "adapter": plan.adapter.label(),
-                "rawAddress": plan.raw_address,
-                "inputKind": plan.resolved_input_kind.label(),
-                "resolvedMint": plan.resolved_mint,
-                "resolvedPinnedPool": plan.resolved_pinned_pool,
-                "nonCanonical": plan.non_canonical,
-                "selector": plan.selector,
-            }
-        }),
-        Err(error) => json!({
-            "ok": false,
-            "request": {
-                "mint": request.mint,
-                "pool": request.pinned_pool,
-            },
-            "classified": classified.map(descriptor_json),
-            "account": raw_account,
-            "pinnedPoolAccount": pool_account,
-            "error": error,
-        }),
+            "attempts": attempts,
+        })
     };
     println!(
         "{}",

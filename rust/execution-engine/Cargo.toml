@@ -1,6 +1,6 @@
 [package]
 name = "execution-engine"
-version = "1.1.4"
+version = "1.1.5"
 edition = "2024"
 default-run = "execution-engine"
 
@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }
+chrono = { workspace = true }
 dotenvy = { workspace = true }
 bs58 = { workspace = true }
 base64 = { workspace = true }

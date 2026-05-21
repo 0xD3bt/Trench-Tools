@@ -1280,11 +1280,12 @@ fn normalize_quote_asset(raw: &RawConfig, launchpad: &str) -> Result<String, Con
         raw.quoteAsset.trim().to_lowercase()
     };
     match launchpad {
+        "pump" => parse_choice(&requested, "quoteAsset", &["sol", "usdc"], "sol"),
         "bonk" => parse_choice(&requested, "quoteAsset", &["sol", "usd1"], "sol"),
         _ => {
             if requested != "sol" {
                 return Err(ConfigError::Message(format!(
-                    "quoteAsset={} is only supported for bonk right now.",
+                    "quoteAsset={} is only supported for pump and bonk right now.",
                     requested
                 )));
             }
@@ -2912,14 +2913,24 @@ mod tests {
     }
 
     #[test]
-    fn pump_rejects_non_sol_quote_asset() {
+    fn pump_allows_usdc_quote_asset() {
         let mut raw = sample_raw_config();
         raw.launchpad = "pump".to_string();
         raw.quoteAsset = "usdc".to_string();
-        let error = normalize_raw_config(raw).expect_err("pump should reject usdc quote asset");
+        let normalized = normalize_raw_config(raw).expect("pump should accept usdc quote asset");
+        assert_eq!(normalized.quoteAsset, "usdc");
+    }
+
+    #[test]
+    fn bagsapp_still_rejects_non_sol_quote_asset() {
+        let mut raw = sample_raw_config();
+        raw.launchpad = "bagsapp".to_string();
+        raw.mode = "bags-2-2".to_string();
+        raw.quoteAsset = "usdc".to_string();
+        let error = normalize_raw_config(raw).expect_err("bagsapp should reject usdc quote asset");
         assert_eq!(
             error.to_string(),
-            "quoteAsset=usdc is only supported for bonk right now."
+            "quoteAsset=usdc is only supported for pump and bonk right now."
         );
     }
 

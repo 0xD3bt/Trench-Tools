@@ -128,6 +128,7 @@ const bonkQuoteAssetInput = getNamedInput("quoteAsset");
 const bonkQuoteAssetToggle = document.getElementById("bonk-quote-asset-toggle");
 const bonkQuoteAssetToggleSolIcon = document.getElementById("bonk-quote-asset-toggle-sol-icon");
 const bonkQuoteAssetToggleUsd1Icon = document.getElementById("bonk-quote-asset-toggle-usd1-icon");
+const bonkQuoteAssetToggleUsdcIcon = document.getElementById("bonk-quote-asset-toggle-usdc-icon");
 const devBuyQuotePrefixIcon = document.getElementById("dev-buy-quote-prefix-icon");
 const devBuyQuotePrefixText = document.getElementById("dev-buy-quote-prefix-text");
 const creationTipInput = document.getElementById("creation-tip-input");
@@ -299,6 +300,7 @@ const SNIPER_DRAFT_STORAGE_KEY = "launchdeck.sniperDraft.v1";
 const SNIPER_DRAFT_STORAGE_PREFIX = "launchdeck.sniperDraft";
 const IMAGE_LAYOUT_COMPACT_STORAGE_KEY = "launchdeck.imageLayoutCompact";
 const SELECTED_MODE_STORAGE_KEY = "launchdeck.selectedMode";
+const SELECTED_PUMP_QUOTE_ASSET_STORAGE_KEY = "launchdeck.pumpQuoteAsset";
 const SELECTED_BONK_QUOTE_ASSET_STORAGE_KEY = "launchdeck.bonkQuoteAsset";
 const FEE_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.feeSplitDraft.v1";
 const AGENT_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.agentSplitDraft.v1";
@@ -555,6 +557,7 @@ let metadataUploadState = {
   autoRetryFailures: 0,
   autoRetryDisabled: false,
   lastAlertedWarning: "",
+  suppressWarningFingerprint: "",
 };
 let runtimeStatusRefreshTimer = null;
 let walletStatusRefreshTimer = null;
@@ -893,7 +896,11 @@ function normalizeLaunchpad(value) {
 }
 
 function normalizeStoredBonkQuoteAsset(value) {
-  return normalizeQuoteAsset(value);
+  return normalizeQuoteAsset(value) === "usd1" ? "usd1" : "sol";
+}
+
+function normalizeStoredPumpQuoteAsset(value) {
+  return normalizeQuoteAsset(value) === "usdc" ? "usdc" : "sol";
 }
 
 function selectedModeStorageKeyForLaunchpad(launchpad = getLaunchpad()) {
@@ -1062,6 +1069,26 @@ function setStoredBonkQuoteAsset(asset) {
     window.localStorage.setItem(
       SELECTED_BONK_QUOTE_ASSET_STORAGE_KEY,
       normalizeStoredBonkQuoteAsset(asset),
+    );
+  } catch (_error) {
+    // Ignore storage failures and keep quote asset controls functional.
+  }
+}
+
+function getStoredPumpQuoteAsset() {
+  try {
+    const stored = window.localStorage.getItem(SELECTED_PUMP_QUOTE_ASSET_STORAGE_KEY);
+    return stored ? normalizeStoredPumpQuoteAsset(stored) : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function setStoredPumpQuoteAsset(asset) {
+  try {
+    window.localStorage.setItem(
+      SELECTED_PUMP_QUOTE_ASSET_STORAGE_KEY,
+      normalizeStoredPumpQuoteAsset(asset),
     );
   } catch (_error) {
     // Ignore storage failures and keep quote asset controls functional.
@@ -1344,7 +1371,7 @@ function normalizeAutoSellDraft(value) {
   return {
     enabled: Boolean(value.enabled),
     sniperEnabled: Boolean(value.sniperEnabled),
-    percent: Math.max(1, Math.min(100, Number(value.percent || 100) || 100)),
+    percent: Math.max(1, Math.min(100, Number(normalizeDecimalInput(value.percent || 100, 2)) || 100)),
     triggerFamily,
     triggerMode: normalizeAutoSellTriggerMode(value.triggerMode),
     delayMs: Math.max(0, Number(value.delayMs || 0) || 0),
@@ -1995,9 +2022,9 @@ async function ensureTestImageSelected() {
   return imageMetadataDomain.ensureTestImageSelected();
 }
 
-async function selectImportedImage(image) {
+async function selectImportedImage(image, options = {}) {
   if (!imageMetadataDomain) return;
-  await imageMetadataDomain.selectImportedImage(image);
+  await imageMetadataDomain.selectImportedImage(image, options);
 }
 
 function restoreLaunchHistoryImage(launch) {
@@ -2376,6 +2403,7 @@ const formDomain = FormDomainModule.createFormDomain({
   serializeAgentSplitDraft,
   normalizeAutoSellTriggerFamily,
   normalizeAutoSellTriggerMode,
+  normalizeDecimalInput,
 });
 
 imageMetadataDomain = ImageMetadataDomainModule.create ? ImageMetadataDomainModule.create({
@@ -3638,41 +3666,60 @@ function getLaunchpad() {
 }
 
 function normalizeQuoteAsset(value) {
-  return String(value || "").trim().toLowerCase() === "usd1" ? "usd1" : "sol";
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "usd1") return "usd1";
+  if (normalized === "usdc") return "usdc";
+  return "sol";
 }
 
 function getQuoteAsset() {
-  if (getLaunchpad() !== "bonk") return "sol";
-  return normalizeQuoteAsset(getNamedValue("quoteAsset"));
+  const launchpad = getLaunchpad();
+  const asset = normalizeQuoteAsset(getNamedValue("quoteAsset"));
+  if (launchpad === "pump") return asset === "usdc" ? "usdc" : "sol";
+  if (launchpad === "bonk") return asset === "usd1" ? "usd1" : "sol";
+  return "sol";
 }
 
 function getQuoteAssetLabel(asset = getQuoteAsset()) {
-  return normalizeQuoteAsset(asset) === "usd1" ? "USD1" : "SOL";
+  const normalized = normalizeQuoteAsset(asset);
+  if (normalized === "usd1") return "USD1";
+  if (normalized === "usdc") return "USDC";
+  return "SOL";
 }
 
 function getDevBuyAssetLabel(launchpad = getLaunchpad(), quoteAsset = getQuoteAsset()) {
-  return launchpad === "bonk" ? "SOL" : getQuoteAssetLabel(quoteAsset);
+  return launchpad === "bonk" || launchpad === "pump" ? "SOL" : getQuoteAssetLabel(quoteAsset);
 }
 
 function getQuoteAssetButtonLabel(asset = getQuoteAsset()) {
-  return normalizeQuoteAsset(asset) === "usd1" ? "usd1" : "solana";
+  const normalized = normalizeQuoteAsset(asset);
+  if (normalized === "usd1") return "usd1";
+  if (normalized === "usdc") return "usdc";
+  return "solana";
 }
 
 function syncBonkQuoteAssetUI() {
   const launchpad = getLaunchpad();
   const mode = getMode();
-  const visible = launchpad === "bonk" && ["regular", "bonkers"].includes(mode);
-  const stored = getStoredBonkQuoteAsset();
+  const visible = (launchpad === "pump" && ["regular", "cashback"].includes(mode))
+    || (launchpad === "bonk" && ["regular", "bonkers"].includes(mode));
+  const stored = launchpad === "pump" ? getStoredPumpQuoteAsset() : getStoredBonkQuoteAsset();
   const rawCurrent = String(getNamedValue("quoteAsset") || "").trim().toLowerCase();
-  const current = rawCurrent === "usd1" || rawCurrent === "sol" ? rawCurrent : "";
-  const asset = visible
-    ? normalizeQuoteAsset(stored || current || "sol")
-    : normalizeQuoteAsset(stored || current || "sol");
+  const current = rawCurrent === "usd1" || rawCurrent === "usdc" || rawCurrent === "sol" ? rawCurrent : "";
+  const currentMatchesLaunchpad = (launchpad === "pump" && (current === "usdc" || current === "sol"))
+    || (launchpad === "bonk" && (current === "usd1" || current === "sol"));
+  const asset = !visible
+    ? "sol"
+    : launchpad === "pump"
+      ? normalizeStoredPumpQuoteAsset((currentMatchesLaunchpad ? current : "") || stored || "sol")
+      : normalizeStoredBonkQuoteAsset((currentMatchesLaunchpad ? current : "") || stored || "sol");
   if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = asset;
   if (bonkQuoteAssetToggle) bonkQuoteAssetToggle.hidden = !visible;
   if (bonkQuoteAssetToggle) bonkQuoteAssetToggle.disabled = !visible;
   if (bonkQuoteAssetToggle) {
-    const nextAsset = asset === "usd1" ? "solana" : "usd1";
+    const nextAsset = launchpad === "pump"
+      ? (asset === "usdc" ? "solana" : "usdc")
+      : (asset === "usd1" ? "solana" : "usd1");
     bonkQuoteAssetToggle.title = `Active quote asset: ${getQuoteAssetButtonLabel(asset)}. Click to switch to ${nextAsset}.`;
     bonkQuoteAssetToggle.setAttribute(
       "aria-label",
@@ -3681,7 +3728,9 @@ function syncBonkQuoteAssetUI() {
   }
   if (bonkQuoteAssetToggleSolIcon) bonkQuoteAssetToggleSolIcon.hidden = asset !== "sol";
   if (bonkQuoteAssetToggleUsd1Icon) bonkQuoteAssetToggleUsd1Icon.hidden = asset !== "usd1";
-  if (visible) setStoredBonkQuoteAsset(asset);
+  if (bonkQuoteAssetToggleUsdcIcon) bonkQuoteAssetToggleUsdcIcon.hidden = asset !== "usdc";
+  if (visible && launchpad === "pump") setStoredPumpQuoteAsset(asset);
+  if (visible && launchpad === "bonk") setStoredBonkQuoteAsset(asset);
   if (devBuyQuotePrefixIcon) devBuyQuotePrefixIcon.hidden = false;
   if (devBuyQuotePrefixText) {
     devBuyQuotePrefixText.hidden = true;
@@ -3743,7 +3792,7 @@ function applyImportedLaunchContext(token = {}) {
     setLaunchpad(launchpad, { resetMode: true, persistMode: false });
   });
   setMode(token.mode || defaultLaunchModeForLaunchpad(launchpad));
-  if (launchpad === "bonk") {
+  if (launchpad === "pump" || launchpad === "bonk") {
     setNamedValue("quoteAsset", normalizeQuoteAsset(token.quoteAsset || "sol"));
   } else {
     setNamedValue("quoteAsset", "sol");
@@ -4313,8 +4362,16 @@ async function importVampToken(contractAddressOverride = "") {
     clearMetadataUploadCache({ clearInput: true });
     updateTokenFieldCounts();
 
+    const importedVampImages = Array.isArray(payload.images) && payload.images.length
+      ? payload.images
+      : (payload.image ? [payload.image] : []);
+    const addedVampImagesToJ7 = addImportedVampImagesToJ7Row(importedVampImages, { selectFirst: !usedCapturedImage });
     if (!usedCapturedImage && payload.image) {
-      await selectImportedImage(payload.image);
+      await selectImportedImage(payload.image, { suppressMetadataWarning: addedVampImagesToJ7 });
+      if (addedVampImagesToJ7) {
+        j7ImageCandidateState.selectedId = upsertLibraryImageJ7Candidate(payload.image) || j7ImageCandidateState.selectedId;
+        renderJ7ImageCandidates();
+      }
     } else if (usedCapturedImage) {
       scheduleMetadataPreupload({ immediate: true });
     }
@@ -4326,8 +4383,9 @@ async function importVampToken(contractAddressOverride = "") {
       usedCapturedImage
         ? "Axiom image imported to library."
         : (payload.image ? "Token image imported to library." : ""),
+      addedVampImagesToJ7 ? "Vamp coin image added to J7 image choices." : "",
       capturedImageWarning,
-      payload.warning || "",
+      j7TweetContext ? "" : (payload.warning || ""),
       detectionNotes.join(" "),
     ].filter(Boolean).join(" ");
     imagePath.textContent = "";
@@ -4517,16 +4575,15 @@ function j7CandidatePreviewUrl(candidate) {
   return String(candidate?.data || candidate?.src || "").trim();
 }
 
-function addLibraryImageToJ7Row(image) {
+function upsertLibraryImageJ7Candidate(image) {
   if (
     !j7ImageCandidates
-    || !tokenSurfaceSection?.classList.contains("has-j7-image-candidates")
     || !image
     || typeof image !== "object"
-  ) return;
+  ) return "";
   const previewUrl = String(image.previewUrl || "").trim()
     || (image.fileName ? `/uploads/${encodeURIComponent(image.fileName)}` : "");
-  if (!previewUrl) return;
+  if (!previewUrl) return "";
   const id = `library-${String(image.id || image.fileName || previewUrl)}`;
   const name = String(image.name || image.fileName || "library-image").trim();
   const existing = j7ImageCandidateState.candidates.find((candidate) => candidate.id === id);
@@ -4548,10 +4605,38 @@ function addLibraryImageToJ7Row(image) {
       removed: false,
     });
   }
+  return id;
+}
+
+function addLibraryImageToJ7Row(image) {
+  if (
+    !j7ImageCandidates
+    || !tokenSurfaceSection?.classList.contains("has-j7-image-candidates")
+  ) return;
+  const id = upsertLibraryImageJ7Candidate(image);
+  if (!id) return;
   j7ImageCandidateState.selectedId = id;
   j7ImagePersistPromise = null;
   setJ7ImagePickerActive(true);
   renderJ7ImageCandidates();
+}
+
+function addImportedVampImagesToJ7Row(images, { selectFirst = false } = {}) {
+  if (!j7ImageCandidates || !j7TweetContext) return false;
+  const importedImages = (Array.isArray(images) ? images : [images]).filter((image) => image && typeof image === "object");
+  const currentSelectedId = j7ImageCandidateState.selectedId;
+  const ids = importedImages.map(upsertLibraryImageJ7Candidate).filter(Boolean);
+  if (!ids.length) return false;
+  j7ImagePersistPromise = null;
+  setJ7ImagePickerActive(true);
+  if (selectFirst) {
+    j7ImageCandidateState.selectedId = ids[0];
+    renderJ7ImageCandidates();
+  } else {
+    j7ImageCandidateState.selectedId = currentSelectedId;
+    renderJ7ImageCandidates();
+  }
+  return true;
 }
 
 function isXProfileOrStatusUrl(value) {
@@ -5277,6 +5362,7 @@ function applyPersistentDefaults(config) {
   const defaultMode = defaults.mode || "regular";
   const storedLaunchpad = getStoredLaunchpad();
   const storedBonkQuoteAsset = getStoredBonkQuoteAsset();
+  const storedPumpQuoteAsset = getStoredPumpQuoteAsset();
   const resolvedLaunchpad = storedLaunchpad || defaults.launchpad || "pump";
   const storedSniperDraft = getStoredSniperDraft();
   const storedMode = getStoredLaunchMode(resolvedLaunchpad);
@@ -5306,7 +5392,11 @@ function applyPersistentDefaults(config) {
   const resolvedFeeSplitDraft = storedFeeSplitDraft || defaultScopedFeeSplitDraft || null;
   const resolvedAgentSplitDraft = storedAgentSplitDraft || defaultScopedAgentSplitDraft || null;
   setLaunchpad(resolvedLaunchpad, { persistLaunchpad: true });
-  if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = normalizeQuoteAsset(storedBonkQuoteAsset || "sol");
+  if (bonkQuoteAssetInput) {
+    bonkQuoteAssetInput.value = resolvedLaunchpad === "pump"
+      ? normalizeStoredPumpQuoteAsset(storedPumpQuoteAsset || "sol")
+      : normalizeStoredBonkQuoteAsset(storedBonkQuoteAsset || "sol");
+  }
   setConfig(resolvedConfig);
   applyPresetToSettingsInputs(getActivePreset(resolvedConfig));
   if (storedAutoSellDraft) {
@@ -5315,8 +5405,11 @@ function applyPersistentDefaults(config) {
     applyAutoSellDraft(buildAutoSellDraftFromDefaults(defaultScopedAutoSellDraft), { persist: false });
   }
   setMode(resolvedMode, { persist: true });
-  if (resolvedLaunchpad === "bonk" && bonkQuoteAssetInput && storedBonkQuoteAsset) {
-    bonkQuoteAssetInput.value = normalizeQuoteAsset(storedBonkQuoteAsset);
+  if (resolvedLaunchpad === "pump" && bonkQuoteAssetInput && storedPumpQuoteAsset) {
+    bonkQuoteAssetInput.value = normalizeStoredPumpQuoteAsset(storedPumpQuoteAsset);
+    syncBonkQuoteAssetUI();
+  } else if (resolvedLaunchpad === "bonk" && bonkQuoteAssetInput && storedBonkQuoteAsset) {
+    bonkQuoteAssetInput.value = normalizeStoredBonkQuoteAsset(storedBonkQuoteAsset);
     syncBonkQuoteAssetUI();
   }
   setStoredLaunchpad(getLaunchpad());
@@ -5730,7 +5823,7 @@ const fieldValidators = {
   },
   automaticDevSellPercent(v) {
     if (!isNamedChecked("automaticDevSellEnabled")) return "";
-    const n = Number(v);
+    const n = Number(normalizeDecimalInput(v, 2));
     if (isNaN(n) || n <= 0 || n > 100) return "Must be between 1 and 100";
     return "";
   },
@@ -5766,7 +5859,7 @@ const fieldValidators = {
   agentUnlockedBuybackPercent(v) {
     if (getMode() !== "agent-unlocked") return "";
     if (!v) return "Buyback % is required";
-    const n = Number(v);
+    const n = Number(normalizeDecimalInput(v, 2));
     if (isNaN(n) || n < 0 || n > 100) return "Must be between 0 and 100";
     return "";
   },
@@ -5878,7 +5971,7 @@ function buildDeployPreviewHTML() {
     : `<div class="modal-token-img-empty">No img</div>`;
 
   const devBuyText = f.devBuyAmount
-    ? `${f.devBuyAmount} ${f.devBuyMode === "tokens" ? "tokens" : getDevBuyAssetLabel(f.launchpad, f.quoteAsset)}`
+    ? `${f.devBuyAmount} ${f.devBuyMode === "tokens" ? "tokens" : "SOL"}`
     : "None";
 
   const quoteText = quoteOutput ? (quoteOutput.textContent || "") : "";
@@ -5932,7 +6025,7 @@ function buildDeployPreviewHTML() {
     : 0;
   const sniperText = f.sniperEnabled
     ? (f.sniperWallets.length
-      ? f.sniperWallets.map((entry) => `#${walletIndexFromEnvKey(entry.envKey)} ${entry.amountSol} ${getQuoteAssetLabel(f.quoteAsset)} @ ${entry.targetBlockOffset != null ? `b${entry.targetBlockOffset}` : (entry.submitWithLaunch ? "same-time" : getSniperTriggerSummary(entry).toLowerCase())}`).join(" | ")
+      ? f.sniperWallets.map((entry) => `#${walletIndexFromEnvKey(entry.envKey)} ${entry.amountSol} SOL @ ${entry.targetBlockOffset != null ? `b${entry.targetBlockOffset}` : (entry.submitWithLaunch ? "same-time" : getSniperTriggerSummary(entry).toLowerCase())}`).join(" | ")
       : "Enabled")
     : "Off";
   const vanityText = f.vanityPrivateKey ? "Custom vanity key attached" : "Off";
@@ -7491,6 +7584,7 @@ const localBinders = LocalBindersModule.create ? LocalBindersModule.create({
     applyLaunchpadTokenMetadata,
     getQuoteAsset,
     setStoredBonkQuoteAsset,
+    setStoredPumpQuoteAsset,
     syncBonkQuoteAssetUI,
     queueQuoteUpdate,
     syncTickerFromName,
@@ -7530,6 +7624,7 @@ const localBinders = LocalBindersModule.create ? LocalBindersModule.create({
     getBuyProvider,
     ensureStandardRpcSlippageDefault,
     getSellProvider,
+    normalizeDecimalInput,
     showFeeSplitModal,
     hideSettingsModal,
     toggleWalletDropdown,

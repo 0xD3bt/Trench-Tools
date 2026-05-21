@@ -25,6 +25,11 @@ const DEFAULT_VOLUME = 70;
 const DEFAULT_BUY_TEMPLATE_ID = SOUND_TEMPLATES[0].id;
 const DEFAULT_SELL_TEMPLATE_ID = SOUND_TEMPLATES[1]?.id || SOUND_TEMPLATES[0].id;
 
+export const QUICK_BUY_BUTTON_SLOTS = Object.freeze([1, 2]);
+export const QUICK_BUY_BUTTON_DEFAULT_COLOR = "#ffffff";
+export const QUICK_BUY_BUTTON_DEFAULT_BACKGROUND = "#000000";
+export const QUICK_BUY_BUTTON_DEFAULT_BORDER = "#ffffff80";
+
 function defaultSoundFor(side) {
   return {
     enabled: true,
@@ -33,11 +38,27 @@ function defaultSoundFor(side) {
   };
 }
 
+function defaultQuickBuyButtonDesign() {
+  return {
+    color: QUICK_BUY_BUTTON_DEFAULT_COLOR,
+    backgroundColor: QUICK_BUY_BUTTON_DEFAULT_BACKGROUND,
+    borderColor: QUICK_BUY_BUTTON_DEFAULT_BORDER
+  };
+}
+
+function defaultQuickBuyButtons() {
+  return {
+    1: defaultQuickBuyButtonDesign(),
+    2: defaultQuickBuyButtonDesign()
+  };
+}
+
 export function defaultAppearance() {
   return {
     volume: DEFAULT_VOLUME,
     buySound: defaultSoundFor("buy"),
-    sellSound: defaultSoundFor("sell")
+    sellSound: defaultSoundFor("sell"),
+    quickBuyButtons: defaultQuickBuyButtons()
   };
 }
 
@@ -83,6 +104,62 @@ function normalizeSound(value, defaults) {
   };
 }
 
+const HEX6_REGEX = /^#[0-9a-f]{6}$/i;
+const HEX8_REGEX = /^#[0-9a-f]{8}$/i;
+
+export function normalizeQuickBuyButtonColor(value, fallback = QUICK_BUY_BUTTON_DEFAULT_COLOR) {
+  const trimmed = String(value || "").trim().toLowerCase();
+  if (HEX6_REGEX.test(trimmed)) {
+    return trimmed;
+  }
+  return String(fallback || QUICK_BUY_BUTTON_DEFAULT_COLOR).toLowerCase();
+}
+
+export function normalizeQuickBuyButtonBackgroundColor(
+  value,
+  fallback = QUICK_BUY_BUTTON_DEFAULT_BACKGROUND
+) {
+  const trimmed = String(value || "").trim().toLowerCase();
+  if (HEX6_REGEX.test(trimmed) || HEX8_REGEX.test(trimmed)) {
+    return trimmed;
+  }
+  return String(fallback || QUICK_BUY_BUTTON_DEFAULT_BACKGROUND).toLowerCase();
+}
+
+export function normalizeQuickBuyButtonBorderColor(
+  value,
+  fallback = QUICK_BUY_BUTTON_DEFAULT_BORDER
+) {
+  const trimmed = String(value || "").trim().toLowerCase();
+  if (HEX6_REGEX.test(trimmed) || HEX8_REGEX.test(trimmed)) {
+    return trimmed;
+  }
+  return String(fallback || QUICK_BUY_BUTTON_DEFAULT_BORDER).toLowerCase();
+}
+
+function normalizeQuickBuyButtonDesign(value, defaults = defaultQuickBuyButtonDesign()) {
+  const source = value || {};
+  return {
+    color: normalizeQuickBuyButtonColor(source.color, defaults.color),
+    backgroundColor: normalizeQuickBuyButtonBackgroundColor(source.backgroundColor, defaults.backgroundColor),
+    borderColor: normalizeQuickBuyButtonBorderColor(source.borderColor, defaults.borderColor)
+  };
+}
+
+function normalizeQuickBuyButtons(value) {
+  const defaults = defaultQuickBuyButtons();
+  const source = value && typeof value === "object" ? value : {};
+  const buttonOne = normalizeQuickBuyButtonDesign(source[1] ?? source["1"], defaults[1]);
+  const rawButtonTwo = source[2] ?? source["2"];
+  const buttonTwo = rawButtonTwo
+    ? normalizeQuickBuyButtonDesign(rawButtonTwo, defaults[2])
+    : { ...defaults[2] };
+  return {
+    1: buttonOne,
+    2: buttonTwo
+  };
+}
+
 // Pick the shared volume from the new top-level field, falling back to any
 // legacy per-side volume so users who set a buy/sell volume in an older build
 // don't get reset to 70.
@@ -101,11 +178,25 @@ function pickSharedVolume(source, defaultVolume) {
 
 export function normalizeAppearance(value) {
   const defaults = defaultAppearance();
+  const source = value && typeof value === "object" ? value : {};
   return {
+    ...source,
     volume: pickSharedVolume(value, defaults.volume),
     buySound: normalizeSound(value?.buySound, defaults.buySound),
-    sellSound: normalizeSound(value?.sellSound, defaults.sellSound)
+    sellSound: normalizeSound(value?.sellSound, defaults.sellSound),
+    quickBuyButtons: normalizeQuickBuyButtons(value?.quickBuyButtons)
   };
+}
+
+export function deriveQuickBuyButtonHoverBackground(backgroundColor) {
+  const normalized = normalizeQuickBuyButtonBackgroundColor(backgroundColor);
+  return `${normalized.slice(0, 7)}cc`;
+}
+
+export function resolveQuickBuyButtonDesign(appearance, index = 1) {
+  const normalized = normalizeAppearance(appearance);
+  const slot = QUICK_BUY_BUTTON_SLOTS.includes(Number(index)) ? Number(index) : 1;
+  return normalized.quickBuyButtons[slot] || normalized.quickBuyButtons[1];
 }
 
 export async function getAppearance() {

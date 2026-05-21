@@ -3731,6 +3731,20 @@ fn build_launchpad_backend_status_payload() -> Value {
     Value::Object(payload)
 }
 
+fn normalized_trench_tools_mode() -> String {
+    match std::env::var("TRENCH_TOOLS_MODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ee" => "ee".to_string(),
+        "ld" => "ld".to_string(),
+        "both" => "both".to_string(),
+        _ => "both".to_string(),
+    }
+}
+
 async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
     let (runtime_workers, follow_daemon) =
         tokio::join!(list_workers(&state.runtime), follow_daemon_status_payload(),);
@@ -3754,6 +3768,7 @@ async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
     json!({
         "ok": true,
         "service": "launchdeck-engine",
+        "trenchToolsMode": normalized_trench_tools_mode(),
         "transport": {
             "heliusSenderEndpoint": configured_helius_sender_endpoint(),
             "jitoBundleEndpoints": configured_jito_bundle_endpoints(),
@@ -8037,6 +8052,7 @@ async fn api_vamp_import(
             )
         })?;
     let mut image = Value::Null;
+    let mut images = Vec::new();
     let mut warning = String::new();
     let mut image_candidates = Vec::new();
     for candidate in &imported.imageCandidates {
@@ -8076,7 +8092,11 @@ async fn api_vamp_import(
             .await
             {
                 Ok(Some(record)) => {
-                    image = serde_json::to_value(record).unwrap_or(Value::Null);
+                    let value = serde_json::to_value(record).unwrap_or(Value::Null);
+                    if image.is_null() {
+                        image = value.clone();
+                    }
+                    images.push(value);
                     warning.clear();
                     break;
                 }
@@ -8102,6 +8122,7 @@ async fn api_vamp_import(
             "detection": imported.detection,
         },
         "image": image,
+        "images": images,
         "warning": warning,
     })))
 }

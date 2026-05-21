@@ -293,14 +293,25 @@
         .replace(/'/g, "&#39;");
     }
 
+    function normalizePercentInput(value) {
+      const raw = String(value || "").replace(/,/g, ".").trim();
+      if (!raw) return "";
+      const sanitized = raw.replace(/[^\d.]/g, "");
+      const [whole = "", fractional = ""] = sanitized.split(".");
+      const safeWhole = whole.replace(/^0+(?=\d)/, "") || (whole ? "0" : "");
+      return fractional !== undefined && sanitized.includes(".")
+        ? `${safeWhole || "0"}.${fractional.slice(0, 2)}`
+        : safeWhole;
+    }
+
     function normalizeSellPercent(value) {
-      const numeric = Number(value || 0);
+      const numeric = Number(normalizePercentInput(value) || 0);
       if (!Number.isFinite(numeric) || numeric <= 0) return "";
-      return String(Math.max(1, Math.min(100, Math.round(numeric))));
+      return String(Math.max(1, Math.min(100, numeric)));
     }
 
     function getSniperSellPercentError(value) {
-      const raw = String(value ?? "").trim();
+      const raw = normalizePercentInput(value);
       if (!raw) return "Sell % is required.";
       const numeric = Number(raw);
       if (!Number.isFinite(numeric) || numeric <= 0 || numeric > 100) {
@@ -371,9 +382,11 @@
     }
 
     function normalizeDevPercent(value) {
-      const numeric = Number(value || 0);
+      const normalized = normalizePercentInput(value);
+      if (normalized.endsWith(".")) return normalized;
+      const numeric = Number(normalized || 0);
       if (!Number.isFinite(numeric) || numeric <= 0) return "100";
-      return String(Math.max(1, Math.min(100, Math.round(numeric))));
+      return String(Math.max(1, Math.min(100, numeric)));
     }
 
     function renderSniperAutosellRows(rowsOverride) {
@@ -431,7 +444,7 @@
                 <button type="button" class="button subtle auto-sell-sniper-wallet-toggle${sellEnabled ? " active" : ""}" data-auto-sell-sniper-toggle="${escapeHTML(row.envKey)}" title="Enable or disable sniper autosell for this wallet." ${!sniperAutoSellEnabled ? "disabled" : ""}>${sellEnabled ? "Auto sell on" : "Auto sell off"}</button>
                 <label class="auto-sell-sniper-percent-field">
                   <span class="auto-sell-percent-input-wrap">
-                    <input class="auto-sell-percent-inline-input${sellPercentError ? " input-error" : ""}" type="number" min="1" max="100" step="1" value="${escapeHTML(rawSellPercent)}" title="Percent of the wallet position to sell." data-auto-sell-sniper-percent="${escapeHTML(row.envKey)}" ${!sniperAutoSellEnabled || !sellEnabled ? "disabled" : ""}>
+                    <input class="auto-sell-percent-inline-input${sellPercentError ? " input-error" : ""}" type="text" inputmode="decimal" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" value="${escapeHTML(rawSellPercent)}" title="Percent of the wallet position to sell." data-auto-sell-sniper-percent="${escapeHTML(row.envKey)}" ${!sniperAutoSellEnabled || !sellEnabled ? "disabled" : ""}>
                     <span class="auto-sell-percent-suffix">%</span>
                   </span>
                 </label>
@@ -487,8 +500,12 @@
 
     function syncUI() {
       const enabled = isNamedChecked("automaticDevSellEnabled");
-      const rawPercent = Number(getNamedValue("automaticDevSellPercent") || "100");
-      const percent = String(Math.max(1, Math.min(100, Number.isFinite(rawPercent) ? rawPercent : 100)));
+      const rawPercentText = normalizePercentInput(getNamedValue("automaticDevSellPercent")) || "100";
+      const rawPercent = Number(rawPercentText);
+      const clampedPercent = Math.max(1, Math.min(100, Number.isFinite(rawPercent) ? rawPercent : 100));
+      const percent = rawPercentText.endsWith(".") && Number.isFinite(rawPercent) && rawPercent >= 1 && rawPercent <= 100
+        ? rawPercentText
+        : String(clampedPercent);
       const triggerFamily = getTriggerFamily();
       const triggerMode = getTriggerMode();
       const delayMs = String(getDelayMs());
@@ -628,7 +645,7 @@
       if (autoSellEnabledInput) {
         autoSellEnabledInput.addEventListener("change", () => {
           if (autoSellEnabledInput.checked) {
-            const currentPercent = Number(getNamedValue("automaticDevSellPercent") || "0");
+            const currentPercent = Number(normalizePercentInput(getNamedValue("automaticDevSellPercent")) || "0");
             if (!Number.isFinite(currentPercent) || currentPercent <= 0) {
               setNamedValue("automaticDevSellPercent", "100");
             }

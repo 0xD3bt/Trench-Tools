@@ -7,6 +7,43 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-05-20
+
+### Added
+
+- Browser extension: Axiom Pulse improvements, including richer Pulse injection, Ultra button support, configurable Pulse surfaces, and support assets for USDC-denominated launch/trade flows.
+- Browser extension: backend-persisted quick-trade preferences so quick-buy, preset, wallet, and related trade controls survive page reloads and cross-surface usage more reliably.
+- Browser extension: native panel options now include a Share PnL action that opens the PnL card editor for the current token.
+- Browser extension: PnL card video export now supports audio, 30/60 FPS selection, 720P/1080P 16:9 exports, export progress, and draggable video crop positioning.
+- LaunchDeck: Pump create v2 support, including updated quote previews, USDC visual support, and matching embedded-extension shell packaging.
+
+### Changed
+
+- Browser extension: the TT native instant panel now has a more capable layout and behavior model for manual trading surfaces.
+- Browser extension: settings/options UI was refreshed for the expanded Axiom/Pulse controls, appearance options, runtime mode handling, and quick-trade preference behavior.
+- Browser extension: PnL card exports now use smoother media loading, compact SOL/USD value formatting, sign-before-currency USD text, native-panel gross/net PnL mode, and a non-selectable card preview.
+- Browser extension: PnL card video uploads now allow 50 MB / 60 second clips while image upload limits remain unchanged.
+- Browser extension: PnL card video mode now hides copy, labels video saves as Export, and previews the selected video with a movable 16:9 export section.
+- LaunchDeck: J7 Vamp/import flows were improved, including better image metadata handling and UI affordances when launching from imported context.
+- Execution engine: route discovery, mint warm/cache behavior, and trade dispatch paths were tightened to reduce stale route reuse and improve warmed-route reliability.
+- Execution engine and LaunchDeck now report the same `1.1.5` patch version as the extension and package manifests.
+- VPS setup guide now uses a clearer fresh-install flow for Vultr account setup, SSH key creation/upload, startup scripts, firewall groups, Dedicated CPU / CPU Optimized server selection, SSH config forwarding, `.env` editing, extension install, and shared-token pairing.
+- VPS bootstrap defaults now use `/root/trench.tools`, the `trenchtools` systemd service, and `TRENCH_TOOLS_*` override names while keeping older `LAUNCHDECK_*` override names as compatibility fallbacks.
+- VPS and troubleshooting docs now use `trenchtools` service commands and updated Trench Tools repository links for extension releases and sparse clone examples.
+- Setup docs now avoid unconfirmed macOS examples, keep the normal happy path short, and move service/tunnel/manual commands into troubleshooting/reference sections.
+
+### Fixed
+
+- Browser extension: auth/runtime-mode availability handling is more robust across execution-only, LaunchDeck-only, and full-stack modes.
+- Browser extension: Axiom balance stream handling and related inline state updates are more reliable.
+- Browser extension: Axiom PnL history now preserves canonical mint identity for ledger reads while keeping pair/route identity for live routing and venue interactions.
+- Browser extension: native panel PnL resync/reset actions now send the active token context and selected wallet scope so pair-based pages can resolve ledger history correctly.
+- Browser extension: PnL card downloads from extension pages are correctly authorized, and video data URLs with codec parameters are accepted.
+- Browser extension: uploaded PnL card media waits for persisted media data before export so video exports no longer fail with missing media data.
+- Browser extension: PnL card video preview/export state now avoids stale metadata listeners and keeps the draggable 16:9 crop aligned after preview resize.
+- Browser extension and LaunchDeck: decimal input normalization was tightened across trade, auto-sell, sniper, and split-editor flows.
+- Execution engine: stale route reuse and route probe behavior were corrected across Pump, Bonk, Meteora, Raydium LaunchLab, Bags, and wrapper compile paths.
+
 ## [1.1.4] - 2026-05-15
 
 ### Added

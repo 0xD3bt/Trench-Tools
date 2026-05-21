@@ -10,6 +10,7 @@ import {
   fetchRuntimeStatus,
   fetchWalletStatus,
   fetchSettings,
+  fetchQuickTradePreferences,
   fetchCanonicalConfig,
   getBatchStatus,
   exportPnlHistory,
@@ -28,6 +29,10 @@ import {
   createWalletGroup,
   updateWalletGroup,
   deleteWalletGroup,
+  deletePnlCardMedia,
+  fetchPnlCardMediaData,
+  fetchPnlCardSolUsd,
+  fetchPnlCardState,
   postActiveMark,
   postPrewarm,
   primeTradeRuntime,
@@ -38,6 +43,10 @@ import {
   resyncPnlHistory,
   revokeAuthToken,
   saveCanonicalConfig,
+  savePnlCardMedia,
+  savePnlCardProfile,
+  savePnlCardSettings,
+  saveQuickTradePreferencesPatch,
   saveSettings,
   sell,
   serializeHostError,
@@ -70,6 +79,12 @@ import {
 import {
   OPTIONS_TARGET_SECTION_KEY
 } from "../shared/constants.js";
+import { normalizeTrenchToolsMode, shouldProbeLaunchdeckRuntime } from "../shared/runtime-mode.js";
+import {
+  normalizeQuickBuyAmountInput,
+  normalizeTradePreferences,
+  tradePreferencePatchFromValue
+} from "../shared/trade-preferences.js";
 // Side-effect import: the shared module attaches its public API to
 // `globalThis.__trenchToolsStorageMigrations` so the popout (a classic
 // <script> context) and this service worker (an ES module) both consume the
@@ -82,6 +97,10 @@ import "../shared/storage-migrations.js";
 // the one-shot storage migration updates stale host settings.
 const backgroundRuntimeReady = initializeBackgroundRuntime();
 const LAUNCHDECK_RUNTIME_STATUS_TIMEOUT_MS = 2500;
+const QUICK_TRADE_PREFERENCES_BROADCAST_TYPE = "trench:quick-trade-preferences-updated";
+const QUICK_TRADE_PREFERENCES_REVISION_KEY = "trenchTools.quickTradePreferencesRevision";
+const LEGACY_TRADE_PREFERENCES_KEY = "trenchTools.panelPreferences";
+const LEGACY_TRADE_PREFERENCES_IMPORT_DONE_KEY = "trenchTools.panelPreferencesBackendImportDone";
 
 async function initializeBackgroundRuntime() {
   try {
@@ -108,6 +127,17 @@ let ensureOffscreenAudioPromise = null;
 function launchdeckConnectionError(message) {
   const error = new Error(message);
   error.code = "LAUNCHDECK_NOT_CONFIGURED";
+  return error;
+}
+
+function launchdeckHostUnavailableError(error, action) {
+  const message = String(error?.message || error || "").trim();
+  const actionLabel = String(action || "request").trim() || "request";
+  if (/failed to fetch|networkerror|load failed/i.test(message)) {
+    return launchdeckConnectionError(
+      `LaunchDeck host is not reachable for ${actionLabel}. Make sure LaunchDeck Engine is running.`
+    );
+  }
   return error;
 }
 
@@ -139,6 +169,121 @@ function assertSecureTransport(baseUrl, label) {
   }
 }
 
+function broadcastQuickTradePreferences(preferences) {
+  const payload = normalizeTradePreferences(preferences);
+  chrome.runtime.sendMessage({
+    type: QUICK_TRADE_PREFERENCES_BROADCAST_TYPE,
+    payload
+  }).catch((error) => {
+    const message = String(error?.message || "");
+    if (!message.includes("Receiving end does not exist")) {
+      console.debug("No quick-trade preference broadcast receivers", error);
+    }
+  });
+}
+
+async function markQuickTradePreferencesChanged() {
+  try {
+    await chrome.storage.local.set({
+      [QUICK_TRADE_PREFERENCES_REVISION_KEY]: `${Date.now()}:${Math.random().toString(36).slice(2)}`
+    });
+  } catch (error) {
+    console.debug("Failed to mark quick-trade preferences revision", error);
+  }
+}
+
+async function getQuickTradePreferencesFromHost() {
+  const rawPreferences = await fetchQuickTradePreferences();
+  if (rawPreferences?.hasSavedPreferences !== true) {
+    const imported = await importLegacyQuickTradePreferencesIfAvailable();
+    if (imported) {
+      return imported;
+    }
+  }
+  const preferences = normalizeTradePreferences(rawPreferences);
+  broadcastQuickTradePreferences(preferences);
+  return preferences;
+}
+
+async function importLegacyQuickTradePreferencesIfAvailable() {
+  const stored = await chrome.storage.local.get([
+    LEGACY_TRADE_PREFERENCES_KEY,
+    LEGACY_TRADE_PREFERENCES_IMPORT_DONE_KEY
+  ]);
+  if (stored[LEGACY_TRADE_PREFERENCES_IMPORT_DONE_KEY]) {
+    return null;
+  }
+  const legacy = stored[LEGACY_TRADE_PREFERENCES_KEY];
+  if (!legacy || typeof legacy !== "object") {
+    await chrome.storage.local.set({ [LEGACY_TRADE_PREFERENCES_IMPORT_DONE_KEY]: true });
+    return null;
+  }
+  const legacyPreferences = normalizeTradePreferences(legacy);
+  const patch = tradePreferencePatchFromValue(legacyPreferences, [
+    "presetId",
+    "selectionSource",
+    "activeWalletGroupId",
+    "manualWalletKeys",
+    "selectionRevision",
+    "quickBuyAmount",
+    "quickBuyAmount2"
+  ]);
+  const hasSelectionValue =
+    String(patch.activeWalletGroupId || "").trim() ||
+    (Array.isArray(patch.manualWalletKeys) && patch.manualWalletKeys.length);
+  if (hasSelectionValue && Math.max(0, Number(patch.selectionRevision || 0) || 0) === 0) {
+    patch.selectionRevision = 1;
+  }
+  const preferences = normalizeTradePreferences(await saveQuickTradePreferencesPatch(patch));
+  await chrome.storage.local.set({ [LEGACY_TRADE_PREFERENCES_IMPORT_DONE_KEY]: true });
+  await markQuickTradePreferencesChanged();
+  broadcastQuickTradePreferences(preferences);
+  return preferences;
+}
+
+async function updateQuickTradePreferencesOnHost(payload) {
+  const rawPatch = payload?.patch || payload || {};
+  const fields = Object.keys(rawPatch);
+  const normalizedSource = {};
+  if (fields.includes("presetId")) {
+    normalizedSource.presetId = String(rawPatch.presetId || "").trim();
+  }
+  if (fields.includes("selectionSource")) {
+    normalizedSource.selectionSource =
+      String(rawPatch.selectionSource || "").trim().toLowerCase() === "manual" ? "manual" : "group";
+  }
+  if (fields.includes("activeWalletGroupId")) {
+    normalizedSource.activeWalletGroupId = String(rawPatch.activeWalletGroupId || "").trim();
+  }
+  if (fields.includes("manualWalletKeys")) {
+    normalizedSource.manualWalletKeys = Array.from(
+      new Set(
+        (Array.isArray(rawPatch.manualWalletKeys) ? rawPatch.manualWalletKeys : [])
+          .map((entry) => String(entry || "").trim())
+          .filter(Boolean)
+      )
+    );
+  }
+  if (fields.includes("selectionRevision")) {
+    normalizedSource.selectionRevision = Math.max(0, Number(rawPatch.selectionRevision || 0) || 0);
+  }
+  if (fields.includes("quickBuyAmount")) {
+    normalizedSource.quickBuyAmount = normalizeQuickBuyAmountInput(rawPatch.quickBuyAmount || "");
+  }
+  if (fields.includes("quickBuyAmount2")) {
+    normalizedSource.quickBuyAmount2 = normalizeQuickBuyAmountInput(rawPatch.quickBuyAmount2 || "");
+  }
+  const patch = Object.fromEntries(
+    fields
+      .filter((field) => Object.prototype.hasOwnProperty.call(normalizedSource, field))
+      .map((field) => [field, normalizedSource[field]])
+  );
+  const preferences = normalizeTradePreferences(await saveQuickTradePreferencesPatch(patch));
+  await markQuickTradePreferencesChanged();
+  broadcastQuickTradePreferences(preferences);
+  return preferences;
+}
+
 async function loadLaunchdeckConnection() {
   const baseUrl = await getLaunchdeckHostBase();
   const authToken = await getHostAuthToken();
@@ -152,12 +297,17 @@ async function loadLaunchdeckConnection() {
 
 async function fetchLaunchdeckSettingsPayload() {
   const { baseUrl, authToken } = await loadLaunchdeckConnection();
-  const response = await fetch(new URL("/api/settings", baseUrl).toString(), {
-    method: "GET",
-    headers: { authorization: `Bearer ${authToken}` },
-    credentials: "omit",
-    cache: "no-cache"
-  });
+  let response;
+  try {
+    response = await fetch(new URL("/api/settings", baseUrl).toString(), {
+      method: "GET",
+      headers: { authorization: `Bearer ${authToken}` },
+      credentials: "omit",
+      cache: "no-cache"
+    });
+  } catch (error) {
+    throw launchdeckHostUnavailableError(error, "settings");
+  }
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json")
     ? await response.json().catch(() => ({}))
@@ -220,6 +370,23 @@ function launchdeckUnavailableDiagnostic(error) {
   };
 }
 
+async function resolveTrenchToolsMode() {
+  try {
+    const status = await fetchRuntimeStatus();
+    return {
+      trenchToolsMode: normalizeTrenchToolsMode(status?.trenchToolsMode),
+      source: "execution-engine"
+    };
+  } catch (executionError) {
+    const launchdeckStatus = await fetchLaunchdeckRuntimeStatusPayload();
+    return {
+      trenchToolsMode: normalizeTrenchToolsMode(launchdeckStatus?.trenchToolsMode),
+      source: "launchdeck-engine",
+      executionError: serializeHostError(executionError)
+    };
+  }
+}
+
 async function ensureOffscreenAudioDocument() {
   if (!chrome.offscreen?.createDocument) {
     return false;
@@ -271,7 +438,7 @@ async function playSoundViaOffscreen(payload) {
 
 const CONTENT_REINJECTION_TARGETS = [
   {
-    matches: ["https://axiom.trade/*"],
+    matches: ["https://axiom.trade/*", "https://backup.axiom.trade/*"],
     loader: "src/content/loaders/axiom-loader.js"
   },
   {
@@ -282,6 +449,7 @@ const CONTENT_REINJECTION_TARGETS = [
 
 const SUPPORTED_CONTENT_ORIGINS = new Set([
   "https://axiom.trade",
+  "https://backup.axiom.trade",
   "https://j7tracker.io"
 ]);
 
@@ -289,6 +457,7 @@ const EXTENSION_PAGE_PATH_PREFIXES = [
   "/src/popup/",
   "/src/options/",
   "/src/panel/",
+  "/src/pnl-card/",
   "/launchdeck/"
 ];
 
@@ -297,11 +466,16 @@ const CONTENT_ALLOWED_MESSAGE_TYPES = new Set([
   "trench:dismiss-runtime-diagnostic",
   "trench:get-batch-status",
   "trench:get-bootstrap",
+  "trench:get-quick-trade-preferences",
   "trench:get-launchdeck-host-settings",
   "trench:get-launchdeck-settings",
+  "trench:get-trench-tools-mode",
   "trench:get-runtime-diagnostics",
   "trench:get-runtime-status",
   "trench:get-wallet-status",
+  "trench:get-pnl-card-sol-usd",
+  "trench:get-pnl-card-media-data",
+  "trench:get-pnl-card-state",
   "trench:invalidate-balances",
   "trench:open-external-url",
   "trench:open-options",
@@ -312,12 +486,18 @@ const CONTENT_ALLOWED_MESSAGE_TYPES = new Set([
   "trench:reset-pnl-history",
   "trench:resolve-token",
   "trench:resync-pnl-history",
+  "trench:delete-pnl-card-media",
+  "trench:download-pnl-card",
   "trench:sell",
+  "trench:save-pnl-card-media",
+  "trench:save-pnl-card-profile",
+  "trench:save-pnl-card-settings",
   "trench:set-active-mark",
   "trench:set-active-mints",
   "trench:set-trade-readiness",
   "trench:token-consolidate",
-  "trench:token-split"
+  "trench:token-split",
+  "trench:update-quick-trade-preferences"
 ]);
 
 function senderUrl(sender = {}) {
@@ -387,6 +567,37 @@ async function openExternalUrl(payload = {}) {
   return { opened: true, mode: "tab" };
 }
 
+async function downloadPnlCard(payload = {}) {
+  const dataUrl = String(payload.dataUrl || "").trim();
+  const downloadToken = String(payload.downloadToken || "").trim();
+  const filename = String(payload.filename || "token-pnl.png")
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, "-") || "token-pnl.png";
+  if (!downloadToken) {
+    throw new Error("Download token required.");
+  }
+  if (!/^data:(image\/png|video\/mp4|video\/webm)(?:;.*)?;base64,/i.test(dataUrl)) {
+    throw new Error("PnL card media data required.");
+  }
+  let downloadId;
+  try {
+    downloadId = await chrome.downloads.download({
+      url: dataUrl,
+      filename,
+      saveAs: true,
+      conflictAction: "uniquify"
+    });
+  } catch (error) {
+    if (/cancel/i.test(String(error?.message || ""))) {
+      const canceled = new Error("Save canceled.");
+      canceled.code = "DOWNLOAD_CANCELED";
+      throw canceled;
+    }
+    throw error;
+  }
+  return { downloadId };
+}
+
 async function handleMessage(message) {
   const type = String(message?.type || "");
   const backgroundReadyStartedAt = Date.now();
@@ -414,6 +625,10 @@ async function handleMessage(message) {
     case "trench:get-runtime-status": {
       const status = await fetchRuntimeStatus();
       await applyRuntimeDiagnostics(status?.diagnostics || [], "execution-engine");
+      if (!shouldProbeLaunchdeckRuntime(status)) {
+        await applyRuntimeDiagnostics([], "launchdeck-engine");
+        return status;
+      }
       try {
         const launchdeckStatus = await fetchLaunchdeckRuntimeStatusPayload();
         await applyRuntimeDiagnostics(launchdeckStatus?.diagnostics || [], "launchdeck-engine");
@@ -424,6 +639,8 @@ async function handleMessage(message) {
     }
     case "trench:get-runtime-diagnostics":
       return getDiagnosticsSnapshot();
+    case "trench:get-trench-tools-mode":
+      return resolveTrenchToolsMode();
     case "trench:prime-trade-runtime": {
       const primeStartedAt = Date.now();
       const payload = message.payload || {};
@@ -514,6 +731,10 @@ async function handleMessage(message) {
     }
     case "trench:get-settings":
       return fetchSettings();
+    case "trench:get-quick-trade-preferences":
+      return getQuickTradePreferencesFromHost();
+    case "trench:update-quick-trade-preferences":
+      return updateQuickTradePreferencesOnHost(message.payload || {});
     case "trench:get-execution-canonical-config":
     case "trench:get-canonical-config":
       return fetchCanonicalConfig();
@@ -530,6 +751,22 @@ async function handleMessage(message) {
       return exportPnlHistory();
     case "trench:wipe-pnl-history":
       return wipePnlHistory();
+    case "trench:get-pnl-card-state":
+      return fetchPnlCardState();
+    case "trench:download-pnl-card":
+      return downloadPnlCard(message.payload);
+    case "trench:save-pnl-card-profile":
+      return savePnlCardProfile(message.payload);
+    case "trench:save-pnl-card-settings":
+      return savePnlCardSettings(message.payload);
+    case "trench:save-pnl-card-media":
+      return savePnlCardMedia(message.payload);
+    case "trench:delete-pnl-card-media":
+      return deletePnlCardMedia(message.payload?.mediaId);
+    case "trench:get-pnl-card-sol-usd":
+      return fetchPnlCardSolUsd();
+    case "trench:get-pnl-card-media-data":
+      return fetchPnlCardMediaData(message.payload?.mediaId);
     case "trench:list-presets":
       return listPresets();
     case "trench:create-preset":
@@ -639,7 +876,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // The offscreen document relays playback requests via chrome.runtime.sendMessage,
   // which also hits this listener. Ignore its own envelope so the background doesn't
   // reply to itself (and so it doesn't bounce through handleMessage).
-  if (message?.type === "trench:offscreen-play-sound") {
+  if (
+    message?.type === "trench:offscreen-play-sound" ||
+    message?.type === QUICK_TRADE_PREFERENCES_BROADCAST_TYPE
+  ) {
     return false;
   }
   Promise.resolve()

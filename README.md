@@ -51,9 +51,9 @@ For most users:
 3. Install the browser extension with [docs/EXTENSION.md](docs/EXTENSION.md). Download the latest packaged extension zip to the PC running Chrome/Edge, or pull `extension/trench-tools` / the full repo with git and load that folder.
 4. Keep [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) nearby for connection/auth issues.
 
-VPS is still the recommended real trading setup because it is cheap, private by default, and closer to the latency profile you actually care about. With a fresh VPS, the bootstrap startup script, and a Helius Developer tier plan, most users can get the stack up from scratch in about 5 minutes. Local setup is fine when you are editing, testing, or learning the tool.
+VPS is still the recommended real trading setup because it is cheap, private by default, and closer to the latency profile you actually care about. With a fresh VPS, the bootstrap startup script, and a Helius Developer tier plan, most users can get the stack up from scratch in about 5-10 minutes. Local setup is fine when you are editing, testing, or learning the tool.
 
-If you get stuck during setup, use an AI coding assistant to walk through the steps with you. Cursor, Codex, Claude, and similar tools are all fine for checking install commands, editing `.env`, reading logs, and following the VPS guide. Do not paste real private keys, API keys, or auth tokens into any AI/chat tool.
+If you get stuck during setup, use an AI coding assistant to walk through the steps with you. [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI), Codex, Claude, and similar tools are all fine for checking install commands, editing `.env`, reading logs, and following the VPS guide.
 
 ## Which Mode Should I Run?
 
@@ -100,7 +100,7 @@ Do not treat any shared latency numbers as universal. Test from the VPS and regi
 
 ### VPS Note
 
-[Vultr](https://www.vultr.com/?ref=9589308) is the worked example in [docs/VPS_SETUP.md](docs/VPS_SETUP.md). It is easy to deploy quickly across many regions, supports standard card/fiat payments as well as crypto, and has been reliable for long-term use. If you use Vultr, please use [my referral link](https://www.vultr.com/?ref=9589308). Any other VPS provider is fine as long as you place it close to the provider endpoints and RPCs you plan to use.
+[Vultr](https://www.vultr.com/?ref=9589308) is the worked example in [docs/VPS_SETUP.md](docs/VPS_SETUP.md). It is easy to deploy quickly across many regions, supports standard card/fiat payments as well as crypto, and has been reliable for long-term use. Any other VPS provider is fine as long as you place it close to the provider endpoints and RPCs you plan to use.
 
 Personal note: I have used Vultr for 5+ years and have not had issues with it.
 
@@ -156,7 +156,7 @@ After setup:
 - Axiom shows the enabled Trench Tools surfaces
 - the toolbar popup shows the expected preset, wallet/group, and quick-buy controls
 
-If the runtime is on a VPS and your browser is on your own computer, add both forwards to your SSH config so Cursor/SSH opens them automatically:
+If the runtime is on a VPS and your browser is on your own computer, add both forwards to your SSH config so [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI)/SSH opens them automatically:
 
 ```sshconfig
 Host Trenchtools-vps

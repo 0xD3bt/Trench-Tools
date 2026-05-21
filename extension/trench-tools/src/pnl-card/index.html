@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trench Tools PnL Card</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="pnl-card-editor">
+      <div class="card-stage">
+        <section class="preview-stage" aria-label="PnL card preview">
+          <article id="card-preview" class="pnl-card-preview">
+            <img id="preview-background-image" class="preview-background-media hidden" alt="" />
+            <video id="preview-background-video" class="preview-background-media hidden" loop muted playsinline></video>
+            <div class="preview-background-scrim hidden" aria-hidden="true"></div>
+            <div id="card-preview-card" class="preview-card-surface">
+              <img id="card-media-image" class="card-media" alt="" />
+              <video id="card-media-video" class="card-media hidden" loop playsinline></video>
+              <div class="card-vignette" aria-hidden="true"></div>
+              <div class="card-content">
+                <div class="card-top">
+                  <img id="brand-logo" class="brand-logo" src="../../assets/pnl-cards/tt-logo-transparent.png" alt="Trench Tools" />
+                  <div class="site-label" id="site-label">Trench.Tools</div>
+                </div>
+                <div class="card-stack">
+                  <div class="token-name" id="token-name">Token</div>
+                  <div class="pnl-amount" id="pnl-amount">
+                    <img id="pnl-currency-icon" class="currency-icon" alt="" />
+                    <span id="pnl-currency-symbol" class="currency-symbol hidden">$</span>
+                    <span id="pnl-amount-text">0</span>
+                  </div>
+                  <div class="metric-grid">
+                    <span>PNL</span>
+                    <strong id="pnl-percent">0.00%</strong>
+                    <span>Invested</span>
+                    <strong id="invested-amount" class="metric-value"></strong>
+                    <span>Position</span>
+                    <strong id="position-amount" class="metric-value"></strong>
+                  </div>
+                  <div class="handle" id="handle">@</div>
+                </div>
+                <div class="promo-copy">
+                  <span id="promo-line-one">Own your execution.</span>
+                  <strong id="promo-line-two">Trade, deploy &amp; snipe with 0% platform fees.</strong>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <aside id="customize-panel" class="customize-panel hidden">
+            <header>
+              <strong>Customize PNL Colors</strong>
+              <button id="customize-close" type="button" aria-label="Close customize panel">×</button>
+            </header>
+            <h2>Username</h2>
+            <label>
+              <span>@username</span>
+              <div class="handle-input-wrap">
+                <input id="handle-input" type="text" maxlength="32" placeholder="yourname" />
+              </div>
+            </label>
+            <h2>Text Colors</h2>
+            <label>
+              <span>Main Text</span>
+              <div class="color-control">
+                <input id="main-color" type="color" value="#ffffff" />
+                <span class="color-hex" data-hex-for="main-color">FFFFFF</span>
+                <button class="color-reset" type="button" data-reset-color="main-color" aria-label="Reset Main Text color" title="Reset">↻</button>
+              </div>
+            </label>
+            <h2>PNL Colors</h2>
+            <label>
+              <span>Positive PNL</span>
+              <div class="color-control">
+                <input id="positive-color" type="color" value="#2fe3ac" />
+                <span class="color-hex" data-hex-for="positive-color">2FE3AC</span>
+                <button class="color-reset" type="button" data-reset-color="positive-color" aria-label="Reset Positive PNL color" title="Reset">↻</button>
+              </div>
+            </label>
+            <label>
+              <span>Negative PNL</span>
+              <div class="color-control">
+                <input id="negative-color" type="color" value="#ec397a" />
+                <span class="color-hex" data-hex-for="negative-color">EC397A</span>
+                <button class="color-reset" type="button" data-reset-color="negative-color" aria-label="Reset Negative PNL color" title="Reset">↻</button>
+              </div>
+            </label>
+            <h2>Layout Options</h2>
+            <label class="toggle-row">
+              <span>Use bold font weight</span>
+              <input id="bold-toggle" type="checkbox" />
+            </label>
+            <label class="toggle-row">
+              <span>Use text shadows</span>
+              <input id="shadow-toggle" type="checkbox" />
+            </label>
+            <label class="toggle-row">
+              <span>Show colored PNL rectangle</span>
+              <input id="rectangle-toggle" type="checkbox" checked />
+            </label>
+            <label>
+              <span>Rectangle Text Color</span>
+              <div class="color-control">
+                <input id="rectangle-text-color" type="color" value="#020307" />
+                <span class="color-hex" data-hex-for="rectangle-text-color">020307</span>
+                <button class="color-reset" type="button" data-reset-color="rectangle-text-color" aria-label="Reset Rectangle Text color" title="Reset">↻</button>
+              </div>
+            </label>
+            <button id="save-customize" class="primary-button wide" type="button">Continue</button>
+          </aside>
+        </section>
+
+        <section class="toolbar" aria-label="PnL card controls">
+          <div class="control-row">
+            <div class="control-group">
+              <div class="segmented">
+                <button id="mode-image" class="active" type="button">Image</button>
+                <button id="mode-video" type="button">Video</button>
+              </div>
+              <div id="volume-control" class="volume-control hidden" role="group" aria-label="Video volume">
+                <button id="volume-button" class="ghost-button volume-button" type="button" aria-label="Mute video">
+                  <span id="volume-icon" class="volume-icon" aria-hidden="true">🔊</span>
+                </button>
+                <input id="volume-slider" class="volume-slider" type="range" min="0" max="100" step="1" value="70" aria-label="Video volume" />
+              </div>
+              <button id="customize-button" class="ghost-button" type="button">Customize</button>
+              <button id="currency-button" class="ghost-button" type="button">USD</button>
+              <button id="fps-button" class="ghost-button hidden" type="button" title="Toggle video export frame rate">30 FPS</button>
+              <button id="video-size-button" class="ghost-button hidden" type="button" title="Toggle video export resolution">720P</button>
+            </div>
+            <div class="control-actions">
+              <button id="resync-button" class="ghost-button" type="button">Resync PNL</button>
+              <button id="download-button" class="primary-button" type="button">Download</button>
+              <button id="copy-button" class="primary-button" type="button">Copy</button>
+            </div>
+          </div>
+
+          <div class="media-row">
+            <div id="media-strip" class="media-strip"></div>
+            <label class="upload-tile">
+              <input id="media-input" type="file" accept="image/png,image/jpeg,image/webp,video/mp4,video/webm" />
+              <span class="upload-tile-icon" aria-hidden="true">⇅</span>
+              <span class="upload-tile-label">Add upload</span>
+              <span class="upload-tile-hint">img 6MB · vid 50MB / 60s</span>
+            </label>
+          </div>
+
+          <div id="notice" class="notice" role="status"></div>
+        </section>
+      </div>
+    </main>
+    <script src="./index.js"></script>
+  </body>
+</html>

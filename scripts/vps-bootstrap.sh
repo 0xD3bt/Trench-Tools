@@ -8,10 +8,10 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 
-LAUNCHDECK_REPO_URL="${LAUNCHDECK_REPO_URL:-https://github.com/0xD3bt/Trench-Tools.git}"
-LAUNCHDECK_REPO_BRANCH="${LAUNCHDECK_REPO_BRANCH:-master}"
-LAUNCHDECK_DIR="${LAUNCHDECK_DIR:-/opt/launchdeck}"
-LAUNCHDECK_SERVICE_NAME="${LAUNCHDECK_SERVICE_NAME:-launchdeck}"
+TRENCH_TOOLS_REPO_URL="${TRENCH_TOOLS_REPO_URL:-${LAUNCHDECK_REPO_URL:-https://github.com/0xD3bt/Trench-Tools.git}}"
+TRENCH_TOOLS_REPO_BRANCH="${TRENCH_TOOLS_REPO_BRANCH:-${LAUNCHDECK_REPO_BRANCH:-master}}"
+TRENCH_TOOLS_DIR="${TRENCH_TOOLS_DIR:-${LAUNCHDECK_DIR:-/root/trench.tools}}"
+TRENCH_TOOLS_SERVICE_NAME="${TRENCH_TOOLS_SERVICE_NAME:-${LAUNCHDECK_SERVICE_NAME:-trenchtools}}"
 NODE_MAJOR="${NODE_MAJOR:-20}"
 
 install_base_packages() {
@@ -64,27 +64,27 @@ install_node() {
 }
 
 sync_repo() {
-  mkdir -p "$(dirname "$LAUNCHDECK_DIR")"
+  mkdir -p "$(dirname "$TRENCH_TOOLS_DIR")"
 
-  if [[ ! -d "$LAUNCHDECK_DIR/.git" ]]; then
-    git clone --branch "$LAUNCHDECK_REPO_BRANCH" "$LAUNCHDECK_REPO_URL" "$LAUNCHDECK_DIR"
+  if [[ ! -d "$TRENCH_TOOLS_DIR/.git" ]]; then
+    git clone --branch "$TRENCH_TOOLS_REPO_BRANCH" "$TRENCH_TOOLS_REPO_URL" "$TRENCH_TOOLS_DIR"
   else
-    git -C "$LAUNCHDECK_DIR" fetch origin "$LAUNCHDECK_REPO_BRANCH"
-    git -C "$LAUNCHDECK_DIR" checkout "$LAUNCHDECK_REPO_BRANCH"
-    git -C "$LAUNCHDECK_DIR" pull --ff-only origin "$LAUNCHDECK_REPO_BRANCH"
+    git -C "$TRENCH_TOOLS_DIR" fetch origin "$TRENCH_TOOLS_REPO_BRANCH"
+    git -C "$TRENCH_TOOLS_DIR" checkout "$TRENCH_TOOLS_REPO_BRANCH"
+    git -C "$TRENCH_TOOLS_DIR" pull --ff-only origin "$TRENCH_TOOLS_REPO_BRANCH"
   fi
 
-  cd "$LAUNCHDECK_DIR"
+  cd "$TRENCH_TOOLS_DIR"
   npm install
-  chmod +x "$LAUNCHDECK_DIR"/trench-tools-*.sh
+  chmod +x "$TRENCH_TOOLS_DIR"/trench-tools-*.sh
 
-  if [[ ! -f "$LAUNCHDECK_DIR/.env" ]]; then
-    cp "$LAUNCHDECK_DIR/.env.example" "$LAUNCHDECK_DIR/.env"
+  if [[ ! -f "$TRENCH_TOOLS_DIR/.env" ]]; then
+    cp "$TRENCH_TOOLS_DIR/.env.example" "$TRENCH_TOOLS_DIR/.env"
   fi
 }
 
 write_systemd_service() {
-  cat >/etc/systemd/system/${LAUNCHDECK_SERVICE_NAME}.service <<EOF
+  cat >/etc/systemd/system/${TRENCH_TOOLS_SERVICE_NAME}.service <<EOF
 [Unit]
 Description=Trench Tools runtime
 After=network-online.target
@@ -93,14 +93,14 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=${LAUNCHDECK_DIR}
+WorkingDirectory=${TRENCH_TOOLS_DIR}
 Environment=HOME=/root
 Environment=CARGO_HOME=/root/.cargo
 Environment=RUSTUP_HOME=/root/.rustup
 Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/usr/bin/env bash -lc 'cd "${LAUNCHDECK_DIR}" && npm start'
-ExecStop=/usr/bin/env bash -lc 'cd "${LAUNCHDECK_DIR}" && npm stop'
-ExecReload=/usr/bin/env bash -lc 'cd "${LAUNCHDECK_DIR}" && npm restart'
+ExecStart=/usr/bin/env bash -lc 'cd "${TRENCH_TOOLS_DIR}" && npm start'
+ExecStop=/usr/bin/env bash -lc 'cd "${TRENCH_TOOLS_DIR}" && npm stop'
+ExecReload=/usr/bin/env bash -lc 'cd "${TRENCH_TOOLS_DIR}" && npm restart'
 TimeoutStartSec=1800
 TimeoutStopSec=180
 
@@ -109,7 +109,7 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable "${LAUNCHDECK_SERVICE_NAME}.service"
+  systemctl enable "${TRENCH_TOOLS_SERVICE_NAME}.service"
 }
 
 configure_host_security() {
@@ -120,8 +120,8 @@ configure_host_security() {
   ufw --force enable
 }
 
-start_launchdeck() {
-  systemctl restart "${LAUNCHDECK_SERVICE_NAME}.service"
+start_trench_tools() {
+  systemctl restart "${TRENCH_TOOLS_SERVICE_NAME}.service"
 }
 
 print_next_steps() {
@@ -130,12 +130,12 @@ print_next_steps() {
 Trench Tools bootstrap complete.
 
 Project path:
-  ${LAUNCHDECK_DIR}
+  ${TRENCH_TOOLS_DIR}
 
 Service commands:
-  systemctl status ${LAUNCHDECK_SERVICE_NAME}
-  systemctl restart ${LAUNCHDECK_SERVICE_NAME}
-  journalctl -u ${LAUNCHDECK_SERVICE_NAME} -n 100 --no-pager
+  systemctl status ${TRENCH_TOOLS_SERVICE_NAME}
+  systemctl restart ${TRENCH_TOOLS_SERVICE_NAME}
+  journalctl -u ${TRENCH_TOOLS_SERVICE_NAME} -n 100 --no-pager
 
 Default local hosts on the VPS:
   execution-engine:          http://127.0.0.1:8788
@@ -143,21 +143,30 @@ Default local hosts on the VPS:
   launchdeck-follow-daemon:  http://127.0.0.1:8790
 
 Shared auth token file:
-  ${LAUNCHDECK_DIR}/.local/trench-tools/default-engine-token.txt
+  ${TRENCH_TOOLS_DIR}/.local/trench-tools/default-engine-token.txt
 
 Next steps:
-  1. Edit ${LAUNCHDECK_DIR}/.env
+  1. Edit ${TRENCH_TOOLS_DIR}/.env
   2. Restart the service:
-       systemctl restart ${LAUNCHDECK_SERVICE_NAME}
-  3. From your local computer, keep an SSH tunnel open while using the browser:
-       ssh -L 8788:127.0.0.1:8788 -L 8789:127.0.0.1:8789 root@YOUR_SERVER_IP
-  4. Use these local URLs in your browser/extension:
+       systemctl restart ${TRENCH_TOOLS_SERVICE_NAME}
+  3. On your local computer, add this SSH config entry:
+       Host Trenchtools-vps
+         HostName YOUR_SERVER_IP
+         User root
+         IdentityFile ~/.ssh/id_ed25519
+         IdentitiesOnly yes
+         LocalForward 8788 127.0.0.1:8788
+         LocalForward 8789 127.0.0.1:8789
+         ExitOnForwardFailure yes
+         ServerAliveInterval 30
+  4. Connect with:
+       ssh Trenchtools-vps
+  5. Keep that SSH session open and use these local URLs in your browser/extension:
        Execution host:  http://127.0.0.1:8788
        LaunchDeck host: http://127.0.0.1:8789
 
-Recommended daily use:
-  Add those LocalForward entries to your local SSH config so Cursor/SSH opens
-  the browser tunnel automatically whenever you connect.
+Manual fallback if you did not add the SSH config:
+  ssh -L 8788:127.0.0.1:8788 -L 8789:127.0.0.1:8789 root@YOUR_SERVER_IP
 
 Keep the raw local hosts private. Use SSH tunnels unless you intentionally add your own HTTPS reverse proxy and access controls.
 EOF
@@ -169,5 +178,5 @@ install_node
 sync_repo
 write_systemd_service
 configure_host_security
-start_launchdeck
+start_trench_tools
 print_next_steps

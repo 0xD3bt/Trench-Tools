@@ -1,0 +1,13 @@
+param([string]$Path)
+Add-Type -AssemblyName System.Drawing
+$img = [System.Drawing.Image]::FromFile($Path)
+Write-Output ("Size: " + $img.Width + "x" + $img.Height)
+Write-Output ("PixelFormat: " + $img.PixelFormat)
+$bmp = New-Object System.Drawing.Bitmap($img)
+$px = $bmp.GetPixel(2, 2)
+Write-Output ("Corner pixel A=" + $px.A + " R=" + $px.R + " G=" + $px.G + " B=" + $px.B)
+$cx = [int]($img.Width / 2)
+$cy = [int]($img.Height / 2)
+$px2 = $bmp.GetPixel($cx, $cy)
+Write-Output ("Center pixel A=" + $px2.A + " R=" + $px2.R + " G=" + $px2.G + " B=" + $px2.B)
+$img.Dispose()

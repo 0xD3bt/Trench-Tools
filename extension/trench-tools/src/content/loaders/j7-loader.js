@@ -391,10 +391,15 @@
     cleanupStaleArtifacts();
     scheduleReconnectFallback();
     const backgroundRpc = await loadModule("src/shared/background-rpc.js");
+    const runtimeMode = await loadModule("src/shared/runtime-mode.js");
+    const tradePreferences = await loadModule("src/shared/trade-preferences.js");
     const launchdeckShell = await loadModule("src/content/launchdeck-shell.js");
     window.__trenchToolsContentModules = {
       callBackground: backgroundRpc.callBackground,
-      createLaunchdeckShellController: launchdeckShell.createLaunchdeckShellController
+      tradePreferences,
+      createLaunchdeckShellController: launchdeckShell.createLaunchdeckShellController,
+      isEeOnlyTrenchToolsMode: runtimeMode.isEeOnlyTrenchToolsMode,
+      isLdOnlyTrenchToolsMode: runtimeMode.isLdOnlyTrenchToolsMode
     };
     await loadModule("src/content/runtime.js");
     await loadModule("src/content/platforms/j7.js");

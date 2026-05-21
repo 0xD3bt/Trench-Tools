@@ -69,16 +69,19 @@ const state = {
   hostError: "",
   panelNotice: null,
   walletPopoverOpen: false,
-  settingsMenuOpen: false
+  settingsMenuOpen: false,
+  sellHover: null
 };
 
 const elements = {
   dragHandle: document.getElementById("drag-handle"),
   versionText: document.getElementById("version-text"),
   walletButton: document.getElementById("wallet-button"),
+  walletButtonCount: document.getElementById("wallet-button-count"),
   settingsButton: document.getElementById("settings-button"),
   settingsMenu: document.getElementById("settings-menu"),
   toggleFeesButton: document.getElementById("toggle-fees-button"),
+  sharePnlButton: document.getElementById("share-pnl-button"),
   resyncCoinButton: document.getElementById("resync-coin-button"),
   resetCoinButton: document.getElementById("reset-coin-button"),
   openGlobalSettingsButton: document.getElementById("open-global-settings-button"),
@@ -123,7 +126,15 @@ const elements = {
   balanceSell: document.getElementById("balance-sell"),
   balanceHold: document.getElementById("balance-hold"),
   balancePnl: document.getElementById("balance-pnl"),
+  balancePnlText: document.getElementById("balance-pnl-text"),
+  balancePnlShare: document.getElementById("balance-pnl-share"),
   balancePnlDetail: document.getElementById("balance-pnl-detail"),
+  buyBalanceSol: document.getElementById("buy-balance-sol"),
+  sellBalanceToken: document.getElementById("sell-balance-token"),
+  sellBalanceTicker: document.getElementById("sell-balance-ticker"),
+  sellBalanceSeparator: document.getElementById("sell-balance-separator"),
+  sellBalanceSolWrapper: document.getElementById("sell-balance-sol-wrapper"),
+  sellBalanceValueSol: document.getElementById("sell-balance-value-sol"),
   minimizeButton: document.getElementById("minimize-button")
 };
 
@@ -213,9 +224,16 @@ window.addEventListener("message", (event) => {
   }
 });
 
-elements.customBuyInput.addEventListener("input", syncLocalCustomInputs);
-elements.customSellPercentInput.addEventListener("input", syncLocalCustomInputs);
-elements.customSellSolInput.addEventListener("input", syncLocalCustomInputs);
+for (const input of [
+  elements.customBuyInput,
+  elements.customSellPercentInput,
+  elements.customSellSolInput
+]) {
+  input.addEventListener("input", () => {
+    sanitizeCustomNumericInput(input);
+    syncLocalCustomInputs();
+  });
+}
 
 attachDragScroll(elements.presetChipRow);
 attachDragScroll(elements.walletGroupChips);
@@ -414,10 +432,15 @@ elements.toggleFeesButton?.addEventListener("click", () => {
   state.settingsMenuOpen = false;
   persistPreferences();
 });
+elements.sharePnlButton?.addEventListener("click", () => {
+  state.settingsMenuOpen = false;
+  renderSettingsMenu();
+  emit("request-open-pnl-card", {});
+});
 elements.resyncCoinButton?.addEventListener("click", () => {
   state.settingsMenuOpen = false;
   renderSettingsMenu();
-  emit("resync-pnl-history");
+  emit("resync-pnl-history", pnlHistoryActionPayload());
 });
 elements.resetCoinButton?.addEventListener("click", () => {
   state.settingsMenuOpen = false;
@@ -425,7 +448,7 @@ elements.resetCoinButton?.addEventListener("click", () => {
   if (!window.confirm("Reset PnL history for this coin and start fresh from here? This only works when the position is fully closed.")) {
     return;
   }
-  emit("reset-pnl-history");
+  emit("reset-pnl-history", pnlHistoryActionPayload());
 });
 elements.openGlobalSettingsButton?.addEventListener("click", () => {
   state.settingsMenuOpen = false;
@@ -493,7 +516,7 @@ elements.dragHandle.addEventListener("pointerdown", (event) => {
   );
 });
 bindImmediateButtonAction(elements.customBuyButton, () => {
-  const value = elements.customBuyInput.value.trim();
+  const value = normalizedCustomNumericValue(elements.customBuyInput.value);
   if (!isPositiveNumericInput(value)) {
     flagEmptyCustomInput(elements.customBuyInput, "Enter a SOL amount before buying.");
     return;
@@ -504,7 +527,7 @@ bindImmediateButtonAction(elements.customBuyButton, () => {
   });
 });
 bindImmediateButtonAction(elements.customSellPercentButton, () => {
-  const value = elements.customSellPercentInput.value.trim();
+  const value = normalizedCustomNumericValue(elements.customSellPercentInput.value);
   if (!isPositiveNumericInput(value)) {
     flagEmptyCustomInput(elements.customSellPercentInput, "Enter a sell percentage before selling.");
     return;
@@ -515,7 +538,7 @@ bindImmediateButtonAction(elements.customSellPercentButton, () => {
   });
 });
 bindImmediateButtonAction(elements.customSellSolButton, () => {
-  const value = elements.customSellSolInput.value.trim();
+  const value = normalizedCustomNumericValue(elements.customSellSolInput.value);
   if (!isPositiveNumericInput(value)) {
     flagEmptyCustomInput(elements.customSellSolInput, "Enter a SOL amount before selling.");
     return;
@@ -527,6 +550,13 @@ bindImmediateButtonAction(elements.customSellSolButton, () => {
 });
 elements.engineStatusRetry?.addEventListener("click", () => emit("refresh-panel"));
 elements.minimizeButton.addEventListener("click", () => emit("minimize-panel"));
+function openPnlCardFromBalance(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  emit("request-open-pnl-card", {});
+}
+elements.balancePnl?.addEventListener("click", openPnlCardFromBalance);
+elements.balancePnlShare?.addEventListener("click", openPnlCardFromBalance);
 
 if (IS_QUICK_MODE) {
   elements.minimizeButton.style.display = "none";
@@ -570,6 +600,39 @@ function isPositiveNumericInput(value) {
   if (!trimmed) return false;
   const parsed = Number(trimmed);
   return Number.isFinite(parsed) && parsed > 0;
+}
+
+function sanitizeCustomNumericInput(input) {
+  if (!(input instanceof HTMLInputElement)) {
+    return;
+  }
+  const value = input.value;
+  const sanitized = sanitizeCustomNumericValue(value);
+  if (value === sanitized) {
+    return;
+  }
+  const selectionStart = input.selectionStart ?? value.length;
+  const removedBeforeCursor = value
+    .slice(0, selectionStart)
+    .replace(/[\d,.]/g, "")
+    .length;
+  input.value = sanitized;
+  const nextCursor = Math.max(0, selectionStart - removedBeforeCursor);
+  input.setSelectionRange(nextCursor, nextCursor);
+}
+
+function sanitizeCustomNumericValue(value) {
+  return String(value || "").replace(/[^\d,.]/g, "");
+}
+
+function normalizedCustomNumericValue(value) {
+  const normalized = sanitizeCustomNumericValue(value).replace(/,/g, ".");
+  const firstDotIndex = normalized.indexOf(".");
+  if (firstDotIndex < 0) {
+    return normalized;
+  }
+  return normalized.slice(0, firstDotIndex + 1)
+    + normalized.slice(firstDotIndex + 1).replace(/\./g, "");
 }
 
 let inputValidationNoticeTimer = null;
@@ -628,11 +691,10 @@ function bindImmediateButtonAction(button, action) {
 
 function collectPreferences() {
   syncLocalCustomInputs();
-  const activePreset = getActivePreset();
   mirrorWalletSelectionPreferenceOntoPreferences(state.preferences);
   const selectionTarget = selectionTargetFromWalletSelectionPreference(state.preferences);
   return {
-    presetId: state.preferences.presetId || activePreset?.id || "",
+    presetId: state.preferences.presetId || "",
     selectionSource: state.preferences.selectionSource || "group",
     activeWalletGroupId: state.preferences.activeWalletGroupId || "",
     manualWalletKeys: [...(state.preferences.manualWalletKeys || [])],
@@ -645,8 +707,17 @@ function collectPreferences() {
     includeFees: typeof state.preferences.includeFees === "boolean"
       ? state.preferences.includeFees
       : undefined,
-    customSellPercent: elements.customSellPercentInput.value.trim(),
-    customSellSol: elements.customSellSolInput.value.trim()
+    customSellPercent: normalizedCustomNumericValue(elements.customSellPercentInput.value),
+    customSellSol: normalizedCustomNumericValue(elements.customSellSolInput.value)
+  };
+}
+
+function pnlHistoryActionPayload() {
+  const walletStatusMint = String(state.walletStatus?.mint || "").trim();
+  return {
+    ...collectPreferences(),
+    tokenContext: state.tokenContext ? { ...state.tokenContext } : null,
+    ...(walletStatusMint ? { walletStatusMint } : {})
   };
 }
 
@@ -774,7 +845,9 @@ function render() {
   renderExecutionSummary();
   renderShortcutRows();
   renderOptionRows();
+  renderSectionBalanceRows();
   renderBalanceSection();
+  renderWalletButtonBadge();
   renderWalletPopover();
   renderSettingsMenu();
   schedulePanelResize();
@@ -911,6 +984,9 @@ function renderSettingsMenu() {
   }
   if (elements.toggleFeesButton) {
     elements.toggleFeesButton.textContent = includeFees ? "Show gross PnL" : "Show net PnL";
+  }
+  if (elements.sharePnlButton) {
+    elements.sharePnlButton.disabled = !hasMint;
   }
   if (elements.resyncCoinButton) {
     elements.resyncCoinButton.disabled = !hasMint;
@@ -1049,6 +1125,10 @@ function renderShortcutRows() {
   });
 
   memoizedRender("quickSellShortcuts", JSON.stringify(sellAmounts), () => {
+    elements.quickSellShortcuts
+      .querySelectorAll(".sell-shortcut")
+      .forEach((button) => button._trenchSellHoverCleanup?.());
+    clearSellHoverState();
     elements.quickSellShortcuts.innerHTML = "";
     for (const value of sellAmounts) {
       const button = document.createElement("button");
@@ -1070,6 +1150,7 @@ function renderShortcutRows() {
             sellPercent: value
           })
         );
+        installSellHoverBridge(button, () => Number(value));
       }
       elements.quickSellShortcuts.appendChild(button);
     }
@@ -1078,7 +1159,6 @@ function renderShortcutRows() {
 
 function renderSelectors() {
   const activePreset = getActivePreset();
-  state.preferences.presetId = activePreset?.id || "";
   normalizeWalletSelection();
   const active = document.activeElement;
   if (active !== elements.customBuyInput) {
@@ -1186,6 +1266,244 @@ function renderOptionRow(container, items) {
   });
 }
 
+function renderWalletButtonBadge() {
+  if (!elements.walletButtonCount || !elements.walletButton) {
+    return;
+  }
+  // Mirror what `renderExecutionSummary` already uses for the canonical
+  // selected-wallet count so the badge cannot drift from the rest of the
+  // panel (planning items, batch summary, etc.).
+  const selection = normalizeWalletSelectionPreference(state.preferences);
+  const activeGroup = getActiveWalletGroup();
+  const count = selection.selectionSource === "group"
+    ? (activeGroup?.walletKeys?.length || 0)
+    : getSelectedWalletKeys().length;
+  const safeCount = Number.isFinite(count) && count > 0 ? count : 0;
+  const display = safeCount > 99 ? "99+" : String(safeCount);
+  elements.walletButtonCount.textContent = display;
+  elements.walletButtonCount.classList.toggle("is-hidden", safeCount === 0);
+  const tooltip = safeCount === 0
+    ? "Wallets"
+    : safeCount === 1
+      ? "Wallets (1 selected)"
+      : `Wallets (${safeCount} selected)`;
+  elements.walletButton.setAttribute("data-tooltip", tooltip);
+  elements.walletButton.setAttribute("aria-label", tooltip);
+}
+
+function renderSectionBalanceRows() {
+  const summary = computeSectionBalanceSummary();
+
+  if (elements.buyBalanceSol) {
+    elements.buyBalanceSol.textContent = formatSectionSolBalance(summary.solBalance);
+  }
+
+  if (elements.sellBalanceToken) {
+    elements.sellBalanceToken.textContent = formatSectionTokenBalance(summary.tokenBalance);
+  }
+
+  if (elements.sellBalanceTicker) {
+    const ticker = summary.ticker;
+    elements.sellBalanceTicker.textContent = ticker;
+    elements.sellBalanceTicker.classList.toggle("is-hidden", !ticker);
+  }
+
+  const hasValueSol = Number.isFinite(summary.tokenValueSol) && summary.tokenValueSol > 0;
+  if (elements.sellBalanceSeparator) {
+    elements.sellBalanceSeparator.classList.toggle("is-hidden", !hasValueSol);
+  }
+  if (elements.sellBalanceSolWrapper) {
+    elements.sellBalanceSolWrapper.classList.toggle("is-hidden", !hasValueSol);
+  }
+  if (elements.sellBalanceValueSol) {
+    elements.sellBalanceValueSol.textContent = hasValueSol
+      ? formatSectionSolBalance(summary.tokenValueSol)
+      : "0";
+  }
+}
+
+function setSellHoverState(next) {
+  const amount = Number(next?.amount);
+  const sourceElement = next?.sourceElement instanceof HTMLElement ? next.sourceElement : null;
+  const sellUnit = String(next?.sellUnit || "").trim().toLowerCase();
+  if (sellUnit !== "percent" || !Number.isFinite(amount) || amount <= 0 || !sourceElement) {
+    clearSellHoverState(sourceElement);
+    return;
+  }
+  const current = state.sellHover;
+  if (
+    current &&
+    current.sourceElement === sourceElement &&
+    current.sellUnit === sellUnit &&
+    Number(current.amount) === amount
+  ) {
+    return;
+  }
+  state.sellHover = {
+    sellUnit,
+    amount,
+    sourceElement
+  };
+  renderSectionBalanceRows();
+}
+
+function clearSellHoverState(sourceElement = null) {
+  if (!state.sellHover) {
+    return;
+  }
+  if (sourceElement instanceof HTMLElement && state.sellHover.sourceElement !== sourceElement) {
+    return;
+  }
+  state.sellHover = null;
+  renderSectionBalanceRows();
+}
+
+function installSellHoverBridge(button, getAmount) {
+  if (!(button instanceof HTMLElement) || typeof getAmount !== "function") {
+    return () => {};
+  }
+  button._trenchSellHoverCleanup?.();
+  const enter = () => {
+    if (button.disabled) {
+      clearSellHoverState(button);
+      return;
+    }
+    const amount = Number(getAmount());
+    if (!Number.isFinite(amount) || amount <= 0) {
+      clearSellHoverState(button);
+      return;
+    }
+    setSellHoverState({
+      sellUnit: "percent",
+      amount,
+      sourceElement: button
+    });
+  };
+  const clear = () => clearSellHoverState(button);
+  button.addEventListener("mouseenter", enter);
+  button.addEventListener("mousemove", enter);
+  button.addEventListener("mouseleave", clear);
+  button.addEventListener("pointercancel", clear);
+  button.addEventListener("blur", clear, true);
+  button._trenchSellHoverCleanup = () => {
+    button.removeEventListener("mouseenter", enter);
+    button.removeEventListener("mousemove", enter);
+    button.removeEventListener("mouseleave", clear);
+    button.removeEventListener("pointercancel", clear);
+    button.removeEventListener("blur", clear, true);
+    delete button._trenchSellHoverCleanup;
+  };
+  return button._trenchSellHoverCleanup;
+}
+
+function computeSectionBalanceSummary() {
+  const walletStatus = state.walletStatus || {};
+  const wallets = getWalletSourceWallets();
+  const selectedKeys = new Set(getSelectedWalletKeys());
+  const selectedWallets = wallets.filter((wallet) => {
+    if (selectedKeys.size === 0) {
+      return false;
+    }
+    const walletKey = String(wallet?.key || wallet?.envKey || "").trim();
+    return selectedKeys.has(walletKey);
+  });
+
+  const solBalance = selectedWallets.reduce(
+    (sum, wallet) => sum + getWalletBalanceNumber(wallet),
+    0
+  );
+
+  // Prefer the aggregate that the host already computed from the active
+  // selection (walletStatus.tokenBalance / holdingValueSol are filtered by
+  // the same selection on the content side). Falling back to a per-wallet
+  // sum keeps the row stable even if a host refresh is in flight.
+  const aggregateTokenBalance = Number(
+    walletStatus.holdingAmount ??
+      walletStatus.mintBalanceUi ??
+      walletStatus.tokenBalance
+  );
+  let tokenBalance = Number.isFinite(aggregateTokenBalance) && aggregateTokenBalance >= 0
+    ? aggregateTokenBalance
+    : selectedWallets.reduce(
+        (sum, wallet) => sum + getWalletTokenBalanceNumber(wallet),
+        0
+      );
+
+  const holdingValueSol = Number(walletStatus.holdingValueSol ?? walletStatus.holding);
+  let tokenValueSol = Number.isFinite(holdingValueSol) ? holdingValueSol : null;
+
+  const hoverAmount = Number(state.sellHover?.amount);
+  if (
+    state.sellHover?.sellUnit === "percent" &&
+    Number.isFinite(hoverAmount) &&
+    hoverAmount > 0 &&
+    tokenBalance > 0
+  ) {
+    tokenBalance = tokenBalance * hoverAmount / 100;
+    tokenValueSol = Number.isFinite(tokenValueSol) && tokenValueSol > 0
+      ? tokenValueSol * hoverAmount / 100
+      : tokenValueSol;
+  }
+
+  const ticker = sanitizeSectionTicker(state.tokenContext?.symbol);
+
+  return {
+    solBalance,
+    tokenBalance,
+    tokenValueSol,
+    ticker
+  };
+}
+
+function sanitizeSectionTicker(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  // Drop the backend's 4-char-mint placeholder symbol (e.g. "ABCD" from
+  // `short_symbol(&mint)`) so we don't paint a misleading ticker in the
+  // panel when the platform adapter couldn't resolve a real one.
+  const mint = String(state.tokenContext?.mint || "").trim();
+  if (mint && normalized.toUpperCase() === mint.slice(0, normalized.length).toUpperCase()) {
+    return "";
+  }
+  return normalized;
+}
+
+function formatSectionSolBalance(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return "0";
+  }
+  if (amount >= 100) {
+    return amount.toFixed(1);
+  }
+  if (amount >= 1) {
+    return amount.toFixed(2);
+  }
+  return amount.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function formatSectionTokenBalance(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return "0";
+  }
+  if (amount >= 1_000_000_000) {
+    return `${(amount / 1_000_000_000).toFixed(2).replace(/\.?0+$/, "")}B`;
+  }
+  if (amount >= 1_000_000) {
+    return `${(amount / 1_000_000).toFixed(2).replace(/\.?0+$/, "")}M`;
+  }
+  if (amount >= 1_000) {
+    return `${(amount / 1_000).toFixed(2).replace(/\.?0+$/, "")}K`;
+  }
+  if (amount >= 1) {
+    return amount.toFixed(2).replace(/\.?0+$/, "");
+  }
+  return amount.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+
 function renderBalanceSection() {
   const walletStatus = state.walletStatus || {};
   const includeFees = resolveIncludeFeesPreference();
@@ -1198,22 +1516,32 @@ function renderBalanceSection() {
   const pnlPercent = formatPercentMetric(
     includeFees ? walletStatus.pnlPercentNet : walletStatus.pnlPercentGross
   );
+  const pnlDisplay = pnlRequiresQuote ? pnlValue : `${pnlValue} (${pnlPercent})`;
 
   elements.balanceBuy.textContent = buyValue;
   elements.balanceSell.textContent = sellValue;
   elements.balanceHold.textContent = holdValue;
-  elements.balancePnl.textContent = pnlValue;
+  if (elements.balancePnlText) {
+    elements.balancePnlText.textContent = pnlDisplay;
+  } else {
+    elements.balancePnl.textContent = pnlDisplay;
+  }
   if (elements.balancePnlDetail) {
     const quoteError = String(walletStatus.holdingQuoteError || "").trim();
     const shortQuoteError =
       quoteError.length > 72 ? `${quoteError.slice(0, 69)}...` : quoteError;
-    const pnlDetail = pnlRequiresQuote
-      ? (shortQuoteError ? `Quote error: ${shortQuoteError}` : "Live quote needed")
-      : pnlPercent;
-    elements.balancePnlDetail.textContent =
-      pnlDetail + (walletStatus.needsResync ? " • Needs resync" : "");
-    elements.balancePnlDetail.title = quoteError;
+    const pnlStatusParts = [
+      pnlRequiresQuote
+        ? (shortQuoteError ? `Quote error: ${shortQuoteError}` : "Live quote needed")
+        : "",
+      walletStatus.needsResync ? "Needs resync" : ""
+    ].filter(Boolean);
+    const pnlStatus = pnlStatusParts.join(" • ");
+    elements.balancePnl.title = pnlStatus;
+    elements.balancePnlDetail.textContent = "";
+    elements.balancePnlDetail.title = pnlStatus || quoteError;
     elements.balancePnlDetail.classList.toggle("is-negative", pnlValue.startsWith("-"));
+    elements.balancePnlDetail.classList.add("hidden");
   }
   elements.balancePnl.classList.toggle("is-negative", pnlValue.startsWith("-"));
   elements.balancePnl.closest(".balance-stat")?.classList.toggle("is-negative", pnlValue.startsWith("-"));
@@ -1222,14 +1550,14 @@ function renderBalanceSection() {
 function persistPreferences() {
   syncLocalCustomInputs();
   clearIncludeFeesOverrideWhenMatchingDefault();
-  const activePreset = getActivePreset();
   mirrorWalletSelectionPreferenceOntoPreferences(state.preferences);
   const selectionTarget = selectionTargetFromWalletSelectionPreference(state.preferences);
   const payload = {
-    presetId: state.preferences.presetId || activePreset?.id || "",
+    presetId: state.preferences.presetId || "",
     selectionSource: state.preferences.selectionSource || "group",
     activeWalletGroupId: state.preferences.activeWalletGroupId || "",
     manualWalletKeys: [...(state.preferences.manualWalletKeys || [])],
+    selectionRevision: Math.max(0, Number(state.preferences.selectionRevision || 0) || 0),
     selectionTarget,
     selectionMode: selectionTarget.type,
     walletKey: selectionTarget.walletKey || "",
@@ -1420,9 +1748,9 @@ function renderExecutionSummary() {
     : getSelectedWalletKeys().length;
   const selectedWalletKeys = getSelectedWalletKeys();
   const batchPolicy = activeGroup?.batchPolicy || null;
-  const currentBuyAmount = elements.customBuyInput.value.trim()
+  const currentBuyAmount = normalizedCustomNumericValue(elements.customBuyInput.value)
     || quickAmountForSummary(getActivePreset())
-    || state.preferences.buyAmountSol
+    || normalizedCustomNumericValue(state.preferences.buyAmountSol)
     || "";
   const matchingBuyPreview = matchingPreviewForBuySummary(state.preview, {
     buyAmountSol: currentBuyAmount,
@@ -1851,24 +2179,7 @@ function applyWalletSelection(walletKeys) {
 }
 
 function normalizeWalletSelection() {
-  const wallets = state.bootstrap?.wallets || [];
-  const knownWalletKeys = new Set(wallets.map((wallet) => wallet.key));
-  const groups = state.bootstrap?.walletGroups || [];
   const selection = normalizeWalletSelectionPreference(state.preferences);
-  if (groups[0] && !selection.activeWalletGroupId) {
-    selection.activeWalletGroupId = groups[0].id;
-  }
-  if (selection.selectionSource === "group") {
-    const knownGroupIds = new Set(groups.map((group) => group.id));
-    if (!knownGroupIds.has(selection.activeWalletGroupId) && groups[0]) {
-      selection.activeWalletGroupId = groups[0].id;
-    } else if (!knownGroupIds.has(selection.activeWalletGroupId) && wallets[0]) {
-      selection.selectionSource = "manual";
-      selection.manualWalletKeys = [wallets[0].key];
-    }
-  } else {
-    selection.manualWalletKeys = (selection.manualWalletKeys || []).filter((key) => knownWalletKeys.has(key));
-  }
   applyWalletSelectionPreference(selection);
 }
 
@@ -2003,8 +2314,8 @@ function quickAmountForSummary(preset) {
 }
 
 function numericStringsMatch(left, right) {
-  const leftNumber = Number(left || 0);
-  const rightNumber = Number(right || 0);
+  const leftNumber = Number(normalizedCustomNumericValue(left) || 0);
+  const rightNumber = Number(normalizedCustomNumericValue(right) || 0);
   return Number.isFinite(leftNumber) &&
     Number.isFinite(rightNumber) &&
     leftNumber > 0 &&
@@ -2070,7 +2381,7 @@ function formatPerWalletBuyAmount(buyAmountSol, walletCount, batchPolicy, previe
       ? formatSolAmount(min)
       : `${min.toFixed(3)}-${max.toFixed(3)} SOL`;
   }
-  const numericAmount = Number(buyAmountSol || 0);
+  const numericAmount = Number(normalizedCustomNumericValue(buyAmountSol) || 0);
   if (!Number.isFinite(numericAmount) || numericAmount <= 0 || walletCount <= 0) {
     return "--";
   }
@@ -2086,7 +2397,7 @@ function formatBatchSpend(buyAmountSol, walletCount, batchPolicy, preview = null
     const total = plannedAmounts.reduce((sum, value) => sum + value, 0);
     return formatSolAmount(total);
   }
-  const numericAmount = Number(buyAmountSol || 0);
+  const numericAmount = Number(normalizedCustomNumericValue(buyAmountSol) || 0);
   if (!Number.isFinite(numericAmount) || numericAmount <= 0 || walletCount <= 0) {
     return "--";
   }

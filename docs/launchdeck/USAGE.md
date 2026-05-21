@@ -56,7 +56,7 @@ LaunchDeck presets control launchpad defaults:
 
 LaunchDeck presets can be edited inside LaunchDeck and from the extension Options page.
 
-Execution-engine presets are separate. Extension token split/consolidate actions use the active execution preset, not the LaunchDeck preset.
+Execution engine presets are separate. Extension token split/consolidate actions use the active execution preset, not the LaunchDeck preset.
 
 ## Name Presets
 

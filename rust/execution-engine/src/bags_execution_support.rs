@@ -302,6 +302,8 @@ pub struct BagsPoolAddressClassification {
     pub market_key: String,
     pub family: String,
     #[serde(default)]
+    pub is_migrated: bool,
+    #[serde(default)]
     pub config_key: String,
 }
 
@@ -2557,6 +2559,7 @@ pub fn classify_bags_pool_address(
             mint: pool.base_mint.to_string(),
             market_key: market_key.to_string(),
             family: "dbc".to_string(),
+            is_migrated: pool.is_migrated,
             config_key: pool.config.to_string(),
         }));
     }
@@ -2584,6 +2587,7 @@ pub fn classify_bags_pool_address(
             mint,
             market_key: market_key.to_string(),
             family: "damm-v2".to_string(),
+            is_migrated: false,
             config_key: String::new(),
         }));
     }
@@ -2941,6 +2945,32 @@ async fn scan_mint_filtered_damm_routes(
 
 fn is_completed_dbc_pool(pool: &DecodedDbcVirtualPool, _config: &DecodedDbcPoolConfig) -> bool {
     pool.is_migrated
+}
+
+pub async fn cached_bags_dbc_route_is_active(
+    rpc_url: &str,
+    mint: &str,
+    market_key: &str,
+    commitment: &str,
+) -> Result<bool, String> {
+    let mint = Pubkey::from_str(mint)
+        .map_err(|error| format!("Invalid cached Bags DBC route mint: {error}"))?;
+    let market_key = market_key.trim();
+    if market_key.is_empty() {
+        return Ok(false);
+    }
+    let market = Pubkey::from_str(market_key)
+        .map_err(|error| format!("Invalid cached Bags DBC market address: {error}"))?;
+    let Some(pool_bytes) =
+        rpc_fetch_account_data(rpc_url, &market, commitment, "dbc-pool-cache-guard").await?
+    else {
+        return Ok(false);
+    };
+    let pool = decode_dbc_virtual_pool(&pool_bytes)?;
+    if pool.base_mint != mint {
+        return Ok(false);
+    }
+    Ok(!pool.is_migrated)
 }
 
 async fn rpc_fetch_first_dbc_pool_by_mint(

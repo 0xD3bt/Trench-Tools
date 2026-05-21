@@ -49,7 +49,7 @@ Default token path:
 Default VPS path:
 
 ```text
-/opt/launchdeck/.local/trench-tools/default-engine-token.txt
+/root/trench.tools/.local/trench-tools/default-engine-token.txt
 ```
 
 The same token authenticates the extension to:

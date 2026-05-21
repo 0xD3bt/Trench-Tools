@@ -100,7 +100,7 @@ For normal extension use, run `ee` or `both`. You can still use `trench-tools-st
 1. Start the backend first:
    - set `TRENCH_TOOLS_MODE=both` in `.env`, or leave it blank for the same default
    - run `npm start` from the repo root
-2. Get the extension on the PC that runs Chrome/Edge. The simplest path is the latest packaged zip: `trench-tools-extension.zip` from the `extension-latest` GitHub release.
+2. Get the extension on the PC that runs Chrome/Edge. The simplest path is the latest packaged zip: `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest).
 3. Unzip it and keep the unzipped `trench-tools-extension` folder somewhere stable, such as `Documents\Trench Tools Extension`.
 4. Open Chrome or Edge.
 5. Open `chrome://extensions` or `edge://extensions`.
@@ -114,10 +114,10 @@ If you only need quick trading and PnL, set `TRENCH_TOOLS_MODE=ee`. If you want 
 Packaged release path:
 
 ```text
-https://github.com/0xD3bt/Execution-engine/releases/tag/extension-latest
+https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest
 ```
 
-Download `trench-tools-extension.zip`, unzip it, and load the unzipped `trench-tools-extension` folder. Chrome/Edge cannot load the zip directly.
+Download `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest), unzip it, and load the unzipped `trench-tools-extension` folder. Chrome/Edge cannot load the zip directly.
 
 If you already cloned the full repository, you can load this source folder instead:
 
@@ -128,7 +128,7 @@ extension/trench-tools
 To pull only the extension folder from git:
 
 ```bash
-git clone --depth 1 --filter=blob:none --sparse https://github.com/0xD3bt/Execution-engine.git trench-tools-extension-source
+git clone --depth 1 --filter=blob:none --sparse https://github.com/0xD3bt/Trench-Tools.git trench-tools-extension-source
 cd trench-tools-extension-source
 git sparse-checkout set extension/trench-tools
 ```
@@ -146,7 +146,7 @@ cd trench-tools-extension-source
 git pull --ff-only
 ```
 
-If you use the packaged zip, update by downloading the newest `trench-tools-extension.zip`, replacing the old unzipped folder, then clicking reload for Trench Tools on `chrome://extensions` or `edge://extensions`.
+If you use the packaged zip, update by downloading the newest `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest), replacing the old unzipped folder, then clicking reload for Trench Tools on `chrome://extensions` or `edge://extensions`.
 
 ## Connect The Extension
 
@@ -191,9 +191,9 @@ flowchart LR
 
 ### VPS Browser Tunnel
 
-If Trench Tools runs on a VPS and Chrome/Edge runs on your own computer, `127.0.0.1` in the extension means your computer, not the VPS. Use SSH forwards so the browser can reach the private VPS services through local loopback. The VPS path is the recommended real trading setup: it can take about 5 minutes with the bootstrap script, keeps the services private, and gives better performance by placing the runtime near RPC/provider endpoints.
+If Trench Tools runs on a VPS and Chrome/Edge runs on your own computer, `127.0.0.1` in the extension means your computer, not the VPS. Use SSH forwards so the browser can reach the private VPS services through local loopback. The VPS path is the recommended real trading setup: it can take about 5-10 minutes with the bootstrap script, keeps the services private, and gives better performance by placing the runtime near RPC/provider endpoints.
 
-The SSH key is created on your computer and the public key is selected in the VPS provider's deploy settings. The private key stays on your computer. That same SSH setup is used for login, Cursor Remote SSH, and the browser tunnel. See [VPS_SETUP.md](VPS_SETUP.md) for the full first-time flow.
+The SSH key is created on your computer and the public key is selected in the VPS provider's deploy settings. The private key stays on your computer. That same SSH setup is used for login, [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI) Remote SSH, and the browser tunnel. See [VPS_SETUP.md](VPS_SETUP.md) for the full first-time flow.
 
 Recommended SSH config on your local machine:
 
@@ -242,7 +242,7 @@ The default token file is:
 On a VPS installed to the default path:
 
 ```text
-/opt/launchdeck/.local/trench-tools/default-engine-token.txt
+/root/trench.tools/.local/trench-tools/default-engine-token.txt
 ```
 
 The execution engine also exposes an unauthenticated bootstrap probe at:
@@ -365,7 +365,7 @@ After pulling a new repo version:
 6. Click reload on the unpacked Trench Tools extension.
 7. Open Options -> `Global settings` and test the execution host and LaunchDeck host again.
 
-If you installed from the packaged zip instead of a git checkout, download the latest `trench-tools-extension.zip` from the `extension-latest` release, unzip it over or beside the old extension folder, then reload the unpacked extension in Chrome/Edge.
+If you installed from the packaged zip instead of a git checkout, download the latest `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest), unzip it over or beside the old extension folder, then reload the unpacked extension in Chrome/Edge.
 
 Upgrade the extension and local binaries together when a release changes host routes or auth behavior.
 

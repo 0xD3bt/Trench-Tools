@@ -6,22 +6,24 @@ use spl_token_2022_interface::{extension::PodStateWithExtensions, pod::PodMint};
 
 use crate::{
     bonk_native::{
-        BonkPoolAddressClassification, classify_bonk_pool_address, compile_bonk_trade,
+        BonkPoolAddressClassification, cached_bonk_launchpad_route_is_active,
+        classify_bonk_pool_address, compile_bonk_trade, invalidate_bonk_import_contexts_for_mint,
         plan_bonk_trade, plan_bonk_trade_uncached, selector_from_classified_bonk_launchpad_pair,
         selector_from_classified_bonk_raydium_pair,
     },
     extension_api::TradeSettlementAsset,
     meteora_native::{
-        classify_bags_pool_address, compile_meteora_trade, plan_meteora_trade,
-        plan_meteora_trade_uncached,
+        cached_bags_dbc_route_is_active, classify_bags_pool_address, compile_meteora_trade,
+        invalidate_bags_follow_buy_context, invalidate_bags_import_contexts_for_mint,
+        plan_meteora_trade, plan_meteora_trade_uncached,
     },
     mint_warm_cache::{
         PrewarmedMint, build_fingerprint, prewarmed_from_plan, shared_mint_warm_cache,
     },
     pump_native::{
-        bonding_curve_pda, canonical_pump_amm_pool, canonical_pump_amm_pool_for_quote,
-        classify_pump_bonding_curve_address, compile_pump_trade, decode_pump_amm_pool_state,
-        plan_pump_trade, pump_amm_program_id,
+        bonding_curve_pda, cached_pump_bonding_route_is_active, canonical_pump_amm_pool,
+        canonical_pump_amm_pool_for_quote, classify_pump_bonding_curve_address, compile_pump_trade,
+        decode_pump_amm_pool_state, plan_pump_trade, pump_amm_program_id,
     },
     raydium_amm_v4_native::{
         classify_raydium_amm_v4_pool_address, compile_raydium_amm_v4_trade,
@@ -32,8 +34,9 @@ use crate::{
         raydium_cpmm_program_id,
     },
     raydium_launchlab_native::{
-        classify_raydium_launchlab_pool_address, compile_raydium_launchlab_trade,
-        plan_raydium_launchlab_trade, raydium_launchlab_program_id,
+        cached_launchlab_route_is_active, classify_raydium_launchlab_pool_address,
+        compile_raydium_launchlab_trade, plan_raydium_launchlab_trade,
+        raydium_launchlab_program_id,
     },
     rollout::{TradeExecutionBackend, family_warm_enabled, preferred_execution_backend},
     route_index::{RouteIndexEntry, RouteIndexKey, shared_route_index},
@@ -384,51 +387,10 @@ async fn try_classify_route_descriptor(
         }));
     }
     if let Some(classified) = classify_bonk_pool_address(input, &owner, &data)? {
-        let family = match classified.family.as_str() {
-            "launchpad" => TradeVenueFamily::BonkLaunchpad,
-            _ => TradeVenueFamily::BonkRaydium,
-        };
-        let lifecycle = match family {
-            TradeVenueFamily::BonkLaunchpad => TradeLifecycle::PreMigration,
-            TradeVenueFamily::BonkRaydium => TradeLifecycle::PostMigration,
-            _ => unreachable!("bonk route family is restricted"),
-        };
-        let canonical_market_key = classified.pool_id.clone();
-        return Ok(Some(RouteDescriptor {
-            raw_address: input.trim().to_string(),
-            resolved_input_kind: TradeInputKind::Pair,
-            resolved_mint: classified.mint,
-            resolved_pair: Some(classified.pool_id),
-            route_locked_pair: Some(input.trim().to_string()),
-            family: Some(family),
-            lifecycle: Some(lifecycle),
-            quote_asset: planner_quote_asset_from_label(&classified.quote_asset),
-            canonical_market_key: Some(canonical_market_key),
-            non_canonical: false,
-        }));
+        return Ok(Some(descriptor_from_bonk_classification(input, classified)));
     }
     if let Some(classified) = classify_bags_pool_address(input, &owner, &data)? {
-        let family = match classified.family.as_str() {
-            "dbc" => TradeVenueFamily::MeteoraDbc,
-            _ => TradeVenueFamily::MeteoraDammV2,
-        };
-        let lifecycle = match family {
-            TradeVenueFamily::MeteoraDbc => TradeLifecycle::PreMigration,
-            TradeVenueFamily::MeteoraDammV2 => TradeLifecycle::PostMigration,
-            _ => unreachable!("bags route family is restricted"),
-        };
-        return Ok(Some(RouteDescriptor {
-            raw_address: input.trim().to_string(),
-            resolved_input_kind: TradeInputKind::Pair,
-            resolved_mint: classified.mint,
-            resolved_pair: Some(classified.market_key),
-            route_locked_pair: Some(input.trim().to_string()),
-            family: Some(family),
-            lifecycle: Some(lifecycle),
-            quote_asset: None,
-            canonical_market_key: Some(input.trim().to_string()),
-            non_canonical: false,
-        }));
+        return Ok(Some(descriptor_from_bags_classification(input, classified)));
     }
     let token_owner = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
         .map_err(|error| format!("invalid token program id constant: {error}"))?;
@@ -516,6 +478,122 @@ fn route_error(code: &str, message: impl Into<String>) -> String {
 enum RouteCacheMode {
     AllowCached,
     BypassCached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CachedRouteReuseDecision {
+    UseCached,
+    ReplanMigrated,
+    Reject(String),
+}
+
+fn route_cache_allowed(cache_mode: RouteCacheMode, bypass_after_migration: bool) -> bool {
+    matches!(cache_mode, RouteCacheMode::AllowCached) && !bypass_after_migration
+}
+
+pub(crate) async fn guard_cached_route_for_request(
+    rpc_url: &str,
+    request: &TradeRuntimeRequest,
+    resolved_mint: &str,
+    selector: &LifecycleAndCanonicalMarket,
+) -> CachedRouteReuseDecision {
+    guard_cached_route(rpc_url, &request.policy.commitment, resolved_mint, selector).await
+}
+
+async fn guard_cached_route(
+    rpc_url: &str,
+    commitment: &str,
+    resolved_mint: &str,
+    selector: &LifecycleAndCanonicalMarket,
+) -> CachedRouteReuseDecision {
+    if matches!(selector.lifecycle, TradeLifecycle::PostMigration) {
+        return CachedRouteReuseDecision::UseCached;
+    }
+    let active_result = match selector.family {
+        TradeVenueFamily::PumpBondingCurve => {
+            cached_pump_bonding_route_is_active(
+                rpc_url,
+                resolved_mint,
+                &selector.canonical_market_key,
+                commitment,
+            )
+            .await
+        }
+        TradeVenueFamily::RaydiumLaunchLab => {
+            cached_launchlab_route_is_active(
+                rpc_url,
+                resolved_mint,
+                &selector.canonical_market_key,
+                commitment,
+            )
+            .await
+        }
+        TradeVenueFamily::BonkLaunchpad => {
+            cached_bonk_launchpad_route_is_active(
+                rpc_url,
+                resolved_mint,
+                &selector.canonical_market_key,
+                commitment,
+            )
+            .await
+        }
+        TradeVenueFamily::MeteoraDbc => {
+            cached_bags_dbc_route_is_active(
+                rpc_url,
+                resolved_mint,
+                &selector.canonical_market_key,
+                commitment,
+            )
+            .await
+        }
+        _ => return CachedRouteReuseDecision::ReplanMigrated,
+    };
+    match active_result {
+        Ok(true) => CachedRouteReuseDecision::UseCached,
+        Ok(false) => CachedRouteReuseDecision::ReplanMigrated,
+        Err(error) => CachedRouteReuseDecision::Reject(error),
+    }
+}
+
+pub(crate) async fn invalidate_pre_migration_route_context(
+    rpc_url: &str,
+    request: &TradeRuntimeRequest,
+    resolved_mint: &str,
+) {
+    let commitment = &request.policy.commitment;
+    let side = side_label(&request.side);
+    shared_route_index()
+        .invalidate_pre_migration_for_mint(rpc_url, commitment, side, resolved_mint)
+        .await;
+    shared_mint_warm_cache()
+        .invalidate_pre_migration_for_mint(rpc_url, commitment, resolved_mint)
+        .await;
+    if let Some(warm_key) = request.warm_key.as_deref() {
+        shared_mint_warm_cache()
+            .invalidate_by_warm_key(warm_key)
+            .await;
+        invalidate_bags_follow_buy_context(warm_key).await;
+    }
+    for mint in [request.mint.trim(), resolved_mint.trim()] {
+        if mint.is_empty() {
+            continue;
+        }
+        shared_warming_service()
+            .invalidate_pre_migration_selectors_for_mint(rpc_url, commitment, side, mint)
+            .await;
+        shared_warming_service()
+            .invalidate_selectors_for_mint(rpc_url, commitment, side, mint)
+            .await;
+        invalidate_bonk_import_contexts_for_mint(rpc_url, mint).await;
+        invalidate_bags_import_contexts_for_mint(rpc_url, mint).await;
+    }
+}
+
+fn descriptor_clears_pair_lock(descriptor: &RouteDescriptor) -> bool {
+    descriptor.family.is_none()
+        && descriptor.resolved_pair.is_none()
+        && descriptor.route_locked_pair.is_none()
+        && descriptor.canonical_market_key.is_none()
 }
 
 fn rewrite_request_after_normalization(
@@ -763,6 +841,9 @@ fn selector_from_authoritative_descriptor(
     }
     match descriptor.family {
         Some(TradeVenueFamily::BonkLaunchpad) => {
+            if !matches!(descriptor.lifecycle, Some(TradeLifecycle::PreMigration)) {
+                return Ok(None);
+            }
             let Some(pool) = descriptor.resolved_pair.as_deref().or_else(|| {
                 descriptor
                     .canonical_market_key
@@ -783,6 +864,7 @@ fn selector_from_authoritative_descriptor(
                 mint: descriptor.resolved_mint.clone(),
                 pool_id: pool.to_string(),
                 family: "launchpad".to_string(),
+                status: 0,
                 quote_asset: quote_asset.to_string(),
                 creator: String::new(),
                 platform_id: String::new(),
@@ -810,6 +892,91 @@ fn selector_from_authoritative_descriptor(
             selector_from_classified_bonk_raydium_pair(request, pool, quote_asset).map(Some)
         }
         _ => Ok(None),
+    }
+}
+
+fn descriptor_from_bonk_classification(
+    input: &str,
+    classified: BonkPoolAddressClassification,
+) -> RouteDescriptor {
+    if classified.family == "launchpad" && classified.status != 0 {
+        return RouteDescriptor {
+            raw_address: input.trim().to_string(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: classified.mint,
+            resolved_pair: None,
+            route_locked_pair: None,
+            family: None,
+            lifecycle: None,
+            quote_asset: None,
+            canonical_market_key: None,
+            non_canonical: false,
+        };
+    }
+
+    let family = match classified.family.as_str() {
+        "launchpad" => TradeVenueFamily::BonkLaunchpad,
+        _ => TradeVenueFamily::BonkRaydium,
+    };
+    let lifecycle = match family {
+        TradeVenueFamily::BonkLaunchpad => TradeLifecycle::PreMigration,
+        TradeVenueFamily::BonkRaydium => TradeLifecycle::PostMigration,
+        _ => unreachable!("bonk route family is restricted"),
+    };
+    let canonical_market_key = classified.pool_id.clone();
+    RouteDescriptor {
+        raw_address: input.trim().to_string(),
+        resolved_input_kind: TradeInputKind::Pair,
+        resolved_mint: classified.mint,
+        resolved_pair: Some(classified.pool_id),
+        route_locked_pair: Some(input.trim().to_string()),
+        family: Some(family),
+        lifecycle: Some(lifecycle),
+        quote_asset: planner_quote_asset_from_label(&classified.quote_asset),
+        canonical_market_key: Some(canonical_market_key),
+        non_canonical: false,
+    }
+}
+
+fn descriptor_from_bags_classification(
+    input: &str,
+    classified: crate::bags_execution_support::BagsPoolAddressClassification,
+) -> RouteDescriptor {
+    if classified.family == "dbc" && classified.is_migrated {
+        return RouteDescriptor {
+            raw_address: input.trim().to_string(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: classified.mint,
+            resolved_pair: None,
+            route_locked_pair: None,
+            family: None,
+            lifecycle: None,
+            quote_asset: None,
+            canonical_market_key: None,
+            non_canonical: false,
+        };
+    }
+
+    let family = match classified.family.as_str() {
+        "dbc" => TradeVenueFamily::MeteoraDbc,
+        _ => TradeVenueFamily::MeteoraDammV2,
+    };
+    let lifecycle = match family {
+        TradeVenueFamily::MeteoraDbc => TradeLifecycle::PreMigration,
+        TradeVenueFamily::MeteoraDammV2 => TradeLifecycle::PostMigration,
+        _ => unreachable!("bags route family is restricted"),
+    };
+    RouteDescriptor {
+        raw_address: input.trim().to_string(),
+        resolved_input_kind: TradeInputKind::Pair,
+        resolved_mint: classified.mint,
+        resolved_pair: Some(classified.market_key),
+        route_locked_pair: Some(input.trim().to_string()),
+        family: Some(family),
+        lifecycle: Some(lifecycle),
+        quote_asset: None,
+        canonical_market_key: Some(input.trim().to_string()),
+        non_canonical: false,
     }
 }
 
@@ -1032,25 +1199,90 @@ async fn resolve_trade_plan_with_route_index(
 ) -> Result<TradeDispatchPlan, String> {
     let rpc_url = configured_rpc_url();
     let key = route_index_key_for_request(request, &rpc_url);
+    let mut cold_cache_mode = RouteCacheMode::AllowCached;
     if let Some(entry) = shared_route_index().current(&key).await
         && family_warm_enabled(&entry.selector.family)
     {
-        shared_warm_metrics()
-            .record_mint_warm_hit(FamilyBucket::from_venue_family(&entry.selector.family));
-        return build_dispatch_plan_from_route_index_entry(request, entry);
+        match guard_cached_route_for_request(
+            &rpc_url,
+            request,
+            &entry.resolved_mint,
+            &entry.selector,
+        )
+        .await
+        {
+            CachedRouteReuseDecision::UseCached => {
+                shared_warm_metrics()
+                    .record_mint_warm_hit(FamilyBucket::from_venue_family(&entry.selector.family));
+                return build_dispatch_plan_from_route_index_entry(request, entry);
+            }
+            CachedRouteReuseDecision::ReplanMigrated => {
+                invalidate_pre_migration_route_context(&rpc_url, request, &entry.resolved_mint)
+                    .await;
+                cold_cache_mode = RouteCacheMode::BypassCached;
+            }
+            CachedRouteReuseDecision::Reject(error) => return Err(error),
+        }
     }
 
     let flight_lock = shared_route_index().flight_lock(&key).await;
     let result = {
         let _guard = flight_lock.lock().await;
-        if let Some(entry) = shared_route_index().current(&key).await
-            && family_warm_enabled(&entry.selector.family)
-        {
-            shared_warm_metrics()
-                .record_mint_warm_hit(FamilyBucket::from_venue_family(&entry.selector.family));
-            build_dispatch_plan_from_route_index_entry(request, entry)
+        if matches!(cold_cache_mode, RouteCacheMode::AllowCached) {
+            if let Some(entry) = shared_route_index().current(&key).await
+                && family_warm_enabled(&entry.selector.family)
+            {
+                match guard_cached_route_for_request(
+                    &rpc_url,
+                    request,
+                    &entry.resolved_mint,
+                    &entry.selector,
+                )
+                .await
+                {
+                    CachedRouteReuseDecision::UseCached => {
+                        shared_warm_metrics().record_mint_warm_hit(
+                            FamilyBucket::from_venue_family(&entry.selector.family),
+                        );
+                        build_dispatch_plan_from_route_index_entry(request, entry)
+                    }
+                    CachedRouteReuseDecision::ReplanMigrated => {
+                        invalidate_pre_migration_route_context(
+                            &rpc_url,
+                            request,
+                            &entry.resolved_mint,
+                        )
+                        .await;
+                        match resolve_trade_plan_with_cache_mode(
+                            request,
+                            RouteCacheMode::BypassCached,
+                        )
+                        .await
+                        {
+                            Ok(plan) => {
+                                shared_route_index()
+                                    .insert_plan(key.clone(), &plan, "click_migrated_replan")
+                                    .await;
+                                Ok(plan)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    CachedRouteReuseDecision::Reject(error) => Err(error),
+                }
+            } else {
+                match resolve_trade_plan_with_cache_mode(request, cold_cache_mode).await {
+                    Ok(plan) => {
+                        shared_route_index()
+                            .insert_plan(key.clone(), &plan, "click_cold_resolve")
+                            .await;
+                        Ok(plan)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         } else {
-            match resolve_trade_plan_with_cache_mode(request, RouteCacheMode::AllowCached).await {
+            match resolve_trade_plan_with_cache_mode(request, cold_cache_mode).await {
                 Ok(plan) => {
                     shared_route_index()
                         .insert_plan(key.clone(), &plan, "click_cold_resolve")
@@ -1081,6 +1313,7 @@ fn build_dispatch_plan_from_route_index_entry(
     request: &TradeRuntimeRequest,
     entry: RouteIndexEntry,
 ) -> Result<TradeDispatchPlan, String> {
+    let effective_request = normalize_request_for_route_index_entry(request, &entry);
     let descriptor = RouteDescriptor {
         raw_address: entry.submitted_address.clone(),
         resolved_input_kind: entry.input_kind,
@@ -1095,10 +1328,20 @@ fn build_dispatch_plan_from_route_index_entry(
     };
     build_dispatch_plan(
         &entry.submitted_address,
-        request,
+        &effective_request,
         Some(&descriptor),
         entry.selector,
     )
+}
+
+fn normalize_request_for_route_index_entry(
+    request: &TradeRuntimeRequest,
+    entry: &RouteIndexEntry,
+) -> TradeRuntimeRequest {
+    let mut normalized = request.clone();
+    normalized.mint = entry.resolved_mint.clone();
+    normalized.pinned_pool = entry.resolved_pool.clone();
+    normalized
 }
 
 fn route_error_code(error: &str) -> Option<&str> {
@@ -1201,22 +1444,41 @@ async fn resolve_trade_plan_with_cache_mode(
         return plan_trusted_stable_trade(request).await;
     }
 
-    if matches!(cache_mode, RouteCacheMode::AllowCached)
+    let mut bypass_cached_after_migration = false;
+
+    if route_cache_allowed(cache_mode, bypass_cached_after_migration)
         && let Some(cached) = lookup_mint_warm(request, &rpc_url).await
         && let Some(plan) = cached
             .plan
             .as_ref()
             .filter(|plan| family_warm_enabled(&plan.selector.family))
     {
-        let resolved_bucket = FamilyBucket::from_venue_family(&plan.selector.family);
-        shared_warm_metrics().record_mint_warm_hit(resolved_bucket);
-        eprintln!(
-            "[execution-engine][dispatch] mint-warm hit mint={} family={} key={}",
-            request.mint,
-            plan.selector.family.label(),
-            cached.warm_key
-        );
-        return build_dispatch_plan_from_warm_entry(&raw_address, request, &cached);
+        match guard_cached_route_for_request(&rpc_url, request, &cached.mint, &plan.selector).await
+        {
+            CachedRouteReuseDecision::UseCached => {
+                let resolved_bucket = FamilyBucket::from_venue_family(&plan.selector.family);
+                shared_warm_metrics().record_mint_warm_hit(resolved_bucket);
+                eprintln!(
+                    "[execution-engine][dispatch] mint-warm hit mint={} family={} key={}",
+                    request.mint,
+                    plan.selector.family.label(),
+                    cached.warm_key
+                );
+                return build_dispatch_plan_from_warm_entry(&raw_address, request, &cached);
+            }
+            CachedRouteReuseDecision::ReplanMigrated => {
+                let mut invalidation_request = request.clone();
+                invalidation_request.warm_key = Some(cached.warm_key.clone());
+                invalidate_pre_migration_route_context(
+                    &rpc_url,
+                    &invalidation_request,
+                    &cached.mint,
+                )
+                .await;
+                bypass_cached_after_migration = true;
+            }
+            CachedRouteReuseDecision::Reject(error) => return Err(error),
+        }
     }
 
     let (primary_descriptor, companion_descriptor) =
@@ -1266,6 +1528,9 @@ async fn resolve_trade_plan_with_cache_mode(
     {
         match companion_descriptor {
             Ok(Some(companion_descriptor)) => {
+                if descriptor_clears_pair_lock(&companion_descriptor) {
+                    ignore_invalid_companion_pair = true;
+                }
                 descriptor = Some(companion_descriptor);
             }
             Ok(None) => {
@@ -1317,7 +1582,7 @@ async fn resolve_trade_plan_with_cache_mode(
         ));
     }
 
-    if matches!(cache_mode, RouteCacheMode::AllowCached)
+    if route_cache_allowed(cache_mode, bypass_cached_after_migration)
         && (effective_request.mint != request.mint
             || effective_request.pinned_pool != request.pinned_pool)
         && let Some(cached) = lookup_mint_warm(&effective_request, &rpc_url).await
@@ -1331,12 +1596,34 @@ async fn resolve_trade_plan_with_cache_mode(
             .as_ref()
             .map(|plan| plan.selector.clone())
             .expect("checked cached selector");
-        let resolved_bucket = FamilyBucket::from_venue_family(&selector.family);
-        shared_warm_metrics().record_mint_warm_hit(resolved_bucket);
-        return build_dispatch_plan_from_warm_entry(&raw_address, &effective_request, &cached);
+        match guard_cached_route_for_request(&rpc_url, &effective_request, &cached.mint, &selector)
+            .await
+        {
+            CachedRouteReuseDecision::UseCached => {
+                let resolved_bucket = FamilyBucket::from_venue_family(&selector.family);
+                shared_warm_metrics().record_mint_warm_hit(resolved_bucket);
+                return build_dispatch_plan_from_warm_entry(
+                    &raw_address,
+                    &effective_request,
+                    &cached,
+                );
+            }
+            CachedRouteReuseDecision::ReplanMigrated => {
+                let mut invalidation_request = effective_request.clone();
+                invalidation_request.warm_key = Some(cached.warm_key.clone());
+                invalidate_pre_migration_route_context(
+                    &rpc_url,
+                    &invalidation_request,
+                    &cached.mint,
+                )
+                .await;
+                bypass_cached_after_migration = true;
+            }
+            CachedRouteReuseDecision::Reject(error) => return Err(error),
+        }
     }
 
-    if matches!(cache_mode, RouteCacheMode::AllowCached)
+    if route_cache_allowed(cache_mode, bypass_cached_after_migration)
         && let Some(cached) = shared_warming_service()
             .current_selector(
                 &rpc_url,
@@ -1351,17 +1638,40 @@ async fn resolve_trade_plan_with_cache_mode(
         && !cached.is_stale(now_unix_ms())
         && family_warm_enabled(&cached.selector.family)
     {
-        let resolved_bucket = FamilyBucket::from_venue_family(&cached.selector.family);
-        shared_warm_metrics().record_static_cache_hit(resolved_bucket);
-        let dispatch_plan = build_dispatch_plan(
-            &raw_address,
+        match guard_cached_route_for_request(
+            &rpc_url,
             &effective_request,
-            descriptor.as_ref(),
-            cached.selector,
-        )?;
-        cache_dispatch_plan_for_request(&rpc_url, &effective_request, &dispatch_plan).await;
-        return Ok(dispatch_plan);
+            &cached.mint,
+            &cached.selector,
+        )
+        .await
+        {
+            CachedRouteReuseDecision::UseCached => {
+                let resolved_bucket = FamilyBucket::from_venue_family(&cached.selector.family);
+                shared_warm_metrics().record_static_cache_hit(resolved_bucket);
+                let dispatch_plan = build_dispatch_plan(
+                    &raw_address,
+                    &effective_request,
+                    descriptor.as_ref(),
+                    cached.selector,
+                )?;
+                cache_dispatch_plan_for_request(&rpc_url, &effective_request, &dispatch_plan).await;
+                return Ok(dispatch_plan);
+            }
+            CachedRouteReuseDecision::ReplanMigrated => {
+                invalidate_pre_migration_route_context(&rpc_url, &effective_request, &cached.mint)
+                    .await;
+                bypass_cached_after_migration = true;
+            }
+            CachedRouteReuseDecision::Reject(error) => return Err(error),
+        }
     }
+
+    let effective_cache_mode = if bypass_cached_after_migration {
+        RouteCacheMode::BypassCached
+    } else {
+        cache_mode
+    };
 
     if let Some(authoritative_descriptor) = descriptor.as_ref().filter(|value| {
         value.family.is_some()
@@ -1396,7 +1706,7 @@ async fn resolve_trade_plan_with_cache_mode(
             return Ok(dispatch_plan);
         }
         if let Some(selector) =
-            resolve_family_plan(&rpc_url, &effective_request, family, cache_mode).await?
+            resolve_family_plan(&rpc_url, &effective_request, family, effective_cache_mode).await?
         {
             let dispatch_plan = build_dispatch_plan(
                 &raw_address,
@@ -1435,7 +1745,13 @@ async fn resolve_trade_plan_with_cache_mode(
             effective_request.mint,
             preferred_family.label()
         );
-        match resolve_family_plan(&rpc_url, &effective_request, &preferred_family, cache_mode).await
+        match resolve_family_plan(
+            &rpc_url,
+            &effective_request,
+            &preferred_family,
+            effective_cache_mode,
+        )
+        .await
         {
             Ok(Some(selector)) => {
                 let dispatch_plan = build_dispatch_plan(
@@ -1473,8 +1789,12 @@ async fn resolve_trade_plan_with_cache_mode(
             "[execution-engine][dispatch] mint-fallback mode=priority-race mint={}",
             effective_request.mint
         );
-        race_no_suffix_family_plans_with_optional_prefetch(&rpc_url, &effective_request, cache_mode)
-            .await?
+        race_no_suffix_family_plans_with_optional_prefetch(
+            &rpc_url,
+            &effective_request,
+            effective_cache_mode,
+        )
+        .await?
     };
 
     if let Some(selector) = resolved_selector {
@@ -2329,6 +2649,227 @@ mod tests {
         assert_eq!(
             selector.wrapper_action,
             crate::trade_planner::WrapperAction::BonkLaunchpadUsd1Buy
+        );
+    }
+
+    #[test]
+    fn migrated_bonk_launchpad_descriptor_drops_pre_migration_route_lock() {
+        let descriptor = descriptor_from_bonk_classification(
+            "LaunchpadPool111",
+            BonkPoolAddressClassification {
+                mint: "Mint111".to_string(),
+                pool_id: "LaunchpadPool111".to_string(),
+                family: "launchpad".to_string(),
+                status: 1,
+                quote_asset: "usd1".to_string(),
+                creator: String::new(),
+                platform_id: String::new(),
+                config_id: String::new(),
+            },
+        );
+
+        assert_eq!(descriptor.resolved_mint, "Mint111");
+        assert_eq!(descriptor.resolved_input_kind, TradeInputKind::Pair);
+        assert!(descriptor.resolved_pair.is_none());
+        assert!(descriptor.route_locked_pair.is_none());
+        assert!(descriptor.family.is_none());
+        assert!(descriptor.lifecycle.is_none());
+        assert!(descriptor.canonical_market_key.is_none());
+    }
+
+    #[test]
+    fn migrated_bags_dbc_descriptor_drops_pre_migration_route_lock() {
+        let descriptor = descriptor_from_bags_classification(
+            "DbcPool111",
+            crate::bags_execution_support::BagsPoolAddressClassification {
+                mint: "Mint111".to_string(),
+                market_key: "DbcPool111".to_string(),
+                family: "dbc".to_string(),
+                is_migrated: true,
+                config_key: "Config111".to_string(),
+            },
+        );
+
+        assert_eq!(descriptor.resolved_mint, "Mint111");
+        assert_eq!(descriptor.resolved_input_kind, TradeInputKind::Pair);
+        assert!(descriptor_clears_pair_lock(&descriptor));
+        assert!(descriptor.family.is_none());
+        assert!(descriptor.lifecycle.is_none());
+    }
+
+    #[test]
+    fn migrated_bags_dbc_companion_pair_clears_pinned_pool() {
+        let request = TradeRuntimeRequest {
+            mint: "Mint111".to_string(),
+            pinned_pool: Some("DbcPool111".to_string()),
+            ..test_runtime_request()
+        };
+        let mut descriptor = descriptor_from_bags_classification(
+            "DbcPool111",
+            crate::bags_execution_support::BagsPoolAddressClassification {
+                mint: "Mint111".to_string(),
+                market_key: "DbcPool111".to_string(),
+                family: "dbc".to_string(),
+                is_migrated: true,
+                config_key: "Config111".to_string(),
+            },
+        );
+        descriptor.raw_address = request.mint.clone();
+        descriptor.resolved_input_kind = TradeInputKind::Mint;
+
+        let mut effective_request =
+            rewrite_request_after_normalization(&request, Some(&descriptor));
+        if descriptor_clears_pair_lock(&descriptor) {
+            effective_request.pinned_pool = None;
+        }
+
+        assert_eq!(effective_request.mint, "Mint111");
+        assert!(effective_request.pinned_pool.is_none());
+    }
+
+    #[test]
+    fn route_index_entry_reuse_ignores_stale_submitted_pair_lock() {
+        let request = TradeRuntimeRequest {
+            mint: "Mint111".to_string(),
+            pinned_pool: Some("OldPreMigrationPool111".to_string()),
+            ..test_runtime_request()
+        };
+        let selector = test_bonk_selector("NewPostMigrationPool111");
+        let entry = RouteIndexEntry {
+            submitted_address: request.mint.clone(),
+            input_kind: TradeInputKind::Mint,
+            resolved_mint: "Mint111".to_string(),
+            resolved_pool: Some("NewPostMigrationPool111".to_string()),
+            selector,
+            non_canonical: false,
+            source: "test".to_string(),
+            fetched_at_unix_ms: 1,
+            last_used_at_unix_ms: 1,
+        };
+
+        let plan = build_dispatch_plan_from_route_index_entry(&request, entry)
+            .expect("cached migrated route should ignore stale submitted pin");
+
+        assert_eq!(plan.resolved_mint, "Mint111");
+        assert_eq!(
+            plan.resolved_pinned_pool.as_deref(),
+            Some("NewPostMigrationPool111")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_pre_migration_route_context_clears_route_caches() {
+        let mut request = test_runtime_request();
+        request.mint = "PoolInvalidate111".to_string();
+        request.pinned_pool = Some("PoolInvalidate111".to_string());
+        let rpc_url = "test-invalidate-pre-migration";
+        let resolved_mint = "MintInvalidate111";
+        let mut selector = test_bonk_selector("PoolInvalidate111");
+        selector.lifecycle = crate::trade_planner::TradeLifecycle::PreMigration;
+        selector.family = TradeVenueFamily::BonkLaunchpad;
+        selector.wrapper_action = crate::trade_planner::WrapperAction::BonkLaunchpadUsd1Buy;
+        selector.direct_protocol_target = Some("bonk-launchpad".to_string());
+        let plan = TradeDispatchPlan {
+            adapter: TradeAdapter::BonkNative,
+            selector: selector.clone(),
+            execution_backend: crate::rollout::TradeExecutionBackend::Native,
+            raw_address: request.mint.clone(),
+            resolved_input_kind: TradeInputKind::Pair,
+            resolved_mint: resolved_mint.to_string(),
+            resolved_pinned_pool: request.pinned_pool.clone(),
+            non_canonical: false,
+        };
+
+        let route_key = route_index_key_for_request(&request, rpc_url);
+        crate::route_index::shared_route_index()
+            .insert_plan(route_key.clone(), &plan, "test")
+            .await;
+        assert!(
+            crate::route_index::shared_route_index()
+                .current(&route_key)
+                .await
+                .is_some()
+        );
+
+        let fingerprint = crate::mint_warm_cache::build_fingerprint(
+            resolved_mint,
+            request.pinned_pool.as_deref(),
+            rpc_url,
+            &request.policy.commitment,
+            &route_policy_label(&request),
+            false,
+        );
+        crate::mint_warm_cache::shared_mint_warm_cache()
+            .insert(
+                fingerprint.clone(),
+                crate::mint_warm_cache::prewarmed_from_plan(
+                    &fingerprint,
+                    request.pinned_pool.clone(),
+                    &plan,
+                ),
+            )
+            .await;
+        assert!(
+            crate::mint_warm_cache::shared_mint_warm_cache()
+                .current(&fingerprint)
+                .await
+                .is_some()
+        );
+
+        crate::warming_service::shared_warming_service()
+            .cache_selector(
+                rpc_url,
+                &request.policy.commitment,
+                side_label(&request.side),
+                &route_policy_label(&request),
+                resolved_mint,
+                request.pinned_pool.as_deref(),
+                false,
+                selector,
+            )
+            .await;
+        assert!(
+            crate::warming_service::shared_warming_service()
+                .current_selector(
+                    rpc_url,
+                    &request.policy.commitment,
+                    side_label(&request.side),
+                    &route_policy_label(&request),
+                    resolved_mint,
+                    request.pinned_pool.as_deref(),
+                    false,
+                )
+                .await
+                .is_some()
+        );
+
+        invalidate_pre_migration_route_context(rpc_url, &request, resolved_mint).await;
+
+        assert!(
+            crate::route_index::shared_route_index()
+                .current(&route_key)
+                .await
+                .is_none()
+        );
+        assert!(
+            crate::mint_warm_cache::shared_mint_warm_cache()
+                .current(&fingerprint)
+                .await
+                .is_none()
+        );
+        assert!(
+            crate::warming_service::shared_warming_service()
+                .current_selector(
+                    rpc_url,
+                    &request.policy.commitment,
+                    side_label(&request.side),
+                    &route_policy_label(&request),
+                    resolved_mint,
+                    request.pinned_pool.as_deref(),
+                    false,
+                )
+                .await
+                .is_none()
         );
     }
 

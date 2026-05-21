@@ -765,6 +765,24 @@ async fn fetch_bonding_curve_state(
     decode_bonding_curve_state(&account_data)
 }
 
+pub(crate) async fn cached_pump_bonding_route_is_active(
+    rpc_url: &str,
+    mint: &str,
+    market_key: &str,
+    commitment: &str,
+) -> Result<bool, String> {
+    let mint = parse_pubkey(mint, "Pump bonding route mint")?;
+    let bonding_curve = bonding_curve_pda(&mint)?;
+    if !market_key.trim().is_empty() && market_key.trim() != bonding_curve.to_string() {
+        return Ok(false);
+    }
+    match fetch_bonding_curve_state(rpc_url, &mint, commitment).await {
+        Ok(curve) => Ok(!curve.complete),
+        Err(error) if error.contains("was not found") => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 async fn fetch_owned_pump_bonding_curve_token_mints(
     rpc_url: &str,
     bonding_curve: &str,
@@ -3763,6 +3781,100 @@ fn build_create_token_ata_instruction(
     ))
 }
 
+#[allow(dead_code, clippy::too_many_arguments)]
+fn build_buy_v2_instruction(
+    global: &PumpGlobalState,
+    mint: &Pubkey,
+    creator_vault_authority: &Pubkey,
+    user: &Pubkey,
+    base_amount_out: u64,
+    max_quote_cost: u64,
+    base_token_program: &Pubkey,
+    quote_meta: &PumpQuoteAssetMeta,
+    mayhem_mode: bool,
+) -> Result<Instruction, String> {
+    let pump_program = pump_program_id()?;
+    let bonding_curve = bonding_curve_pda(mint)?;
+    let creator_vault = creator_vault_pda(creator_vault_authority)?;
+    let user_volume_accumulator = user_volume_accumulator_pda(user)?;
+    let fee_recipient = select_buy_fee_recipient(global, mayhem_mode);
+    let buyback_fee_recipient = select_pump_buyback_fee_recipient(global);
+    let associated_base_bonding_curve =
+        get_associated_token_address_with_program_id(&bonding_curve, mint, base_token_program);
+    let associated_quote_bonding_curve = get_associated_token_address_with_program_id(
+        &bonding_curve,
+        &quote_meta.mint,
+        &quote_meta.token_program,
+    );
+    let associated_base_user =
+        get_associated_token_address_with_program_id(user, mint, base_token_program);
+    let associated_quote_user = get_associated_token_address_with_program_id(
+        user,
+        &quote_meta.mint,
+        &quote_meta.token_program,
+    );
+    let associated_creator_vault = get_associated_token_address_with_program_id(
+        &creator_vault,
+        &quote_meta.mint,
+        &quote_meta.token_program,
+    );
+    let associated_user_volume_accumulator = get_associated_token_address_with_program_id(
+        &user_volume_accumulator,
+        &quote_meta.mint,
+        &quote_meta.token_program,
+    );
+    let mut data = vec![184, 23, 238, 97, 103, 197, 211, 61];
+    data.extend_from_slice(&base_amount_out.to_le_bytes());
+    data.extend_from_slice(&max_quote_cost.to_le_bytes());
+    Ok(Instruction {
+        program_id: pump_program,
+        accounts: vec![
+            AccountMeta::new_readonly(global_pda()?, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(quote_meta.mint, false),
+            AccountMeta::new_readonly(*base_token_program, false),
+            AccountMeta::new_readonly(quote_meta.token_program, false),
+            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+            AccountMeta::new(fee_recipient, false),
+            AccountMeta::new(
+                get_associated_token_address_with_program_id(
+                    &fee_recipient,
+                    &quote_meta.mint,
+                    &quote_meta.token_program,
+                ),
+                false,
+            ),
+            AccountMeta::new(buyback_fee_recipient, false),
+            AccountMeta::new(
+                get_associated_token_address_with_program_id(
+                    &buyback_fee_recipient,
+                    &quote_meta.mint,
+                    &quote_meta.token_program,
+                ),
+                false,
+            ),
+            AccountMeta::new(bonding_curve, false),
+            AccountMeta::new(associated_base_bonding_curve, false),
+            AccountMeta::new(associated_quote_bonding_curve, false),
+            AccountMeta::new(*user, true),
+            AccountMeta::new(associated_base_user, false),
+            AccountMeta::new(associated_quote_user, false),
+            AccountMeta::new(creator_vault, false),
+            AccountMeta::new(associated_creator_vault, false),
+            AccountMeta::new(fee_sharing_config_pda(mint)?, false),
+            AccountMeta::new_readonly(global_volume_accumulator_pda()?, false),
+            AccountMeta::new(user_volume_accumulator, false),
+            AccountMeta::new(associated_user_volume_accumulator, false),
+            AccountMeta::new_readonly(fee_config_pda()?, false),
+            AccountMeta::new_readonly(pump_fee_program_id()?, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(event_authority_pda(&pump_program), false),
+            AccountMeta::new_readonly(pump_program, false),
+        ],
+        data,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_buy_exact_quote_in_v2_instruction(
     global: &PumpGlobalState,
@@ -4895,6 +5007,42 @@ mod tests {
         )
         .expect("sell instruction");
 
+        assert_v2_bonding_curve_token_program_accounts(&instruction, &mint, &user, &token_program);
+    }
+
+    #[test]
+    fn bonding_curve_buy_v2_shape_matches_public_idl() {
+        let global = sample_global();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let token_program = token_2022_program_id().expect("token 2022 program");
+        let quote_meta = pump_quote_asset_meta(&usdc_mint().expect("usdc mint")).expect("quote meta");
+        let instruction = build_buy_v2_instruction(
+            &global,
+            &mint,
+            &creator,
+            &user,
+            1_000_000,
+            100_000_000,
+            &token_program,
+            &quote_meta,
+            false,
+        )
+        .expect("buy v2 instruction");
+
+        assert_eq!(instruction.program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(instruction.accounts.len(), 27);
+        assert_eq!(&instruction.data[..8], &[184, 23, 238, 97, 103, 197, 211, 61]);
+        assert_eq!(&instruction.data[8..16], &1_000_000u64.to_le_bytes());
+        assert_eq!(&instruction.data[16..24], &100_000_000u64.to_le_bytes());
+        assert_eq!(instruction.accounts[2].pubkey, quote_meta.mint);
+        assert_eq!(instruction.accounts[3].pubkey, token_program);
+        assert_eq!(instruction.accounts[4].pubkey, quote_meta.token_program);
+        assert_eq!(
+            instruction.accounts[19].pubkey,
+            global_volume_accumulator_pda().expect("global volume")
+        );
         assert_v2_bonding_curve_token_program_accounts(&instruction, &mint, &user, &token_program);
     }
 

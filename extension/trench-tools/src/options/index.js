@@ -13,12 +13,20 @@ import {
 import { callBackground } from "../shared/background-rpc.js";
 import { getSiteFeatures, saveSiteFeatures } from "../shared/site-features.js";
 import {
+  QUICK_BUY_BUTTON_DEFAULT_BACKGROUND,
+  QUICK_BUY_BUTTON_DEFAULT_BORDER,
+  QUICK_BUY_BUTTON_DEFAULT_COLOR,
+  QUICK_BUY_BUTTON_SLOTS,
   SOUND_CUSTOM_ID,
   SOUND_CUSTOM_MAX_BYTES,
   SOUND_TEMPLATES,
   defaultAppearance,
   getAppearance,
   normalizeAppearance,
+  normalizeQuickBuyButtonBackgroundColor,
+  normalizeQuickBuyButtonBorderColor,
+  normalizeQuickBuyButtonColor,
+  resolveQuickBuyButtonDesign,
   resolveSoundUrl,
   saveAppearance
 } from "../shared/appearance.js";
@@ -28,6 +36,7 @@ import {
   RUNTIME_DIAGNOSTICS_REVISION_KEY,
   RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY
 } from "../shared/constants.js";
+import { isEeOnlyTrenchToolsMode } from "../shared/runtime-mode.js";
 
 const BOOTSTRAP_REVISION_KEY = "trenchTools.bootstrapRevision";
 const WALLET_STATUS_REVISION_KEY = "trenchTools.walletStatusRevision";
@@ -66,7 +75,8 @@ const state = {
   walletEditModal: createEmptyWalletEditModalState(),
   createGroupModal: createEmptyCreateGroupModalState(),
   engineSettingsDirty: false,
-  runtimeDiagnosticToastKeys: new Set()
+  runtimeDiagnosticToastKeys: new Set(),
+  axiomPulseSecondButtonTablesDraft: null
 };
 
 const elements = {
@@ -198,6 +208,16 @@ const elements = {
   siteAxiomLaunchdeck: document.getElementById("site-axiom-launchdeck"),
   siteAxiomPulseQb: document.getElementById("site-axiom-pulse-qb"),
   siteAxiomPulsePanel: document.getElementById("site-axiom-pulse-panel"),
+  siteAxiomPulseQuickBuyButtonCount: document.getElementById("site-axiom-pulse-quick-buy-button-count"),
+  siteAxiomPulseSecondButtonTableNewPairs: document.getElementById(
+    "site-axiom-pulse-second-button-table-new-pairs"
+  ),
+  siteAxiomPulseSecondButtonTableFinalStretch: document.getElementById(
+    "site-axiom-pulse-second-button-table-final-stretch"
+  ),
+  siteAxiomPulseSecondButtonTableMigrated: document.getElementById(
+    "site-axiom-pulse-second-button-table-migrated"
+  ),
   siteAxiomPulseVamp: document.getElementById("site-axiom-pulse-vamp"),
   siteAxiomVampIconMode: document.getElementById("site-axiom-vamp-icon-mode"),
   siteAxiomPulseVampMode: document.getElementById("site-axiom-pulse-vamp-mode"),
@@ -260,8 +280,21 @@ const elements = {
     slider: document.getElementById("appearance-sound-volume-slider"),
     input: document.getElementById("appearance-sound-volume-input"),
     value: document.getElementById("appearance-sound-volume-value")
+  },
+  appearanceQuickBuyButtons: buildAppearanceQuickBuyElements(),
+  appearanceColorPopover: {
+    root: document.getElementById("appearance-color-popover"),
+    preview: document.querySelector("#appearance-color-popover .appearance-color-popover-preview"),
+    color: document.getElementById("appearance-color-popover-color"),
+    hex: document.getElementById("appearance-color-popover-hex"),
+    alphaField: document.getElementById("appearance-color-popover-alpha-field"),
+    alpha: document.getElementById("appearance-color-popover-alpha"),
+    alphaValue: document.getElementById("appearance-color-popover-alpha-value"),
+    close: document.getElementById("appearance-color-popover-close")
   }
 };
+
+bindPresetNumericInputSanitizers();
 
 function buildAppearanceSoundElements(side) {
   const prefix = `appearance-${side}-sound`;
@@ -276,6 +309,33 @@ function buildAppearanceSoundElements(side) {
     customInput: document.getElementById(`${prefix}-custom-input`),
     status: document.getElementById(`${prefix}-status`)
   };
+}
+
+function buildAppearanceQuickBuyElements() {
+  const result = {};
+  const logoImageUrl = `url(${chrome.runtime.getURL("assets/TT-compact.png")})`;
+  for (const slot of [1, 2]) {
+    const previewLogo = document.querySelector(
+      `#appearance-quick-buy-${slot}-preview-button .appearance-quick-buy-preview-logo`
+    );
+    if (previewLogo instanceof HTMLElement) {
+      previewLogo.style.setProperty("--quick-buy-logo-image", logoImageUrl);
+    }
+    result[slot] = {
+      slot,
+      panel: document.querySelector(`.appearance-quick-buy-panel[data-quick-buy-slot="${slot}"]`),
+      backgroundSwatch: document.getElementById(`appearance-quick-buy-${slot}-background-swatch`),
+      colorSwatch: document.getElementById(`appearance-quick-buy-${slot}-color-swatch`),
+      borderSwatch: document.getElementById(`appearance-quick-buy-${slot}-border-swatch`),
+      reset: document.getElementById(`appearance-quick-buy-${slot}-reset`),
+      previewButton: document.getElementById(`appearance-quick-buy-${slot}-preview-button`),
+      previewLogo,
+      previewAmount: document.querySelector(
+        `#appearance-quick-buy-${slot}-preview-button .appearance-quick-buy-preview-amount`
+      )
+    };
+  }
+  return result;
 }
 
 const PROVIDER_LABELS = {
@@ -402,15 +462,64 @@ function defaultTipForProvider(provider) {
 }
 
 function normalizePriorityFeeForProvider(provider, value) {
-  const trimmed = String(value || "").trim();
+  const trimmed = normalizedPresetNumericValue(value);
   if (!providerRequiresPriorityFee(provider)) return trimmed;
   return trimmed || defaultPriorityFeeForProvider(provider);
 }
 
 function normalizeTipForProvider(provider, value) {
   if (!providerSupportsTip(provider)) return "";
-  const trimmed = String(value || "").trim();
+  const trimmed = normalizedPresetNumericValue(value);
   return trimmed || defaultTipForProvider(provider);
+}
+
+function sanitizePresetNumericValue(value) {
+  return String(value || "").replace(/[^\d,.]/g, "");
+}
+
+function normalizedPresetNumericValue(value) {
+  let normalized = sanitizePresetNumericValue(value).replace(/,/g, ".");
+  const firstDotIndex = normalized.indexOf(".");
+  if (firstDotIndex >= 0) {
+    normalized =
+      normalized.slice(0, firstDotIndex + 1) +
+      normalized.slice(firstDotIndex + 1).replace(/\./g, "");
+  }
+  if (normalized.startsWith(".")) {
+    normalized = `0${normalized}`;
+  }
+  if (normalized.includes(".")) {
+    const [whole, fractional] = normalized.split(".");
+    return `${whole.replace(/^0+(?=\d)/, "") || "0"}.${fractional}`;
+  }
+  return normalized.replace(/^0+(?=\d)/, "");
+}
+
+function sanitizePresetNumericInput(input) {
+  if (!(input instanceof HTMLInputElement)) return;
+  const value = input.value;
+  const sanitized = sanitizePresetNumericValue(value);
+  if (value === sanitized) return;
+  const selectionStart = input.selectionStart ?? value.length;
+  const removedBeforeCursor = value
+    .slice(0, selectionStart)
+    .replace(/[\d,.]/g, "")
+    .length;
+  input.value = sanitized;
+  const nextCursor = Math.max(0, selectionStart - removedBeforeCursor);
+  input.setSelectionRange(nextCursor, nextCursor);
+}
+
+function bindPresetNumericInputSanitizers() {
+  document
+    .querySelectorAll("#preset-modal input[inputmode='decimal'], #launchdeck-preset-modal input[inputmode='decimal']")
+    .forEach((input) => {
+      input.setAttribute("autocomplete", "off");
+      input.setAttribute("autocorrect", "off");
+      input.setAttribute("autocapitalize", "off");
+      input.setAttribute("spellcheck", "false");
+      input.addEventListener("input", () => sanitizePresetNumericInput(input));
+    });
 }
 
 function formatMinSol(value) {
@@ -1143,6 +1252,10 @@ for (const input of [
   elements.siteAxiomLaunchdeck,
   elements.siteAxiomPulseQb,
   elements.siteAxiomPulsePanel,
+  elements.siteAxiomPulseQuickBuyButtonCount,
+  elements.siteAxiomPulseSecondButtonTableNewPairs,
+  elements.siteAxiomPulseSecondButtonTableFinalStretch,
+  elements.siteAxiomPulseSecondButtonTableMigrated,
   elements.siteAxiomPulseVamp,
   elements.siteAxiomVampIconMode,
   elements.siteAxiomPulseVampMode,
@@ -1159,6 +1272,15 @@ for (const input of [
 ]) {
   if (!input) continue;
   input.addEventListener("change", () => {
+    if (input === elements.siteAxiomPulseQuickBuyButtonCount) {
+      syncAxiomPulseSecondButtonTableControls();
+    } else if (
+      input === elements.siteAxiomPulseSecondButtonTableNewPairs ||
+      input === elements.siteAxiomPulseSecondButtonTableFinalStretch ||
+      input === elements.siteAxiomPulseSecondButtonTableMigrated
+    ) {
+      updateAxiomPulseSecondButtonTablesDraftFromControls();
+    }
     void persistSiteSettings();
   });
 }
@@ -1347,7 +1469,7 @@ async function persistSanitizedLaunchdeckConfig(config) {
   }
 }
 
-function applyLaunchdeckSettings(payload, error = null) {
+function applyLaunchdeckSettings(payload, error = null, options = {}) {
   if (payload && typeof payload === "object") {
     const rawConfig = payload.config || state.launchdeckConfig;
     const normalizedConfig = normalizeLaunchdeckConfig(rawConfig);
@@ -1361,6 +1483,10 @@ function applyLaunchdeckSettings(payload, error = null) {
   }
   state.launchdeckSettingsPayload = null;
   state.launchdeckConfig = createDefaultLaunchdeckConfig();
+  if (isEeOnlyTrenchToolsMode(options.trenchToolsMode)) {
+    elements.launchdeckConnectionStatus.textContent = "LaunchDeck disabled in EE-only mode.";
+    return;
+  }
   elements.launchdeckConnectionStatus.textContent = formatLaunchdeckConnectionStatusMessage(error);
 }
 
@@ -1398,14 +1524,23 @@ async function refreshEngineData() {
   // payload and connection status through the dedicated LaunchDeck host.
   setStatus("Checking execution and LaunchDeck hosts...");
   state.authBootstrap = null;
-  const launchdeckSettingsPromise = fetchLaunchdeckSettingsPayload()
-    .then((payload) => ({ payload, error: null }))
-    .catch((error) => ({ payload: null, error }));
   try {
     state.authBootstrap = await callBackground("trench:get-auth-bootstrap");
   } catch (error) {
     state.authBootstrap = null;
   }
+  let modeSnapshot = { trenchToolsMode: "both" };
+  try {
+    modeSnapshot = await callBackground("trench:get-trench-tools-mode");
+  } catch (_error) {
+    modeSnapshot = { trenchToolsMode: "both" };
+  }
+  const initialTrenchToolsMode = modeSnapshot?.trenchToolsMode;
+  const launchdeckSettingsPromise = isEeOnlyTrenchToolsMode(initialTrenchToolsMode)
+    ? Promise.resolve({ payload: null, error: null })
+    : fetchLaunchdeckSettingsPayload()
+      .then((payload) => ({ payload, error: null }))
+      .catch((error) => ({ payload: null, error }));
   try {
     const [health, bootstrap, settings, presets, wallets, walletGroups, authTokens] = await Promise.all([
       callBackground("trench:get-health"),
@@ -1416,7 +1551,10 @@ async function refreshEngineData() {
       callBackground("trench:list-wallet-groups"),
       callBackground("trench:list-auth-tokens")
     ]);
-    const launchdeckSettings = await launchdeckSettingsPromise;
+    const trenchToolsMode = health?.trenchToolsMode || initialTrenchToolsMode;
+    const launchdeckSettings = isEeOnlyTrenchToolsMode(trenchToolsMode)
+      ? { payload: null, error: null }
+      : await launchdeckSettingsPromise;
     state.health = health;
     state.bootstrap = normalizeBootstrap(bootstrap);
     state.settings = normalizeSettings(settings || bootstrap.settings || {});
@@ -1424,7 +1562,9 @@ async function refreshEngineData() {
     state.wallets = wallets.map((wallet) => normalizeWallet(wallet));
     state.walletGroups = walletGroups.map((group) => normalizeWalletGroup(group));
     state.authTokens = Array.isArray(authTokens) ? authTokens : [];
-    applyLaunchdeckSettings(launchdeckSettings.payload, launchdeckSettings.error);
+    applyLaunchdeckSettings(launchdeckSettings.payload, launchdeckSettings.error, {
+      trenchToolsMode
+    });
     setStatus(`Connected to ${health.engineVersion}`);
     elements.connectionStatus.textContent = formatConnectionStatusMessage();
     renderAll();
@@ -1433,7 +1573,9 @@ async function refreshEngineData() {
     const launchdeckSettings = await launchdeckSettingsPromise;
     // Keep the last successfully loaded state on refresh failures so a
     // completed save doesn't appear to revert back to defaults.
-    applyLaunchdeckSettings(launchdeckSettings.payload, launchdeckSettings.error);
+    applyLaunchdeckSettings(launchdeckSettings.payload, launchdeckSettings.error, {
+      trenchToolsMode: state.health?.trenchToolsMode || initialTrenchToolsMode
+    });
     setStatus(error.message, true);
     elements.connectionStatus.textContent = formatConnectionStatusMessage(error);
     renderAll();
@@ -1932,6 +2074,32 @@ function renderSiteSettings() {
   }
   elements.siteAxiomPulseQb.checked = Boolean(siteFeatures.axiom?.pulseButton);
   elements.siteAxiomPulsePanel.checked = Boolean(siteFeatures.axiom?.pulsePanel);
+  if (elements.siteAxiomPulseQuickBuyButtonCount) {
+    const count = Number(siteFeatures.axiom?.pulseQuickBuyButtonCount);
+    elements.siteAxiomPulseQuickBuyButtonCount.checked = count === 2;
+  }
+  const pulseSecondTables = siteFeatures.axiom?.pulseSecondButtonTables || {};
+  state.axiomPulseSecondButtonTablesDraft = {
+    new_pairs: pulseSecondTables.new_pairs !== false,
+    final_stretch: pulseSecondTables.final_stretch !== false,
+    migrated: pulseSecondTables.migrated !== false
+  };
+  if (elements.siteAxiomPulseSecondButtonTableNewPairs) {
+    elements.siteAxiomPulseSecondButtonTableNewPairs.checked =
+      Boolean(elements.siteAxiomPulseQuickBuyButtonCount?.checked) &&
+      state.axiomPulseSecondButtonTablesDraft.new_pairs;
+  }
+  if (elements.siteAxiomPulseSecondButtonTableFinalStretch) {
+    elements.siteAxiomPulseSecondButtonTableFinalStretch.checked =
+      Boolean(elements.siteAxiomPulseQuickBuyButtonCount?.checked) &&
+      state.axiomPulseSecondButtonTablesDraft.final_stretch;
+  }
+  if (elements.siteAxiomPulseSecondButtonTableMigrated) {
+    elements.siteAxiomPulseSecondButtonTableMigrated.checked =
+      Boolean(elements.siteAxiomPulseQuickBuyButtonCount?.checked) &&
+      state.axiomPulseSecondButtonTablesDraft.migrated;
+  }
+  syncAxiomPulseSecondButtonTableControls();
   if (elements.siteAxiomPulseVamp) {
     elements.siteAxiomPulseVamp.checked = Boolean(siteFeatures.axiom?.pulseVamp);
   }
@@ -1985,6 +2153,49 @@ function renderSiteSettings() {
   }
 }
 
+function syncAxiomPulseSecondButtonTableControls() {
+  const enabled = Boolean(elements.siteAxiomPulseQuickBuyButtonCount?.checked);
+  const controls = [
+    ["new_pairs", elements.siteAxiomPulseSecondButtonTableNewPairs],
+    ["final_stretch", elements.siteAxiomPulseSecondButtonTableFinalStretch],
+    ["migrated", elements.siteAxiomPulseSecondButtonTableMigrated]
+  ];
+  if (!state.axiomPulseSecondButtonTablesDraft) {
+    state.axiomPulseSecondButtonTablesDraft = {
+      new_pairs: true,
+      final_stretch: true,
+      migrated: true
+    };
+  }
+  controls.forEach(([tableId, input]) => {
+    if (!input) return;
+    input.disabled = !enabled;
+    input.checked = enabled && state.axiomPulseSecondButtonTablesDraft[tableId] !== false;
+  });
+}
+
+function updateAxiomPulseSecondButtonTablesDraftFromControls() {
+  if (!state.axiomPulseSecondButtonTablesDraft) {
+    state.axiomPulseSecondButtonTablesDraft = {
+      new_pairs: true,
+      final_stretch: true,
+      migrated: true
+    };
+  }
+  if (elements.siteAxiomPulseSecondButtonTableNewPairs) {
+    state.axiomPulseSecondButtonTablesDraft.new_pairs =
+      elements.siteAxiomPulseSecondButtonTableNewPairs.checked;
+  }
+  if (elements.siteAxiomPulseSecondButtonTableFinalStretch) {
+    state.axiomPulseSecondButtonTablesDraft.final_stretch =
+      elements.siteAxiomPulseSecondButtonTableFinalStretch.checked;
+  }
+  if (elements.siteAxiomPulseSecondButtonTableMigrated) {
+    state.axiomPulseSecondButtonTablesDraft.migrated =
+      elements.siteAxiomPulseSecondButtonTableMigrated.checked;
+  }
+}
+
 function appearanceSoundKey(side) {
   return side === "sell" ? "sellSound" : "buySound";
 }
@@ -2032,6 +2243,43 @@ function renderAppearanceSettings() {
   renderAppearanceVolume();
   renderAppearanceSoundSide("buy");
   renderAppearanceSoundSide("sell");
+  renderAppearanceQuickBuyButton(1);
+  renderAppearanceQuickBuyButton(2);
+}
+
+function renderAppearanceQuickBuyButton(slot) {
+  const refs = elements.appearanceQuickBuyButtons?.[slot];
+  if (!refs?.previewButton) {
+    return;
+  }
+  const design = resolveQuickBuyButtonDesign(state.appearance, slot);
+  const backgroundColor = design.backgroundColor || QUICK_BUY_BUTTON_DEFAULT_BACKGROUND;
+  const color = design.color || QUICK_BUY_BUTTON_DEFAULT_COLOR;
+  const borderColor = design.borderColor || QUICK_BUY_BUTTON_DEFAULT_BORDER;
+  const border = `1px solid ${borderColor}`;
+
+  if (refs.backgroundSwatch) {
+    refs.backgroundSwatch.style.setProperty("--swatch-color", backgroundColor);
+    refs.backgroundSwatch.dataset.color = backgroundColor;
+  }
+  if (refs.colorSwatch) {
+    refs.colorSwatch.style.setProperty("--swatch-color", color);
+    refs.colorSwatch.dataset.color = color;
+  }
+  if (refs.borderSwatch) {
+    refs.borderSwatch.style.setProperty("--swatch-color", borderColor);
+    refs.borderSwatch.dataset.color = borderColor;
+  }
+
+  refs.previewButton.style.backgroundColor = backgroundColor;
+  refs.previewButton.style.color = color;
+  refs.previewButton.style.border = border;
+  if (refs.previewLogo) {
+    refs.previewLogo.style.backgroundColor = color;
+  }
+  if (refs.previewAmount) {
+    refs.previewAmount.textContent = slot === 2 ? "2.0" : "1.0";
+  }
 }
 
 function setAppearanceStatus(side, message = "", kind = "") {
@@ -2245,6 +2493,259 @@ function registerAppearanceHandlers() {
   registerAppearanceVolumeHandlers();
   registerAppearanceHandlersForSide("buy");
   registerAppearanceHandlersForSide("sell");
+  registerAppearanceQuickBuyHandlers();
+  registerAppearanceColorPopoverHandlers();
+}
+
+const appearanceColorPopoverState = {
+  open: false,
+  slot: 0,
+  field: "",
+  anchor: null,
+  pendingValue: ""
+};
+
+function isHexColorString(value) {
+  return /^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(String(value || "").trim());
+}
+
+function colorWithoutAlpha(hex) {
+  return String(hex || "").slice(0, 7);
+}
+
+function alphaHexFromPercent(percent) {
+  const clamped = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  const value = Math.round((clamped / 100) * 255);
+  return value.toString(16).padStart(2, "0");
+}
+
+function alphaPercentFromHex(hex) {
+  const trimmed = String(hex || "").trim();
+  if (trimmed.length !== 9) {
+    return 100;
+  }
+  const value = parseInt(trimmed.slice(7, 9), 16);
+  if (!Number.isFinite(value)) {
+    return 100;
+  }
+  return Math.round((value / 255) * 100);
+}
+
+function normalizeAlphaPercent(value, fallback = 100) {
+  const parsed = Number(value);
+  const resolved = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.max(0, Math.min(100, Math.round(resolved)));
+}
+
+function registerAppearanceQuickBuyHandlers() {
+  for (const slot of QUICK_BUY_BUTTON_SLOTS) {
+    const refs = elements.appearanceQuickBuyButtons?.[slot];
+    if (!refs?.panel) {
+      continue;
+    }
+    if (refs.backgroundSwatch) {
+      refs.backgroundSwatch.addEventListener("click", (event) => {
+        event.preventDefault();
+        openAppearanceColorPopover(slot, "backgroundColor", refs.backgroundSwatch);
+      });
+    }
+    if (refs.colorSwatch) {
+      refs.colorSwatch.addEventListener("click", (event) => {
+        event.preventDefault();
+        openAppearanceColorPopover(slot, "color", refs.colorSwatch);
+      });
+    }
+    if (refs.borderSwatch) {
+      refs.borderSwatch.addEventListener("click", (event) => {
+        event.preventDefault();
+        openAppearanceColorPopover(slot, "borderColor", refs.borderSwatch);
+      });
+    }
+    if (refs.reset) {
+      refs.reset.addEventListener("click", () => {
+        const next = normalizeAppearance(state.appearance);
+        next.quickBuyButtons[slot] = {
+          color: QUICK_BUY_BUTTON_DEFAULT_COLOR,
+          backgroundColor: QUICK_BUY_BUTTON_DEFAULT_BACKGROUND,
+          borderColor: QUICK_BUY_BUTTON_DEFAULT_BORDER
+        };
+        void persistAppearance(next);
+      });
+    }
+  }
+}
+
+function appearanceColorFieldSupportsAlpha(field) {
+  return field === "backgroundColor" || field === "borderColor";
+}
+
+function registerAppearanceColorPopoverHandlers() {
+  const refs = elements.appearanceColorPopover;
+  if (!refs?.root) {
+    return;
+  }
+  refs.color.addEventListener("input", () => {
+    const baseHex = String(refs.color.value || "").trim().toLowerCase();
+    if (!isHexColorString(baseHex)) {
+      return;
+    }
+    const alphaPercent = appearanceColorFieldSupportsAlpha(appearanceColorPopoverState.field)
+      ? normalizeAlphaPercent(refs.alpha.value)
+      : 100;
+    const alphaHex = alphaPercent === 100 ? "" : alphaHexFromPercent(alphaPercent);
+    applyAppearanceColorPopoverValue(`${colorWithoutAlpha(baseHex)}${alphaHex}`, { fromColorInput: true });
+  });
+  refs.hex.addEventListener("input", () => {
+    const value = String(refs.hex.value || "").trim();
+    if (!isHexColorString(value)) {
+      return;
+    }
+    applyAppearanceColorPopoverValue(value.toLowerCase(), { fromHexInput: true });
+  });
+  refs.hex.addEventListener("change", () => {
+    const value = String(refs.hex.value || "").trim();
+    if (!isHexColorString(value)) {
+      refs.hex.value = appearanceColorPopoverState.pendingValue;
+    }
+  });
+  refs.alpha.addEventListener("input", () => {
+    if (!appearanceColorFieldSupportsAlpha(appearanceColorPopoverState.field)) {
+      return;
+    }
+    const baseHex = colorWithoutAlpha(appearanceColorPopoverState.pendingValue);
+    const alphaPercent = normalizeAlphaPercent(refs.alpha.value);
+    refs.alphaValue.textContent = `${alphaPercent}%`;
+    const alphaHex = alphaPercent === 100 ? "" : alphaHexFromPercent(alphaPercent);
+    applyAppearanceColorPopoverValue(`${baseHex}${alphaHex}`, { fromAlphaInput: true });
+  });
+  refs.close.addEventListener("click", () => closeAppearanceColorPopover());
+  document.addEventListener("mousedown", (event) => {
+    if (!appearanceColorPopoverState.open) {
+      return;
+    }
+    if (refs.root.contains(event.target)) {
+      return;
+    }
+    if (appearanceColorPopoverState.anchor?.contains?.(event.target)) {
+      return;
+    }
+    closeAppearanceColorPopover();
+  }, true);
+  document.addEventListener("keydown", (event) => {
+    if (!appearanceColorPopoverState.open) {
+      return;
+    }
+    if (event.key === "Escape") {
+      closeAppearanceColorPopover();
+    }
+  }, true);
+  window.addEventListener("resize", () => {
+    if (appearanceColorPopoverState.open) {
+      positionAppearanceColorPopover();
+    }
+  });
+}
+
+function openAppearanceColorPopover(slot, field, anchor) {
+  const refs = elements.appearanceColorPopover;
+  if (!refs?.root) {
+    return;
+  }
+  const design = resolveQuickBuyButtonDesign(state.appearance, slot);
+  let currentValue;
+  if (field === "backgroundColor") {
+    currentValue = design.backgroundColor;
+  } else if (field === "borderColor") {
+    currentValue = design.borderColor || QUICK_BUY_BUTTON_DEFAULT_BORDER;
+  } else {
+    currentValue = design.color;
+  }
+  const supportsAlpha = appearanceColorFieldSupportsAlpha(field);
+  appearanceColorPopoverState.open = true;
+  appearanceColorPopoverState.slot = slot;
+  appearanceColorPopoverState.field = field;
+  appearanceColorPopoverState.anchor = anchor;
+  appearanceColorPopoverState.pendingValue = currentValue;
+
+  refs.root.hidden = false;
+  refs.root.classList.remove("hidden");
+  refs.alphaField.style.display = supportsAlpha ? "" : "none";
+  refs.color.value = colorWithoutAlpha(currentValue) || "#000000";
+  refs.hex.value = currentValue;
+  const alphaPercent = supportsAlpha ? alphaPercentFromHex(currentValue) : 100;
+  refs.alpha.value = String(alphaPercent);
+  refs.alphaValue.textContent = `${alphaPercent}%`;
+  refs.preview.style.setProperty("--popover-color", currentValue);
+  positionAppearanceColorPopover();
+}
+
+function closeAppearanceColorPopover() {
+  const refs = elements.appearanceColorPopover;
+  if (!refs?.root) {
+    return;
+  }
+  refs.root.hidden = true;
+  refs.root.classList.add("hidden");
+  appearanceColorPopoverState.open = false;
+  appearanceColorPopoverState.anchor = null;
+}
+
+function positionAppearanceColorPopover() {
+  const refs = elements.appearanceColorPopover;
+  const anchor = appearanceColorPopoverState.anchor;
+  if (!refs?.root || !(anchor instanceof HTMLElement)) {
+    return;
+  }
+  const rect = anchor.getBoundingClientRect();
+  const popoverRect = refs.root.getBoundingClientRect();
+  const margin = 8;
+  let top = rect.bottom + margin;
+  let left = rect.left;
+  if (top + popoverRect.height > window.innerHeight - margin) {
+    top = Math.max(margin, rect.top - popoverRect.height - margin);
+  }
+  if (left + popoverRect.width > window.innerWidth - margin) {
+    left = Math.max(margin, window.innerWidth - popoverRect.width - margin);
+  }
+  refs.root.style.top = `${top}px`;
+  refs.root.style.left = `${left}px`;
+}
+
+function applyAppearanceColorPopoverValue(rawValue, { fromColorInput, fromHexInput, fromAlphaInput } = {}) {
+  const slot = appearanceColorPopoverState.slot;
+  const field = appearanceColorPopoverState.field;
+  if (!slot || !field) {
+    return;
+  }
+  const next = normalizeAppearance(state.appearance);
+  let normalizedValue;
+  if (field === "backgroundColor") {
+    normalizedValue = normalizeQuickBuyButtonBackgroundColor(rawValue, next.quickBuyButtons[slot].backgroundColor);
+    next.quickBuyButtons[slot].backgroundColor = normalizedValue;
+  } else if (field === "borderColor") {
+    normalizedValue = normalizeQuickBuyButtonBorderColor(rawValue, next.quickBuyButtons[slot].borderColor);
+    next.quickBuyButtons[slot].borderColor = normalizedValue;
+  } else {
+    normalizedValue = normalizeQuickBuyButtonColor(rawValue, next.quickBuyButtons[slot].color);
+    next.quickBuyButtons[slot].color = normalizedValue;
+  }
+  appearanceColorPopoverState.pendingValue = normalizedValue;
+  const refs = elements.appearanceColorPopover;
+  if (refs) {
+    if (!fromHexInput) {
+      refs.hex.value = normalizedValue;
+    }
+    if (!fromColorInput) {
+      refs.color.value = colorWithoutAlpha(normalizedValue) || "#000000";
+    }
+    if (appearanceColorFieldSupportsAlpha(field) && !fromAlphaInput) {
+      const alphaPercent = alphaPercentFromHex(normalizedValue);
+      refs.alpha.value = String(alphaPercent);
+      refs.alphaValue.textContent = `${alphaPercent}%`;
+    }
+    refs.preview.style.setProperty("--popover-color", normalizedValue);
+  }
+  void persistAppearance(next);
 }
 
 const PRESET_REGION_OPTIONS = new Set([
@@ -2922,6 +3423,15 @@ function collectSiteSettings() {
     j7PostDeployActionRaw === "open_window_toast"
       ? j7PostDeployActionRaw
       : "close_modal_toast";
+  const pulseQuickBuyButtonCountRaw = Number(
+    elements.siteAxiomPulseQuickBuyButtonCount?.checked ? 2 : 1
+  );
+  const pulseQuickBuyButtonCount = pulseQuickBuyButtonCountRaw === 2 ? 2 : 1;
+  const pulseSecondButtonTables = {
+    new_pairs: state.axiomPulseSecondButtonTablesDraft?.new_pairs !== false,
+    final_stretch: state.axiomPulseSecondButtonTablesDraft?.final_stretch !== false,
+    migrated: state.axiomPulseSecondButtonTablesDraft?.migrated !== false
+  };
   return {
     axiom: {
       enabled: elements.siteAxiomEnabled.checked,
@@ -2931,6 +3441,8 @@ function collectSiteSettings() {
       launchdeckInjection: elements.siteAxiomLaunchdeck ? elements.siteAxiomLaunchdeck.checked : true,
       pulseButton: elements.siteAxiomPulseQb.checked,
       pulsePanel: elements.siteAxiomPulsePanel.checked,
+      pulseQuickBuyButtonCount,
+      pulseSecondButtonTables,
       pulseVamp: vampIconMode === "both" || vampIconMode === "pulse",
       pulseVampMode,
       vampIconMode,
@@ -3722,7 +4234,9 @@ function fillPresetModal(preset) {
 }
 
 function collectPresetModal() {
-  const allBuyAmounts = elements.presetModalBuyAmounts.map((input) => input.value.trim());
+  const allBuyAmounts = elements.presetModalBuyAmounts.map((input) =>
+    normalizedPresetNumericValue(input.value)
+  );
   let rows = currentBuyAmountRows();
   let buyAmountsSol = allBuyAmounts.slice(0, rows * 4);
   while (buyAmountsSol.length < rows * 4) {
@@ -3734,7 +4248,9 @@ function collectPresetModal() {
     rows = 1;
     buyAmountsSol = buyAmountsSol.slice(0, 4);
   }
-  const allSellPercents = elements.presetModalSellPercents.map((input) => input.value.trim());
+  const allSellPercents = elements.presetModalSellPercents.map((input) =>
+    normalizedPresetNumericValue(input.value)
+  );
   let sellRows = currentSellPercentRows();
   let sellAmountsPercent = allSellPercents.slice(0, sellRows * 4);
   while (sellAmountsPercent.length < sellRows * 4) {
@@ -3759,18 +4275,18 @@ function collectPresetModal() {
     sellAmountsPercent,
     sellPercentRows: sellRows,
     buyAutoTipEnabled: Boolean(elements.presetModalBuyAutoFee.checked),
-    buyMaxFeeSol: elements.presetModalBuyMaxFee.value.trim(),
-    buyFeeSol: elements.presetModalBuyFee.value.trim(),
-    buyTipSol: elements.presetModalBuyTip.value.trim(),
-    buySlippagePercent: elements.presetModalBuySlippage.value.trim(),
+    buyMaxFeeSol: normalizedPresetNumericValue(elements.presetModalBuyMaxFee.value),
+    buyFeeSol: normalizedPresetNumericValue(elements.presetModalBuyFee.value),
+    buyTipSol: normalizedPresetNumericValue(elements.presetModalBuyTip.value),
+    buySlippagePercent: normalizedPresetNumericValue(elements.presetModalBuySlippage.value),
     buyMevMode: elements.presetModalBuyMevMode.value.trim(),
     buyProvider: selectableExtensionRouteProvider(elements.presetModalBuyProvider.value),
     buyEndpointProfile: elements.presetModalBuyEndpointProfile.value.trim(),
     sellAutoTipEnabled: Boolean(elements.presetModalSellAutoFee.checked),
-    sellMaxFeeSol: elements.presetModalSellMaxFee.value.trim(),
-    sellFeeSol: elements.presetModalSellFee.value.trim(),
-    sellTipSol: elements.presetModalSellTip.value.trim(),
-    sellSlippagePercent: elements.presetModalSellSlippage.value.trim(),
+    sellMaxFeeSol: normalizedPresetNumericValue(elements.presetModalSellMaxFee.value),
+    sellFeeSol: normalizedPresetNumericValue(elements.presetModalSellFee.value),
+    sellTipSol: normalizedPresetNumericValue(elements.presetModalSellTip.value),
+    sellSlippagePercent: normalizedPresetNumericValue(elements.presetModalSellSlippage.value),
     sellMevMode: elements.presetModalSellMevMode.value.trim(),
     sellProvider: selectableExtensionRouteProvider(elements.presetModalSellProvider.value),
     sellEndpointProfile: elements.presetModalSellEndpointProfile.value.trim()
@@ -4225,17 +4741,27 @@ function normalizePreset(preset) {
     ...preset,
     id: String(preset?.id || "").trim(),
     label: String(preset?.label || "").trim(),
-    buyMaxFeeSol: String(preset?.buyMaxFeeSol ?? "").trim(),
-    buySlippagePercent: String(preset?.buySlippagePercent ?? preset?.slippagePercent ?? "").trim(),
+    buyMaxFeeSol: normalizedPresetNumericValue(preset?.buyMaxFeeSol),
+    buyFeeSol: normalizedPresetNumericValue(preset?.buyFeeSol),
+    buyTipSol: normalizedPresetNumericValue(preset?.buyTipSol),
+    buySlippagePercent: normalizedPresetNumericValue(
+      preset?.buySlippagePercent ?? preset?.slippagePercent
+    ),
     buyMevMode: String(preset?.buyMevMode ?? preset?.mevMode ?? "off").trim() || "off",
     buyProvider: selectableExtensionRouteProvider(preset?.buyProvider),
     buyEndpointProfile: String(preset?.buyEndpointProfile ?? "").trim(),
-    sellMaxFeeSol: String(preset?.sellMaxFeeSol ?? "").trim(),
-    sellSlippagePercent: String(preset?.sellSlippagePercent ?? preset?.slippagePercent ?? "").trim(),
+    sellMaxFeeSol: normalizedPresetNumericValue(preset?.sellMaxFeeSol),
+    sellFeeSol: normalizedPresetNumericValue(preset?.sellFeeSol),
+    sellTipSol: normalizedPresetNumericValue(preset?.sellTipSol),
+    sellSlippagePercent: normalizedPresetNumericValue(
+      preset?.sellSlippagePercent ?? preset?.slippagePercent
+    ),
     sellMevMode: String(preset?.sellMevMode ?? preset?.mevMode ?? "off").trim() || "off",
     sellProvider: selectableExtensionRouteProvider(preset?.sellProvider),
     sellEndpointProfile: String(preset?.sellEndpointProfile ?? "").trim(),
-    slippagePercent: String(preset?.buySlippagePercent ?? preset?.slippagePercent ?? "").trim(),
+    slippagePercent: normalizedPresetNumericValue(
+      preset?.buySlippagePercent ?? preset?.slippagePercent
+    ),
     mevMode: String(preset?.buyMevMode ?? preset?.mevMode ?? "off").trim() || "off",
     buyAmountSol: buyAmountsSol.find(Boolean) || "",
     sellPercent: sellAmountsPercent.find(Boolean) || "",
@@ -4385,10 +4911,10 @@ function normalizeLaunchdeckPreset(preset, index = 0) {
   const buyAutoFee = Boolean(preset?.buySettings?.autoFee);
   const sellAutoFee = Boolean(preset?.sellSettings?.autoFee);
   const normalizePriorityForAutoFee = (provider, value, autoFee) =>
-    autoFee ? String(value ?? "").trim() : normalizePriorityFeeForProvider(provider, value);
+    autoFee ? normalizedPresetNumericValue(value) : normalizePriorityFeeForProvider(provider, value);
   const normalizeTipForAutoFee = (provider, value, autoFee) =>
     autoFee
-      ? (providerSupportsTip(provider) ? String(value ?? "").trim() : "")
+      ? (providerSupportsTip(provider) ? normalizedPresetNumericValue(value) : "")
       : normalizeTipForProvider(provider, value);
   const normalized = {
     ...fallback,
@@ -4399,9 +4925,10 @@ function normalizeLaunchdeckPreset(preset, index = 0) {
       ...fallback.creationSettings,
       ...(preset?.creationSettings || {}),
       provider: creationProvider,
-      devBuySol: String(preset?.creationSettings?.devBuySol || "").trim(),
+      devBuySol: normalizedPresetNumericValue(preset?.creationSettings?.devBuySol),
       priorityFeeSol: normalizePriorityForAutoFee(creationProvider, preset?.creationSettings?.priorityFeeSol, creationAutoFee),
       tipSol: normalizeTipForAutoFee(creationProvider, preset?.creationSettings?.tipSol, creationAutoFee),
+      maxFeeSol: normalizedPresetNumericValue(preset?.creationSettings?.maxFeeSol),
       mevMode: String(preset?.creationSettings?.mevMode || fallback.creationSettings.mevMode).trim() || "off"
     },
     buySettings: {
@@ -4410,9 +4937,12 @@ function normalizeLaunchdeckPreset(preset, index = 0) {
       provider: buyProvider,
       priorityFeeSol: normalizePriorityForAutoFee(buyProvider, preset?.buySettings?.priorityFeeSol, buyAutoFee),
       tipSol: normalizeTipForAutoFee(buyProvider, preset?.buySettings?.tipSol, buyAutoFee),
-      slippagePercent: String(preset?.buySettings?.slippagePercent || fallback.buySettings.slippagePercent).trim(),
+      maxFeeSol: normalizedPresetNumericValue(preset?.buySettings?.maxFeeSol),
+      slippagePercent: normalizedPresetNumericValue(
+        preset?.buySettings?.slippagePercent || fallback.buySettings.slippagePercent
+      ),
       mevMode: String(preset?.buySettings?.mevMode || fallback.buySettings.mevMode).trim() || "off",
-      snipeBuyAmountSol: String(preset?.buySettings?.snipeBuyAmountSol || "").trim()
+      snipeBuyAmountSol: normalizedPresetNumericValue(preset?.buySettings?.snipeBuyAmountSol)
     },
     sellSettings: {
       ...fallback.sellSettings,
@@ -4420,7 +4950,10 @@ function normalizeLaunchdeckPreset(preset, index = 0) {
       provider: sellProvider,
       priorityFeeSol: normalizePriorityForAutoFee(sellProvider, preset?.sellSettings?.priorityFeeSol, sellAutoFee),
       tipSol: normalizeTipForAutoFee(sellProvider, preset?.sellSettings?.tipSol, sellAutoFee),
-      slippagePercent: String(preset?.sellSettings?.slippagePercent || fallback.sellSettings.slippagePercent).trim(),
+      maxFeeSol: normalizedPresetNumericValue(preset?.sellSettings?.maxFeeSol),
+      slippagePercent: normalizedPresetNumericValue(
+        preset?.sellSettings?.slippagePercent || fallback.sellSettings.slippagePercent
+      ),
       mevMode: String(preset?.sellSettings?.mevMode || fallback.sellSettings.mevMode).trim() || "off"
     }
   };
@@ -4771,10 +5304,10 @@ function collectLaunchdeckPresetModal() {
   const buyAutoFee = Boolean(elements.launchdeckPresetBuyAutoFee.checked);
   const sellAutoFee = Boolean(elements.launchdeckPresetSellAutoFee.checked);
   const normalizePriorityForAutoFee = (provider, input, autoFee) =>
-    autoFee ? input.value.trim() : normalizePriorityFeeForProvider(provider, input.value);
+    autoFee ? normalizedPresetNumericValue(input.value) : normalizePriorityFeeForProvider(provider, input.value);
   const normalizeTipForAutoFee = (provider, input, autoFee) =>
     autoFee
-      ? (providerSupportsTip(provider) ? input.value.trim() : "")
+      ? (providerSupportsTip(provider) ? normalizedPresetNumericValue(input.value) : "")
       : normalizeTipForProvider(provider, input.value);
   return normalizeLaunchdeckPreset({
     id: presetId,
@@ -4786,31 +5319,31 @@ function collectLaunchdeckPresetModal() {
       priorityFeeSol: normalizePriorityForAutoFee(creationProvider, elements.launchdeckPresetCreationFee, creationAutoFee),
       tipSol: normalizeTipForAutoFee(creationProvider, elements.launchdeckPresetCreationTip, creationAutoFee),
       autoFee: creationAutoFee,
-      maxFeeSol: elements.launchdeckPresetCreationMaxFee.value.trim(),
+      maxFeeSol: normalizedPresetNumericValue(elements.launchdeckPresetCreationMaxFee.value),
       // Dev buy is entered in the LaunchDeck panel itself; preserve stored value.
-      devBuySol: elements.launchdeckPresetDevBuy.value.trim() || existingCreation.devBuySol || ""
+      devBuySol: normalizedPresetNumericValue(elements.launchdeckPresetDevBuy.value) || existingCreation.devBuySol || ""
     },
     buySettings: {
       ...existingBuy,
       provider: buyProvider,
       mevMode: elements.launchdeckPresetBuyMev.value.trim() || "off",
-      slippagePercent: elements.launchdeckPresetBuySlippage.value.trim(),
+      slippagePercent: normalizedPresetNumericValue(elements.launchdeckPresetBuySlippage.value),
       priorityFeeSol: normalizePriorityForAutoFee(buyProvider, elements.launchdeckPresetBuyFee, buyAutoFee),
       tipSol: normalizeTipForAutoFee(buyProvider, elements.launchdeckPresetBuyTip, buyAutoFee),
       autoFee: buyAutoFee,
-      maxFeeSol: elements.launchdeckPresetBuyMaxFee.value.trim(),
+      maxFeeSol: normalizedPresetNumericValue(elements.launchdeckPresetBuyMaxFee.value),
       // Snipe amount is entered in the sniper modal in the LaunchDeck UI.
-      snipeBuyAmountSol: elements.launchdeckPresetSnipeBuy.value.trim() || existingBuy.snipeBuyAmountSol || ""
+      snipeBuyAmountSol: normalizedPresetNumericValue(elements.launchdeckPresetSnipeBuy.value) || existingBuy.snipeBuyAmountSol || ""
     },
     sellSettings: {
       ...existingSell,
       provider: sellProvider,
       mevMode: elements.launchdeckPresetSellMev.value.trim() || "off",
-      slippagePercent: elements.launchdeckPresetSellSlippage.value.trim(),
+      slippagePercent: normalizedPresetNumericValue(elements.launchdeckPresetSellSlippage.value),
       priorityFeeSol: normalizePriorityForAutoFee(sellProvider, elements.launchdeckPresetSellFee, sellAutoFee),
       tipSol: normalizeTipForAutoFee(sellProvider, elements.launchdeckPresetSellTip, sellAutoFee),
       autoFee: sellAutoFee,
-      maxFeeSol: elements.launchdeckPresetSellMaxFee.value.trim()
+      maxFeeSol: normalizedPresetNumericValue(elements.launchdeckPresetSellMaxFee.value)
     }
   }, Math.max(0, existingPresets.findIndex((entry) => entry.id === state.editingLaunchdeckPresetId)));
 }
@@ -4940,13 +5473,13 @@ async function deleteLaunchdeckPresetFromModal() {
 function normalizePresetValues(values, legacyValue, length = 4) {
   const targetLength = Number.isFinite(length) && length > 0 ? Math.floor(length) : 4;
   const normalized = Array.isArray(values)
-    ? values.slice(0, targetLength).map((value) => String(value || "").trim())
+    ? values.slice(0, targetLength).map((value) => normalizedPresetNumericValue(value))
     : [];
   while (normalized.length < targetLength) {
     normalized.push("");
   }
   if (!normalized.some(Boolean) && legacyValue) {
-    normalized[0] = String(legacyValue).trim();
+    normalized[0] = normalizedPresetNumericValue(legacyValue);
   }
   return normalized.slice(0, targetLength);
 }

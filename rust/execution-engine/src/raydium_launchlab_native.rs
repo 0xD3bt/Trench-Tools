@@ -148,6 +148,41 @@ pub(crate) async fn plan_raydium_launchlab_trade(
     selector_for_pool(rpc_url, request, canonical_pool, &pool).await
 }
 
+pub(crate) async fn cached_launchlab_route_is_active(
+    rpc_url: &str,
+    mint: &str,
+    market_key: &str,
+    commitment: &str,
+) -> Result<bool, String> {
+    let mint = parse_pubkey(mint, "Raydium LaunchLab cached route mint")?;
+    let quote_mint = wsol_mint()?;
+    let canonical_pool = canonical_pool_id(&mint, &quote_mint)?;
+    if !market_key.trim().is_empty() && market_key.trim() != canonical_pool.to_string() {
+        return Ok(false);
+    }
+    let Some((owner, pool_data)) =
+        fetch_account_owner_and_data(rpc_url, &canonical_pool.to_string(), commitment).await?
+    else {
+        return Ok(false);
+    };
+    if owner != launchlab_program_id()? {
+        return Ok(false);
+    }
+    let pool = decode_launchlab_pool(&pool_data)?;
+    validate_launchlab_pool_for_request(&pool, &mint, &canonical_pool)?;
+    match pool.lifecycle_status() {
+        LaunchLabPoolStatus::Trading => Ok(true),
+        LaunchLabPoolStatus::Migrated => Ok(false),
+        LaunchLabPoolStatus::Migrating => Err(
+            "[stale_route_reclassified] Raydium LaunchLab pool is migrating; refusing to use cached pre-migration route."
+                .to_string(),
+        ),
+        LaunchLabPoolStatus::Unknown(status) => Err(format!(
+            "Raydium LaunchLab pool status {status} is unsupported for cached route reuse."
+        )),
+    }
+}
+
 fn validate_launchlab_policy_for_side(request: &TradeRuntimeRequest) -> Result<(), String> {
     match request.side {
         TradeSide::Buy => {

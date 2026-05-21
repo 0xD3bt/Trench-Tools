@@ -3,8 +3,14 @@ import {
   HOST_AUTH_TOKEN_STORAGE_KEY,
   OPTIONS_TARGET_SECTION_KEY
 } from "../shared/constants.js";
+import {
+  normalizeTradePreferences,
+  normalizeQuickBuyAmountInput,
+  normalizeWalletSelectionPreference,
+  mirrorWalletSelectionPreferenceOntoPreferences,
+  tradePreferencePatchFromValue
+} from "../shared/trade-preferences.js";
 
-const PREFERENCES_KEY = "trenchTools.panelPreferences";
 const BOOTSTRAP_REVISION_KEY = "trenchTools.bootstrapRevision";
 const statusPill = document.getElementById("status-pill");
 const presetCount = document.getElementById("preset-count");
@@ -22,6 +28,7 @@ const authTokenStatus = document.getElementById("auth-token-status");
 const openOptionsButton = document.getElementById("open-options-button");
 const connectionButton = document.getElementById("connection-button");
 const quickBuyAmountInput = document.getElementById("quick-buy-amount");
+const quickBuyAmount2Input = document.getElementById("quick-buy-amount-2");
 const presetSelect = document.getElementById("preset-select");
 const walletDropdownButton = document.getElementById("wallet-dropdown-button");
 const walletDropdownLabel = document.getElementById("wallet-dropdown-label");
@@ -39,112 +46,16 @@ const state = {
 };
 let authTokenSaveInProgress = false;
 
-function normalizeQuickBuyAmountInput(value) {
-  const trimmed = String(value || "").trim();
-  if (!trimmed) {
-    return "";
-  }
-
-  let normalized = trimmed.replace(/[^\d.]/g, "");
-  const firstDotIndex = normalized.indexOf(".");
-  if (firstDotIndex >= 0) {
-    normalized =
-      normalized.slice(0, firstDotIndex + 1) +
-      normalized.slice(firstDotIndex + 1).replace(/\./g, "");
-  }
-
-  if (normalized.startsWith(".")) {
-    normalized = `0${normalized}`;
-  }
-
-  if (normalized.includes(".")) {
-    const [whole, fractional] = normalized.split(".");
-    normalized = `${whole.replace(/^0+(?=\d)/, "") || "0"}.${fractional}`;
-  } else {
-    normalized = normalized.replace(/^0+(?=\d)/, "");
-  }
-
-  return normalized;
-}
-
 function normalizeWalletKeys(keys) {
   return Array.from(
     new Set((Array.isArray(keys) ? keys : []).map((key) => String(key || "").trim()).filter(Boolean))
   );
 }
 
-function normalizeWalletSelectionPreference(value) {
-  const selectionSource = String(value?.selectionSource || "").trim().toLowerCase();
-  const activeWalletGroupId = String(
-    value?.activeWalletGroupId ||
-      value?.selectionTarget?.walletGroupId ||
-      value?.walletGroupId ||
-      ""
-  ).trim();
-  const directManualWalletKeys = Array.isArray(value?.manualWalletKeys)
-    ? value.manualWalletKeys
-    : Array.isArray(value?.selectionTarget?.manualWalletKeys)
-      ? value.selectionTarget.manualWalletKeys
-      : null;
-  const manualWalletKeys = normalizeWalletKeys(
-    directManualWalletKeys ||
-      value?.walletKeys ||
-      value?.selectionTarget?.walletKeys ||
-      [value?.walletKey || value?.selectionTarget?.walletKey]
-  );
-
-  if (selectionSource === "group" || selectionSource === "manual") {
-    return {
-      selectionSource,
-      activeWalletGroupId,
-      manualWalletKeys
-    };
-  }
-  if (activeWalletGroupId) {
-    return {
-      selectionSource: "group",
-      activeWalletGroupId,
-      manualWalletKeys: []
-    };
-  }
-  return {
-    selectionSource: "manual",
-    activeWalletGroupId: "",
-    manualWalletKeys
-  };
-}
-
-function selectionTargetFromWalletSelectionPreference(selection) {
-  if (selection.selectionSource === "group") {
-    return {
-      type: "wallet_group",
-      walletKey: "",
-      walletGroupId: selection.activeWalletGroupId,
-      walletKeys: []
-    };
-  }
-  const manualWalletKeys = normalizeWalletKeys(selection.manualWalletKeys);
-  return {
-    type: manualWalletKeys.length === 1 ? "single_wallet" : "wallet_list",
-    walletKey: manualWalletKeys[0] || "",
-    walletGroupId: "",
-    walletKeys: manualWalletKeys
-  };
-}
-
 function mirrorWalletSelectionPreference(preferences, selection) {
-  const target = selectionTargetFromWalletSelectionPreference(selection);
-  return {
-    ...preferences,
-    selectionSource: selection.selectionSource,
-    activeWalletGroupId: selection.activeWalletGroupId,
-    manualWalletKeys: normalizeWalletKeys(selection.manualWalletKeys),
-    selectionTarget: target,
-    selectionMode: target.type,
-    walletKey: target.walletKey,
-    walletGroupId: target.walletGroupId,
-    walletKeys: target.walletKeys
-  };
+  const next = { ...preferences };
+  mirrorWalletSelectionPreferenceOntoPreferences(next, selection);
+  return next;
 }
 
 function enabledWallets() {
@@ -212,19 +123,47 @@ function currentSelection() {
 }
 
 async function savePreferences(nextPreferences) {
-  state.preferences = nextPreferences;
-  await chrome.storage.local.set({ [PREFERENCES_KEY]: nextPreferences });
+  state.preferences = normalizeTradePreferences(nextPreferences);
   renderTradeControls();
 }
 
 async function updatePreferences(updater) {
-  const stored = await chrome.storage.local.get(PREFERENCES_KEY);
-  const current = {
-    ...state.preferences,
-    ...(stored[PREFERENCES_KEY] || {})
-  };
+  const current = normalizeTradePreferences(state.preferences);
   const next = updater(current);
   await savePreferences(next);
+  const changedFields = Object.keys(next).filter((key) => {
+    const currentValue = current[key];
+    const nextValue = next[key];
+    return Array.isArray(nextValue)
+      ? JSON.stringify(currentValue || []) !== JSON.stringify(nextValue)
+      : currentValue !== nextValue;
+  });
+  const patch = tradePreferencePatchFromValue(next, changedFields);
+  if (Object.keys(patch).length) {
+    try {
+      state.preferences = normalizeTradePreferences(
+        await callBackground("trench:update-quick-trade-preferences", { patch })
+      );
+    } catch (error) {
+      if (isStaleQuickTradePreferencesError(error)) {
+        state.preferences = normalizeTradePreferences(
+          await callBackground("trench:get-quick-trade-preferences")
+        );
+      } else {
+        state.preferences = current;
+        renderTradeControls();
+        throw error;
+      }
+    }
+    renderTradeControls();
+  }
+}
+
+function isStaleQuickTradePreferencesError(error) {
+  if (error?.status !== 400) {
+    return false;
+  }
+  return /stale wallet selection update/i.test(String(error?.message || error || ""));
 }
 
 function renderPresetSelect() {
@@ -466,9 +405,25 @@ function handleWalletDropdownKey(event) {
   }
 }
 
+function setQuickBuyInputValue(input, value) {
+  if (!input || document.activeElement === input) {
+    return;
+  }
+  input.value = value;
+}
+
 function renderTradeControls() {
   const selection = currentSelection();
-  quickBuyAmountInput.value = normalizeQuickBuyAmountInput(state.preferences.quickBuyAmount || "");
+  setQuickBuyInputValue(
+    quickBuyAmountInput,
+    normalizeQuickBuyAmountInput(state.preferences.quickBuyAmount || "")
+  );
+  if (quickBuyAmount2Input) {
+    setQuickBuyInputValue(
+      quickBuyAmount2Input,
+      normalizeQuickBuyAmountInput(state.preferences.quickBuyAmount2 || "")
+    );
+  }
   renderPresetSelect();
   renderWalletDropdown(selection);
 }
@@ -496,6 +451,19 @@ quickBuyAmountInput.addEventListener("input", async () => {
     quickBuyAmount: normalizedQuickBuyAmount
   }));
 });
+quickBuyAmountInput.addEventListener("blur", renderTradeControls);
+
+if (quickBuyAmount2Input) {
+  quickBuyAmount2Input.addEventListener("input", async () => {
+    const normalizedQuickBuyAmount2 = normalizeQuickBuyAmountInput(quickBuyAmount2Input.value);
+    quickBuyAmount2Input.value = normalizedQuickBuyAmount2;
+    await updatePreferences((preferences) => ({
+      ...preferences,
+      quickBuyAmount2: normalizedQuickBuyAmount2
+    }));
+  });
+  quickBuyAmount2Input.addEventListener("blur", renderTradeControls);
+}
 
 presetSelect.addEventListener("change", async () => {
   await updatePreferences((preferences) => ({
@@ -601,15 +569,19 @@ async function init() {
 
   try {
     await callBackground("trench:refresh-host-connection");
-    const [health, bootstrap, stored] = await Promise.all([
+    const [health, bootstrap, preferencesResult] = await Promise.all([
       callBackground("trench:get-health"),
       callBackground("trench:get-bootstrap"),
-      chrome.storage.local.get(PREFERENCES_KEY)
+      callBackground("trench:get-quick-trade-preferences").then(
+        (preferences) => ({ ok: true, preferences }),
+        (error) => ({ ok: false, error })
+      )
     ]);
-    const preferences = stored[PREFERENCES_KEY] || {};
     state.isConnected = true;
     state.bootstrap = bootstrap;
-    state.preferences = preferences;
+    state.preferences = normalizeTradePreferences(
+      preferencesResult.ok ? preferencesResult.preferences : state.preferences
+    );
     authTokenInput.value = "";
     statusPill.textContent = `Host ${health.engineVersion}`;
     statusPill.dataset.state = "online";
@@ -627,14 +599,12 @@ async function init() {
       });
       return;
     }
-    const stored = await chrome.storage.local.get(PREFERENCES_KEY);
-    const preferences = stored[PREFERENCES_KEY] || {};
     state.bootstrap = {
       presets: [],
       wallets: [],
       walletGroups: []
     };
-    state.preferences = preferences;
+    state.preferences = normalizeTradePreferences(state.preferences);
     state.isConnected = false;
     statusPill.textContent = state.hasStoredHost ? "Host unavailable" : "No host set";
     statusPill.dataset.state = "offline";
@@ -658,10 +628,28 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     void init();
     return;
   }
-  if (changes[PREFERENCES_KEY]) {
-    state.preferences = changes[PREFERENCES_KEY].newValue || {};
-    renderTradeControls();
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== "trench:quick-trade-preferences-updated") {
+    return;
   }
+  const incomingPreferences = normalizeTradePreferences(message.payload || {});
+  const currentSelectionRevision = Math.max(0, Number(state.preferences?.selectionRevision || 0) || 0);
+  const incomingSelectionRevision = Math.max(0, Number(incomingPreferences.selectionRevision || 0) || 0);
+  state.preferences = normalizeTradePreferences({
+    ...state.preferences,
+    ...incomingPreferences,
+    ...(incomingSelectionRevision < currentSelectionRevision
+      ? {
+          selectionSource: state.preferences.selectionSource,
+          activeWalletGroupId: state.preferences.activeWalletGroupId,
+          manualWalletKeys: [...(state.preferences.manualWalletKeys || [])],
+          selectionRevision: currentSelectionRevision
+        }
+      : {})
+  });
+  renderTradeControls();
 });
 
 setInterval(() => {

@@ -330,7 +330,7 @@ impl AuthManager {
 
     fn ensure_default_token(&self) -> Result<(), String> {
         self.with_locked_state("ensure default auth token", |state| {
-            let final_token = if let Some(raw_token) =
+            let mut final_token = if let Some(raw_token) =
                 read_token_from_file(&self.default_token_path)
             {
                 raw_token
@@ -343,6 +343,10 @@ impl AuthManager {
                 self.write_default_token_with_race_recovery(&raw_token)?;
                 read_token_from_file(&self.default_token_path).unwrap_or(raw_token)
             };
+            if token_record_is_revoked(state, &final_token) {
+                final_token = generate_token();
+                self.replace_default_token(&final_token)?;
+            }
             ensure_token_record_in_state(state, &final_token, true, DEFAULT_TOKEN_LABEL);
             Ok(())
         })
@@ -404,6 +408,13 @@ impl AuthManager {
                 }),
             Err(error) => Err(error),
         }
+    }
+
+    fn replace_default_token(&self, raw_token: &str) -> Result<(), String> {
+        atomic_write(
+            &self.default_token_path,
+            format!("{raw_token}\n").as_bytes(),
+        )
     }
 
     fn with_locked_state<T, F>(&self, label: &str, action: F) -> Result<T, String>
@@ -668,6 +679,13 @@ fn read_token_from_file(path: &Path) -> Option<String> {
     })
 }
 
+fn token_record_is_revoked(state: &AuthStateFile, raw_token: &str) -> bool {
+    let hashed = hash_token(raw_token);
+    state.tokens.iter().any(|token| {
+        constant_time_hex_eq(&token.token_hash, &hashed) && token.revoked_at_unix_ms.is_some()
+    })
+}
+
 fn summary_from_record(record: AuthTokenRecord) -> AuthTokenSummary {
     AuthTokenSummary {
         id: record.id,
@@ -699,7 +717,6 @@ fn ensure_token_record_in_state(
         .find(|token| constant_time_hex_eq(&token.token_hash, &hashed))
     {
         existing.is_default = is_default;
-        existing.revoked_at_unix_ms = None;
         if existing.label.trim().is_empty() {
             existing.label = label.to_string();
         }
@@ -919,6 +936,42 @@ mod tests {
             let raw =
                 fs::read_to_string(root.join(AUTH_STATE_FILE)).expect("read corrupted state back");
             assert_eq!(raw, "{not-json");
+        });
+    }
+
+    #[test]
+    fn revoked_default_token_stays_revoked_after_restart() {
+        with_temp_auth_root(|_root| {
+            let manager = AuthManager::new().expect("create manager");
+            let old_token = manager.default_token().expect("default token");
+            let old_default = manager
+                .list_tokens()
+                .into_iter()
+                .find(|token| token.is_default)
+                .expect("default token summary");
+            manager
+                .revoke_token(&old_default.id)
+                .expect("revoke default token");
+            assert!(manager.verify_token(&old_token).is_err());
+            drop(manager);
+
+            let restarted = AuthManager::new().expect("restart manager");
+            let new_token = restarted.default_token().expect("rotated default token");
+            assert_ne!(old_token, new_token);
+            assert!(restarted.verify_token(&old_token).is_err());
+            restarted
+                .verify_token(&new_token)
+                .expect("new default token verifies");
+            let tokens = restarted.list_tokens();
+            let old_summary = tokens
+                .iter()
+                .find(|token| token.id == old_default.id)
+                .expect("old token summary preserved");
+            assert!(old_summary.revoked_at_unix_ms.is_some());
+            assert!(!old_summary.is_default);
+            assert!(tokens.iter().any(|token| {
+                token.is_default && token.revoked_at_unix_ms.is_none() && token.id != old_default.id
+            }));
         });
     }
 }

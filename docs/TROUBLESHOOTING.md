@@ -30,8 +30,8 @@ Local Linux:
 VPS systemd logs:
 
 ```bash
-journalctl -u launchdeck -n 100 --no-pager
-journalctl -u launchdeck -f
+journalctl -u trenchtools -n 100 --no-pager
+journalctl -u trenchtools -f
 ```
 
 ## Startup Fails
@@ -99,7 +99,7 @@ The shared token file is:
 On the default VPS install:
 
 ```text
-/opt/launchdeck/.local/trench-tools/default-engine-token.txt
+/root/trench.tools/.local/trench-tools/default-engine-token.txt
 ```
 
 Fix:
@@ -301,11 +301,11 @@ If the tunnel fails:
 - confirm the public key was added to the VPS provider and selected during deploy
 - confirm the private key still exists on your computer, usually `~/.ssh/id_ed25519`
 - confirm SSH works normally with `ssh Trenchtools-vps`
-- confirm `systemctl status launchdeck`
+- confirm `systemctl status trenchtools`
 - confirm the service started the hosts
 - confirm your local ports are not already in use
 - keep the SSH session open while using the tunnel
-- if using Cursor Remote SSH, disconnect and reconnect after editing `~/.ssh/config` or `C:\Users\<user>\.ssh\config`
+- if using [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI) Remote SSH, disconnect and reconnect after editing `~/.ssh/config` or `C:\Users\<user>\.ssh\config`
 
 The extension should still point at local-looking URLs while the tunnel is open:
 
