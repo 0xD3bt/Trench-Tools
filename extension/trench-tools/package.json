@@ -3,6 +3,7 @@
   "version": "1.1.6",
   "private": true,
   "type": "module",
+  "license": "AGPL-3.0-only",
   "description": "Standalone Chrome extension surface for the execution-engine product.",
   "scripts": {
     "check": "node ./scripts/check-manifest.mjs",

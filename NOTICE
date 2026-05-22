@@ -1,0 +1,10 @@
+Trench.Tools
+Copyright (c) 2026 Trench.Tools contributors
+
+The Trench.Tools core software, including the execution engine, browser extension,
+LaunchDeck, and shared runtime crates, is licensed under the GNU Affero General
+Public License v3.0 only. See LICENSE for the full license text.
+
+The Trench.Tools name, logo, domain, visual identity, and related branding are
+not licensed under the AGPLv3. See TRADEMARK.md for trademark and branding
+guidelines.

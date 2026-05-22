@@ -2,6 +2,7 @@
 name = "shared-raydium-launchlab"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 num-bigint = "0.4.6"

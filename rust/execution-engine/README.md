@@ -2,6 +2,11 @@
 
 This crate is the local Rust trading host for Trench Tools extension trading. It owns wallets, presets, route planning, transaction build/sign/send, confirmation handling, the local ledger, live balance/PnL events, token distribution, and the extension API on port `8788`.
 
+This crate is licensed under the GNU Affero General Public License v3.0 only
+as part of the Trench.Tools core software. Trench.Tools branding is not
+included in that software license; see the repository root `LICENSE`, `NOTICE`,
+and `TRADEMARK.md` files.
+
 ## Execution Model
 
 The execution engine is authoritative for trades.

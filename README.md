@@ -34,6 +34,18 @@ No mandatory accounts. No required platform fees. Clone it, run it, own what get
 
 This repo is under active development. The docs reflect the setup and features we consider usable today. The software is provided as-is; by using it, you accept responsibility for your machine, VPS, wallets, keys, dependencies, provider accounts, and any trading outcome.
 
+## Licensing
+
+Trench.Tools core software, including the execution engine, browser extension, LaunchDeck, and shared runtime crates, is licensed under the GNU Affero General Public License v3.0 only. See [LICENSE](LICENSE) for the full license text and [NOTICE](NOTICE) for project notices.
+
+You are free to use, study, modify, self-host, and redistribute the software under the terms of the AGPLv3. If you modify the software and make it available to others, including through a hosted service or network-accessible product, you must make the corresponding source code available under the same license.
+
+## Branding
+
+The Trench.Tools name, logo, domain, visual identity, and related branding are not licensed under the AGPLv3. You may not use Trench.Tools branding to present a fork, modified version, commercial service, hosted service, extension package, or unrelated product as official, endorsed, sponsored, or affiliated with Trench.Tools without written permission.
+
+See [TRADEMARK.md](TRADEMARK.md) for trademark and branding guidelines.
+
 ## What Trench Tools Is
 
 Trench Tools has three main pieces:

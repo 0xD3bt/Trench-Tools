@@ -2,6 +2,11 @@
 
 This folder contains the Chrome/Edge extension surface for Trench Tools.
 
+This package is licensed under the GNU Affero General Public License v3.0 only
+as part of the Trench.Tools core software. Trench.Tools branding is not
+included in that software license; see the repository root `LICENSE`, `NOTICE`,
+and `TRADEMARK.md` files.
+
 Operator setup lives in the root docs:
 
 - [../../docs/EXTENSION.md](../../docs/EXTENSION.md) - install, connect, auth token, presets, sites, updates
