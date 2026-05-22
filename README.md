@@ -1,4 +1,4 @@
-# Trench.Tools - Arming the Solana trenches with open-source tooling.
+# Trench.Tools - The open-source trading stack for Solana traders.
 
 <p align="center">
   <img src="assets/trench-tools-hero.png" alt="Trench Tools - the open-source trading stack for the trenches" width="100%">
@@ -26,69 +26,22 @@
   </table>
 </div>
 
-Trench Tools is a self-hosted Solana trading stack. You run it, you choose the RPCs and senders, and your wallets stay on your own machine or VPS.
+Trench Tools is an open-source, self-hosted execution stack for Solana trading and launch workflows.
 
-The browser extension plugs into the terminals you already use, so you can trade with your own presets and wallet groups instead of routing everything through another platform account. The toolbar popup lets you check connection/auth state, choose the active preset and wallet selection, and set a quick-buy amount without opening the full Options page. LaunchDeck is the launch side: deploy, snipe, dev-buy, dev-sell, follow flows, reports, and automation.
+The stack is built around a local Rust execution engine, a browser extension for supported terminals, and LaunchDeck for launchpad operations. The runtime keeps wallets, presets, RPC configuration, transaction construction, signing, and send policy on infrastructure you control.
 
-No mandatory accounts. No required platform fees. Clone it, run it, own what gets built, signed, and sent.
+Use it locally for setup and testing. For lower latency and a cleaner security boundary in live trading, run it on a cheap private VPS near your closest RPC and execution-provider endpoints.
 
-This repo is under active development. The docs reflect the setup and features we consider usable today. The software is provided as-is; by using it, you accept responsibility for your machine, VPS, wallets, keys, dependencies, provider accounts, and any trading outcome.
+The project is under active development. Make sure your setup is configured and verified end to end before using it for proper trading.
 
-## Licensing
+## How It Works
 
-Trench.Tools core software, including the execution engine, browser extension, LaunchDeck, and shared runtime crates, is licensed under the GNU Affero General Public License v3.0 only. See [LICENSE](LICENSE) for the full license text and [NOTICE](NOTICE) for project notices.
+Trench Tools separates the browser surface from execution:
 
-You are free to use, study, modify, self-host, and redistribute the software under the terms of the AGPLv3. If you modify the software and make it available to others, including through a hosted service or network-accessible product, you must make the corresponding source code available under the same license.
-
-## Branding
-
-The Trench.Tools name, logo, domain, visual identity, and related branding are not licensed under the AGPLv3. You may not use Trench.Tools branding to present a fork, modified version, commercial service, hosted service, extension package, or unrelated product as official, endorsed, sponsored, or affiliated with Trench.Tools without written permission.
-
-See [TRADEMARK.md](TRADEMARK.md) for trademark and branding guidelines.
-
-## What Trench Tools Is
-
-Trench Tools has three main pieces:
-
-- `execution engine` (`execution-engine`, port `8788`) - the local Rust trading host. It owns wallets, presets, fee and route resolution, transaction build/sign/send, confirmations, the balance/PnL event stream, and the voluntary Trench Tools fee setting. Anything that submits a trade goes through here. The browser extension talks to this for every trade.
-- `Trench Tools extension` - the Chrome/Edge extension that injects Trench Tools into supported trading terminals so you can trade with your presets and wallet groups from inside those sites. It talks to the local hosts over loopback by default and uses a shared bearer token.
-- `LaunchDeck` (`launchdeck-engine`, port `8789`, plus `launchdeck-follow-daemon` on port `8790`) - the launchpad feature inside Trench Tools. It handles deploy, snipe, dev-buy, dev-sell, and follow flows for Pump, Bonk, and Bagsapp. It has its own standalone UI on `http://127.0.0.1:8789` and is also available through the extension popout.
-
-## Start Here
-
-For most users:
-
-1. Read [docs/QUICKSTART.md](docs/QUICKSTART.md) for local Windows/Linux setup.
-2. If you are using a fresh server, use [docs/VPS_SETUP.md](docs/VPS_SETUP.md) instead.
-3. Install the browser extension with [docs/EXTENSION.md](docs/EXTENSION.md). Download the latest packaged extension zip to the PC running Chrome/Edge, or pull `extension/trench-tools` / the full repo with git and load that folder.
-4. Keep [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) nearby for connection/auth issues.
-
-VPS is still the recommended real trading setup because it is cheap, private by default, and closer to the latency profile you actually care about. With a fresh VPS, the bootstrap startup script, and a Helius Developer tier plan, most users can get the stack up from scratch in about 5-10 minutes. Local setup is fine when you are editing, testing, or learning the tool.
-
-If you get stuck during setup, use an AI coding assistant to walk through the steps with you. [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI), Codex, Claude, and similar tools are all fine for checking install commands, editing `.env`, reading logs, and following the VPS guide.
-
-## Which Mode Should I Run?
-
-Set the mode in `.env` first:
-
-- `TRENCH_TOOLS_MODE=` or `TRENCH_TOOLS_MODE=both` - normal full stack. Starts `execution-engine`, `launchdeck-engine`, and `launchdeck-follow-daemon`.
-- `TRENCH_TOOLS_MODE=ee` - extension trading only. Starts only `execution-engine` on `8788`.
-- `TRENCH_TOOLS_MODE=ld` - LaunchDeck only. Starts LaunchDeck and the follow daemon, but not extension trading.
-
-Then use the simple repo-root commands:
-
-```bash
-npm start
-npm stop
-npm restart
-```
-
-You can still override the mode for a one-off run:
-
-- Windows: `.\trench-tools-start.ps1 --mode both`
-- Linux: `./trench-tools-start.sh --mode both`
-
-The launcher exits after the selected services pass their health checks. `npm stop` stops the running Trench Tools processes.
+- Run `execution-engine` and `LaunchDeck` on your own machine or a private VPS. For live trading, the recommended setup is a cheap VPS near your RPC and execution-provider endpoints.
+- Install the Chrome/Edge extension in your local browser. It injects Trench Tools controls into supported platforms such as Axiom and J7Tracker.
+- When you trade from a supported platform, the extension sends the trade intent to your own execution engine. The engine handles route validation, transaction build/sign/send, confirmations, and PnL events using your configured wallets, presets, RPCs, and providers.
+- If the runtime is on a VPS, keep the raw ports private and connect your local browser through SSH forwards to `127.0.0.1:8788` and `127.0.0.1:8789`.
 
 ## Recommended Stack
 
@@ -96,9 +49,9 @@ For most operators today:
 
 - run on a VPS near the provider endpoints and RPCs you actually use
 - EU VPS location: Frankfurt or Amsterdam
-- US VPS location: New York / Newark area or Salt Lake City area
+- US VPS location: New York / Newark area for the default east-side endpoints, or Salt Lake City area for western users who set the Salt Lake provider endpoint
 - Asia VPS location: Singapore or Tokyo
-- [Helius Developer tier](https://www.helius.dev/pricing), about $50/month, or better for the main infrastructure
+- [Helius Developer tier](https://www.helius.dev/pricing), about $50/month, for the main infrastructure
 - `SOLANA_RPC_URL`: Helius Gatekeeper HTTP, `https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`
 - `SOLANA_WS_URL`: Helius standard websocket, `wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`
 - `WARM_RPC_URL`: separate [Shyft](https://shyft.to/) RPC for compatible warm/cache traffic off the main Helius budget
@@ -116,19 +69,69 @@ Do not treat any shared latency numbers as universal. Test from the VPS and regi
 
 Personal note: I have used Vultr for 5+ years and have not had issues with it.
 
+## Start Here
+
+For most users:
+
+1. Read [docs/QUICKSTART.md](docs/QUICKSTART.md) for local Windows/Linux setup.
+2. If you are using a fresh server, use [docs/VPS_SETUP.md](docs/VPS_SETUP.md) instead.
+3. Install the browser extension with [docs/EXTENSION.md](docs/EXTENSION.md). For most users, download the latest `trench-tools-extension.zip`, unzip it, and load the unzipped folder as an unpacked Chrome/Edge extension.
+4. Keep [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) nearby for connection/auth issues.
+
+With a fresh VPS, the bootstrap startup script, and a Helius Developer tier plan, most users can get the stack up from scratch in about 5-10 minutes. Local setup is fine when you are editing, testing, or learning the tool.
+
+If you get stuck during setup, use an AI coding assistant to walk through the steps with you. [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI), Codex, Claude, and similar tools are all fine for checking install commands, editing `.env`, reading logs, and following the VPS guide.
+
+## Runtime Modes
+
+The starter `.env.example` runs the full stack by default:
+
+```bash
+TRENCH_TOOLS_MODE=both
+```
+
+Use `both` for the normal setup. It starts `execution-engine`, `launchdeck-engine`, and `launchdeck-follow-daemon`.
+
+Other modes:
+
+- `ee` - extension trading only. Starts `execution-engine` on port `8788`.
+- `ld` - LaunchDeck only. Starts `launchdeck-engine` on port `8789` and `launchdeck-follow-daemon` on port `8790`.
+
+Run from the repo root:
+
+```bash
+npm start
+npm stop
+npm restart
+```
+
+The launcher exits after health checks pass, and the selected services keep running in the background. Use `npm stop` to stop them.
+
+For one-off mode overrides:
+
+```bash
+# Windows
+.\trench-tools-start.ps1 --mode both
+
+# Linux
+./trench-tools-start.sh --mode both
+```
+
 ## Supported Sites
 
-The extension site list is moving fast. Current status:
+The extension site list is moving fast. Current shipped support:
 
-- Live: `axiom.trade`
+- Live: `axiom.trade` / `backup.axiom.trade`
 - Live: `j7tracker.io`
-- Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, X, and more terminals
+- Planned: Terminal (formerly Padre), GMGN, Telegram web, Discord web, X, and more terminals
 
-Axiom currently includes token-page controls, Pulse quick buy and manual panel controls, watchlist and wallet-tracker quick buys, floating panel, LaunchDeck popout, Vamp import helpers, and DexScreener shortcuts. J7 includes contract-address quick actions and tweet-card LaunchDeck Deploy/Vamp buttons. See [docs/EXTENSION.md](docs/EXTENSION.md) for the current extension setup and site-status details.
+See [docs/EXTENSION.md](docs/EXTENSION.md) for current install steps, site toggles, and platform-specific surfaces.
 
 ## Current Route Coverage
 
-The execution engine verifies routes from on-chain state before trading. Current native coverage includes Pump bonding curve and Pump AMM, Bonk routes, Raydium AMM v4 and CPMM WSOL pool inputs, Raydium LaunchLab SOL pools, Meteora DBC and DAMM v2 launchpad routes, and a small trusted stable-route allowlist.
+The execution engine verifies routes from on-chain state before trading. Current native coverage includes Pump bonding curve, Pump AMM, LetsBonk launchpad and supported post-migration Bonk routes, Raydium LaunchLab SOL pools, Raydium AMM v4 and CPMM WSOL pool inputs, Meteora DBC, Meteora DAMM v2, and a small trusted stable-route allowlist.
+
+Raydium AMM v4 and CPMM support does not mean generic best-pool discovery. Standalone Raydium pools must be submitted as verified pool accounts and pass owner/layout/mint checks.
 
 Pool/pair support is intentionally not the same as "anything a website labels as a pair." See [docs/SUPPORTED_POOLS.md](docs/SUPPORTED_POOLS.md) before assuming a route is executable.
 
@@ -188,18 +191,6 @@ ssh -L 8788:127.0.0.1:8788 -L 8789:127.0.0.1:8789 root@YOUR_SERVER_IP
 
 Use a small test amount first. Start with the recommended providers: `Helius Sender` or `Hello Moon`.
 
-## Security
-
-Keep the runtime private by default:
-
-- do not share `.env`
-- do not paste real private keys, API keys, JWTs, or auth tokens into issues, screenshots, Discord, or support messages
-- do not expose raw local ports to the public internet
-- use the SSH-tunnel VPS pattern in [docs/VPS_SETUP.md](docs/VPS_SETUP.md)
-- use HTTPS and browser host-permission grants if you intentionally point the extension at non-loopback hosts
-
-Read [SECURITY.md](SECURITY.md) before running this with real wallets.
-
 ## Documentation Map
 
 Start here:
@@ -214,6 +205,7 @@ Execution and architecture:
 
 - [docs/PROVIDERS.md](docs/PROVIDERS.md) - Helius Sender, Hello Moon, and deferred provider notes
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - execution engine, extension, LaunchDeck, auth flow, local state
+- [docs/SUPPORTED_POOLS.md](docs/SUPPORTED_POOLS.md) - supported execution-engine pools, routes, and pair caveats
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - startup, extension auth, VPS, RPC, and provider issues
 
 LaunchDeck:
@@ -221,6 +213,7 @@ LaunchDeck:
 - [docs/launchdeck/USAGE.md](docs/launchdeck/USAGE.md) - LaunchDeck operator workflow
 - [docs/launchdeck/LAUNCHPADS.md](docs/launchdeck/LAUNCHPADS.md) - Pump, Bonk, Bagsapp support matrix
 - [docs/launchdeck/STRATEGIES.md](docs/launchdeck/STRATEGIES.md) - dev buys, snipes, dev sells, follow sells
+- [docs/launchdeck/METADATA_AND_VANITY.md](docs/launchdeck/METADATA_AND_VANITY.md) - metadata/IPFS uploads, Pinata, and vanity mint queues
 - [docs/launchdeck/FOLLOW_DAEMON.md](docs/launchdeck/FOLLOW_DAEMON.md) - watcher ownership, triggers, and follow timing
 - [docs/launchdeck/REPORTING.md](docs/launchdeck/REPORTING.md) - reports, history, and local state
 
@@ -228,3 +221,27 @@ Contributor/internal reference:
 
 - [docs/internal/EXECUTION_DOS_AND_DONTS.md](docs/internal/EXECUTION_DOS_AND_DONTS.md)
 - [docs/internal/ROUTE_SOURCE_POLICY.md](docs/internal/ROUTE_SOURCE_POLICY.md)
+
+## Security
+
+Keep the runtime private by default:
+
+- do not share `.env`
+- do not paste real private keys, API keys, JWTs, or auth tokens into issues, screenshots, Discord, or support messages
+- do not expose raw local ports to the public internet
+- use the SSH-tunnel VPS pattern in [docs/VPS_SETUP.md](docs/VPS_SETUP.md)
+- use HTTPS and browser host-permission grants if you intentionally point the extension at non-loopback hosts
+
+Read [SECURITY.md](SECURITY.md) before running this with real wallets.
+
+## Licensing
+
+Trench.Tools core software, including the execution engine, browser extension, LaunchDeck, and shared runtime crates, is licensed under the GNU Affero General Public License v3.0 only. See [LICENSE](LICENSE) for the full license text and [NOTICE](NOTICE) for project notices.
+
+You are free to use, study, modify, self-host, and redistribute the software under the terms of the AGPLv3. If you modify the software and make it available to others, including through a hosted service or network-accessible product, you must make the corresponding source code available under the same license.
+
+## Branding
+
+The Trench.Tools name, logo, domain, visual identity, and related branding are not licensed under the AGPLv3. You may not use Trench.Tools branding to present a fork, modified version, commercial service, hosted service, extension package, or unrelated product as official, endorsed, sponsored, or affiliated with Trench.Tools without written permission.
+
+See [TRADEMARK.md](TRADEMARK.md) for trademark and branding guidelines.

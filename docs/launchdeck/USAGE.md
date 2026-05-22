@@ -66,14 +66,14 @@ Name presets are saved in the LaunchDeck config and can be edited from the Launc
 
 ## Metadata And Images
 
-Metadata upload defaults to the launchpad's native uploader when `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` is blank: pump-fun for Pump, Bonk's upload endpoints for Bonk, and Bags API prepare for Bagsapp.
-
-Use Pinata only when you want it:
+Pinata is recommended for Pump/Bonk metadata uploads, and the free tier is enough for normal use. Create a free account at [pinata.cloud](https://pinata.cloud/), create an API key, copy the JWT, and set:
 
 ```bash
 LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata
 PINATA_JWT=YOUR_PINATA_JWT
 ```
+
+Metadata upload defaults to the launchpad's native uploader when `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` is blank: pump-fun for Pump, Bonk's upload endpoints for Bonk, and Bags API prepare for Bagsapp.
 
 The image library is local state. Do not commit uploaded local assets or metadata that you do not intend to publish.
 

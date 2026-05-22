@@ -13,7 +13,7 @@ This guide explains the recommended Trench Tools setup and the defaults most use
 For most operators today:
 
 - run on a VPS close to your provider endpoints and RPCs
-- use [Helius Developer tier](https://www.helius.dev/pricing), about $50/month, or better for primary infrastructure
+- use [Helius Developer tier](https://www.helius.dev/pricing), about $50/month, for primary infrastructure
 - `SOLANA_RPC_URL`: Helius Gatekeeper HTTP
 - `SOLANA_WS_URL`: Helius standard websocket
 - `WARM_RPC_URL`: separate [Shyft](https://shyft.to/) RPC for compatible warm/cache traffic off the main Helius budget
@@ -123,7 +123,7 @@ Metros:
 Practical guidance:
 
 - EU: use `eu`, `fra`, or `ams`; place the VPS in Frankfurt or Amsterdam.
-- US: use `ewr` or `slc` when you want to pin closer to one side; `us` fans out across a wide region.
+- US: use `ewr` with a New York / Newark VPS for the default east-side endpoints. Use `slc` with a Salt Lake City VPS if you are farther west and want the Salt Lake provider endpoint. Avoid broad `us` when you care about predictable latency, because it spans a wide region.
 - Asia: use `sg` or `tyo` when you know which side you are closer to; `asia` spans far-apart endpoints.
 
 Helius Sender supports exact metro routing where those metros exist. Hello Moon maps unsupported metros to the closest endpoints it exposes. For example, Hello Moon does not expose every Helius metro one-to-one.
@@ -201,16 +201,14 @@ Restart the runtime after changing `.env`. If Trench Tools has saved you money a
 
 ## Metadata Upload
 
-Blank/default uses the launchpad's native metadata flow: pump-fun for Pump, Bonk's upload endpoints for Bonk, and Bags API prepare for Bagsapp.
-
-Use Pinata only when you want it:
+Pinata is recommended for Pump/Bonk metadata uploads, and the free tier is enough for normal use. Create a free account at [pinata.cloud](https://pinata.cloud/), create an API key, copy the JWT, and set:
 
 ```bash
 LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata
 PINATA_JWT=YOUR_PINATA_JWT
 ```
 
-Get a JWT from [Pinata](https://pinata.cloud/).
+Blank/default uses the launchpad's native metadata flow: pump-fun for Pump, Bonk's upload endpoints for Bonk, and Bags API prepare for Bagsapp.
 
 Pump and Bonk use the shared LaunchDeck metadata/IPFS flow. Bagsapp uses the Bags API prepare flow and returns its own mint and metadata URI. See [launchdeck/METADATA_AND_VANITY.md](launchdeck/METADATA_AND_VANITY.md) for platform behavior and vanity queue formatting.
 

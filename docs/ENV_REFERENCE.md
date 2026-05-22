@@ -18,8 +18,8 @@ These are the values most users may need.
 - `WARM_WS_URL` - best-effort websocket for warm probes or non-authoritative observers. When set, those probes can move off `SOLANA_WS_URL`. Live visible subscriptions and confirmations stay on `SOLANA_WS_URL`.
 - `HELLOMOON_API_KEY` - optional Hello Moon Lunar Lander API key.
 - `BAGS_API_KEY` - optional Bags API key for Bags launchpad flows.
-- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` - blank/default uses the launchpad's native metadata flow. Set `pinata` to use Pinata for Pump/Bonk.
-- `PINATA_JWT` - required only when metadata provider is `pinata`.
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` - recommended: set `pinata` to use Pinata for Pump/Bonk metadata uploads. Blank/default uses the launchpad's native metadata flow.
+- `PINATA_JWT` - required when metadata provider is `pinata`. The Pinata free tier is enough for normal use; create a free account at [pinata.cloud](https://pinata.cloud/), create an API key, and copy the JWT.
 
 For per-launchpad metadata/IPFS behavior and local Pump/Bonk vanity mint queue formatting, see [launchdeck/METADATA_AND_VANITY.md](launchdeck/METADATA_AND_VANITY.md).
 

@@ -5,6 +5,10 @@ The Trench.Tools core software, including the execution engine, browser extensio
 LaunchDeck, and shared runtime crates, is licensed under the GNU Affero General
 Public License v3.0 only. See LICENSE for the full license text.
 
+The software is provided without warranty under the terms of the AGPLv3.
+Trading, launch, wallet, infrastructure, RPC, provider, and configuration risks
+remain with the operator.
+
 The Trench.Tools name, logo, domain, visual identity, and related branding are
 not licensed under the AGPLv3. See TRADEMARK.md for trademark and branding
 guidelines.

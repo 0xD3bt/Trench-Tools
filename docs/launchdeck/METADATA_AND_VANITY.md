@@ -12,7 +12,7 @@ If no metadata URI is present:
 - `Bonk` uses the shared LaunchDeck metadata uploader. The default uploader uploads the image to Bonk, then uploads metadata JSON to Bonk and uses the returned URI.
 - `Bagsapp` owns its metadata flow through the Bags API. LaunchDeck does not pre-upload through the shared Pump/Bonk uploader. During Bags prepare, Bags uploads token info and image, then returns the mint, config key, and metadata URI used for the launch transaction.
 
-You can override the Pump/Bonk uploader with Pinata:
+Pinata is recommended for Pump/Bonk metadata uploads, and the free tier is enough for normal use. Create a free account at [pinata.cloud](https://pinata.cloud/), create an API key, copy the JWT, and set:
 
 ```bash
 LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata

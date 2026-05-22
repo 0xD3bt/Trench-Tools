@@ -52,8 +52,8 @@ Place the VPS near the provider endpoints and RPCs you actually plan to use.
 Good starting points:
 
 - EU: Frankfurt or Amsterdam
-- US East: New York / Newark area
-- US West / central fallback: Salt Lake City area
+- US East: New York / Newark area for the default east-side endpoints
+- US West / central fallback: Salt Lake City area if you set the Salt Lake provider endpoint
 - Asia: Singapore or Tokyo
 
 If you use a grouped `USER_REGION` like `us` or `asia`, remember those metros are far apart. In practice, pick a server near the side you care about and use the exact metro token (`ewr`, `slc`, `sg`, `tyo`, etc.).
@@ -273,8 +273,8 @@ What this does: this creates the actual VPS and attaches the SSH key, startup sc
 6. Choose at least `2 vCPU / 4 GB RAM`.
 7. Choose the region closest to your target RPC/provider endpoints.
 8. For EU, start with Frankfurt or Amsterdam.
-9. For US East, start with New York / Newark.
-10. For US West or central fallback, start with Salt Lake City.
+9. For US East, start with New York / Newark for the default east-side endpoints.
+10. For US West or central fallback, start with Salt Lake City and set the Salt Lake provider endpoint.
 11. In the SSH key section, select `trench-tools`.
 12. In the startup script/user-data section, select `trench-tools-bootstrap`.
 13. In the firewall section, select `trench-tools-ssh-only`.
@@ -417,7 +417,7 @@ Fill the starter values:
 - `WARM_RPC_URL` moves compatible warm/cache traffic off the primary RPC
 - `HELLOMOON_API_KEY` only if using Hello Moon
 - `BAGS_API_KEY` only if using Bags launchpad flows
-- `PINATA_JWT` only if using Pinata metadata uploads
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata` and `PINATA_JWT` for the recommended Pump/Bonk metadata upload path
 
 Recommended URL examples:
 
@@ -426,6 +426,13 @@ SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
 SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
 WARM_RPC_URL=https://rpc.shyft.to?api_key=YOUR_SHYFT_API_KEY
 WARM_WS_URL=wss://rpc.shyft.to?api_key=YOUR_SHYFT_API_KEY
+```
+
+For LaunchDeck Pump/Bonk metadata uploads, Pinata is recommended and the free tier is enough for normal use. Create a free account at [pinata.cloud](https://pinata.cloud/), create an API key, copy the JWT, and set:
+
+```bash
+LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata
+PINATA_JWT=YOUR_PINATA_JWT
 ```
 
 After saving `.env`, restart Trench Tools:

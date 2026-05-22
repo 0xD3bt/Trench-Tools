@@ -13,8 +13,8 @@ When `LaunchDeck` is running too, the extension also gives you an embedded Launc
 npm start
 ```
 
-3. Download the latest packaged extension zip to the PC running Chrome/Edge, unzip it, and load the unzipped `trench-tools-extension` folder as an unpacked extension. You can also pull `extension/trench-tools` or the full repo with git and load that source folder.
-4. Load the extension folder as an unpacked Chrome/Edge extension.
+3. Download `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest) to the PC running Chrome/Edge.
+4. Unzip it and load the unzipped `trench-tools-extension` folder as an unpacked extension.
 5. Open extension Options -> `Global settings`.
 6. Set `Execution host` to `http://127.0.0.1:8788`.
 7. Set `LaunchDeck host` to `http://127.0.0.1:8789`.
@@ -22,6 +22,8 @@ npm start
 9. Save and test both hosts.
 
 For VPS installs, keep the SSH tunnel open first so those local-looking URLs point through to the VPS.
+
+Unpacked Chrome/Edge extensions do not auto-update. Until Trench Tools is published in the browser extension stores, download the latest zip again after each Trench Tools patch, replace the old unzipped folder, and click reload for Trench Tools on `chrome://extensions` or `edge://extensions`. Store distribution is planned once extension updates are less frequent.
 
 ## Supported Sites
 
@@ -100,7 +102,7 @@ For normal extension use, run `ee` or `both`. You can still use `trench-tools-st
 1. Start the backend first:
    - set `TRENCH_TOOLS_MODE=both` in `.env`, or leave it blank for the same default
    - run `npm start` from the repo root
-2. Get the extension on the PC that runs Chrome/Edge. The simplest path is the latest packaged zip: `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest).
+2. Get the extension on the PC that runs Chrome/Edge. For most users, use the latest packaged zip: `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest).
 3. Unzip it and keep the unzipped `trench-tools-extension` folder somewhere stable, such as `Documents\Trench Tools Extension`.
 4. Open Chrome or Edge.
 5. Open `chrome://extensions` or `edge://extensions`.
@@ -118,6 +120,8 @@ https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest
 ```
 
 Download `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest), unzip it, and load the unzipped `trench-tools-extension` folder. Chrome/Edge cannot load the zip directly.
+
+The packaged zip is not an auto-updating store install. After each Trench Tools patch, download the latest zip again, replace the old unzipped folder, and click reload for Trench Tools on `chrome://extensions` or `edge://extensions`.
 
 If you already cloned the full repository, you can load this source folder instead:
 
@@ -147,6 +151,20 @@ git pull --ff-only
 ```
 
 If you use the packaged zip, update by downloading the newest `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest), replacing the old unzipped folder, then clicking reload for Trench Tools on `chrome://extensions` or `edge://extensions`.
+
+## Extension Updates
+
+For now, Trench Tools is distributed as an unpacked extension because the extension is changing quickly. Unpacked extensions do not update themselves.
+
+When you update Trench Tools:
+
+1. Download the newest `trench-tools-extension.zip` from the [`extension-latest` GitHub release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest).
+2. Unzip it over or beside your old `trench-tools-extension` folder.
+3. Open `chrome://extensions` or `edge://extensions`.
+4. Click reload on the Trench Tools extension.
+5. Re-open Options -> `Global settings` and test the execution host and LaunchDeck host.
+
+The extension will be submitted to the browser extension stores once updates are less frequent.
 
 ## Connect The Extension
 

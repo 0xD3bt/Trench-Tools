@@ -38,11 +38,25 @@ curl https://sh.rustup.rs -sSf | sh -s -- -y
 source "$HOME/.cargo/env"
 ```
 
-Make sure you have [Node.js 20](https://nodejs.org/en/download).
+Install [Node.js 20](https://nodejs.org/en/download). One common Linux path is `nvm`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+\. "$HOME/.nvm/nvm.sh"
+nvm install 20
+nvm use 20
+```
 
 ## 2. Install Project Dependencies
 
-From the repo root:
+Clone the repository if you do not already have it:
+
+```bash
+git clone https://github.com/0xD3bt/Trench-Tools.git
+cd Trench-Tools
+```
+
+Then install dependencies from the repo root:
 
 ```bash
 npm install
@@ -74,7 +88,7 @@ Fill the practical starter values:
 - `WARM_RPC_URL` moves compatible warm/cache traffic off the primary RPC
 - `HELLOMOON_API_KEY` only if you want Hello Moon
 - `BAGS_API_KEY` only if you use Bags launchpad flows
-- `PINATA_JWT` only if you set `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata` and `PINATA_JWT` for the recommended Pump/Bonk metadata upload path
 
 Recommended Helius/Shyft examples:
 
@@ -86,6 +100,13 @@ WARM_WS_URL=wss://rpc.shyft.to?api_key=YOUR_SHYFT_API_KEY
 ```
 
 Put your Helius key immediately after `api-key=`. Put your Shyft key immediately after `api_key=`.
+
+For LaunchDeck Pump/Bonk metadata uploads, Pinata is recommended and the free tier is enough for normal use. Create a free account at [pinata.cloud](https://pinata.cloud/), create an API key, copy the JWT, and set:
+
+```bash
+LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata
+PINATA_JWT=YOUR_PINATA_JWT
+```
 
 For the full list of advanced options, see [.env.advanced](../.env.advanced) and [ENV_REFERENCE.md](ENV_REFERENCE.md).
 
@@ -120,6 +141,12 @@ Windows:
 .\trench-tools-start.ps1 --mode both
 ```
 
+If PowerShell blocks direct script execution, use the npm command above or run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\trench-tools-start.ps1 --mode both
+```
+
 Linux:
 
 ```bash
@@ -127,6 +154,8 @@ Linux:
 ```
 
 The first startup can take a few minutes while Rust builds the binaries. Later starts should be much faster.
+
+After startup passes health checks, the launcher exits and leaves the selected services running in the background. Use `npm stop` when you want to stop them.
 
 ### VPS + Local Browser Tunnel
 
@@ -167,6 +196,20 @@ The shared default bearer token is written here after startup:
 .local/trench-tools/default-engine-token.txt
 ```
 
+Read it from the repo root.
+
+Windows:
+
+```powershell
+Get-Content .local\trench-tools\default-engine-token.txt
+```
+
+Linux:
+
+```bash
+cat .local/trench-tools/default-engine-token.txt
+```
+
 Use the contents of that file in the extension Options page:
 
 - `Execution host URL` -> `http://127.0.0.1:8788`
@@ -182,12 +225,14 @@ Follow [EXTENSION.md](EXTENSION.md) for the full guide. Short version:
 1. Open Chrome or Edge.
 2. Open `chrome://extensions` or `edge://extensions`.
 3. Enable Developer mode.
-4. Download `trench-tools-extension.zip` from the [latest extension release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest), unzip it on the PC running Chrome/Edge, or get the extension folder by pulling this repo with git.
+4. Download `trench-tools-extension.zip` from the [latest extension release](https://github.com/0xD3bt/Trench-Tools/releases/tag/extension-latest) to the PC running Chrome/Edge and unzip it.
 5. Click `Load unpacked`.
 6. Select the unzipped `trench-tools-extension` folder. If you are using a git checkout, select `extension/trench-tools`.
 7. Open the extension Options page and fill the host URLs and shared access token.
 
 [EXTENSION.md](EXTENSION.md) shows the packaged zip link, full-repo option, and git sparse-checkout flow if you only want to pull `extension/trench-tools`.
+
+Unpacked Chrome/Edge extensions do not auto-update. After each Trench Tools patch, download the latest `trench-tools-extension.zip` again, replace the old unzipped folder, and click reload for Trench Tools on `chrome://extensions` or `edge://extensions`. Store distribution is planned once extension updates are less frequent.
 
 ## 7. Verify Setup
 
