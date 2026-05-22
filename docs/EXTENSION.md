@@ -355,21 +355,19 @@ Future platforms such as Terminal, GMGN, Telegram web, Discord web, X, and other
 
 Open Options -> `Global settings` -> `Voluntary fee`.
 
-The default tier is `0.1%` (`10` bps). It can be turned off or increased:
+Supported tiers:
 
 - `0% (no fee)` = off
 - `0.1%` = default
 - `0.2%` = increased support
 
-The same default can be set in `.env`:
+The same value can be set in `.env`:
 
 ```bash
 TRENCH_TOOL_FEE=0    # off
 TRENCH_TOOL_FEE=0.1  # default
 TRENCH_TOOL_FEE=0.2  # increased support
 ```
-
-If Trench Tools has saved you money and time and you want to support development and future tools, consider leaving the default `0.1%` fee enabled.
 
 ## Updating Later
 

@@ -185,19 +185,15 @@ See [ENV_REFERENCE.md](ENV_REFERENCE.md) before changing them.
 
 ## Voluntary Support Fee
 
-Trench Tools defaults to a voluntary `0.1%` fee on supported trade paths.
+Trench Tools uses a voluntary fee on supported trade paths:
 
 ```bash
-TRENCH_TOOL_FEE=
+TRENCH_TOOL_FEE=0.1  # default
+TRENCH_TOOL_FEE=0    # off
+TRENCH_TOOL_FEE=0.2  # increased support
 ```
 
-Values:
-
-- blank or `0.1`: `0.1%`
-- `0`: off
-- `0.2`: increased support at `0.2%`
-
-Restart the runtime after changing `.env`. If Trench Tools has saved you money and time and you want to support development and future tools, consider leaving the default `0.1%` fee enabled.
+Restart the runtime after changing `.env`.
 
 ## Metadata Upload
 

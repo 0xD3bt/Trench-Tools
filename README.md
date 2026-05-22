@@ -137,7 +137,13 @@ Pool/pair support is intentionally not the same as "anything a website labels as
 
 ## Voluntary Support Fee
 
-Trench Tools defaults to a voluntary `0.1%` fee on supported trade paths.
+Trench Tools has a voluntary fee setting on supported trade paths. The value is a percentage, so `0.1` means `0.1%`. For example, `100 SOL` in volume would total `0.1 SOL` in support fees at `0.1%`. The fee helps support continued development and maintenance.
+
+The starter `.env.example` uses the default:
+
+```bash
+TRENCH_TOOL_FEE=0.1
+```
 
 To turn it off:
 
@@ -145,19 +151,13 @@ To turn it off:
 TRENCH_TOOL_FEE=0
 ```
 
-To keep the default, leave it blank or set:
-
-```bash
-TRENCH_TOOL_FEE=0.1
-```
-
-To increase support to `0.2%`:
+To increase it to `0.2%`:
 
 ```bash
 TRENCH_TOOL_FEE=0.2
 ```
 
-Restart the runtime after changing `.env`. If Trench Tools has saved you money and time and you want to support development and future tools, consider leaving the default `0.1%` fee enabled. It is still much lower than the average fee charged by current trading platforms.
+Restart the runtime after changing `.env`. The setting only applies to supported trade paths that include the Trench Tools fee route.
 
 ## Quick Verification
 
