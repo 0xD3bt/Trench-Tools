@@ -64,6 +64,7 @@ use crate::{
 pub struct NativeLaunchArtifacts {
     pub compiled_transactions: Vec<CompiledTransaction>,
     pub creation_transactions: Vec<CompiledTransaction>,
+    pub pre_launch_transactions: Vec<CompiledTransaction>,
     pub deferred_setup_transactions: Vec<CompiledTransaction>,
     /// Jito-style setup bundles (e.g. Bags fee-share) executed before `setup_transactions`.
     pub setup_bundles: Vec<Vec<CompiledTransaction>>,
@@ -255,6 +256,7 @@ impl From<NativePumpArtifacts> for NativeLaunchArtifacts {
         Self {
             compiled_transactions: value.compiled_transactions,
             creation_transactions: value.creation_transactions,
+            pre_launch_transactions: value.pre_launch_transactions,
             deferred_setup_transactions: value.deferred_setup_transactions,
             setup_bundles: Vec::new(),
             setup_transactions: Vec::new(),
@@ -280,6 +282,7 @@ impl From<NativeBonkArtifacts> for NativeLaunchArtifacts {
         Self {
             compiled_transactions: value.compiled_transactions,
             creation_transactions: value.creation_transactions,
+            pre_launch_transactions: Vec::new(),
             deferred_setup_transactions: value.deferred_setup_transactions,
             setup_bundles: Vec::new(),
             setup_transactions: Vec::new(),
@@ -315,6 +318,7 @@ impl From<NativeBagsArtifacts> for NativeLaunchArtifacts {
         Self {
             creation_transactions: value.compiled_transactions,
             compiled_transactions,
+            pre_launch_transactions: Vec::new(),
             deferred_setup_transactions: vec![],
             setup_bundles: value.setup_bundles,
             setup_transactions: value.setup_transactions,
@@ -422,8 +426,6 @@ async fn maybe_wrap_launch_dev_buy_artifacts(
         return Ok(Some(artifacts));
     };
     let _ = (rpc_url, wallet_secret, dev_buy);
-    // Launch dev-buy transactions intentionally stay native so creation
-    // flows keep the venue's canonical transaction shape.
     Ok(Some(artifacts))
 }
 
@@ -437,53 +439,7 @@ pub async fn maybe_wrap_launch_dev_buy_transaction(
         return Ok(source);
     };
     let _ = (rpc_url, config, wallet_secret, dev_buy);
-    // Launch dev-buy transactions intentionally stay native so creation
-    // flows keep the venue's canonical transaction shape.
     Ok(source)
-}
-
-fn launch_dev_buy_wrap_request(
-    config: &NormalizedConfig,
-    dev_buy: &crate::config::NormalizedDevBuy,
-) -> Result<LaunchdeckWrapRequest, String> {
-    let gross_sol_in_lamports = match dev_buy.mode.trim().to_ascii_lowercase().as_str() {
-        "sol" => match parse_sol_amount_to_lamports(&dev_buy.amount) {
-            Ok(value) if value > 0 => value,
-            Ok(_) => {
-                return Err(
-                    "LaunchDeck wrapper dev-buy amount must be greater than zero".to_string(),
-                );
-            }
-            Err(error) => {
-                return Err(format!(
-                    "LaunchDeck wrapper dev-buy amount parse failed for launchpad={}: {}",
-                    config.launchpad, error
-                ));
-            }
-        },
-        "tokens" if config.launchpad != "bagsapp" => 0,
-        "tokens" => {
-            return Err(
-                "Bags creation dev-buy token mode is not atomic-safe in the native API path; Bags currently requires initialBuyLamports."
-                    .to_string(),
-            );
-        }
-        other => {
-            return Err(format!(
-                "LaunchDeck wrapper dev-buy mode {other} is not supported for launchpad={}",
-                config.launchpad
-            ));
-        }
-    };
-    Ok(LaunchdeckWrapRequest {
-        route_kind: WrapperRouteKind::SolIn,
-        fee_bps: config.wrapperDefaultFeeBps,
-        gross_sol_in_lamports,
-        infer_gross_sol_in_from_inner: dev_buy.mode.trim().eq_ignore_ascii_case("tokens"),
-        min_net_output: 0,
-        select_first_allowlisted_venue_instruction: false,
-        select_last_allowlisted_venue_instruction: true,
-    })
 }
 
 async fn maybe_wrap_follow_transaction(
@@ -586,7 +542,7 @@ fn bonk_allows_already_wrapped_passthrough(launchpad: &str, label: &str) -> bool
 }
 
 fn pump_allows_already_wrapped_passthrough(launchpad: &str, label: &str) -> bool {
-    launchpad == "pump" && matches!(label, "follow-buy" | "follow-sell")
+    launchpad == "pump" && matches!(label, "follow-buy" | "follow-buy-atomic" | "follow-sell")
 }
 
 fn wrapper_passthrough_reason<'a>(launchpad: &str, error: &str) -> Option<&'a str> {
@@ -835,6 +791,7 @@ pub async fn compile_atomic_follow_buy_for_launchpad(
         "pump" => {
             let tx = compile_atomic_pump_follow_buy(
                 rpc_url,
+                quote_asset,
                 &execution,
                 token_mayhem_mode,
                 jito_tip_account,
@@ -931,6 +888,7 @@ pub async fn compile_follow_sell_for_launchpad(
                 request.launch_creator,
                 request.sell_percent,
                 request.prefer_post_setup_creator_vault,
+                request.quote_asset,
                 request.token_amount_override,
                 request.pump_cashback_enabled_override,
                 request.wrapper_fee_bps,
@@ -1171,6 +1129,7 @@ mod tests {
         NativeLaunchArtifacts {
             compiled_transactions: vec![dummy_compiled_transaction("launch", "v0-alt")],
             creation_transactions: vec![dummy_compiled_transaction("launch", "v0-alt")],
+            pre_launch_transactions: vec![],
             deferred_setup_transactions: vec![dummy_compiled_transaction("setup", "v0-alt")],
             setup_bundles: vec![],
             setup_transactions: vec![],
@@ -1335,11 +1294,11 @@ mod tests {
         ));
         assert!(pump_allows_already_wrapped_passthrough(
             "pump",
-            "follow-sell"
-        ));
-        assert!(!pump_allows_already_wrapped_passthrough(
-            "pump",
             "follow-buy-atomic"
+        ));
+        assert!(pump_allows_already_wrapped_passthrough(
+            "pump",
+            "follow-sell"
         ));
         assert!(!pump_allows_already_wrapped_passthrough(
             "bonk",

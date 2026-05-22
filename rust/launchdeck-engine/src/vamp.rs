@@ -17,7 +17,10 @@ const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 const PUMP_AGENT_PAYMENTS_PROGRAM_ID: &str = "AgenTMiC2hvxGebTsgmsD4HHBa8WEcqGFf87iwRRxLo7";
 const MPL_TOKEN_METADATA_PROGRAM_ID: &str = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const PLATFORM_GITHUB: u8 = 2;
+const VAMP_SAFE_IMAGE_EXTENSIONS: [&str; 3] = [".png", ".jpg", ".webp"];
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ImportedRouteRecipient {
@@ -129,6 +132,14 @@ fn insert_unique_url(urls: &mut Vec<String>, index: usize, candidate: String) {
         return;
     }
     urls.insert(index.min(urls.len()), normalized.to_string());
+}
+
+fn remove_url(urls: &mut Vec<String>, candidate: &str) {
+    let normalized = candidate.trim();
+    if normalized.is_empty() {
+        return;
+    }
+    urls.retain(|entry| entry != normalized);
 }
 
 fn normalize_ipfs_path(raw_value: &str) -> Option<String> {
@@ -699,6 +710,7 @@ fn prioritize_image_url(imported: &mut ImportedTokenData, image_url: &str) {
     }
     let previous_primary = imported.imageUrl.trim().to_string();
     imported.imageUrl = normalized.clone();
+    remove_url(&mut imported.imageCandidates, &normalized);
     insert_unique_url(&mut imported.imageCandidates, 0, normalized);
     if !previous_primary.is_empty() && previous_primary != imported.imageUrl {
         insert_unique_url(&mut imported.imageCandidates, 1, previous_primary);
@@ -741,6 +753,48 @@ fn pump_token_agent_payments_pda(mint: &Pubkey) -> Result<Pubkey, String> {
         &pump_agent_payments_program_id()?,
     )
     .0)
+}
+
+fn pump_quote_asset_from_mint(quote_mint: &Pubkey) -> (String, Option<String>) {
+    let quote_mint_text = quote_mint.to_string();
+    if *quote_mint == Pubkey::default() || quote_mint_text == WSOL_MINT {
+        return ("sol".to_string(), None);
+    }
+    if quote_mint_text == USDC_MINT {
+        return ("usdc".to_string(), None);
+    }
+    (
+        String::new(),
+        Some(format!(
+            "Pump bonding curve uses unsupported quote mint {quote_mint}."
+        )),
+    )
+}
+
+fn infer_pump_payload_quote_asset(payload: &Value) -> String {
+    let quote_mint = payload
+        .get("quote_mint")
+        .or_else(|| payload.get("quoteMint"))
+        .or_else(|| payload.get("quote_token_mint"))
+        .or_else(|| payload.get("quoteTokenMint"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if let Ok(pubkey) = Pubkey::from_str(quote_mint) {
+        return pump_quote_asset_from_mint(&pubkey).0;
+    }
+    let quote_asset = payload
+        .get("quote_asset")
+        .or_else(|| payload.get("quoteAsset"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match quote_asset.as_str() {
+        "usdc" => "usdc".to_string(),
+        "sol" | "wsol" => "sol".to_string(),
+        _ => String::new(),
+    }
 }
 
 fn read_bool(data: &[u8], offset: &mut usize) -> Result<bool, String> {
@@ -806,7 +860,7 @@ fn read_pubkey(data: &[u8], offset: &mut usize) -> Result<Pubkey, String> {
     Ok(Pubkey::new_from_array(bytes))
 }
 
-fn parse_pump_creator_and_cashback(data: &[u8]) -> Result<(Pubkey, bool), String> {
+fn parse_pump_curve_context(data: &[u8]) -> Result<(Pubkey, bool, String, Vec<String>), String> {
     let mut offset = 8usize;
     let _virtual_token_reserves = read_u64(data, &mut offset)?;
     let _virtual_sol_reserves = read_u64(data, &mut offset)?;
@@ -815,8 +869,28 @@ fn parse_pump_creator_and_cashback(data: &[u8]) -> Result<(Pubkey, bool), String
     let _token_total_supply = read_u64(data, &mut offset)?;
     let _complete = read_bool(data, &mut offset)?;
     let creator = read_pubkey(data, &mut offset)?;
-    let cashback_enabled = data.len() > 82 && data[82] != 0;
-    Ok((creator, cashback_enabled))
+    let _is_mayhem_mode = if offset < data.len() {
+        read_bool(data, &mut offset)?
+    } else {
+        false
+    };
+    let cashback_enabled = if offset < data.len() {
+        read_bool(data, &mut offset)?
+    } else {
+        false
+    };
+    let (quote_asset, quote_note) = if offset < data.len() {
+        let quote_mint = read_pubkey(data, &mut offset)?;
+        pump_quote_asset_from_mint(&quote_mint)
+    } else {
+        ("sol".to_string(), None)
+    };
+    Ok((
+        creator,
+        cashback_enabled,
+        quote_asset,
+        quote_note.into_iter().collect(),
+    ))
 }
 
 fn parse_pump_social_fee_pda(data: &[u8]) -> Result<(String, u8), String> {
@@ -1026,7 +1100,8 @@ async fn detect_pump_import_context(
     )
     .await?;
     if let Some(data) = batch_accounts.first().cloned().flatten() {
-        let (creator, cashback_enabled) = parse_pump_creator_and_cashback(&data)?;
+        let (creator, cashback_enabled, quote_asset, curve_notes) =
+            parse_pump_curve_context(&data)?;
         let agent_enabled = batch_accounts.get(1).is_some_and(|value| value.is_some());
         let fee_sharing_data = batch_accounts.get(2).cloned().flatten();
         let fee_sharing_enabled = fee_sharing_data.is_some();
@@ -1051,6 +1126,7 @@ async fn detect_pump_import_context(
             } else {
                 infer_imported_mode(pump_payload.unwrap_or(&Value::Null))
             },
+            quoteAsset: quote_asset,
             source: "pump-state".to_string(),
             routes: if agent_enabled {
                 ImportedRouteData::default()
@@ -1069,7 +1145,7 @@ async fn detect_pump_import_context(
             },
             detection: ImportedDetectionSummary {
                 sources: vec!["pump-state".to_string()],
-                notes: Vec::new(),
+                notes: curve_notes,
             },
             ..ImportedTokenData::default()
         };
@@ -1097,6 +1173,7 @@ async fn detect_pump_import_context(
         return Ok(Some(ImportedTokenData {
             launchpad: "pump".to_string(),
             mode: infer_imported_mode(payload),
+            quoteAsset: infer_pump_payload_quote_asset(payload),
             source: "pump.fun".to_string(),
             detection: ImportedDetectionSummary {
                 sources: vec!["pump.fun".to_string()],
@@ -1217,6 +1294,27 @@ fn attach_pump_image_proxy_candidate(
     prioritize_image_url(imported, &proxy_url);
 }
 
+fn reprioritize_pump_image_proxy_candidates(
+    imported: &mut ImportedTokenData,
+    contract_address: &str,
+    pump_payload: Option<&Value>,
+) {
+    if let Some(image_uri) = pump_payload
+        .and_then(|payload| payload.get("image_uri"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        attach_pump_image_proxy_candidate(imported, contract_address, image_uri);
+        return;
+    }
+    for candidate in imported.imageCandidates.clone() {
+        if candidate.contains("images.pump.fun/coin-image/") {
+            prioritize_image_url(imported, &candidate);
+            return;
+        }
+    }
+}
+
 fn infer_image_extension_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 8
         && bytes[0] == 0x89
@@ -1246,6 +1344,89 @@ fn infer_image_extension_from_bytes(bytes: &[u8]) -> Option<&'static str> {
         return Some(".avif");
     }
     None
+}
+
+fn image_extension_from_content_type(content_type: &str) -> Option<&'static str> {
+    match content_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some(".png"),
+        "image/avif" => Some(".avif"),
+        "image/jpeg" | "image/jpg" => Some(".jpg"),
+        "image/webp" => Some(".webp"),
+        "image/gif" => Some(".gif"),
+        _ => None,
+    }
+}
+
+fn image_extension_from_url(url: &str) -> Option<&'static str> {
+    Path::new(
+        reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| {
+                url.path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .map(|v| v.to_string())
+            })
+            .unwrap_or_default()
+            .as_str(),
+    )
+    .extension()
+    .and_then(|value| value.to_str())
+    .map(|ext| match ext.to_ascii_lowercase().as_str() {
+        "avif" => ".avif",
+        "png" => ".png",
+        "jpg" | "jpeg" => ".jpg",
+        "webp" => ".webp",
+        "gif" => ".gif",
+        _ => "",
+    })
+    .filter(|value| !value.is_empty())
+}
+
+fn is_vamp_deploy_safe_image_extension(extension: &str) -> bool {
+    VAMP_SAFE_IMAGE_EXTENSIONS.contains(&extension)
+}
+
+fn candidate_looks_vamp_deploy_safe(url: &str) -> bool {
+    if url.contains("images.pump.fun/coin-image/") {
+        return true;
+    }
+    image_extension_from_url(url).is_some_and(is_vamp_deploy_safe_image_extension)
+}
+
+fn order_vamp_image_candidates(candidate_urls: Vec<String>) -> Vec<String> {
+    let mut ordered_candidates = Vec::new();
+    for candidate in &candidate_urls {
+        if candidate_looks_vamp_deploy_safe(candidate) {
+            push_unique_url(&mut ordered_candidates, candidate.clone());
+        }
+    }
+    for candidate in candidate_urls {
+        if !candidate_looks_vamp_deploy_safe(&candidate) {
+            push_unique_url(&mut ordered_candidates, candidate);
+        }
+    }
+    ordered_candidates
+}
+
+fn image_import_error_message(
+    saw_too_large: bool,
+    saw_unsupported: bool,
+    saw_unsafe_format: bool,
+    saw_empty_bytes: bool,
+) -> String {
+    if saw_too_large {
+        return "Imported token image is too large.".to_string();
+    }
+    if saw_unsupported {
+        return "Imported token image format is not supported.".to_string();
+    }
+    if saw_unsafe_format {
+        return "Imported vamp image was AVIF/GIF only. Use a Pump image proxy, crop/save, or choose a PNG/JPG/WebP image before deploy.".to_string();
+    }
+    if saw_empty_bytes {
+        return "Imported token image was empty.".to_string();
+    }
+    "Unable to download token image.".to_string()
 }
 
 fn imported_has_any_content(imported: &ImportedTokenData) -> bool {
@@ -1480,6 +1661,11 @@ pub async fn fetch_imported_token_metadata(
                 }
                 hinted = enrich_from_dexscreener(&client, contract_address, hinted).await;
                 hinted = enrich_from_metaplex_metadata(&client, rpc_url, &mint, hinted).await;
+                reprioritize_pump_image_proxy_candidates(
+                    &mut hinted,
+                    contract_address,
+                    pump_payload.as_ref(),
+                );
             }
             "bonk" => {
                 if let Some(context) =
@@ -1528,6 +1714,11 @@ pub async fn fetch_imported_token_metadata(
     {
         imported = apply_import_context(imported, context);
     }
+    reprioritize_pump_image_proxy_candidates(
+        &mut imported,
+        contract_address,
+        pump_payload.as_ref(),
+    );
     if let Some(LaunchpadImportContext::Bonk(context)) =
         detect_import_context_for_launchpad("bonk", rpc_url, contract_address, None).await?
     {
@@ -1550,6 +1741,23 @@ pub async fn import_remote_image_to_library(
     original_name: &str,
     record_name: &str,
 ) -> Result<Option<SerializedImageRecord>, String> {
+    import_remote_image_to_library_with_safety(image_url, original_name, record_name, false).await
+}
+
+pub async fn import_vamp_image_to_library(
+    image_url: &str,
+    original_name: &str,
+    record_name: &str,
+) -> Result<Option<SerializedImageRecord>, String> {
+    import_remote_image_to_library_with_safety(image_url, original_name, record_name, true).await
+}
+
+async fn import_remote_image_to_library_with_safety(
+    image_url: &str,
+    original_name: &str,
+    record_name: &str,
+    require_vamp_deploy_safe_image: bool,
+) -> Result<Option<SerializedImageRecord>, String> {
     let candidate_urls = remote_resource_url_candidates(image_url);
     if candidate_urls.is_empty() {
         return Ok(None);
@@ -1562,7 +1770,13 @@ pub async fn import_remote_image_to_library(
     let mut saw_empty_bytes = false;
     let mut saw_too_large = false;
     let mut saw_unsupported = false;
-    for safe_url in candidate_urls {
+    let mut saw_unsafe_format = false;
+    let ordered_candidates = if require_vamp_deploy_safe_image {
+        order_vamp_image_candidates(candidate_urls)
+    } else {
+        candidate_urls
+    };
+    for safe_url in ordered_candidates {
         let response = match client
             .get(&safe_url)
             .header(
@@ -1589,37 +1803,9 @@ pub async fn import_remote_image_to_library(
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        let mut extension = match content_type.as_str() {
-            "image/png" => Some(".png"),
-            "image/avif" => Some(".avif"),
-            "image/jpeg" | "image/jpg" => Some(".jpg"),
-            "image/webp" => Some(".webp"),
-            "image/gif" => Some(".gif"),
-            _ => None,
-        };
+        let mut extension = image_extension_from_content_type(&content_type);
         if extension.is_none() {
-            extension = Path::new(
-                reqwest::Url::parse(&safe_url)
-                    .ok()
-                    .and_then(|url| {
-                        url.path_segments()
-                            .and_then(|mut segments| segments.next_back())
-                            .map(|v| v.to_string())
-                    })
-                    .unwrap_or_default()
-                    .as_str(),
-            )
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|ext| match ext.to_ascii_lowercase().as_str() {
-                "avif" => ".avif",
-                "png" => ".png",
-                "jpg" | "jpeg" => ".jpg",
-                "webp" => ".webp",
-                "gif" => ".gif",
-                _ => "",
-            })
-            .filter(|value| !value.is_empty());
+            extension = image_extension_from_url(&safe_url);
         }
         let bytes = match response.bytes().await {
             Ok(value) => value,
@@ -1640,6 +1826,10 @@ pub async fn import_remote_image_to_library(
             saw_unsupported = true;
             continue;
         };
+        if require_vamp_deploy_safe_image && !is_vamp_deploy_safe_image_extension(extension) {
+            saw_unsafe_format = true;
+            continue;
+        }
         return save_image_bytes(
             &bytes,
             extension,
@@ -1652,25 +1842,25 @@ pub async fn import_remote_image_to_library(
         )
         .map(Some);
     }
-    if saw_too_large {
-        return Err("Imported token image is too large.".to_string());
-    }
-    if saw_unsupported {
-        return Err("Imported token image format is not supported.".to_string());
-    }
-    if saw_empty_bytes {
-        return Err("Imported token image was empty.".to_string());
-    }
-    Err("Unable to download token image.".to_string())
+    Err(image_import_error_message(
+        saw_too_large,
+        saw_unsupported,
+        saw_unsafe_format,
+        saw_empty_bytes,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ImportedTokenData, attach_pump_image_proxy_candidate, build_pump_creator_fee_route,
-        build_pump_image_proxy_url, choose_merged_image_url, extract_html_meta_content,
-        infer_image_extension_from_bytes, infer_imported_mode, merge_imported,
-        normalize_imported_metadata_payload, prioritize_image_url, remote_resource_url_candidates,
+        build_pump_image_proxy_url, candidate_looks_vamp_deploy_safe, choose_merged_image_url,
+        extract_html_meta_content, image_extension_from_content_type, image_extension_from_url,
+        image_import_error_message, infer_image_extension_from_bytes, infer_imported_mode,
+        infer_pump_payload_quote_asset, is_vamp_deploy_safe_image_extension, merge_imported,
+        normalize_imported_metadata_payload, order_vamp_image_candidates, parse_pump_curve_context,
+        prioritize_image_url, remote_resource_url_candidates,
+        reprioritize_pump_image_proxy_candidates,
     };
     use serde_json::json;
     use solana_sdk::pubkey::Pubkey;
@@ -1703,6 +1893,43 @@ mod tests {
     }
 
     #[test]
+    fn infers_pump_usdc_quote_asset_from_payload() {
+        assert_eq!(
+            infer_pump_payload_quote_asset(&json!({
+                "quote_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            })),
+            "usdc"
+        );
+    }
+
+    #[test]
+    fn parses_pump_curve_quote_asset_from_state() {
+        let creator = Pubkey::new_unique();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0; 8]);
+        for value in [1_u64, 2, 3, 4, 5] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.push(0);
+        data.extend_from_slice(creator.as_ref());
+        data.push(0);
+        data.push(0);
+        data.extend_from_slice(
+            Pubkey::try_from("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+                .expect("USDC mint")
+                .as_ref(),
+        );
+
+        let (parsed_creator, cashback_enabled, quote_asset, notes) =
+            parse_pump_curve_context(&data).expect("curve context");
+
+        assert_eq!(parsed_creator, creator);
+        assert!(!cashback_enabled);
+        assert_eq!(quote_asset, "usdc");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
     fn infers_png_extension_from_bytes() {
         assert_eq!(
             infer_image_extension_from_bytes(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
@@ -1725,6 +1952,72 @@ mod tests {
                 0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'a', b'v', b'i', b'f',
             ]),
             Some(".avif")
+        );
+    }
+
+    #[test]
+    fn classifies_vamp_deploy_safe_image_formats() {
+        assert_eq!(image_extension_from_content_type("image/png"), Some(".png"));
+        assert_eq!(
+            image_extension_from_content_type("image/jpeg"),
+            Some(".jpg")
+        );
+        assert_eq!(
+            image_extension_from_content_type("image/webp"),
+            Some(".webp")
+        );
+        assert_eq!(
+            image_extension_from_content_type("image/avif"),
+            Some(".avif")
+        );
+        assert!(is_vamp_deploy_safe_image_extension(".png"));
+        assert!(is_vamp_deploy_safe_image_extension(".jpg"));
+        assert!(is_vamp_deploy_safe_image_extension(".webp"));
+        assert!(!is_vamp_deploy_safe_image_extension(".avif"));
+        assert!(!is_vamp_deploy_safe_image_extension(".gif"));
+    }
+
+    #[test]
+    fn classifies_pump_proxy_as_vamp_deploy_safe_candidate() {
+        assert!(candidate_looks_vamp_deploy_safe(
+            "https://images.pump.fun/coin-image/ExampleMint?variant=256x256&src=https%3A%2F%2Fexample.com%2Fimage.avif"
+        ));
+        assert!(candidate_looks_vamp_deploy_safe(
+            "https://metadata.example/image.webp"
+        ));
+        assert!(!candidate_looks_vamp_deploy_safe(
+            "https://metadata.example/image.avif"
+        ));
+        assert_eq!(
+            image_extension_from_url("https://metadata.example/path/image.jpeg?cache=1"),
+            Some(".jpg")
+        );
+    }
+
+    #[test]
+    fn orders_vamp_image_candidates_with_safe_formats_first() {
+        let ordered = order_vamp_image_candidates(vec![
+            "https://metadata.example/raw.avif".to_string(),
+            "https://metadata.example/thumb.webp".to_string(),
+            "https://images.pump.fun/coin-image/ExampleMint?variant=256x256&src=https%3A%2F%2Fmetadata.example%2Fraw.avif".to_string(),
+            "https://metadata.example/anim.gif".to_string(),
+        ]);
+        assert_eq!(
+            ordered,
+            vec![
+                "https://metadata.example/thumb.webp".to_string(),
+                "https://images.pump.fun/coin-image/ExampleMint?variant=256x256&src=https%3A%2F%2Fmetadata.example%2Fraw.avif".to_string(),
+                "https://metadata.example/raw.avif".to_string(),
+                "https://metadata.example/anim.gif".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_clear_error_for_unsafe_only_vamp_image() {
+        assert_eq!(
+            image_import_error_message(false, false, true, false),
+            "Imported vamp image was AVIF/GIF only. Use a Pump image proxy, crop/save, or choose a PNG/JPG/WebP image before deploy."
         );
     }
 
@@ -1766,6 +2059,29 @@ mod tests {
                 "https://metadata.j7tracker.io/images/59423e1816ad4d61.png".to_string(),
                 "https://cdn.dexscreener.com/cms/images/example".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn reprioritizes_pump_proxy_after_metadata_promotes_raw_avif() {
+        let mut imported = ImportedTokenData {
+            imageUrl: "https://cloudflare-ipfs.com/ipfs/QmRawImage/image.avif".to_string(),
+            imageCandidates: vec![
+                "https://cloudflare-ipfs.com/ipfs/QmRawImage/image.avif".to_string(),
+                "https://images.pump.fun/coin-image/ExamplePump?variant=256x256&src=https%3A%2F%2Fcloudflare-ipfs.com%2Fipfs%2FQmRawImage%2Fimage.avif".to_string(),
+            ],
+            ..ImportedTokenData::default()
+        };
+        reprioritize_pump_image_proxy_candidates(&mut imported, "ExamplePump", None);
+        assert_eq!(
+            imported.imageUrl,
+            "https://images.pump.fun/coin-image/ExamplePump?variant=256x256&src=https%3A%2F%2Fcloudflare-ipfs.com%2Fipfs%2FQmRawImage%2Fimage.avif"
+        );
+        assert_eq!(
+            imported.imageCandidates.first().map(String::as_str),
+            Some(
+                "https://images.pump.fun/coin-image/ExamplePump?variant=256x256&src=https%3A%2F%2Fcloudflare-ipfs.com%2Fipfs%2FQmRawImage%2Fimage.avif"
+            )
         );
     }
 

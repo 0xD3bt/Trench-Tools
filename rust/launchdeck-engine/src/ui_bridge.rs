@@ -441,7 +441,7 @@ fn parse_recipients(
                     index + 1
                 )
             })?;
-            if share_bps <= 0 {
+            if share_bps <= 0 && !(allow_agent && entry_type == "agent" && share_bps == 0) {
                 return Err(format!(
                     "Fee split recipient {} must have a positive share.",
                     index + 1
@@ -1136,6 +1136,15 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         buyback_percent_to_bps(&form.buybackPercent)?
     };
+    agent_fee_recipients.retain(|entry| {
+        entry.r#type != "agent"
+            || entry
+                .shareBps
+                .as_ref()
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                > 0
+    });
     let mut fee_sharing_recipients = if fee_split_enabled || bags_fee_split_enabled {
         parse_recipients(&form.feeSplitRecipients, false, &form.launchpad)?
     } else {
@@ -1165,10 +1174,23 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     let follow_launch_snipes = follow_snipes
         .iter()
         .enumerate()
-        .filter(|(_, entry)| !entry.envKey.trim().is_empty() && !entry.amountSol.trim().is_empty())
+        .filter(|(_, entry)| !entry.envKey.trim().is_empty())
         .map(|(index, entry)| -> Result<RawFollowLaunchSnipe, String> {
             let sell_mode = entry.sellTriggerMode.trim().to_lowercase();
             let sell_enabled = sniper_auto_sell_enabled && entry.sellEnabled;
+            let buy_amount_sol = entry.amountSol.trim();
+            if buy_amount_sol.is_empty() {
+                if sell_enabled {
+                    return Err(format!(
+                        "Sniper wallet #{} autosell requires a selected sniper buy amount.",
+                        index + 1
+                    ));
+                }
+                return Err(format!(
+                    "Sniper wallet #{} requires a selected sniper buy amount.",
+                    index + 1
+                ));
+            }
             let sell_percent = entry.sellPercent.unwrap_or(0).max(0);
             let sell_market_threshold = entry.sellMarketCapThreshold.trim().to_string();
             let post_buy_sell = if sell_enabled {
@@ -1242,7 +1264,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                 actionId: format!("snipe-{}-buy", index + 1),
                 enabled: Some(json!(snipes_enabled)),
                 walletEnvKey: entry.envKey.trim().to_string(),
-                buyAmountSol: entry.amountSol.trim().to_string(),
+                buyAmountSol: buy_amount_sol.to_string(),
                 submitWithLaunch: Some(json!(
                     entry.triggerMode.trim().eq_ignore_ascii_case("same-time")
                 )),
@@ -1763,6 +1785,7 @@ mod tests {
         normalize_metadata_uri, parse_metadata_upload_provider,
     };
     use serde_json::json;
+    use solana_sdk::pubkey::Pubkey;
 
     #[test]
     fn keeps_ipfs_uri_unchanged() {
@@ -1936,6 +1959,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_custom_zero_bps_agent_split_maps_to_buyback_without_recipient() {
+        let wallet = Pubkey::new_unique();
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                mode: "agent-custom".to_string(),
+                agentSplitRecipients: vec![
+                    UiRecipientInput {
+                        r#type: "agent".to_string(),
+                        shareBps: Some(0),
+                        ..UiRecipientInput::default()
+                    },
+                    UiRecipientInput {
+                        r#type: "wallet".to_string(),
+                        address: wallet.to_string(),
+                        shareBps: Some(10_000),
+                        ..UiRecipientInput::default()
+                    },
+                ],
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("zero-bps agent split should build");
+
+        assert_eq!(raw.agent.buybackBps, Some(json!(0)));
+        assert_eq!(raw.agent.splitAgentInit, Some(json!(true)));
+        assert_eq!(raw.agent.feeRecipients.len(), 1);
+        assert_eq!(raw.agent.feeRecipients[0].address, wallet.to_string());
+        assert_eq!(raw.agent.feeRecipients[0].shareBps, Some(json!(10_000)));
+    }
+
+    #[tokio::test]
+    async fn agent_custom_positive_agent_split_keeps_agent_recipient() {
+        let wallet = Pubkey::new_unique();
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                mode: "agent-custom".to_string(),
+                agentSplitRecipients: vec![
+                    UiRecipientInput {
+                        r#type: "agent".to_string(),
+                        shareBps: Some(2_500),
+                        ..UiRecipientInput::default()
+                    },
+                    UiRecipientInput {
+                        r#type: "wallet".to_string(),
+                        address: wallet.to_string(),
+                        shareBps: Some(7_500),
+                        ..UiRecipientInput::default()
+                    },
+                ],
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("agent split should build");
+
+        assert_eq!(raw.agent.buybackBps, Some(json!(2_500)));
+        assert_eq!(raw.agent.splitAgentInit, Some(json!(true)));
+        assert_eq!(raw.agent.feeRecipients.len(), 2);
+        assert_eq!(raw.agent.feeRecipients[0].r#type, "agent");
+        assert_eq!(raw.agent.feeRecipients[0].shareBps, Some(json!(2_500)));
+        assert_eq!(raw.agent.feeRecipients[1].address, wallet.to_string());
+        assert_eq!(raw.agent.feeRecipients[1].shareBps, Some(json!(7_500)));
+    }
+
+    #[tokio::test]
     async fn preserves_vanity_private_key_from_ui_form() {
         let raw = build_raw_config_from_ui_form(
             "send",
@@ -2044,6 +2135,30 @@ mod tests {
         assert_eq!(sell.marketCap.threshold, "100k");
         assert_eq!(sell.marketCap.scanTimeoutSeconds, Some(json!(35)));
         assert_eq!(sell.marketCap.timeoutAction, "sell");
+    }
+
+    #[tokio::test]
+    async fn rejects_sniper_autosell_wallet_without_buy_amount() {
+        let error = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                selectedWalletKey: "SOLANA_PRIVATE_KEY".to_string(),
+                sniperEnabled: true,
+                automaticSniperSellEnabled: true,
+                sniperWallets: vec![UiSniperWalletInput {
+                    envKey: "SOLANA_PRIVATE_KEY2".to_string(),
+                    amountSol: "".to_string(),
+                    sellEnabled: true,
+                    sellPercent: Some(40),
+                    ..UiSniperWalletInput::default()
+                }],
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect_err("sell-enabled sniper row without buy amount should fail");
+
+        assert!(error.contains("autosell requires a selected sniper buy amount"));
     }
 
     #[test]

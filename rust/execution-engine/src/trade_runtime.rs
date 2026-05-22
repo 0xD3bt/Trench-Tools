@@ -5,7 +5,6 @@ use crate::{
     },
     mint_warm_cache::{WarmFingerprint, build_fingerprint, shared_mint_warm_cache},
     rollout::{allow_non_canonical_pool_trades, wrapper_fee_vault_pubkey},
-    route_index::{RouteIndexKey, shared_route_index},
     rpc_client::{
         CompiledTransaction, SentResult, configured_rpc_url,
         confirm_submitted_transactions_for_transport, rpc_request_with_client,
@@ -15,8 +14,8 @@ use crate::{
     trade_dispatch::{
         CachedRouteReuseDecision, CompiledAdapterTrade, TradeDispatchPlan,
         TransactionDependencyMode, adapter_for_selector, compile_trade_for_adapter,
-        guard_cached_route_for_request, invalidate_pre_migration_route_context, resolve_trade_plan,
-        resolve_trade_plan_fresh,
+        guard_cached_route_for_request, invalidate_pre_migration_route_context,
+        invalidate_route_index_for_request, resolve_trade_plan, resolve_trade_plan_fresh,
     },
     trade_planner::{LifecycleAndCanonicalMarket, TradeLifecycle, TradeVenueFamily},
     transport::{ExecutionTransportConfig, TransportPlan, build_transport_plan},
@@ -1183,16 +1182,7 @@ async fn invalidate_route_retry_caches(
         candidates.push(normalize_request_for_dispatch_plan(request, planned_route));
     }
     for candidate in candidates {
-        let route_key = RouteIndexKey::new(
-            &candidate.mint,
-            rpc_url,
-            &candidate.policy.commitment,
-            side_label(&candidate.side),
-            &route_policy_label(&candidate),
-            candidate.pinned_pool.as_deref(),
-            allow_non_canonical_pool_trades(),
-        );
-        shared_route_index().invalidate(&route_key).await;
+        invalidate_route_index_for_request(rpc_url, &candidate).await;
         shared_warming_service()
             .invalidate_selector(
                 rpc_url,

@@ -422,6 +422,8 @@
           ? getSniperMarketCapTimeoutError(timeoutSeconds)
           : "";
         const timeoutAction = normalizeSellTimeoutAction(row.sellMarketCapTimeoutAction);
+        const rowInvalid = row.valid === false;
+        const rowValidationError = rowInvalid ? String(row.validationError || "Sniper wallet is invalid.").trim() : "";
         const buyAmountPillMarkup = row.buyAmountValue
           ? (String(row.buyAmountAssetLabel || "").toUpperCase() === "SOL"
             ? `<span class="auto-sell-sniper-wallet-pill auto-sell-sniper-wallet-buy-pill">${escapeHTML(row.buyAmountValue)} <img src="/images/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo auto-sell-sniper-wallet-buy-icon"></span>`
@@ -431,27 +433,28 @@
           ? `<span class="auto-sell-sniper-wallet-pill auto-sell-sniper-wallet-percent-pill">${escapeHTML(sellPercentError ? "Sell % required" : `${sellPercent}% sell`)}</span>`
           : "";
         return `
-          <div class="auto-sell-sniper-wallet-row${sellEnabled ? " is-active" : ""}">
+          <div class="auto-sell-sniper-wallet-row${sellEnabled ? " is-active" : ""}${rowInvalid ? " is-invalid" : ""}">
             <div class="auto-sell-sniper-wallet-main">
               <div class="auto-sell-sniper-wallet-info">
                 <div class="auto-sell-sniper-wallet-title-row">
                   <strong>${escapeHTML(row.walletLabel || row.envKey)}</strong>
                   ${buyAmountPillMarkup}
                   ${percentPillMarkup}
+                  ${rowInvalid ? `<span class="auto-sell-sniper-wallet-pill">${escapeHTML(rowValidationError)}</span>` : ""}
                 </div>
               </div>
               <div class="auto-sell-sniper-wallet-head-actions">
-                <button type="button" class="button subtle auto-sell-sniper-wallet-toggle${sellEnabled ? " active" : ""}" data-auto-sell-sniper-toggle="${escapeHTML(row.envKey)}" title="Enable or disable sniper autosell for this wallet." ${!sniperAutoSellEnabled ? "disabled" : ""}>${sellEnabled ? "Auto sell on" : "Auto sell off"}</button>
+                <button type="button" class="button subtle auto-sell-sniper-wallet-toggle${sellEnabled ? " active" : ""}" data-auto-sell-sniper-toggle="${escapeHTML(row.envKey)}" title="Enable or disable sniper autosell for this wallet." ${!sniperAutoSellEnabled || rowInvalid ? "disabled" : ""}>${sellEnabled ? "Auto sell on" : "Auto sell off"}</button>
                 <label class="auto-sell-sniper-percent-field">
                   <span class="auto-sell-percent-input-wrap">
-                    <input class="auto-sell-percent-inline-input${sellPercentError ? " input-error" : ""}" type="text" inputmode="decimal" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" value="${escapeHTML(rawSellPercent)}" title="Percent of the wallet position to sell." data-auto-sell-sniper-percent="${escapeHTML(row.envKey)}" ${!sniperAutoSellEnabled || !sellEnabled ? "disabled" : ""}>
+                    <input class="auto-sell-percent-inline-input${sellPercentError ? " input-error" : ""}" type="text" inputmode="decimal" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" value="${escapeHTML(rawSellPercent)}" title="Percent of the wallet position to sell." data-auto-sell-sniper-percent="${escapeHTML(row.envKey)}" ${!sniperAutoSellEnabled || !sellEnabled || rowInvalid ? "disabled" : ""}>
                     <span class="auto-sell-percent-suffix">%</span>
                   </span>
                 </label>
               </div>
               <div class="field-error auto-sell-sniper-percent-error">${escapeHTML(sellPercentError)}</div>
             </div>
-            <div class="auto-sell-sniper-wallet-config"${sniperAutoSellEnabled && sellEnabled ? "" : " hidden"}>
+            <div class="auto-sell-sniper-wallet-config"${sniperAutoSellEnabled && sellEnabled && !rowInvalid ? "" : " hidden"}>
               <div class="auto-sell-trigger-toolbar auto-sell-sniper-trigger-toolbar">
                 <div class="auto-sell-segmented-control" title="Choose the sniper autosell trigger family.">
                   <button type="button" class="preset-chip compact wallet-chip-button auto-sell-segmented-button${sellMode === "block-offset" ? " active" : ""}" data-auto-sell-sniper-mode="${escapeHTML(row.envKey)}" data-auto-sell-sniper-mode-value="block-offset" title="Sell after the matching buy confirms, plus the selected extra confirmed slots.">
@@ -719,16 +722,39 @@
           const percentInput = event.target.closest("[data-auto-sell-sniper-percent]");
           if (percentInput) {
             syncSniperPercentFieldState(percentInput);
+            const envKey = percentInput.getAttribute("data-auto-sell-sniper-percent");
+            if (!envKey) return;
+            updateSniperAutosellWallet(envKey, {
+              sellEnabled: true,
+              sellPercent: normalizeSellPercent(percentInput.value),
+            }, { render: false });
+            if (typeof persistDraft === "function") persistDraft();
             return;
           }
           const thresholdInput = event.target.closest("[data-auto-sell-sniper-market-threshold]");
           if (thresholdInput) {
             syncSniperMarketCapFieldState(thresholdInput);
+            const envKey = thresholdInput.getAttribute("data-auto-sell-sniper-market-threshold");
+            if (!envKey) return;
+            updateSniperAutosellWallet(envKey, {
+              sellEnabled: true,
+              sellTriggerMode: "market-cap",
+              sellMarketCapThreshold: String(thresholdInput.value || "").trim(),
+            }, { render: false });
+            if (typeof persistDraft === "function") persistDraft();
             return;
           }
           const timeoutInput = event.target.closest("[data-auto-sell-sniper-market-timeout]");
           if (timeoutInput) {
             syncSniperMarketCapFieldState(timeoutInput);
+            const envKey = timeoutInput.getAttribute("data-auto-sell-sniper-market-timeout");
+            if (!envKey) return;
+            updateSniperAutosellWallet(envKey, {
+              sellEnabled: true,
+              sellTriggerMode: "market-cap",
+              sellMarketCapTimeoutSeconds: String(timeoutInput.value || "").trim(),
+            }, { render: false });
+            if (typeof persistDraft === "function") persistDraft();
           }
         });
         autoSellSniperWalletList.addEventListener("change", (event) => {

@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [1.1.6] - 2026-05-22
+
+### Changed
+
+- Execution engine: Pump USDC route compilation now parallelizes independent Pump AMM, mint, fee-config, and trusted Raydium CLMM account fetches to reduce composed-route latency.
+- Execution engine: Pump AMM postbond discovery now batches canonical WSOL and USDC pool probes while preserving canonical route selection behavior.
+- LaunchDeck: Pump USDC follow-buy runtime preparation and trusted Raydium CLMM setup now overlap independent account fetches for lower follow/snipe latency.
+- Trench Tools, LaunchDeck, the extension, and the execution engine now report the same `1.1.6` patch version.
+
+### Fixed
+
+- Execution engine and LaunchDeck: Pump USDC buy routes now keep the Pump bonding-curve leg quoted from a fresh curve snapshot after the SOL-to-USDC conversion leg is built.
+- Execution engine: Pump USDC AMM routes no longer prepare unused SOL-quote temporary account rent/setup before taking the composed USDC route path.
+
 ## [1.1.5] - 2026-05-20
 
 ### Added

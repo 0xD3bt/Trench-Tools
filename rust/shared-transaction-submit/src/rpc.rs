@@ -141,6 +141,15 @@ struct HeliusTransactionSubscribeRequest {
     account_required: Vec<String>,
     capture_post_token_balances: bool,
     request_full_transaction_details: bool,
+    balance_watch_account: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SignatureStatusReconcileRequest {
+    index: usize,
+    signature: String,
+    capture_post_token_balances: bool,
+    balance_watch_account: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1364,7 +1373,7 @@ fn should_fallback_after_watch_error(error: &ConfirmWatchError) -> bool {
 
 async fn reconcile_signature_statuses_once(
     rpc_url: &str,
-    requests: &[(usize, String, bool)],
+    requests: &[SignatureStatusReconcileRequest],
     commitment: &str,
 ) -> Result<Vec<(usize, ConfirmationDetails)>, String> {
     if requests.is_empty() {
@@ -1376,7 +1385,7 @@ async fn reconcile_signature_statuses_once(
         json!([
             requests
                 .iter()
-                .map(|(_, signature, _)| Value::String(signature.clone()))
+                .map(|request| Value::String(request.signature.clone()))
                 .collect::<Vec<_>>(),
             { "searchTransactionHistory": true }
         ]),
@@ -1389,26 +1398,37 @@ async fn reconcile_signature_statuses_once(
         .unwrap_or_default();
     let observed_at_ms = current_time_ms();
     let mut reconciled = Vec::new();
-    for (position, (index, signature, capture_post_token_balances)) in requests.iter().enumerate() {
+    for (position, request) in requests.iter().enumerate() {
         let status = values.get(position).cloned().unwrap_or(Value::Null);
         if status.is_null() {
             continue;
         }
         let err = status.get("err").cloned().unwrap_or(Value::Null);
         if !err.is_null() {
-            return Err(terminal_confirmation_error(signature, err));
+            return Err(terminal_confirmation_error(&request.signature, err));
         }
         let actual_commitment = status
             .get("confirmationStatus")
             .and_then(Value::as_str)
             .unwrap_or("processed")
             .to_string();
-        if !commitment_satisfied(&actual_commitment, commitment) || *capture_post_token_balances {
+        if !commitment_satisfied(&actual_commitment, commitment) {
             continue;
         }
         let slot = status.get("slot").and_then(Value::as_u64);
+        let confirmed_token_balance_raw = if request.capture_post_token_balances {
+            match request.balance_watch_account.as_deref() {
+                Some(account) => reconcile_token_account_balance_raw(rpc_url, account)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            }
+        } else {
+            None
+        };
         reconciled.push((
-            *index,
+            request.index,
             ConfirmationDetails {
                 status,
                 confirmed_observed_slot: slot,
@@ -1419,7 +1439,7 @@ async fn reconcile_signature_statuses_once(
                 first_observed_at_ms: Some(observed_at_ms),
                 confirmed_at_ms: Some(observed_at_ms),
                 post_token_balances: vec![],
-                confirmed_token_balance_raw: None,
+                confirmed_token_balance_raw,
             },
         ));
     }
@@ -1432,6 +1452,7 @@ async fn wait_for_confirmation(
     account_required: &[String],
     capture_post_token_balances: bool,
     request_full_transaction_details: bool,
+    balance_watch_account: Option<&str>,
     commitment: &str,
     max_attempts: u32,
     track_confirmed_block_height: bool,
@@ -1450,6 +1471,7 @@ async fn wait_for_confirmation(
                 account_required,
                 capture_post_token_balances,
                 request_full_transaction_details,
+                balance_watch_account,
                 commitment,
                 track_confirmed_block_height,
             )
@@ -2198,6 +2220,7 @@ async fn wait_for_confirmation_helius_transaction_subscribe(
     account_required: &[String],
     capture_post_token_balances: bool,
     request_full_transaction_details: bool,
+    balance_watch_account: Option<&str>,
     commitment: &str,
     track_confirmed_block_height: bool,
 ) -> Result<ConfirmationDetails, ConfirmWatchError> {
@@ -2244,7 +2267,12 @@ async fn wait_for_confirmation_helius_transaction_subscribe(
                 Err(_) => {
                     let reconciled = reconcile_signature_statuses_once(
                         rpc_url,
-                        &[(0usize, signature.to_string(), capture_post_token_balances)],
+                        &[SignatureStatusReconcileRequest {
+                            index: 0,
+                            signature: signature.to_string(),
+                            capture_post_token_balances,
+                            balance_watch_account: balance_watch_account.map(str::to_string),
+                        }],
                         commitment,
                     )
                     .await
@@ -2685,12 +2713,11 @@ async fn wait_for_confirmations_helius_transaction_subscribe_batch(
                         let reconcile_requests = requests
                             .iter()
                             .filter(|request| pending.contains(&request.index))
-                            .map(|request| {
-                                (
-                                    request.index,
-                                    request.signature.clone(),
-                                    request.capture_post_token_balances,
-                                )
+                            .map(|request| SignatureStatusReconcileRequest {
+                                index: request.index,
+                                signature: request.signature.clone(),
+                                capture_post_token_balances: request.capture_post_token_balances,
+                                balance_watch_account: request.balance_watch_account.clone(),
                             })
                             .collect::<Vec<_>>();
                         let reconciled = reconcile_signature_statuses_once(
@@ -2828,6 +2855,7 @@ pub async fn confirm_transactions_with_websocket_fallback(
                 account_required: result.transactionSubscribeAccountRequired.clone(),
                 capture_post_token_balances: result.capturePostTokenBalances,
                 request_full_transaction_details: result.requestFullTransactionDetails,
+                balance_watch_account: result.balanceWatchAccount.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -3430,6 +3458,7 @@ pub async fn confirm_transactions_sequential_with_attempts(
             &result.transactionSubscribeAccountRequired,
             result.capturePostTokenBalances,
             result.requestFullTransactionDetails,
+            result.balanceWatchAccount.as_deref(),
             commitment,
             max_attempts,
             track_send_block_height,
@@ -5912,6 +5941,74 @@ mod tests {
         .expect("failed on-chain status should win over bare helius notification");
         assert!(error.contains("sig-test-123 failed on-chain"));
         assert!(error.contains("\"Custom\":1"));
+    }
+
+    #[tokio::test]
+    async fn signature_status_reconcile_confirms_even_when_balance_capture_requested() {
+        let rpc_addr = start_jsonrpc_server_with_signature_status(json!({
+            "confirmationStatus": "confirmed",
+            "err": null,
+            "slot": 456789
+        }))
+        .await;
+        let rpc_url = format!("http://{rpc_addr}/");
+
+        let confirmed = reconcile_signature_statuses_once(
+            &rpc_url,
+            &[SignatureStatusReconcileRequest {
+                index: 7,
+                signature: "sig-balance-capture".to_string(),
+                capture_post_token_balances: true,
+                balance_watch_account: None,
+            }],
+            "confirmed",
+        )
+        .await
+        .expect("signature status should reconcile");
+
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].0, 7);
+        assert_eq!(
+            confirmed[0].1.confirmation_source,
+            "rpc-status-reconcile"
+        );
+        assert_eq!(confirmed[0].1.confirmed_slot, Some(456789));
+        assert_eq!(confirmed[0].1.confirmed_token_balance_raw, None);
+    }
+
+    #[tokio::test]
+    async fn signature_status_reconcile_ignores_balance_fetch_errors() {
+        let rpc_addr = start_jsonrpc_server_with_signature_status(json!({
+            "confirmationStatus": "confirmed",
+            "err": null,
+            "slot": 456789
+        }))
+        .await;
+        let rpc_url = format!("http://{rpc_addr}/");
+
+        let confirmed = reconcile_signature_statuses_once(
+            &rpc_url,
+            &[SignatureStatusReconcileRequest {
+                index: 7,
+                signature: "sig-balance-capture".to_string(),
+                capture_post_token_balances: true,
+                balance_watch_account: Some(
+                    "token-account-that-test-server-does-not-support".to_string(),
+                ),
+            }],
+            "confirmed",
+        )
+        .await
+        .expect("signature status should still reconcile");
+
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].0, 7);
+        assert_eq!(
+            confirmed[0].1.confirmation_source,
+            "rpc-status-reconcile"
+        );
+        assert_eq!(confirmed[0].1.confirmed_slot, Some(456789));
+        assert_eq!(confirmed[0].1.confirmed_token_balance_raw, None);
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@
       getAutoSellTriggerMode,
       getAutoSellDelayMs,
       getAutoSellBlockOffset,
+      supportsQuoteAssetForMode = () => true,
       getUploadedImage,
       getMetadataUploadState,
       cloneConfig,
@@ -50,6 +51,10 @@
       const values = Object.fromEntries(data.entries());
       const mode = values.mode || "regular";
       const launchpad = getLaunchpad();
+      const quoteAsset = getQuoteAsset();
+      if (!supportsQuoteAssetForMode(launchpad, mode, quoteAsset)) {
+        throw new Error(`${quoteAsset.toUpperCase()} quote asset is not supported for ${launchpad} ${mode}.`);
+      }
       const launchpadCapabilities = getLaunchpadUiCapabilities(launchpad);
       const sniperSupported = Boolean(launchpadCapabilities && launchpadCapabilities.sniper);
       const autoSellSupported = Boolean(launchpadCapabilities && launchpadCapabilities.autoSell);
@@ -113,7 +118,7 @@
       return {
         selectedWalletKey: selectedWalletKey(),
         launchpad,
-        quoteAsset: getQuoteAsset(),
+        quoteAsset,
         provider: getProvider(),
         buyProvider: getBuyProvider(),
         sellProvider: getSellProvider(),

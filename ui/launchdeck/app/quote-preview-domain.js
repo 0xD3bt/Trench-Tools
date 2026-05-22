@@ -264,13 +264,8 @@
       };
     }
     const quoteAsset = shape.quoteAsset === "usdc" ? "usdc" : "sol";
-    if (quoteAsset === "usdc") {
-      return {
-        quote: null,
-        placeholder: "Pump USDC preview uses the live SOL/USDC route and will be shown by the launch compiler.",
-      };
-    }
     const quoteAssetLabel = "SOL";
+    const previewOnly = quoteAsset === "usdc";
     const initialVirtualTokenReserves = BigInt(basis.initialVirtualTokenReserves);
     const initialVirtualSolReserves = BigInt(basis.initialVirtualSolReserves);
     const initialRealTokenReserves = BigInt(basis.initialRealTokenReserves);
@@ -293,9 +288,10 @@
           estimatedTokens: formatDecimal(tokensOut, PUMP_TOKEN_DECIMALS, 6),
           estimatedSol: formatDecimal(spendableSol, 9, 6),
           estimatedQuoteAmount: formatDecimal(spendableSol, 9, 6),
-          quoteAsset,
+          quoteAsset: "sol",
           quoteAssetLabel,
           estimatedSupplyPercent: formatSupplyPercent(tokensOut, PUMP_TOTAL_SUPPLY_RAW),
+          previewOnly,
         },
       };
     }
@@ -315,9 +311,10 @@
           estimatedTokens: formatDecimal(tokenAmount, PUMP_TOKEN_DECIMALS, 6),
           estimatedSol: formatDecimal(totalSol, 9, 6),
           estimatedQuoteAmount: formatDecimal(totalSol, 9, 6),
-          quoteAsset,
+          quoteAsset: "sol",
           quoteAssetLabel,
           estimatedSupplyPercent: formatSupplyPercent(tokenAmount, PUMP_TOTAL_SUPPLY_RAW),
+          previewOnly,
         },
       };
     }

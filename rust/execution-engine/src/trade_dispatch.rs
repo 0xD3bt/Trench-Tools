@@ -49,6 +49,7 @@ use crate::{
     },
     trade_planner::{
         LifecycleAndCanonicalMarket, PlannerQuoteAsset, TradeLifecycle, TradeVenueFamily,
+        WrapperAction,
     },
     trade_runtime::TradeRuntimeRequest,
     warm_metrics::{FamilyBucket, shared_warm_metrics},
@@ -224,6 +225,7 @@ async fn try_classify_route_descriptor(
     if trusted_stable_route_for_pool(input).is_some() {
         return Ok(None);
     }
+    validate_route_pubkey(input)?;
     let classify = fetch_account_owner_and_data_with_null_retry(
         rpc_url,
         input,
@@ -417,6 +419,16 @@ async fn try_classify_route_descriptor(
             input.trim()
         ),
     ))
+}
+
+fn validate_route_pubkey(input: &str) -> Result<(), String> {
+    let trimmed = input.trim();
+    Pubkey::from_str(trimmed).map(|_| ()).map_err(|error| {
+        route_error(
+            "invalid_address",
+            format!("Address {trimmed} is not a valid Solana pubkey: {error}"),
+        )
+    })
 }
 
 async fn try_classify_companion_pair_descriptor(
@@ -704,11 +716,12 @@ fn build_dispatch_plan_from_warm_entry(
     request: &TradeRuntimeRequest,
     entry: &PrewarmedMint,
 ) -> Result<TradeDispatchPlan, String> {
-    let cached_plan = entry
+    let mut cached_plan = entry
         .plan
         .as_ref()
         .cloned()
         .ok_or_else(|| "Warm entry was missing a cached selector.".to_string())?;
+    cached_plan.selector = selector_for_request_side(cached_plan.selector, request);
     let descriptor = RouteDescriptor {
         raw_address: raw_address.trim().to_string(),
         resolved_input_kind: route_input_kind(raw_address, entry.resolved_pair.as_deref()),
@@ -1133,8 +1146,7 @@ pub(crate) async fn resolve_trade_plan_fresh(
 ) -> Result<TradeDispatchPlan, String> {
     let (result, metrics) = crate::route_metrics::collect_route_metrics(async {
         let rpc_url = configured_rpc_url();
-        let key = route_index_key_for_request(request, &rpc_url);
-        shared_route_index().invalidate(&key).await;
+        invalidate_route_index_for_request(&rpc_url, request).await;
         resolve_trade_plan_with_cache_mode(request, RouteCacheMode::BypassCached).await
     })
     .await;
@@ -1212,9 +1224,17 @@ async fn resolve_trade_plan_with_route_index(
         .await
         {
             CachedRouteReuseDecision::UseCached => {
+                eprintln!(
+                    "[execution-engine][dispatch] route_cache_hit=shared_identity mint={} family={} source={}",
+                    entry.resolved_mint,
+                    entry.selector.family.label(),
+                    entry.source
+                );
                 shared_warm_metrics()
                     .record_mint_warm_hit(FamilyBucket::from_venue_family(&entry.selector.family));
-                return build_dispatch_plan_from_route_index_entry(request, entry);
+                let plan = build_dispatch_plan_from_route_index_entry(request, entry)?;
+                cache_dispatch_plan_for_request(&rpc_url, request, &plan).await;
+                return Ok(plan);
             }
             CachedRouteReuseDecision::ReplanMigrated => {
                 invalidate_pre_migration_route_context(&rpc_url, request, &entry.resolved_mint)
@@ -1241,10 +1261,18 @@ async fn resolve_trade_plan_with_route_index(
                 .await
                 {
                     CachedRouteReuseDecision::UseCached => {
+                        eprintln!(
+                            "[execution-engine][dispatch] route_cache_hit=shared_identity mint={} family={} source={}",
+                            entry.resolved_mint,
+                            entry.selector.family.label(),
+                            entry.source
+                        );
                         shared_warm_metrics().record_mint_warm_hit(
                             FamilyBucket::from_venue_family(&entry.selector.family),
                         );
-                        build_dispatch_plan_from_route_index_entry(request, entry)
+                        let plan = build_dispatch_plan_from_route_index_entry(request, entry)?;
+                        cache_dispatch_plan_for_request(&rpc_url, request, &plan).await;
+                        Ok(plan)
                     }
                     CachedRouteReuseDecision::ReplanMigrated => {
                         invalidate_pre_migration_route_context(
@@ -1260,9 +1288,13 @@ async fn resolve_trade_plan_with_route_index(
                         .await
                         {
                             Ok(plan) => {
-                                shared_route_index()
-                                    .insert_plan(key.clone(), &plan, "click_migrated_replan")
-                                    .await;
+                                cache_route_index_plan(
+                                    &rpc_url,
+                                    request,
+                                    &plan,
+                                    "click_migrated_replan",
+                                )
+                                .await;
                                 Ok(plan)
                             }
                             Err(error) => Err(error),
@@ -1273,8 +1305,7 @@ async fn resolve_trade_plan_with_route_index(
             } else {
                 match resolve_trade_plan_with_cache_mode(request, cold_cache_mode).await {
                     Ok(plan) => {
-                        shared_route_index()
-                            .insert_plan(key.clone(), &plan, "click_cold_resolve")
+                        cache_route_index_plan(&rpc_url, request, &plan, "click_cold_resolve")
                             .await;
                         Ok(plan)
                     }
@@ -1284,9 +1315,7 @@ async fn resolve_trade_plan_with_route_index(
         } else {
             match resolve_trade_plan_with_cache_mode(request, cold_cache_mode).await {
                 Ok(plan) => {
-                    shared_route_index()
-                        .insert_plan(key.clone(), &plan, "click_cold_resolve")
-                        .await;
+                    cache_route_index_plan(&rpc_url, request, &plan, "click_cold_resolve").await;
                     Ok(plan)
                 }
                 Err(error) => Err(error),
@@ -1302,11 +1331,119 @@ fn route_index_key_for_request(request: &TradeRuntimeRequest, rpc_url: &str) -> 
         &request.mint,
         rpc_url,
         &request.policy.commitment,
-        side_label(&request.side),
-        &route_policy_label(request),
         request.pinned_pool.as_deref(),
         non_canonical_pool_trades_allowed(),
     )
+}
+
+async fn cache_route_index_plan(
+    rpc_url: &str,
+    request: &TradeRuntimeRequest,
+    plan: &TradeDispatchPlan,
+    source: &str,
+) {
+    for key in route_index_keys_for_plan(request, rpc_url, plan) {
+        shared_route_index().insert_plan(key, plan, source).await;
+    }
+}
+
+fn route_index_keys_for_plan(
+    request: &TradeRuntimeRequest,
+    rpc_url: &str,
+    plan: &TradeDispatchPlan,
+) -> Vec<RouteIndexKey> {
+    let mut keys = Vec::new();
+    push_route_index_key(&mut keys, route_index_key_for_request(request, rpc_url));
+    push_route_index_key(
+        &mut keys,
+        RouteIndexKey::new(
+            &plan.resolved_mint,
+            rpc_url,
+            &request.policy.commitment,
+            plan.resolved_pinned_pool.as_deref(),
+            non_canonical_pool_trades_allowed(),
+        ),
+    );
+    if let Some(pool) = plan.resolved_pinned_pool.as_deref() {
+        push_route_index_key(
+            &mut keys,
+            RouteIndexKey::new(
+                pool,
+                rpc_url,
+                &request.policy.commitment,
+                None,
+                non_canonical_pool_trades_allowed(),
+            ),
+        );
+        push_route_index_key(
+            &mut keys,
+            RouteIndexKey::new(
+                pool,
+                rpc_url,
+                &request.policy.commitment,
+                Some(pool),
+                non_canonical_pool_trades_allowed(),
+            ),
+        );
+    }
+    if Some(plan.selector.canonical_market_key.as_str()) != plan.resolved_pinned_pool.as_deref() {
+        push_route_index_key(
+            &mut keys,
+            RouteIndexKey::new(
+                &plan.selector.canonical_market_key,
+                rpc_url,
+                &request.policy.commitment,
+                None,
+                non_canonical_pool_trades_allowed(),
+            ),
+        );
+        push_route_index_key(
+            &mut keys,
+            RouteIndexKey::new(
+                &plan.selector.canonical_market_key,
+                rpc_url,
+                &request.policy.commitment,
+                Some(&plan.selector.canonical_market_key),
+                non_canonical_pool_trades_allowed(),
+            ),
+        );
+    }
+    if plan.raw_address != plan.resolved_mint
+        && Some(plan.raw_address.as_str()) != plan.resolved_pinned_pool.as_deref()
+    {
+        push_route_index_key(
+            &mut keys,
+            RouteIndexKey::new(
+                &plan.raw_address,
+                rpc_url,
+                &request.policy.commitment,
+                plan.resolved_pinned_pool.as_deref(),
+                non_canonical_pool_trades_allowed(),
+            ),
+        );
+    }
+    keys
+}
+
+pub(crate) async fn invalidate_route_index_for_request(
+    rpc_url: &str,
+    request: &TradeRuntimeRequest,
+) {
+    shared_route_index()
+        .invalidate_route_input(
+            rpc_url,
+            &request.policy.commitment,
+            &request.mint,
+            request.pinned_pool.as_deref(),
+            non_canonical_pool_trades_allowed(),
+        )
+        .await;
+}
+
+fn push_route_index_key(keys: &mut Vec<RouteIndexKey>, key: RouteIndexKey) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
 }
 
 fn build_dispatch_plan_from_route_index_entry(
@@ -1314,24 +1451,149 @@ fn build_dispatch_plan_from_route_index_entry(
     entry: RouteIndexEntry,
 ) -> Result<TradeDispatchPlan, String> {
     let effective_request = normalize_request_for_route_index_entry(request, &entry);
+    let selector = selector_for_request_side(entry.selector, request);
     let descriptor = RouteDescriptor {
         raw_address: entry.submitted_address.clone(),
         resolved_input_kind: entry.input_kind,
         resolved_mint: entry.resolved_mint.clone(),
         resolved_pair: entry.resolved_pool.clone(),
         route_locked_pair: entry.resolved_pool.clone(),
-        family: Some(entry.selector.family.clone()),
-        lifecycle: Some(entry.selector.lifecycle.clone()),
-        quote_asset: Some(entry.selector.quote_asset.clone()),
-        canonical_market_key: Some(entry.selector.canonical_market_key.clone()),
+        family: Some(selector.family.clone()),
+        lifecycle: Some(selector.lifecycle.clone()),
+        quote_asset: Some(selector.quote_asset.clone()),
+        canonical_market_key: Some(selector.canonical_market_key.clone()),
         non_canonical: entry.non_canonical,
     };
     build_dispatch_plan(
         &entry.submitted_address,
         &effective_request,
         Some(&descriptor),
-        entry.selector,
+        selector,
     )
+}
+
+fn selector_for_request_side(
+    mut selector: LifecycleAndCanonicalMarket,
+    request: &TradeRuntimeRequest,
+) -> LifecycleAndCanonicalMarket {
+    selector.wrapper_action = wrapper_action_for_side(&selector.wrapper_action, &request.side);
+    selector.input_amount_hint = match request.side {
+        crate::extension_api::TradeSide::Buy => request.buy_amount_sol.clone(),
+        crate::extension_api::TradeSide::Sell => None,
+    };
+    selector
+}
+
+fn wrapper_action_for_side(
+    action: &WrapperAction,
+    side: &crate::extension_api::TradeSide,
+) -> WrapperAction {
+    match (action, side) {
+        (
+            WrapperAction::PumpBondingCurveBuy | WrapperAction::PumpBondingCurveSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::PumpBondingCurveBuy,
+        (
+            WrapperAction::PumpBondingCurveBuy | WrapperAction::PumpBondingCurveSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::PumpBondingCurveSell,
+        (
+            WrapperAction::PumpAmmBuy | WrapperAction::PumpAmmSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::PumpAmmBuy,
+        (
+            WrapperAction::PumpAmmBuy | WrapperAction::PumpAmmSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::PumpAmmSell,
+        (
+            WrapperAction::PumpAmmWsolBuy | WrapperAction::PumpAmmWsolSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::PumpAmmWsolBuy,
+        (
+            WrapperAction::PumpAmmWsolBuy | WrapperAction::PumpAmmWsolSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::PumpAmmWsolSell,
+        (
+            WrapperAction::RaydiumAmmV4WsolBuy | WrapperAction::RaydiumAmmV4WsolSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::RaydiumAmmV4WsolBuy,
+        (
+            WrapperAction::RaydiumAmmV4WsolBuy | WrapperAction::RaydiumAmmV4WsolSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::RaydiumAmmV4WsolSell,
+        (
+            WrapperAction::RaydiumCpmmWsolBuy | WrapperAction::RaydiumCpmmWsolSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::RaydiumCpmmWsolBuy,
+        (
+            WrapperAction::RaydiumCpmmWsolBuy | WrapperAction::RaydiumCpmmWsolSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::RaydiumCpmmWsolSell,
+        (
+            WrapperAction::RaydiumLaunchLabSolBuy | WrapperAction::RaydiumLaunchLabSolSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::RaydiumLaunchLabSolBuy,
+        (
+            WrapperAction::RaydiumLaunchLabSolBuy | WrapperAction::RaydiumLaunchLabSolSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::RaydiumLaunchLabSolSell,
+        (
+            WrapperAction::TrustedStableSwapBuy | WrapperAction::TrustedStableSwapSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::TrustedStableSwapBuy,
+        (
+            WrapperAction::TrustedStableSwapBuy | WrapperAction::TrustedStableSwapSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::TrustedStableSwapSell,
+        (
+            WrapperAction::BonkLaunchpadSolBuy | WrapperAction::BonkLaunchpadSolSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::BonkLaunchpadSolBuy,
+        (
+            WrapperAction::BonkLaunchpadSolBuy | WrapperAction::BonkLaunchpadSolSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::BonkLaunchpadSolSell,
+        (
+            WrapperAction::BonkLaunchpadUsd1Buy | WrapperAction::BonkLaunchpadUsd1Sell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::BonkLaunchpadUsd1Buy,
+        (
+            WrapperAction::BonkLaunchpadUsd1Buy | WrapperAction::BonkLaunchpadUsd1Sell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::BonkLaunchpadUsd1Sell,
+        (
+            WrapperAction::BonkRaydiumSolBuy | WrapperAction::BonkRaydiumSolSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::BonkRaydiumSolBuy,
+        (
+            WrapperAction::BonkRaydiumSolBuy | WrapperAction::BonkRaydiumSolSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::BonkRaydiumSolSell,
+        (
+            WrapperAction::BonkRaydiumUsd1Buy | WrapperAction::BonkRaydiumUsd1Sell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::BonkRaydiumUsd1Buy,
+        (
+            WrapperAction::BonkRaydiumUsd1Buy | WrapperAction::BonkRaydiumUsd1Sell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::BonkRaydiumUsd1Sell,
+        (
+            WrapperAction::MeteoraDbcBuy | WrapperAction::MeteoraDbcSell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::MeteoraDbcBuy,
+        (
+            WrapperAction::MeteoraDbcBuy | WrapperAction::MeteoraDbcSell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::MeteoraDbcSell,
+        (
+            WrapperAction::MeteoraDammV2Buy | WrapperAction::MeteoraDammV2Sell,
+            crate::extension_api::TradeSide::Buy,
+        ) => WrapperAction::MeteoraDammV2Buy,
+        (
+            WrapperAction::MeteoraDammV2Buy | WrapperAction::MeteoraDammV2Sell,
+            crate::extension_api::TradeSide::Sell,
+        ) => WrapperAction::MeteoraDammV2Sell,
+    }
 }
 
 fn normalize_request_for_route_index_entry(
@@ -1360,6 +1622,13 @@ async fn prefetch_classifier_accounts(
     }) else {
         return;
     };
+    if let Err(error) = validate_route_pubkey(mint).and_then(|_| validate_route_pubkey(pool)) {
+        eprintln!(
+            "[execution-engine][dispatch] classifier prefetch skipped mint={} pair={} error={}",
+            mint, pool, error
+        );
+        return;
+    }
     let accounts = vec![mint.trim().to_string(), pool.to_string()];
     if let Err(error) = fetch_multiple_account_owner_and_data(rpc_url, &accounts, commitment).await
     {
@@ -1907,9 +2176,6 @@ fn warm_entry_matches_request(
     if request_pool != cached_route_lock {
         return false;
     }
-    if !selector_matches_trade_side(&plan.selector, &request.side) {
-        return false;
-    }
     true
 }
 
@@ -1938,88 +2204,6 @@ fn warm_entry_fingerprint_context_matches_request(
             .is_some_and(|commitment| commitment == expected_commitment)
         && warm_key_field(&entry.warm_key, "policy").is_some_and(|policy| policy == expected_policy)
         && warm_key_field(&entry.warm_key, "nc").is_some_and(|nc| nc == expected_nc)
-}
-
-fn selector_matches_trade_side(
-    selector: &LifecycleAndCanonicalMarket,
-    requested_side: &crate::extension_api::TradeSide,
-) -> bool {
-    matches!(
-        (selector.wrapper_action.clone(), requested_side),
-        (
-            crate::trade_planner::WrapperAction::PumpBondingCurveBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::PumpBondingCurveSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::PumpAmmBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::PumpAmmSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::PumpAmmWsolBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::PumpAmmWsolSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::RaydiumAmmV4WsolBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::RaydiumAmmV4WsolSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::RaydiumCpmmWsolBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::RaydiumCpmmWsolSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::RaydiumLaunchLabSolBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::RaydiumLaunchLabSolSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::BonkLaunchpadSolBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::BonkLaunchpadSolSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::BonkLaunchpadUsd1Buy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::BonkLaunchpadUsd1Sell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::BonkRaydiumSolBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::BonkRaydiumSolSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::BonkRaydiumUsd1Buy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::BonkRaydiumUsd1Sell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::MeteoraDbcBuy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::MeteoraDbcSell,
-            crate::extension_api::TradeSide::Sell
-        ) | (
-            crate::trade_planner::WrapperAction::MeteoraDammV2Buy,
-            crate::extension_api::TradeSide::Buy
-        ) | (
-            crate::trade_planner::WrapperAction::MeteoraDammV2Sell,
-            crate::extension_api::TradeSide::Sell
-        )
-    )
 }
 
 fn side_label(side: &crate::extension_api::TradeSide) -> &'static str {
@@ -2175,6 +2359,14 @@ mod tests {
 
         assert_eq!(route_policy_label(&axiom), route_policy_label(&j7));
         assert!(!route_policy_label(&axiom).contains("platform="));
+    }
+
+    #[test]
+    fn route_pubkey_validation_rejects_malformed_address_before_rpc() {
+        let error = validate_route_pubkey("not a pubkey")
+            .expect_err("malformed route input should be rejected locally");
+
+        assert!(error.contains("[invalid_address]"));
     }
 
     fn test_bonk_selector(canonical_market_key: &str) -> LifecycleAndCanonicalMarket {
@@ -2509,12 +2701,12 @@ mod tests {
                 selector: LifecycleAndCanonicalMarket {
                     lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
                     family: TradeVenueFamily::BonkRaydium,
-                    canonical_market_key: "pool-1".to_string(),
+                    canonical_market_key: "Pool222".to_string(),
                     quote_asset: crate::trade_planner::PlannerQuoteAsset::Usd1,
                     verification_source:
                         crate::trade_planner::PlannerVerificationSource::HybridDerived,
                     wrapper_action: crate::trade_planner::WrapperAction::BonkRaydiumUsd1Buy,
-                    wrapper_accounts: vec!["pool-1".to_string()],
+                    wrapper_accounts: vec!["Pool222".to_string()],
                     market_subtype: Some("canonical-raydium".to_string()),
                     direct_protocol_target: Some("raydium".to_string()),
                     input_amount_hint: Some("0.5".to_string()),
@@ -2572,12 +2764,12 @@ mod tests {
                 selector: LifecycleAndCanonicalMarket {
                     lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
                     family: TradeVenueFamily::BonkRaydium,
-                    canonical_market_key: "pool-1".to_string(),
+                    canonical_market_key: "Pool222".to_string(),
                     quote_asset: crate::trade_planner::PlannerQuoteAsset::Usd1,
                     verification_source:
                         crate::trade_planner::PlannerVerificationSource::HybridDerived,
                     wrapper_action: crate::trade_planner::WrapperAction::BonkRaydiumUsd1Buy,
-                    wrapper_accounts: vec!["pool-1".to_string()],
+                    wrapper_accounts: vec!["Pool222".to_string()],
                     market_subtype: Some("canonical-raydium".to_string()),
                     direct_protocol_target: Some("raydium".to_string()),
                     input_amount_hint: Some("0.5".to_string()),
@@ -2755,6 +2947,66 @@ mod tests {
             plan.resolved_pinned_pool.as_deref(),
             Some("NewPostMigrationPool111")
         );
+    }
+
+    #[test]
+    fn route_index_entry_reuse_rebuilds_selector_for_requested_side() {
+        let mut request = test_runtime_request();
+        request.side = TradeSide::Sell;
+        request.mint = "Mint111".to_string();
+        request.buy_amount_sol = None;
+        request.sell_intent = Some(crate::trade_runtime::RuntimeSellIntent::Percent(
+            "100".to_string(),
+        ));
+        request.pinned_pool = Some("Pool222".to_string());
+        let entry = RouteIndexEntry {
+            submitted_address: "Mint111".to_string(),
+            input_kind: TradeInputKind::Mint,
+            resolved_mint: "Mint111".to_string(),
+            resolved_pool: Some("Pool222".to_string()),
+            selector: test_bonk_selector("Pool222"),
+            non_canonical: false,
+            source: "test".to_string(),
+            fetched_at_unix_ms: 1,
+            last_used_at_unix_ms: 1,
+        };
+
+        let plan = build_dispatch_plan_from_route_index_entry(&request, entry)
+            .expect("cached buy selector should rebuild for sell side");
+
+        assert_eq!(plan.resolved_mint, "Mint111");
+        assert_eq!(plan.resolved_pinned_pool.as_deref(), Some("Pool222"));
+        assert!(matches!(
+            plan.selector.wrapper_action,
+            crate::trade_planner::WrapperAction::BonkRaydiumUsd1Sell
+        ));
+    }
+
+    #[test]
+    fn route_index_keys_include_canonical_market_alias_without_resolved_pin() {
+        let mut request = test_runtime_request();
+        request.mint = "Mint111".to_string();
+        request.pinned_pool = None;
+        let plan = TradeDispatchPlan {
+            adapter: TradeAdapter::BonkNative,
+            selector: test_bonk_selector("Pool222"),
+            execution_backend: crate::rollout::TradeExecutionBackend::Native,
+            raw_address: "Mint111".to_string(),
+            resolved_input_kind: TradeInputKind::Mint,
+            resolved_mint: "Mint111".to_string(),
+            resolved_pinned_pool: None,
+            non_canonical: false,
+        };
+
+        let keys = route_index_keys_for_plan(&request, "test-rpc", &plan);
+
+        assert!(
+            keys.iter()
+                .any(|key| { key.submitted_address == "Pool222" && key.pinned_pool.is_none() })
+        );
+        assert!(keys.iter().any(|key| {
+            key.submitted_address == "Pool222" && key.pinned_pool.as_deref() == Some("Pool222")
+        }));
     }
 
     #[tokio::test]
@@ -3058,12 +3310,12 @@ mod tests {
                 selector: LifecycleAndCanonicalMarket {
                     lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
                     family: TradeVenueFamily::BonkRaydium,
-                    canonical_market_key: "pool-1".to_string(),
+                    canonical_market_key: "Pool222".to_string(),
                     quote_asset: crate::trade_planner::PlannerQuoteAsset::Usd1,
                     verification_source:
                         crate::trade_planner::PlannerVerificationSource::HybridDerived,
                     wrapper_action: crate::trade_planner::WrapperAction::BonkRaydiumUsd1Buy,
-                    wrapper_accounts: vec!["pool-1".to_string()],
+                    wrapper_accounts: vec!["Pool222".to_string()],
                     market_subtype: Some("canonical-raydium".to_string()),
                     direct_protocol_target: Some("raydium".to_string()),
                     input_amount_hint: Some("0.5".to_string()),
@@ -3106,7 +3358,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_entry_rejects_mismatched_trade_side() {
+    fn warm_entry_accepts_opposite_side_for_same_route_identity() {
         let request = TradeRuntimeRequest {
             side: TradeSide::Sell,
             mint: "Mint111".to_string(),
@@ -3145,12 +3397,12 @@ mod tests {
                 selector: LifecycleAndCanonicalMarket {
                     lifecycle: crate::trade_planner::TradeLifecycle::PostMigration,
                     family: TradeVenueFamily::BonkRaydium,
-                    canonical_market_key: "pool-1".to_string(),
+                    canonical_market_key: "Pool222".to_string(),
                     quote_asset: crate::trade_planner::PlannerQuoteAsset::Usd1,
                     verification_source:
                         crate::trade_planner::PlannerVerificationSource::HybridDerived,
                     wrapper_action: crate::trade_planner::WrapperAction::BonkRaydiumUsd1Buy,
-                    wrapper_accounts: vec!["pool-1".to_string()],
+                    wrapper_accounts: vec!["Pool222".to_string()],
                     market_subtype: Some("canonical-raydium".to_string()),
                     direct_protocol_target: Some("raydium".to_string()),
                     input_amount_hint: Some("0.5".to_string()),
@@ -3167,7 +3419,15 @@ mod tests {
             warmed_at_unix_ms: 1,
             last_used_at_unix_ms: 1,
         };
-        assert!(!warm_entry_matches_request(&entry, &request, "test"));
+        assert!(warm_entry_matches_request(&entry, &request, "test"));
+
+        let plan = build_dispatch_plan_from_warm_entry("Mint111", &request, &entry)
+            .expect("shared route identity should rebuild for sell side");
+        assert!(matches!(
+            plan.selector.wrapper_action,
+            crate::trade_planner::WrapperAction::BonkRaydiumUsd1Sell
+        ));
+        assert_eq!(plan.selector.canonical_market_key, "Pool222");
     }
 
     #[test]

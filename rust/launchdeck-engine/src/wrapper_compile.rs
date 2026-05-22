@@ -1236,9 +1236,7 @@ fn read_pump_bonding_v2_amounts(data: &[u8]) -> Option<([u8; 8], u64, u64)> {
 
 fn pump_bonding_v2_expected_account_layout(discriminator: &[u8; 8]) -> Option<(usize, usize)> {
     match discriminator {
-        &PUMP_BUY_V2_DISCRIMINATOR => {
-            Some((PUMP_V2_BUY_ACCOUNT_COUNT, PUMP_V2_BUY_PROGRAM_INDEX))
-        }
+        &PUMP_BUY_V2_DISCRIMINATOR => Some((PUMP_V2_BUY_ACCOUNT_COUNT, PUMP_V2_BUY_PROGRAM_INDEX)),
         &PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR => {
             Some((PUMP_V2_BUY_ACCOUNT_COUNT, PUMP_V2_BUY_PROGRAM_INDEX))
         }

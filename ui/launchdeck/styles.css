@@ -2718,21 +2718,70 @@ label.is-field-error {
   position: relative;
 }
 
+#bonk-quote-asset-toggle[data-quote-asset="sol"] {
+  --quote-asset-color: #9945ff;
+  --quote-asset-color-strong: #14f195;
+  --quote-asset-contrast: #ffffff;
+}
+
+#bonk-quote-asset-toggle[data-quote-asset="usdc"] {
+  --quote-asset-color: #2775ca;
+  --quote-asset-color-strong: #4a96e4;
+  --quote-asset-contrast: #ffffff;
+}
+
+#bonk-quote-asset-toggle[data-quote-asset="usd1"] {
+  --quote-asset-color: #c7901b;
+  --quote-asset-color-strong: #f5cb5c;
+  --quote-asset-contrast: #2a1a05;
+}
+
+#bonk-quote-asset-toggle[data-quote-asset] {
+  border-color: color-mix(in srgb, var(--quote-asset-color) 72%, transparent);
+  background:
+    linear-gradient(
+      135deg,
+      var(--quote-asset-color-strong) 0%,
+      var(--quote-asset-color) 100%
+    );
+  color: var(--quote-asset-contrast);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 0 0 1px color-mix(in srgb, var(--quote-asset-color) 18%, transparent),
+    0 8px 18px color-mix(in srgb, var(--quote-asset-color) 22%, transparent);
+}
+
+#bonk-quote-asset-toggle[data-quote-asset]:hover {
+  border-color: color-mix(in srgb, var(--quote-asset-color-strong) 82%, transparent);
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--quote-asset-color-strong) 95%, white 5%) 0%,
+      color-mix(in srgb, var(--quote-asset-color) 90%, black 10%) 100%
+    );
+  color: var(--quote-asset-contrast);
+}
+
 .bonk-quote-asset-toggle-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
   pointer-events: none;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.42),
+    0 1px 3px rgba(0, 0, 0, 0.28);
 }
 
 #bonk-quote-asset-toggle .inline-sol-logo,
 #bonk-quote-asset-toggle .wallet-balance-icon-usd1 {
-  width: 14px;
-  height: 14px;
+  width: 20px;
+  height: 20px;
   display: block;
   object-fit: contain;
+  border-radius: 50%;
 }
 
 .mode-option:hover,

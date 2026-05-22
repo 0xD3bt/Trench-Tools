@@ -88,7 +88,7 @@ jobs:
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TITLE" \
               --notes "$NOTES" \
-              --prerelease
+              --latest
             gh release delete "$TEMP_TAG_NAME" --cleanup-tag -y
             exit 0
           fi
@@ -96,6 +96,6 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TITLE" \
             --notes "$NOTES" \
-            --prerelease
+            --latest
           gh release upload "$TAG_NAME" "$ZIP_PATH#$STABLE_ASSET_NAME" --clobber
           gh release delete "$TEMP_TAG_NAME" --cleanup-tag -y

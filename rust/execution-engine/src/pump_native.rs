@@ -184,6 +184,7 @@ const PUMP_BUY_COMPUTE_UNIT_LIMIT: u32 = 280_000;
 const PUMP_SELL_COMPUTE_UNIT_LIMIT: u32 = 280_000;
 const PUMP_AMM_BUY_COMPUTE_UNIT_LIMIT: u32 = 280_000;
 const PUMP_AMM_SELL_COMPUTE_UNIT_LIMIT: u32 = 280_000;
+const PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT: u32 = 420_000;
 const SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const SHARED_SUPER_LOOKUP_TABLE: &str = "7CaMLcAuSskoeN7HoRwZjsSthU8sMwKqxtXkyMiMjuc";
 
@@ -337,11 +338,17 @@ pub(crate) async fn classify_pump_bonding_curve_address(
     let bonding_curve = parse_pubkey(input, "Pump bonding curve address")?;
     let mint_candidates =
         fetch_owned_pump_bonding_curve_token_mints(rpc_url, input, commitment).await?;
-    let [(mint, _token_program)] = mint_candidates.as_slice() else {
+    let quote_meta = pump_quote_asset_meta(&curve.quote_mint)?;
+    let base_mint_candidates = mint_candidates
+        .iter()
+        .filter(|(mint, _)| is_pump_bonding_base_mint_candidate(mint, &quote_meta.mint))
+        .collect::<Vec<_>>();
+    let [(mint, _token_program)] = base_mint_candidates.as_slice() else {
         return Err(format!(
-            "Pump bonding curve {} owned {} supported token mint accounts; expected exactly one.",
+            "Pump bonding curve {} owned {} supported base token mint accounts after excluding quote mint {}; expected exactly one.",
             input.trim(),
-            mint_candidates.len()
+            base_mint_candidates.len(),
+            quote_meta.mint
         ));
     };
     let mint_pubkey = parse_pubkey(mint, "Pump bonding curve token mint")?;
@@ -358,7 +365,7 @@ pub(crate) async fn classify_pump_bonding_curve_address(
         mint: mint_pubkey.to_string(),
         bonding_curve: bonding_curve.to_string(),
         complete: curve.complete,
-        quote_asset: pump_quote_asset_meta(&curve.quote_mint)?.planner_asset,
+        quote_asset: quote_meta.planner_asset,
     }))
 }
 
@@ -592,9 +599,10 @@ pub async fn compile_pump_trade(
         }
     };
     let quote_meta = pump_quote_asset_meta(&curve.quote_mint)?;
-    let global = fetch_global_state(&rpc_url).await?;
-    let creator_vault_authority =
-        resolve_follow_creator_vault_authority(&rpc_url, &mint, &curve.creator).await?;
+    let (global, creator_vault_authority) = tokio::try_join!(
+        fetch_global_state(&rpc_url),
+        resolve_follow_creator_vault_authority(&rpc_url, &mint, &curve.creator),
+    )?;
     let is_mayhem_mode = curve.is_mayhem_mode;
     let is_cashback_coin = curve.cashback_enabled;
     let slippage_bps = parse_slippage_bps(Some(request.policy.slippage_percent.as_str()))?;
@@ -627,8 +635,10 @@ pub async fn compile_pump_trade(
                     &owner_pubkey,
                     &mint,
                     &token_program,
+                    &global,
+                    &creator_vault_authority,
                     spend_lamports,
-                    compute_unit_limit,
+                    PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT,
                     compute_unit_price_micro_lamports,
                     jitodontfront_enabled,
                 )
@@ -662,8 +672,11 @@ pub async fn compile_pump_trade(
                     &owner_pubkey,
                     &mint,
                     &token_program,
+                    &curve,
+                    &global,
+                    &creator_vault_authority,
                     wallet_key,
-                    compute_unit_limit,
+                    PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT,
                     compute_unit_price_micro_lamports,
                     jitodontfront_enabled,
                 )
@@ -805,6 +818,12 @@ async fn fetch_owned_pump_bonding_curve_token_mints(
         }
     }
     Ok(candidates)
+}
+
+fn is_pump_bonding_base_mint_candidate(mint: &str, quote_mint: &Pubkey) -> bool {
+    parse_pubkey(mint, "Pump bonding curve token mint")
+        .map(|candidate| candidate != *quote_mint)
+        .unwrap_or(false)
 }
 
 async fn resolve_pump_bonding_mint_token_program(
@@ -1309,7 +1328,12 @@ async fn compile_pump_amm_trade(
     };
     let (global_config, pool, fee_config, base_mint_supply, base_mint_decimals, mint_token_program) =
         if let Some(PlannerRuntimeBundle::PumpAmm(bundle)) = selector.runtime_bundle.as_ref() {
-            let mint_account = fetch_account_data(rpc_url, &mint.to_string(), "confirmed").await?;
+            let mint_address = mint.to_string();
+            let (mint_account, global_config, fee_config) = tokio::try_join!(
+                fetch_account_data(rpc_url, &mint_address, "confirmed"),
+                fetch_pump_amm_global_config(rpc_url),
+                fetch_pump_amm_fee_config(rpc_url),
+            )?;
             let pool = PumpAmmPoolState {
                 pubkey: parse_pubkey(&bundle.pool, "pump amm pool")?,
                 creator: parse_pubkey(&bundle.pool_creator, "pump amm pool creator")?,
@@ -1328,28 +1352,23 @@ async fn compile_pump_amm_trade(
                 is_cashback_coin: bundle.is_cashback_coin,
             };
             (
-                fetch_pump_amm_global_config(rpc_url).await?,
+                global_config,
                 pool,
-                fetch_pump_amm_fee_config(rpc_url).await?,
+                fee_config,
                 read_mint_supply(&mint_account)?,
                 read_mint_decimals(&mint_account)?,
                 parse_pubkey(&bundle.mint_token_program, "pump amm mint token program")?,
             )
         } else {
-            let (global_config, pool, fee_config, base_mint_supply, base_mint_decimals) =
+            let (global_config, pool, fee_config, mint_account) =
                 fetch_pump_amm_runtime(rpc_url, &mint, pinned_pool_pubkey.as_ref()).await?;
-            let mint_token_program =
-                fetch_account_owner_and_data(rpc_url, &mint.to_string(), "confirmed")
-                    .await?
-                    .map(|(owner, _)| owner)
-                    .ok_or_else(|| format!("Mint account {mint} was not found."))?;
             (
                 global_config,
                 pool,
                 fee_config,
-                base_mint_supply,
-                base_mint_decimals,
-                mint_token_program,
+                read_mint_supply(&mint_account.data)?,
+                read_mint_decimals(&mint_account.data)?,
+                mint_account.owner,
             )
         };
     let quote_meta = pump_quote_asset_meta(&pool.quote_mint)?;
@@ -1402,21 +1421,6 @@ async fn compile_pump_amm_trade(
         priority_fee_sol_to_micro_lamports(&request.policy.fee_sol)?;
     let jitodontfront_enabled =
         matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure);
-
-    let user_base_token_account =
-        get_associated_token_address_with_program_id(&owner_pubkey, &mint, &mint_token_program);
-    let temp_quote_account = Keypair::new();
-    let temp_quote_account_pubkey = temp_quote_account.pubkey();
-    let quote_account_rent_lamports = shared_warming_service()
-        .minimum_balance_for_rent_exemption(SPL_TOKEN_ACCOUNT_LEN, || async {
-            fetch_minimum_balance_for_rent_exemption(
-                rpc_url,
-                &request.policy.commitment,
-                SPL_TOKEN_ACCOUNT_LEN,
-            )
-            .await
-        })
-        .await?;
 
     let (
         protocol_fee_recipient,
@@ -1478,7 +1482,7 @@ async fn compile_pump_amm_trade(
             quote_reserve,
             fees,
             pool.coin_creator != Pubkey::default(),
-            compute_unit_limit,
+            PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT,
             compute_unit_price_micro_lamports,
             jitodontfront_enabled,
             protocol_fee_recipient,
@@ -1502,7 +1506,7 @@ async fn compile_pump_amm_trade(
             base_reserve,
             quote_reserve,
             fees,
-            compute_unit_limit,
+            PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT,
             compute_unit_price_micro_lamports,
             jitodontfront_enabled,
             protocol_fee_recipient,
@@ -1513,6 +1517,21 @@ async fn compile_pump_amm_trade(
         )
         .await;
     }
+
+    let user_base_token_account =
+        get_associated_token_address_with_program_id(&owner_pubkey, &mint, &mint_token_program);
+    let temp_quote_account = Keypair::new();
+    let temp_quote_account_pubkey = temp_quote_account.pubkey();
+    let quote_account_rent_lamports = shared_warming_service()
+        .minimum_balance_for_rent_exemption(SPL_TOKEN_ACCOUNT_LEN, || async {
+            fetch_minimum_balance_for_rent_exemption(
+                rpc_url,
+                &request.policy.commitment,
+                SPL_TOKEN_ACCOUNT_LEN,
+            )
+            .await
+        })
+        .await?;
 
     let mut instructions = vec![build_compute_unit_limit_instruction(compute_unit_limit)?];
     if compute_unit_price_micro_lamports > 0 {
@@ -1813,6 +1832,8 @@ async fn compile_pump_usdc_bonding_buy_from_sol_route(
     owner_pubkey: &Pubkey,
     mint: &Pubkey,
     base_token_program: &Pubkey,
+    global: &PumpGlobalState,
+    creator_vault_authority: &Pubkey,
     gross_sol_in_lamports: u64,
     compute_unit_limit: u32,
     compute_unit_price_micro_lamports: u64,
@@ -1854,10 +1875,7 @@ async fn compile_pump_usdc_bonding_buy_from_sol_route(
         u64::from(conversion_slippage_bps),
     )
     .await?;
-    let global = fetch_global_state(rpc_url).await?;
     let curve = fetch_bonding_curve_state(rpc_url, mint, &request.policy.commitment).await?;
-    let creator_vault_authority =
-        resolve_follow_creator_vault_authority(rpc_url, mint, &curve.creator).await?;
     let quote_meta = pump_quote_asset_meta(&curve.quote_mint)?;
     if !matches!(quote_meta.kind, PumpQuoteAssetKind::Usdc) {
         return Err("Pump USDC route was selected for a non-USDC bonding curve.".to_string());
@@ -2022,6 +2040,9 @@ async fn compile_pump_usdc_bonding_sell_to_sol_route(
     owner_pubkey: &Pubkey,
     mint: &Pubkey,
     base_token_program: &Pubkey,
+    curve: &PumpBondingCurveState,
+    global: &PumpGlobalState,
+    creator_vault_authority: &Pubkey,
     wallet_key: &str,
     compute_unit_limit: u32,
     compute_unit_price_micro_lamports: u64,
@@ -2040,11 +2061,7 @@ async fn compile_pump_usdc_bonding_sell_to_sol_route(
         &quote_token_program,
     );
     let route_wsol_account = route_wsol_pda(owner_pubkey, 0).0;
-    let global = fetch_global_state(rpc_url).await?;
-    let curve = fetch_bonding_curve_state(rpc_url, mint, &request.policy.commitment).await?;
     let quote_meta = pump_quote_asset_meta(&curve.quote_mint)?;
-    let creator_vault_authority =
-        resolve_follow_creator_vault_authority(rpc_url, mint, &curve.creator).await?;
     if !matches!(quote_meta.kind, PumpQuoteAssetKind::Usdc) {
         return Err("Pump USDC sell route was selected for a non-USDC bonding curve.".to_string());
     }
@@ -2231,6 +2248,7 @@ async fn compile_pump_usdc_amm_buy_from_sol_route(
     }
     let user_base_account =
         get_associated_token_address_with_program_id(owner_pubkey, mint, base_token_program);
+    let min_base_amount_out = apply_sell_side_slippage(base_amount_out, pump_slippage_bps);
     let pump_ix = build_pump_amm_buy_exact_quote_in_instruction(
         pool,
         owner_pubkey,
@@ -2242,7 +2260,7 @@ async fn compile_pump_usdc_amm_buy_from_sol_route(
         &coin_creator_vault_authority,
         base_token_program,
         conversion.min_out,
-        apply_sell_side_slippage(base_amount_out, pump_slippage_bps),
+        min_base_amount_out,
         pool.is_cashback_coin,
     )?;
     let mut route_accounts = vec![
@@ -2563,36 +2581,43 @@ async fn fetch_pump_amm_runtime(
         PumpAmmGlobalConfig,
         PumpAmmPoolState,
         Option<PumpAmmFeeConfig>,
-        u64,
-        u8,
+        AccountWithOwnerData,
     ),
     String,
 > {
-    let global_config = fetch_pump_amm_global_config(rpc_url).await?;
-    let pool = find_pump_amm_pool_state(rpc_url, mint, pinned_pool, "confirmed")
+    let mint_address = mint.to_string();
+    let (global_config, pool, fee_config, mint_account) = tokio::try_join!(
+        fetch_pump_amm_global_config(rpc_url),
+        async {
+            find_pump_amm_pool_state(rpc_url, mint, pinned_pool, "confirmed")
+                .await?
+                .ok_or_else(|| match pinned_pool {
+                    Some(pinned) => format!(
+                        "Pinned Pump AMM pool {pinned} was not found on-chain for mint {mint}."
+                    ),
+                    None => format!("No supported Pump AMM pool was found for mint {mint}."),
+                })
+        },
+        fetch_pump_amm_fee_config(rpc_url),
+        fetch_account_owner_and_data_required(rpc_url, &mint_address, "confirmed"),
+    )?;
+    Ok((global_config, pool, fee_config, mint_account))
+}
+
+struct AccountWithOwnerData {
+    owner: Pubkey,
+    data: Vec<u8>,
+}
+
+async fn fetch_account_owner_and_data_required(
+    rpc_url: &str,
+    address: &str,
+    commitment: &str,
+) -> Result<AccountWithOwnerData, String> {
+    let (owner, data) = fetch_account_owner_and_data(rpc_url, address, commitment)
         .await?
-        .ok_or_else(|| match pinned_pool {
-            Some(pinned) => {
-                format!("Pinned Pump AMM pool {pinned} was not found on-chain for mint {mint}.")
-            }
-            None => format!("No supported Pump AMM pool was found for mint {mint}."),
-        })?;
-    let fee_config = fetch_pump_amm_fee_config(rpc_url).await?;
-    // Read supply and decimals from the same on-chain mint account fetch.
-    // Decimals flow into the wallet-token cache reconstruction so the
-    // Pump AMM sell-sizing path stops hardcoding `6` — if Pump ever
-    // supports a Token-2022 mint with different decimals, the cache
-    // value will still round-trip correctly.
-    let mint_account = fetch_account_data(rpc_url, &mint.to_string(), "confirmed").await?;
-    let base_mint_supply = read_mint_supply(&mint_account)?;
-    let base_mint_decimals = read_mint_decimals(&mint_account)?;
-    Ok((
-        global_config,
-        pool,
-        fee_config,
-        base_mint_supply,
-        base_mint_decimals,
-    ))
+        .ok_or_else(|| format!("Account {address} was not found."))?;
+    Ok(AccountWithOwnerData { owner, data })
 }
 
 async fn resolve_sell_token_amount(
@@ -2858,14 +2883,18 @@ async fn quote_pump_holding_value_sol_with_cache(
             CachedPumpQuoteSnapshot::BondingCurve { curve, global }
         }
         TradeVenueFamily::PumpAmm => {
-            let (global_config, pool, fee_config, base_mint_supply, _) =
+            let (global_config, pool, fee_config, base_mint_supply) =
                 if let Some(PlannerRuntimeBundle::PumpAmm(bundle)) =
                     selector.runtime_bundle.as_ref()
                 {
-                    let mint_account =
-                        fetch_account_data(rpc_url, &mint_pubkey.to_string(), commitment).await?;
+                    let mint_address = mint_pubkey.to_string();
+                    let (mint_account, global_config, fee_config) = tokio::try_join!(
+                        fetch_account_data(rpc_url, &mint_address, commitment),
+                        fetch_pump_amm_global_config(rpc_url),
+                        fetch_pump_amm_fee_config(rpc_url),
+                    )?;
                     (
-                        fetch_pump_amm_global_config(rpc_url).await?,
+                        global_config,
                         PumpAmmPoolState {
                             pubkey: parse_pubkey(&bundle.pool, "pump amm pool")?,
                             creator: parse_pubkey(&bundle.pool_creator, "pump amm pool creator")?,
@@ -2886,12 +2915,18 @@ async fn quote_pump_holding_value_sol_with_cache(
                             is_mayhem_mode: bundle.is_mayhem_mode,
                             is_cashback_coin: bundle.is_cashback_coin,
                         },
-                        fetch_pump_amm_fee_config(rpc_url).await?,
+                        fee_config,
                         read_mint_supply(&mint_account)?,
-                        read_mint_decimals(&mint_account)?,
                     )
                 } else {
-                    fetch_pump_amm_runtime(rpc_url, &mint_pubkey, None).await?
+                    let (global_config, pool, fee_config, mint_account) =
+                        fetch_pump_amm_runtime(rpc_url, &mint_pubkey, None).await?;
+                    (
+                        global_config,
+                        pool,
+                        fee_config,
+                        read_mint_supply(&mint_account.data)?,
+                    )
                 };
             pump_quote_asset_meta(&pool.quote_mint)?;
             let reserve_accounts = vec![
@@ -3164,17 +3199,33 @@ async fn find_pump_amm_pool_state(
     }
 
     let quote_candidates = [wsol_mint()?, usdc_mint()?];
-    for quote_mint in quote_candidates {
-        let canonical_pool = canonical_pump_amm_pool_for_quote(mint, &quote_mint)?;
-        match fetch_account_data(rpc_url, &canonical_pool.to_string(), commitment).await {
-            Ok(account_data) => {
-                let pool = decode_pump_amm_pool_state(canonical_pool, &account_data)?;
-                if pool.base_mint == *mint && pool.quote_mint == quote_mint {
-                    return Ok(Some(pool));
-                }
-            }
-            Err(error) if error.contains("was not found") => {}
-            Err(error) => return Err(error),
+    let pool_candidates = quote_candidates
+        .iter()
+        .map(|quote_mint| canonical_pump_amm_pool_for_quote(mint, quote_mint))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pool_accounts = pool_candidates
+        .iter()
+        .map(Pubkey::to_string)
+        .collect::<Vec<_>>();
+    let pool_datas = fetch_multiple_account_data(rpc_url, &pool_accounts, commitment).await?;
+    if pool_datas.len() != pool_candidates.len() {
+        return Err(format!(
+            "Pump AMM pool batch returned {} accounts for {} requested pools.",
+            pool_datas.len(),
+            pool_candidates.len()
+        ));
+    }
+    for ((quote_mint, canonical_pool), account_data) in quote_candidates
+        .into_iter()
+        .zip(pool_candidates.into_iter())
+        .zip(pool_datas.into_iter())
+    {
+        let Some(account_data) = account_data else {
+            continue;
+        };
+        let pool = decode_pump_amm_pool_state(canonical_pool, &account_data)?;
+        if pool.base_mint == *mint && pool.quote_mint == quote_mint {
+            return Ok(Some(pool));
         }
     }
     Ok(None)
@@ -3595,6 +3646,7 @@ fn build_pump_amm_buy_exact_quote_in_instruction(
     let mut data = vec![198, 46, 21, 82, 180, 217, 232, 112];
     data.extend_from_slice(&spendable_quote_in.to_le_bytes());
     data.extend_from_slice(&min_base_amount_out.to_le_bytes());
+    data.push(1);
     let mut accounts = vec![
         AccountMeta::new(pool.pubkey, false),
         AccountMeta::new(*user, true),
@@ -3622,7 +3674,7 @@ fn build_pump_amm_buy_exact_quote_in_instruction(
     ];
     if append_cashback_remaining_accounts {
         accounts.push(AccountMeta::new(
-            pump_amm_user_volume_accumulator_wsol_ata(user)?,
+            pump_amm_user_volume_accumulator_quote_ata(user, &pool.quote_mint)?,
             false,
         ));
     }
@@ -3687,7 +3739,7 @@ fn build_pump_amm_sell_instruction(
     ];
     if append_cashback_remaining_accounts {
         accounts.push(AccountMeta::new(
-            pump_amm_user_volume_accumulator_wsol_ata(user)?,
+            pump_amm_user_volume_accumulator_quote_ata(user, &pool.quote_mint)?,
             false,
         ));
         accounts.push(AccountMeta::new(
@@ -4498,10 +4550,13 @@ fn pump_amm_user_volume_accumulator_pda(user: &Pubkey) -> Pubkey {
     .0
 }
 
-fn pump_amm_user_volume_accumulator_wsol_ata(user: &Pubkey) -> Result<Pubkey, String> {
+fn pump_amm_user_volume_accumulator_quote_ata(
+    user: &Pubkey,
+    quote_mint: &Pubkey,
+) -> Result<Pubkey, String> {
     Ok(get_associated_token_address_with_program_id(
         &pump_amm_user_volume_accumulator_pda(user),
-        &wsol_mint()?,
+        quote_mint,
         &token_program_id()?,
     ))
 }
@@ -4576,7 +4631,7 @@ async fn append_pump_amm_setup_instructions(
         instructions.push(create_associated_token_account_idempotent(
             owner,
             &pump_amm_user_volume_accumulator_pda(owner),
-            &wsol_mint()?,
+            &pool.quote_mint,
             &token_program_id()?,
         ));
     }
@@ -4710,6 +4765,16 @@ mod tests {
             is_mayhem_mode: false,
             is_cashback_coin: false,
         }
+    }
+
+    fn select_base_mint_candidates_for_quote<'a>(
+        mint_candidates: &'a [(String, Pubkey)],
+        quote_mint: &Pubkey,
+    ) -> Vec<&'a (String, Pubkey)> {
+        mint_candidates
+            .iter()
+            .filter(|(mint, _)| is_pump_bonding_base_mint_candidate(mint, quote_mint))
+            .collect::<Vec<_>>()
     }
 
     fn assert_v2_bonding_curve_token_program_accounts(
@@ -4880,6 +4945,26 @@ mod tests {
     }
 
     #[test]
+    fn bonding_curve_pair_classification_excludes_usdc_quote_account() {
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = usdc_mint().expect("usdc mint");
+        let candidates = vec![
+            (
+                quote_mint.to_string(),
+                token_program_id().expect("token program"),
+            ),
+            (
+                base_mint.to_string(),
+                token_2022_program_id().expect("token 2022 program"),
+            ),
+        ];
+        let base_candidates = select_base_mint_candidates_for_quote(&candidates, &quote_mint);
+
+        assert_eq!(base_candidates.len(), 1);
+        assert_eq!(base_candidates[0].0, base_mint.to_string());
+    }
+
+    #[test]
     fn canonical_pump_amm_pool_derives_distinct_quote_pools() {
         let base_mint = Pubkey::new_unique();
         let wsol_pool = canonical_pump_amm_pool_for_quote(&base_mint, &wsol_mint().expect("wsol"))
@@ -5017,7 +5102,8 @@ mod tests {
         let creator = Pubkey::new_unique();
         let user = Pubkey::new_unique();
         let token_program = token_2022_program_id().expect("token 2022 program");
-        let quote_meta = pump_quote_asset_meta(&usdc_mint().expect("usdc mint")).expect("quote meta");
+        let quote_meta =
+            pump_quote_asset_meta(&usdc_mint().expect("usdc mint")).expect("quote meta");
         let instruction = build_buy_v2_instruction(
             &global,
             &mint,
@@ -5033,7 +5119,10 @@ mod tests {
 
         assert_eq!(instruction.program_id.to_string(), PUMP_PROGRAM_ID);
         assert_eq!(instruction.accounts.len(), 27);
-        assert_eq!(&instruction.data[..8], &[184, 23, 238, 97, 103, 197, 211, 61]);
+        assert_eq!(
+            &instruction.data[..8],
+            &[184, 23, 238, 97, 103, 197, 211, 61]
+        );
         assert_eq!(&instruction.data[8..16], &1_000_000u64.to_le_bytes());
         assert_eq!(&instruction.data[16..24], &100_000_000u64.to_le_bytes());
         assert_eq!(instruction.accounts[2].pubkey, quote_meta.mint);
@@ -5071,6 +5160,8 @@ mod tests {
             false,
         )
         .expect("AMM buy instruction");
+        assert_eq!(buy.data.len(), 25);
+        assert_eq!(buy.data[24], 1);
         assert_eq!(buy.accounts.len(), 26);
         assert_eq!(
             buy.accounts[23].pubkey,
@@ -5083,6 +5174,46 @@ mod tests {
         assert!(!buy.accounts[24].is_writable);
         assert_eq!(buy.accounts[25].pubkey, expected_quote_ata);
         assert!(buy.accounts[25].is_writable);
+
+        let mut usdc_pool = pool.clone();
+        usdc_pool.quote_mint = usdc_mint().expect("usdc mint");
+        usdc_pool.is_cashback_coin = true;
+        let usdc_buy = build_pump_amm_buy_exact_quote_in_instruction(
+            &usdc_pool,
+            &user,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &token_program_id().expect("token program"),
+            100_000_000,
+            1_000,
+            true,
+        )
+        .expect("AMM USDC buy instruction");
+        assert_eq!(
+            usdc_buy.accounts[23].pubkey,
+            pump_amm_user_volume_accumulator_quote_ata(&user, &usdc_pool.quote_mint)
+                .expect("USDC volume accumulator ATA")
+        );
+        assert_eq!(
+            usdc_buy.accounts[24].pubkey,
+            pump_amm_pool_v2_pda(&usdc_pool.base_mint)
+        );
+        assert_eq!(
+            usdc_buy.accounts[25].pubkey,
+            selected_pump_apr28_fee_recipient().expect("April 28 recipient")
+        );
+        assert_eq!(
+            usdc_buy.accounts[26].pubkey,
+            pump_apr28_fee_recipient_ata_for_quote_mint(
+                &usdc_pool.quote_mint,
+                &token_program_id().unwrap(),
+            )
+            .expect("USDC April 28 quote ATA")
+        );
 
         let sell = build_pump_amm_sell_instruction(
             &pool,
@@ -5203,6 +5334,14 @@ mod tests {
         .expect("high cap fees");
         assert_eq!(high_cap_fees.lp_fee_bps, 20);
         assert_eq!(high_cap_fees.creator_fee_bps, 95);
+    }
+
+    #[test]
+    fn usdc_wrapper_buy_routes_use_expanded_compute_budget() {
+        assert!(PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT > PUMP_BUY_COMPUTE_UNIT_LIMIT);
+        assert!(PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT > PUMP_SELL_COMPUTE_UNIT_LIMIT);
+        assert!(PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT > PUMP_AMM_BUY_COMPUTE_UNIT_LIMIT);
+        assert!(PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT > PUMP_AMM_SELL_COMPUTE_UNIT_LIMIT);
     }
 
     #[test]

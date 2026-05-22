@@ -12,13 +12,14 @@ use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     message::{AddressLookupTableAccount, VersionedMessage, v0},
     pubkey::Pubkey,
+    rent::Rent,
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
 use solana_system_interface::{instruction::transfer, program as system_program};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     str::FromStr,
     sync::{Mutex, OnceLock},
@@ -27,11 +28,14 @@ use std::{
 use tokio::{join, task::JoinSet, time::sleep};
 
 use crate::{
-    bonk_native::{TrustedRaydiumClmmSwap, build_trusted_raydium_clmm_swap_exact_in},
+    bonk_native::{
+        TrustedRaydiumClmmRouteSetup, TrustedRaydiumClmmSwap,
+        build_trusted_raydium_clmm_swap_exact_in,
+        build_trusted_raydium_clmm_swap_exact_in_from_setup, load_trusted_raydium_clmm_route_setup,
+    },
     compiled_transaction_signers,
     config::{
         NormalizedConfig, NormalizedExecution, NormalizedRecipient,
-        configured_default_agent_setup_compute_unit_limit,
         configured_default_dev_auto_sell_compute_unit_limit,
         configured_default_follow_up_compute_unit_limit,
         configured_default_launch_compute_unit_limit,
@@ -39,6 +43,7 @@ use crate::{
         launch_follow_up_label,
     },
     paths,
+    provider_tip::{provider_min_tip_sol_label, provider_required_tip_lamports},
     report::{LaunchReport, build_report, render_report},
     rpc::{
         COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS, CompiledTransaction,
@@ -51,7 +56,7 @@ use crate::{
     vanity_pool::{
         VanityLaunchpad, VanityReservation, append_vanity_report_note, reserve_vanity_mint,
     },
-    wallet::read_keypair_bytes,
+    wallet::{load_solana_wallet_by_env_key, read_keypair_bytes},
     wrapper_compile::{
         ABI_VERSION as WRAPPER_ABI_VERSION, EXECUTE_SWAP_ROUTE_FIXED_ACCOUNT_COUNT,
         EXECUTE_SWAP_ROUTE_WSOL_ACCOUNT_COUNT, ExecutePumpBondingV2Request,
@@ -87,11 +92,14 @@ const DEFAULT_LOOKUP_TABLES: [&str; 1] = [SHARED_SUPER_LOOKUP_TABLE];
 const DEFAULT_LAUNCH_LOOKUP_TABLE_PROFILES: [[&str; 1]; 1] = [[SHARED_SUPER_LOOKUP_TABLE]];
 const DEFAULT_FOLLOW_UP_LOOKUP_TABLE_PROFILES: [[&str; 1]; 1] = [[SHARED_SUPER_LOOKUP_TABLE]];
 const LOOKUP_TABLE_CACHE_TTL: Duration = Duration::from_secs(60);
+const PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT: u64 = 420_000;
+const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
 
 #[derive(Debug)]
 pub struct NativePumpArtifacts {
     pub compiled_transactions: Vec<CompiledTransaction>,
     pub creation_transactions: Vec<CompiledTransaction>,
+    pub pre_launch_transactions: Vec<CompiledTransaction>,
     pub deferred_setup_transactions: Vec<CompiledTransaction>,
     pub report: Value,
     pub text: String,
@@ -311,19 +319,57 @@ pub async fn try_compile_native_pump(
     let launch_lookup_table_variants =
         lookup_table_variants_for_transaction("launch", config, &lookup_tables);
     let mut launch_instructions = launch_pre_instructions;
+    let mut pre_launch_transactions = vec![];
+    let mut pre_launch_metrics_opt = None;
+    let mut pre_launch_instruction_summaries_opt = None;
     if config.quoteAsset.eq_ignore_ascii_case("usdc") {
-        launch_instructions.extend(
-            build_usdc_launch_instructions(
-                rpc_url,
-                config,
-                mint,
-                creator,
-                launch_creator,
-                agent_authority.as_ref(),
-                global.as_ref(),
-            )
-            .await?,
-        );
+        let usdc_launch_plan = build_usdc_launch_instruction_plan(
+            rpc_url,
+            config,
+            mint,
+            creator,
+            launch_creator,
+            agent_authority.as_ref(),
+            global.as_ref(),
+        )
+        .await?;
+        if !usdc_launch_plan.pre_launch_instructions.is_empty() {
+            let pre_launch_tx_instructions = with_tx_settings(
+                usdc_launch_plan.pre_launch_instructions.clone(),
+                &launch_tx_config,
+                &creator,
+                config.execution.jitodontfront,
+            )?;
+            let pre_launch_serialize_started = Instant::now();
+            let pre_launch_extra_signers = usdc_launch_plan
+                .pre_launch_signers
+                .iter()
+                .collect::<Vec<_>>();
+            let (pre_launch_compiled, mut pre_launch_metrics) = compile_transaction_with_metrics(
+                "pre-launch-usdc-funding",
+                tx_format,
+                &blockhash,
+                last_valid_block_height,
+                &creator_keypair,
+                None,
+                &pre_launch_extra_signers,
+                pre_launch_tx_instructions.clone(),
+                &launch_tx_config,
+                &launch_lookup_table_variants,
+            )?;
+            compile_timings.tx_serialize_ms += pre_launch_serialize_started.elapsed().as_millis();
+            pre_launch_metrics
+                .warnings
+                .extend(transaction_size_diagnostics(
+                    &pre_launch_tx_instructions,
+                    &launch_tx_config,
+                ));
+            pre_launch_instruction_summaries_opt =
+                Some(summarize_instructions(&pre_launch_tx_instructions));
+            pre_launch_metrics_opt = Some(pre_launch_metrics);
+            pre_launch_transactions.push(pre_launch_compiled);
+        }
+        launch_instructions.extend(usdc_launch_plan.launch_instructions);
     } else {
         launch_instructions.extend(build_launch_instructions(
             config,
@@ -348,6 +394,7 @@ pub async fn try_compile_native_pump(
         last_valid_block_height,
         &creator_keypair,
         Some(&mint_keypair),
+        &[],
         launch_tx_instructions.clone(),
         &launch_tx_config,
         &launch_lookup_table_variants,
@@ -359,19 +406,31 @@ pub async fn try_compile_native_pump(
         &launch_tx_instructions,
         &launch_tx_config,
     ));
-    let mut compiled_transactions = vec![launch_compiled.clone()];
+    let mut compiled_transactions = pre_launch_transactions.clone();
+    compiled_transactions.push(launch_compiled.clone());
     let mut creation_transactions = vec![launch_compiled];
     let mut deferred_setup_transactions = vec![];
-    let mut compile_metrics = vec![launch_metrics];
-    let mut instruction_summaries = vec![summarize_instructions(&launch_tx_instructions)];
+    let mut compile_metrics = Vec::new();
+    let mut instruction_summaries = Vec::new();
+    if !pre_launch_transactions.is_empty() {
+        if let Some(pre_launch_metrics) = pre_launch_metrics_opt {
+            compile_metrics.push(pre_launch_metrics);
+        }
+        if let Some(pre_launch_instruction_summaries) = pre_launch_instruction_summaries_opt {
+            instruction_summaries.push(pre_launch_instruction_summaries);
+        }
+    }
+    compile_metrics.push(launch_metrics);
+    instruction_summaries.push(summarize_instructions(&launch_tx_instructions));
 
-    if let Some(follow_up_label) = native_follow_up_label(config) {
+    for follow_up_label in native_follow_up_labels(config) {
         let follow_up_lookup_table_variants =
             lookup_table_variants_for_transaction(follow_up_label, config, &lookup_tables);
         let follow_up_prep_started = Instant::now();
         let follow_up_instructions = build_native_follow_up_instructions(
             rpc_url,
             config,
+            follow_up_label,
             mint,
             creator,
             agent_authority.as_ref(),
@@ -401,6 +460,7 @@ pub async fn try_compile_native_pump(
             last_valid_block_height,
             &creator_keypair,
             None,
+            &[],
             follow_up_tx_instructions.clone(),
             &NativeTxConfig {
                 compute_unit_limit: configured_follow_up_compute_unit_limit(
@@ -466,6 +526,7 @@ pub async fn try_compile_native_pump(
             last_valid_block_height,
             &creator_keypair,
             None,
+            &[],
             tip_tx_instructions.clone(),
             &NativeTxConfig {
                 compute_unit_limit: configured_launch_compute_unit_limit(config)?,
@@ -507,6 +568,14 @@ pub async fn try_compile_native_pump(
             .map(|table| table.key.to_string())
             .collect(),
     );
+    if pre_launch_transactions.is_empty()
+        && let Some(index) = report
+            .transactions
+            .iter()
+            .position(|transaction| transaction.label == "pre-launch-usdc-funding")
+    {
+        report.transactions.remove(index);
+    }
     if let Some(first_note) = report.execution.notes.first_mut() {
         *first_note =
             "Rust engine owns validation, runtime state, and API contracts. Native Pump assembly now covers LaunchDeck's Pump launch modes end-to-end; non-Pump flows still fall back to the JS compile bridge."
@@ -533,6 +602,7 @@ pub async fn try_compile_native_pump(
     Ok(Some(NativePumpArtifacts {
         compiled_transactions,
         creation_transactions,
+        pre_launch_transactions,
         deferred_setup_transactions,
         report,
         text,
@@ -643,23 +713,48 @@ fn configured_launch_compute_unit_limit(config: &NormalizedConfig) -> Result<u32
         .tx
         .computeUnitLimit
         .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_else(configured_default_launch_compute_unit_limit);
+        .unwrap_or_else(|| {
+            if config.quoteAsset.eq_ignore_ascii_case("usdc") && config.devBuy.is_some() {
+                PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT
+            } else {
+                configured_default_launch_compute_unit_limit()
+            }
+        });
     u64_to_u32_limit(limit, "launch compute unit limit")
+}
+
+fn configured_pump_usdc_buy_compute_unit_limit() -> Result<u32, String> {
+    u64_to_u32_limit(
+        PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT,
+        "Pump USDC buy compute unit limit",
+    )
+}
+
+fn configured_pump_usdc_route_compute_unit_limit() -> Result<u32, String> {
+    u64_to_u32_limit(
+        PUMP_USDC_ROUTE_COMPUTE_UNIT_LIMIT,
+        "Pump USDC route compute unit limit",
+    )
 }
 
 fn configured_follow_up_compute_unit_limit(
     config: &NormalizedConfig,
     follow_up_label: &str,
 ) -> Result<u32, String> {
-    let limit = config
+    if let Some(limit) = config
         .tx
         .computeUnitLimit
         .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_else(|| match follow_up_label {
-            "agent-setup" => configured_default_agent_setup_compute_unit_limit(),
-            _ => configured_default_follow_up_compute_unit_limit(),
-        });
-    u64_to_u32_limit(limit, "follow-up compute unit limit")
+    {
+        return u64_to_u32_limit(limit, "follow-up compute unit limit");
+    }
+    match follow_up_label {
+        "agent-setup" => configured_launch_compute_unit_limit(config),
+        _ => u64_to_u32_limit(
+            configured_default_follow_up_compute_unit_limit(),
+            "follow-up compute unit limit",
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -739,6 +834,12 @@ pub struct PreparedFollowBuyRuntime {
     global: PumpGlobalState,
     curve: PumpBondingCurveState,
     creator_vault_authority: Pubkey,
+}
+
+struct PumpUsdcLaunchInstructionPlan {
+    launch_instructions: Vec<Instruction>,
+    pre_launch_instructions: Vec<Instruction>,
+    pre_launch_signers: Vec<Keypair>,
 }
 
 fn global_state_cache() -> &'static Mutex<Option<PumpGlobalState>> {
@@ -1035,11 +1136,15 @@ fn coin_creator_vault_authority_pda(coin_creator: &Pubkey) -> Result<Pubkey, Str
     .0)
 }
 
-fn coin_creator_vault_ata_pda(coin_creator_vault_authority: &Pubkey) -> Result<Pubkey, String> {
+fn coin_creator_vault_ata_pda(
+    coin_creator_vault_authority: &Pubkey,
+    quote_mint: &Pubkey,
+    quote_token_program: &Pubkey,
+) -> Result<Pubkey, String> {
     Ok(get_associated_token_address_with_program_id(
         coin_creator_vault_authority,
-        &wsol_mint()?,
-        &token_program_id()?,
+        quote_mint,
+        quote_token_program,
     ))
 }
 
@@ -1259,6 +1364,18 @@ fn decode_spl_token_account_amount(data: &[u8], label: &str) -> Result<u64, Stri
     Ok(u64::from_le_bytes(bytes))
 }
 
+async fn fetch_spl_token_account_amount(
+    rpc_url: &str,
+    commitment: &str,
+    account: &Pubkey,
+) -> Result<Option<u64>, String> {
+    let values = fetch_multiple_account_data(rpc_url, &[account.to_string()], commitment).await?;
+    let Some(Some(data)) = values.into_iter().next() else {
+        return Ok(None);
+    };
+    decode_spl_token_account_amount(&data, "SPL token").map(Some)
+}
+
 fn decode_spl_mint_supply(data: &[u8], label: &str) -> Result<u64, String> {
     let bytes: [u8; 8] = data
         .get(36..44)
@@ -1276,6 +1393,12 @@ fn current_market_cap_quote_units(total_supply: u64, quote_reserve: u64, base_re
         .min(u128::from(u64::MAX))
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn completed_curve_amm_error(curve_snapshot: &PumpMarketSnapshot, error: &str) -> Option<String> {
+    curve_snapshot.complete.then(|| {
+        format!("Pump bonding curve is complete but Pump AMM market snapshot was unavailable ({error}).")
+    })
 }
 
 fn quote_asset_meta_for_mint(quote_mint: &Pubkey) -> Option<(&'static str, &'static str, u32)> {
@@ -1327,22 +1450,19 @@ fn derive_pump_amm_pool_address(
     Ok(pubkey)
 }
 
-async fn find_pump_amm_pool_state(
-    rpc_url: &str,
+fn pump_amm_pool_candidate_pubkeys(
     mint: &Pubkey,
-    creator: &Pubkey,
-) -> Result<Option<PumpAmmPoolState>, String> {
+    known_creators: &[Pubkey],
+) -> Result<Vec<String>, String> {
     let quote_candidates = [WSOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT];
-    let mut requests = Vec::new();
     let canonical_creator = pump_pool_authority_pda(mint)?;
-
+    let mut requests = Vec::new();
     let mut push_candidate = |pool_pubkey: Pubkey| {
         let value = pool_pubkey.to_string();
         if !requests.iter().any(|existing| existing == &value) {
             requests.push(value);
         }
     };
-
     for quote_mint in quote_candidates {
         let quote_pubkey = parse_pubkey(quote_mint, "pump amm quote mint")?;
         push_candidate(derive_pump_amm_pool_address(
@@ -1351,15 +1471,26 @@ async fn find_pump_amm_pool_state(
             &quote_pubkey,
             0,
         )?);
-        for index in 0u16..=3 {
-            push_candidate(derive_pump_amm_pool_address(
-                creator,
-                mint,
-                &quote_pubkey,
-                index,
-            )?);
+        for creator in known_creators {
+            for index in 0u16..=3 {
+                push_candidate(derive_pump_amm_pool_address(
+                    creator,
+                    mint,
+                    &quote_pubkey,
+                    index,
+                )?);
+            }
         }
     }
+    Ok(requests)
+}
+
+async fn find_pump_amm_pool_state(
+    rpc_url: &str,
+    mint: &Pubkey,
+    known_creators: &[Pubkey],
+) -> Result<Option<PumpAmmPoolState>, String> {
+    let requests = pump_amm_pool_candidate_pubkeys(mint, known_creators)?;
     let accounts = fetch_multiple_account_data(rpc_url, &requests, "confirmed").await?;
     let mut pools = requests
         .into_iter()
@@ -1378,12 +1509,12 @@ async fn find_pump_amm_pool_state(
 async fn fetch_pump_amm_market_snapshot_for_mint(
     rpc_url: &str,
     mint: &Pubkey,
-    creator: &Pubkey,
+    known_creators: &[Pubkey],
 ) -> Result<PumpMarketSnapshot, String> {
-    let Some(pool) = find_pump_amm_pool_state(rpc_url, mint, creator).await? else {
+    let Some(pool) = find_pump_amm_pool_state(rpc_url, mint, known_creators).await? else {
         return Err(format!(
-            "No Pump AMM pool found for mint {} and creator {} with a supported quote asset.",
-            mint, creator
+            "No Pump AMM pool found for mint {} with a supported quote asset.",
+            mint
         ));
     };
     let Some((quote_asset, quote_asset_label, quote_decimals)) =
@@ -1606,10 +1737,9 @@ fn quote_buy_quote_from_tokens(
     if amount >= u128::from(curve.virtual_token_reserves) {
         return u64::MAX;
     }
-    let quote_cost =
-        ((amount * u128::from(curve.virtual_sol_reserves))
-            / (u128::from(curve.virtual_token_reserves) - amount))
-            + 1;
+    let quote_cost = ((amount * u128::from(curve.virtual_sol_reserves))
+        / (u128::from(curve.virtual_token_reserves) - amount))
+        + 1;
     let protocol_fee = ceil_div(quote_cost * u128::from(global.fee_basis_points), 10_000);
     let creator_fee = ceil_div(
         quote_cost * u128::from(global.creator_fee_basis_points),
@@ -1658,12 +1788,21 @@ fn split_two_leg_slippage_bps(slippage_bps: u64) -> (u64, u64) {
 }
 
 fn quote_buy_curve_input_from_tokens(global: &PumpGlobalState, token_amount: u64) -> u64 {
+    let quote_mint = Pubkey::default();
+    let initial_curve = initial_bonding_curve_for_quote(global, &Pubkey::default(), &quote_mint);
+    quote_buy_curve_input_from_tokens_for_curve(&initial_curve, token_amount)
+}
+
+fn quote_buy_curve_input_from_tokens_for_curve(
+    curve: &PumpBondingCurveState,
+    token_amount: u64,
+) -> u64 {
     if token_amount == 0 {
         return 0;
     }
-    let amount = u128::from(token_amount).min(u128::from(global.initial_real_token_reserves));
-    let virtual_token_reserves = u128::from(global.initial_virtual_token_reserves);
-    let virtual_sol_reserves = u128::from(global.initial_virtual_sol_reserves);
+    let amount = u128::from(token_amount).min(u128::from(curve.real_token_reserves));
+    let virtual_token_reserves = u128::from(curve.virtual_token_reserves);
+    let virtual_sol_reserves = u128::from(curve.virtual_sol_reserves);
     (((amount * virtual_sol_reserves) / (virtual_token_reserves.saturating_sub(amount))) + 1)
         .min(u128::from(u64::MAX))
         .try_into()
@@ -1676,25 +1815,30 @@ fn synthetic_curve_after_buy_tokens(
     token_amount: u64,
     cashback_enabled: bool,
 ) -> PumpBondingCurveState {
-    let curve_input = quote_buy_curve_input_from_tokens(global, token_amount);
-    PumpBondingCurveState {
-        virtual_token_reserves: global
-            .initial_virtual_token_reserves
-            .saturating_sub(token_amount),
-        virtual_sol_reserves: global
-            .initial_virtual_sol_reserves
-            .saturating_add(curve_input),
-        real_token_reserves: global
-            .initial_real_token_reserves
-            .saturating_sub(token_amount),
-        real_sol_reserves: curve_input,
-        token_total_supply: global.initial_real_token_reserves,
-        complete: false,
-        creator: *launch_creator,
-        is_mayhem_mode: false,
+    synthetic_curve_after_buy_tokens_for_quote(
+        global,
+        launch_creator,
+        token_amount,
         cashback_enabled,
-        quote_mint: Pubkey::default(),
-    }
+        &Pubkey::default(),
+    )
+}
+
+fn synthetic_curve_after_buy_tokens_for_quote(
+    global: &PumpGlobalState,
+    launch_creator: &Pubkey,
+    token_amount: u64,
+    cashback_enabled: bool,
+    quote_mint: &Pubkey,
+) -> PumpBondingCurveState {
+    let mut curve = initial_bonding_curve_for_quote(global, launch_creator, quote_mint);
+    let curve_input = quote_buy_curve_input_from_tokens_for_curve(&curve, token_amount);
+    curve.virtual_token_reserves = curve.virtual_token_reserves.saturating_sub(token_amount);
+    curve.virtual_sol_reserves = curve.virtual_sol_reserves.saturating_add(curve_input);
+    curve.real_token_reserves = curve.real_token_reserves.saturating_sub(token_amount);
+    curve.real_sol_reserves = curve_input;
+    curve.cashback_enabled = cashback_enabled;
+    curve
 }
 
 fn initial_bonding_curve_for_quote(
@@ -1762,8 +1906,7 @@ fn resolve_dev_buy_quote(
 }
 
 async fn quote_sol_input_for_usdc_output(
-    rpc_url: &str,
-    commitment: &str,
+    route_setup: &TrustedRaydiumClmmRouteSetup,
     owner: &Pubkey,
     input_account: &Pubkey,
     output_account: &Pubkey,
@@ -1782,10 +1925,8 @@ async fn quote_sol_input_for_usdc_output(
     high = high.max(1);
     loop {
         let net_high = wrapper_net_sol_input(high, fee_bps)?;
-        let quote = build_trusted_raydium_clmm_swap_exact_in(
-            rpc_url,
-            RAYDIUM_SOL_USDC_POOL,
-            commitment,
+        let quote = build_trusted_raydium_clmm_swap_exact_in_from_setup(
+            route_setup,
             owner,
             input_account,
             output_account,
@@ -1793,8 +1934,7 @@ async fn quote_sol_input_for_usdc_output(
             &usdc_mint()?,
             net_high,
             slippage_bps,
-        )
-        .await?;
+        )?;
         if quote.min_out >= required_usdc {
             break;
         }
@@ -1810,10 +1950,8 @@ async fn quote_sol_input_for_usdc_output(
         }
         let mid = low + (high - low) / 2;
         let net_mid = wrapper_net_sol_input(mid, fee_bps)?;
-        let quote = build_trusted_raydium_clmm_swap_exact_in(
-            rpc_url,
-            RAYDIUM_SOL_USDC_POOL,
-            commitment,
+        let quote = build_trusted_raydium_clmm_swap_exact_in_from_setup(
+            route_setup,
             owner,
             input_account,
             output_account,
@@ -1821,8 +1959,7 @@ async fn quote_sol_input_for_usdc_output(
             &usdc_mint()?,
             net_mid,
             slippage_bps,
-        )
-        .await?;
+        )?;
         if quote.min_out >= required_usdc {
             high = mid;
         } else {
@@ -1832,21 +1969,184 @@ async fn quote_sol_input_for_usdc_output(
     Ok(high)
 }
 
+async fn build_usdc_prefund_plan_if_needed(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+    creator: &Pubkey,
+    user_usdc_account: &Pubkey,
+    current_usdc: u64,
+    required_usdc: u64,
+    max_gross_sol_lamports: u64,
+    conversion_slippage_bps: u64,
+) -> Result<(Vec<Instruction>, Vec<Keypair>), String> {
+    if current_usdc >= required_usdc {
+        return Ok((vec![], vec![]));
+    }
+    let shortfall_usdc = required_usdc
+        .checked_sub(current_usdc)
+        .ok_or_else(|| "Pump USDC launch funding shortfall underflowed.".to_string())?;
+    let route_wsol_keypair = Keypair::new();
+    let route_wsol_account = route_wsol_keypair.pubkey();
+    let route_setup = load_trusted_raydium_clmm_route_setup(
+        rpc_url,
+        RAYDIUM_SOL_USDC_POOL,
+        &config.execution.commitment,
+    )
+    .await?;
+    let gross_sol_amount = quote_sol_input_for_usdc_output(
+        &route_setup,
+        creator,
+        &route_wsol_account,
+        user_usdc_account,
+        shortfall_usdc,
+        conversion_slippage_bps,
+        max_gross_sol_lamports,
+        0,
+    )
+    .await?;
+    let conversion = build_trusted_raydium_clmm_swap_exact_in_from_setup(
+        &route_setup,
+        creator,
+        &route_wsol_account,
+        user_usdc_account,
+        &wsol_mint()?,
+        &usdc_mint()?,
+        gross_sol_amount,
+        conversion_slippage_bps,
+    )?;
+    let mut instructions = vec![build_create_token_ata_instruction(
+        creator,
+        &usdc_mint()?,
+        &token_program_id()?,
+    )?];
+    instructions.extend(build_wrapped_sol_open_instructions(
+        creator,
+        &route_wsol_account,
+        gross_sol_amount,
+    )?);
+    instructions.push(conversion.instruction);
+    instructions.push(build_close_token_account_instruction(
+        &route_wsol_account,
+        creator,
+    )?);
+    Ok((instructions, vec![route_wsol_keypair]))
+}
+
+async fn quote_usdc_for_launch_dev_buy(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+    creator: &Pubkey,
+    user_usdc_account: &Pubkey,
+    global: &PumpGlobalState,
+    synthetic_curve: &PumpBondingCurveState,
+    conversion_slippage_bps: u64,
+) -> Result<(u64, u64, u64, u64), String> {
+    let dev_buy = config
+        .devBuy
+        .as_ref()
+        .ok_or_else(|| "devBuy config is required for Pump USDC launch quote.".to_string())?;
+    if dev_buy.mode == "tokens" {
+        let token_amount = parse_decimal_u64(&dev_buy.amount, TOKEN_DECIMALS, "devBuy.amount")?;
+        if token_amount == 0 {
+            return Err("Pump USDC launch dev-buy token amount resolved to zero.".to_string());
+        }
+        let quote_amount = quote_buy_quote_from_tokens(synthetic_curve, global, token_amount);
+        let max_gross_sol_lamports = parse_decimal_u64(
+            "100",
+            9,
+            "Pump USDC token-target dev-buy maximum SOL budget",
+        )?;
+        return Ok((
+            quote_amount,
+            token_amount,
+            max_gross_sol_lamports,
+            quote_amount,
+        ));
+    }
+    if dev_buy.mode == "sol" {
+        let gross_sol_amount = parse_decimal_u64(&dev_buy.amount, 9, "devBuy.amount")?;
+        if gross_sol_amount == 0 {
+            return Err("Pump USDC launch dev-buy SOL budget resolved to zero.".to_string());
+        }
+        let quote_account = Pubkey::new_unique();
+        let conversion = build_trusted_raydium_clmm_swap_exact_in(
+            rpc_url,
+            RAYDIUM_SOL_USDC_POOL,
+            &config.execution.commitment,
+            creator,
+            &quote_account,
+            user_usdc_account,
+            &wsol_mint()?,
+            &usdc_mint()?,
+            gross_sol_amount,
+            conversion_slippage_bps,
+        )
+        .await?;
+        let quote_amount = conversion.expected_out;
+        if quote_amount == 0 {
+            return Err("Pump USDC launch dev-buy SOL budget resolved to zero USDC.".to_string());
+        }
+        let token_amount = quote_buy_tokens_from_curve(synthetic_curve, global, quote_amount);
+        if token_amount == 0 {
+            return Err("Pump USDC launch dev-buy quote resolved to zero tokens.".to_string());
+        }
+        return Ok((
+            quote_amount,
+            token_amount,
+            gross_sol_amount,
+            conversion.min_out,
+        ));
+    }
+    Err(format!(
+        "Unsupported devBuy.mode for Pump USDC launch: {}",
+        dev_buy.mode
+    ))
+}
+
 pub async fn predict_dev_buy_token_amount(
     rpc_url: &str,
     config: &NormalizedConfig,
 ) -> Result<Option<u64>, String> {
-    if config.quoteAsset.eq_ignore_ascii_case("usdc") {
-        return Ok(None);
-    }
     let global = fetch_global_state_cached(rpc_url).await?;
+    if config.quoteAsset.eq_ignore_ascii_case("usdc") {
+        if config.devBuy.is_none() {
+            return Ok(None);
+        }
+        let quote_mint = usdc_mint()?;
+        let launch_creator = predict_configured_launch_creator(config)?;
+        let curve = initial_bonding_curve_for_quote(&global, &launch_creator, &quote_mint);
+        let selected_wallet = config.selectedWalletKey.trim();
+        if selected_wallet.is_empty() {
+            return Ok(None);
+        }
+        let wallet_secret = load_solana_wallet_by_env_key(selected_wallet)?;
+        let owner = keypair_from_secret_bytes(&wallet_secret)?.pubkey();
+        let user_usdc_account =
+            get_associated_token_address_with_program_id(&owner, &quote_mint, &token_program_id()?);
+        let conversion_slippage_bps = split_two_leg_slippage_bps(slippage_bps_from_percent(
+            &config.execution.buySlippagePercent,
+        )?)
+        .0;
+        let (_quote_amount, token_amount, _gross_sol_amount, _guaranteed_quote_amount) =
+            quote_usdc_for_launch_dev_buy(
+                rpc_url,
+                config,
+                &owner,
+                &user_usdc_account,
+                &global,
+                &curve,
+                conversion_slippage_bps,
+            )
+            .await?;
+        return Ok(Some(token_amount.min(curve.real_token_reserves)));
+    }
     Ok(resolve_dev_buy_quote(config, &global)?.map(|(_, token_amount)| token_amount))
 }
 
 #[allow(dead_code)]
 pub async fn quote_launch(
     rpc_url: &str,
-    quote_asset: &str,
+    _quote_asset: &str,
     mode: &str,
     amount: &str,
 ) -> Result<Option<LaunchQuote>, String> {
@@ -1859,9 +2159,6 @@ pub async fn quote_launch(
         return Err(format!(
             "Unsupported dev buy quote mode: {mode}. Expected sol or tokens."
         ));
-    }
-    if quote_asset.trim().eq_ignore_ascii_case("usdc") {
-        return Ok(None);
     }
     let global = fetch_global_state_cached(rpc_url).await?;
     if trimmed_mode == "sol" {
@@ -1910,7 +2207,29 @@ pub async fn fetch_pump_market_snapshot(
     rpc_url: &str,
     mint: &str,
 ) -> Result<PumpMarketSnapshot, String> {
+    fetch_pump_market_snapshot_with_known_creator(rpc_url, mint, None).await
+}
+
+pub async fn fetch_pump_market_snapshot_for_follow(
+    rpc_url: &str,
+    mint: &str,
+    launch_creator: Option<&str>,
+) -> Result<PumpMarketSnapshot, String> {
+    let known_creator = launch_creator
+        .map(str::trim)
+        .filter(|creator| !creator.is_empty())
+        .map(|creator| parse_pubkey(creator, "launch creator"))
+        .transpose()?;
+    fetch_pump_market_snapshot_with_known_creator(rpc_url, mint, known_creator.as_ref()).await
+}
+
+async fn fetch_pump_market_snapshot_with_known_creator(
+    rpc_url: &str,
+    mint: &str,
+    known_creator: Option<&Pubkey>,
+) -> Result<PumpMarketSnapshot, String> {
     let mint = parse_pubkey(mint, "mint")?;
+    let fallback_creators = known_creator.into_iter().copied().collect::<Vec<_>>();
     match fetch_bonding_curve_state(rpc_url, &mint).await {
         Ok(curve) => {
             let market_cap_lamports = current_market_cap_lamports(&curve);
@@ -1932,13 +2251,33 @@ pub async fn fetch_pump_market_snapshot(
             {
                 return Ok(curve_snapshot);
             }
-            fetch_pump_amm_market_snapshot_for_mint(rpc_url, &mint, &curve.creator)
-                .await
-                .or(Ok(curve_snapshot))
+            let mut known_creators = vec![curve.creator];
+            if let Some(creator) = known_creator
+                && !known_creators.iter().any(|existing| existing == creator)
+            {
+                known_creators.push(*creator);
+            }
+            let amm_snapshot =
+                fetch_pump_amm_market_snapshot_for_mint(rpc_url, &mint, &known_creators).await;
+            match amm_snapshot {
+                Ok(snapshot) => Ok(snapshot),
+                Err(error) => {
+                    if let Some(error) = completed_curve_amm_error(&curve_snapshot, &error) {
+                        return Err(error);
+                    }
+                    Ok(curve_snapshot)
+                }
+            }
         }
-        Err(curve_error) => Err(format!(
-            "Failed to fetch Pump bonding-curve snapshot ({curve_error}). Pump AMM fallback requires the bonding-curve creator."
-        )),
+        Err(curve_error) => {
+            match fetch_pump_amm_market_snapshot_for_mint(rpc_url, &mint, &fallback_creators).await
+            {
+                Ok(snapshot) => Ok(snapshot),
+                Err(amm_error) => Err(format!(
+                    "Failed to fetch Pump bonding-curve snapshot ({curve_error}) and Pump AMM fallback failed ({amm_error})."
+                )),
+            }
+        }
     }
 }
 
@@ -2040,8 +2379,6 @@ fn provider_uses_follow_tip(provider: &str) -> bool {
     )
 }
 
-const HELLOMOON_MIN_INLINE_TIP_LAMPORTS: i64 = 1_000_000;
-
 fn resolve_follow_tip_config(
     provider: &str,
     tip_sol: &str,
@@ -2051,20 +2388,48 @@ fn resolve_follow_tip_config(
     if !provider_uses_follow_tip(provider) {
         return Ok((0, String::new()));
     }
-    let tip_lamports = parse_decimal_u64(tip_sol, 9, label)? as i64;
-    if provider.trim().eq_ignore_ascii_case("hellomoon")
-        && tip_lamports < HELLOMOON_MIN_INLINE_TIP_LAMPORTS
-    {
+    if tip_sol.trim().is_empty() {
         return Err(format!(
-            "{label} must be at least 0.001 SOL when using Hello Moon for follow / snipe / auto-sell."
+            "{label} is required when using {} for follow / snipe / auto-sell.",
+            provider.trim()
         ));
     }
-    let tip_account = if tip_sol.trim().is_empty() {
-        String::new()
-    } else {
-        jito_tip_account.to_string()
-    };
-    Ok((tip_lamports, tip_account))
+    let tip_lamports = parse_decimal_u64(tip_sol, 9, label)?;
+    let minimum_tip_lamports = provider_required_tip_lamports(provider).unwrap_or(0);
+    if tip_lamports < minimum_tip_lamports {
+        return Err(format!(
+            "{label} must be at least {} SOL when using {} for follow / snipe / auto-sell.",
+            provider_min_tip_sol_label(provider),
+            provider.trim()
+        ));
+    }
+    Ok((tip_lamports as i64, jito_tip_account.to_string()))
+}
+
+fn build_atomic_follow_buy_tx_config(
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    provider: &str,
+    tip_sol: &str,
+    usdc_route: bool,
+) -> Result<NativeTxConfig, String> {
+    let (jito_tip_lamports, jito_tip_account) =
+        resolve_follow_tip_config(provider, tip_sol, jito_tip_account, "buy tip")?;
+    Ok(NativeTxConfig {
+        compute_unit_limit: if usdc_route {
+            configured_pump_usdc_buy_compute_unit_limit()?
+        } else {
+            u64_to_u32_limit(
+                configured_default_sniper_buy_compute_unit_limit(),
+                "sniper buy compute unit limit",
+            )?
+        },
+        compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(
+            &execution.buyPriorityFeeSol,
+        )? as i64,
+        jito_tip_lamports,
+        jito_tip_account,
+    })
 }
 
 pub async fn prepare_follow_buy_static(
@@ -2119,15 +2484,16 @@ pub async fn prepare_follow_buy_runtime(
 ) -> Result<PreparedFollowBuyRuntime, String> {
     let mint = parse_pubkey(mint, "mint")?;
     let launch_creator = parse_pubkey(launch_creator, "launch creator")?;
-    let creator_vault_authority = resolve_follow_creator_vault_authority(
-        rpc_url,
-        &mint,
-        &launch_creator,
-        prefer_post_setup_creator_vault,
-    )
-    .await?;
-    let global = fetch_global_state_cached(rpc_url).await?;
-    let curve = fetch_bonding_curve_state(rpc_url, &mint).await?;
+    let (creator_vault_authority, global, curve) = tokio::try_join!(
+        resolve_follow_creator_vault_authority(
+            rpc_url,
+            &mint,
+            &launch_creator,
+            prefer_post_setup_creator_vault,
+        ),
+        fetch_global_state_cached(rpc_url),
+        fetch_bonding_curve_state(rpc_url, &mint),
+    )?;
     Ok(PreparedFollowBuyRuntime {
         global,
         curve,
@@ -2166,8 +2532,9 @@ async fn finalize_usdc_follow_buy_transaction(
         conversion_slippage_bps,
     )
     .await?;
+    let curve = fetch_bonding_curve_state(rpc_url, &prepared.mint).await?;
     let token_amount =
-        quote_buy_tokens_from_curve(&runtime.curve, &runtime.global, conversion.min_out);
+        quote_buy_tokens_from_curve(&curve, &runtime.global, conversion.min_out);
     if token_amount == 0 {
         return Err("Pump USDC follow buy quote resolved to zero tokens.".to_string());
     }
@@ -2406,9 +2773,15 @@ async fn compile_usdc_follow_transaction(
     tx_config: &NativeTxConfig,
     jitodontfront_enabled: bool,
 ) -> Result<CompiledTransaction, String> {
+    let mut tx_config = tx_config.clone();
+    if label.contains("buy") || label.contains("sell") {
+        tx_config.compute_unit_limit = tx_config
+            .compute_unit_limit
+            .max(configured_pump_usdc_route_compute_unit_limit()?);
+    }
     let tx_instructions = with_tx_settings(
         instructions,
-        tx_config,
+        &tx_config,
         &user_keypair.pubkey(),
         jitodontfront_enabled,
     )?;
@@ -2429,8 +2802,9 @@ async fn compile_usdc_follow_transaction(
         last_valid_block_height,
         user_keypair,
         None,
+        &[],
         tx_instructions,
-        tx_config,
+        &tx_config,
         &lookup_table_variants,
     )?;
     Ok(compiled)
@@ -2506,6 +2880,7 @@ pub async fn finalize_follow_buy_transaction(
         last_valid_block_height,
         &user_keypair,
         None,
+        &[],
         tx_instructions,
         &prepared.tx_config,
         &lookup_table_variants,
@@ -2515,6 +2890,7 @@ pub async fn finalize_follow_buy_transaction(
 
 pub async fn compile_atomic_follow_buy_transaction(
     rpc_url: &str,
+    quote_asset: &str,
     execution: &NormalizedExecution,
     token_mayhem_mode: bool,
     jito_tip_account: &str,
@@ -2537,6 +2913,92 @@ pub async fn compile_atomic_follow_buy_transaction(
     let sol_amount = parse_decimal_u64(buy_amount_sol, 9, "followLaunch.snipes.buyAmountSol")?;
     let net_sol_amount = wrapper_net_sol_input(sol_amount, wrapper_fee_bps)?;
     let buy_slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
+    if quote_asset.trim().eq_ignore_ascii_case("usdc") {
+        let usdc_mint = usdc_mint()?;
+        let quote_token_program = token_program_id()?;
+        let route_wsol_account = route_wsol_pda(&user, 0);
+        let user_usdc_account =
+            get_associated_token_address_with_program_id(&user, &usdc_mint, &quote_token_program);
+        let (conversion_slippage_bps, pump_slippage_bps) =
+            split_two_leg_slippage_bps(buy_slippage_bps);
+        let conversion = build_trusted_raydium_clmm_swap_exact_in(
+            rpc_url,
+            RAYDIUM_SOL_USDC_POOL,
+            &execution.commitment,
+            &user,
+            &route_wsol_account,
+            &user_usdc_account,
+            &wsol_mint()?,
+            &usdc_mint,
+            net_sol_amount,
+            conversion_slippage_bps,
+        )
+        .await?;
+        let curve = if let Some(token_amount) = predicted_prior_buy_token_amount {
+            synthetic_curve_after_buy_tokens_for_quote(
+                &global,
+                &launch_creator,
+                token_amount,
+                cashback_enabled_override.unwrap_or(false),
+                &usdc_mint,
+            )
+        } else {
+            initial_bonding_curve_for_quote(&global, &launch_creator, &usdc_mint)
+        };
+        let token_amount = quote_buy_tokens_from_curve(&curve, &global, conversion.min_out);
+        if token_amount == 0 {
+            return Err("Pump USDC atomic follow buy quote resolved to zero tokens.".to_string());
+        }
+        let min_tokens_out = apply_buy_token_slippage(token_amount, pump_slippage_bps);
+        let pump_ix = build_buy_exact_quote_in_v2_instruction(
+            &global,
+            &mint,
+            &launch_creator,
+            &user,
+            conversion.min_out,
+            min_tokens_out,
+            &token_program,
+            &usdc_mint,
+            &quote_token_program,
+            token_mayhem_mode,
+        )?;
+        let user_base_account =
+            get_associated_token_address_with_program_id(&user, &mint, &token_program);
+        let wrapper_ix = build_pump_usdc_buy_from_sol_route_instruction(
+            &user,
+            sol_amount,
+            net_sol_amount,
+            conversion,
+            pump_ix,
+            &user_usdc_account,
+            &user_base_account,
+            min_tokens_out,
+            8,
+            wrapper_fee_bps,
+        )?;
+        let instructions = vec![
+            build_create_token_ata_instruction(&user, &usdc_mint, &quote_token_program)?,
+            build_create_token_ata_instruction(&user, &mint, &token_program)?,
+            wrapper_ix,
+        ];
+        let tx_config = build_atomic_follow_buy_tx_config(
+            execution,
+            jito_tip_account,
+            &execution.buyProvider,
+            &execution.buyTipSol,
+            true,
+        )?;
+        return compile_usdc_follow_transaction(
+            rpc_url,
+            "follow-buy-atomic",
+            execution,
+            &user_keypair,
+            instructions,
+            &tx_config,
+            execution.buyJitodontfront,
+        )
+        .await;
+    }
     let tokens_out = if let Some(token_amount) = predicted_prior_buy_token_amount {
         let curve = synthetic_curve_after_buy_tokens(
             &global,
@@ -2561,23 +3023,13 @@ pub async fn compile_atomic_follow_buy_transaction(
             token_mayhem_mode,
         )?,
     ];
-    let (jito_tip_lamports, jito_tip_account) = resolve_follow_tip_config(
+    let tx_config = build_atomic_follow_buy_tx_config(
+        execution,
+        jito_tip_account,
         &execution.buyProvider,
         &execution.buyTipSol,
-        jito_tip_account,
-        "buy tip",
+        quote_asset.trim().eq_ignore_ascii_case("usdc"),
     )?;
-    let tx_config = NativeTxConfig {
-        compute_unit_limit: u64_to_u32_limit(
-            configured_default_sniper_buy_compute_unit_limit(),
-            "sniper buy compute unit limit",
-        )?,
-        compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(
-            &execution.buyPriorityFeeSol,
-        )? as i64,
-        jito_tip_lamports,
-        jito_tip_account,
-    };
     let tx_instructions =
         with_tx_settings(instructions, &tx_config, &user, execution.buyJitodontfront)?;
     let lookup_tables =
@@ -2595,6 +3047,7 @@ pub async fn compile_atomic_follow_buy_transaction(
         last_valid_block_height,
         &user_keypair,
         None,
+        &[],
         tx_instructions,
         &tx_config,
         &lookup_table_variants,
@@ -2604,6 +3057,7 @@ pub async fn compile_atomic_follow_buy_transaction(
 
 pub async fn compile_follow_sell_transaction(
     rpc_url: &str,
+    quote_asset: &str,
     execution: &NormalizedExecution,
     token_mayhem_mode: bool,
     jito_tip_account: &str,
@@ -2623,6 +3077,7 @@ pub async fn compile_follow_sell_transaction(
         launch_creator,
         sell_percent,
         prefer_post_setup_creator_vault,
+        quote_asset,
         None,
         None,
         10,
@@ -2640,6 +3095,7 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
     launch_creator: &str,
     sell_percent: u8,
     prefer_post_setup_creator_vault: bool,
+    quote_asset: &str,
     token_amount_override: Option<u64>,
     cashback_enabled_override: Option<bool>,
     wrapper_fee_bps: u16,
@@ -2650,6 +3106,8 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
     let launch_creator = parse_pubkey(launch_creator, "launch creator")?;
     let token_program =
         resolve_pump_bonding_mint_token_program(rpc_url, &mint, &execution.commitment).await?;
+    let associated_user =
+        get_associated_token_address_with_program_id(&user, &mint, &token_program);
     let creator_vault_authority = resolve_follow_creator_vault_authority(
         rpc_url,
         &mint,
@@ -2659,11 +3117,17 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
     .await?;
     let global = fetch_global_state_cached(rpc_url).await?;
     let curve = if let Some(token_amount_override) = token_amount_override {
-        synthetic_curve_after_buy_tokens(
+        let quote_mint = if quote_asset.trim().eq_ignore_ascii_case("usdc") {
+            usdc_mint()?
+        } else {
+            Pubkey::default()
+        };
+        synthetic_curve_after_buy_tokens_for_quote(
             &global,
             &launch_creator,
             token_amount_override,
             cashback_enabled_override.unwrap_or(false),
+            &quote_mint,
         )
     } else {
         fetch_bonding_curve_state(rpc_url, &mint).await?
@@ -2672,8 +3136,6 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
         ((u128::from(token_amount_override) * u128::from(sell_percent)) / 100u128)
             .min(u128::from(u64::MAX)) as u64
     } else {
-        let associated_user =
-            get_associated_token_address_with_program_id(&user, &mint, &token_program);
         let account_key = associated_user.to_string();
         let mut account_data = None;
         let mut last_error = None;
@@ -2699,7 +3161,15 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
             as u64
     };
     if token_amount == 0 {
-        return Ok(None);
+        let source = if token_amount_override.is_some() {
+            "buy-confirmation override"
+        } else {
+            "live balance lookup"
+        };
+        return Err(format!(
+            "Pump sell resolved zero token balance; action=sell wallet={} mint={} token_program={} ata={} source={source}.",
+            user, mint, token_program, associated_user
+        ));
     }
     let (jito_tip_lamports, jito_tip_account) = resolve_follow_tip_config(
         &execution.sellProvider,
@@ -2795,6 +3265,7 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
         last_valid_block_height,
         &user_keypair,
         None,
+        &[],
         tx_instructions,
         &tx_config,
         &lookup_table_variants,
@@ -2910,9 +3381,6 @@ fn apply_sell_side_slippage(value: u64, slippage_bps: u64) -> u64 {
 
 fn select_buy_fee_recipient(global: &PumpGlobalState, mayhem_mode: bool) -> Pubkey {
     if mayhem_mode {
-        if global.reserved_fee_recipient != Pubkey::default() {
-            return global.reserved_fee_recipient;
-        }
         if let Some(entry) = global
             .reserved_fee_recipients
             .iter()
@@ -2921,10 +3389,10 @@ fn select_buy_fee_recipient(global: &PumpGlobalState, mayhem_mode: bool) -> Pubk
         {
             return entry;
         }
-    } else {
-        if global.fee_recipient != Pubkey::default() {
-            return global.fee_recipient;
+        if global.reserved_fee_recipient != Pubkey::default() {
+            return global.reserved_fee_recipient;
         }
+    } else {
         if let Some(entry) = global
             .fee_recipients
             .iter()
@@ -2932,6 +3400,9 @@ fn select_buy_fee_recipient(global: &PumpGlobalState, mayhem_mode: bool) -> Pubk
             .find(|entry| *entry != Pubkey::default())
         {
             return entry;
+        }
+        if global.fee_recipient != Pubkey::default() {
+            return global.fee_recipient;
         }
     }
     Pubkey::default()
@@ -2999,6 +3470,21 @@ async fn resolve_launch_creator_and_pre_instructions(
     Ok((*creator, vec![]))
 }
 
+fn predict_configured_launch_creator(config: &NormalizedConfig) -> Result<Pubkey, String> {
+    if config.creatorFee.mode == "wallet" && !config.creatorFee.address.is_empty() {
+        return parse_pubkey(&config.creatorFee.address, "creatorFee.address");
+    }
+    if config.creatorFee.mode == "github" && !config.creatorFee.githubUserId.is_empty() {
+        return social_fee_pda(&config.creatorFee.githubUserId, PLATFORM_GITHUB);
+    }
+    let selected_wallet = config.selectedWalletKey.trim();
+    if selected_wallet.is_empty() {
+        return Ok(Pubkey::default());
+    }
+    let wallet_secret = load_solana_wallet_by_env_key(selected_wallet)?;
+    Ok(keypair_from_secret_bytes(&wallet_secret)?.pubkey())
+}
+
 fn resolve_agent_authority(
     config: &NormalizedConfig,
     creator: &Pubkey,
@@ -3015,12 +3501,19 @@ fn resolve_agent_authority(
     )?))
 }
 
+fn should_initialize_agent_in_setup(config: &NormalizedConfig) -> bool {
+    matches!(
+        config.mode.as_str(),
+        "agent-unlocked" | "agent-custom" | "agent-locked"
+    )
+}
+
 fn build_launch_instructions(
     config: &NormalizedConfig,
     mint: Pubkey,
     creator: Pubkey,
     launch_creator: Pubkey,
-    agent_authority: Option<&Pubkey>,
+    _agent_authority: Option<&Pubkey>,
     global: Option<&PumpGlobalState>,
 ) -> Result<Vec<Instruction>, String> {
     let mut instructions = vec![build_create_v2_instruction(
@@ -3038,10 +3531,6 @@ fn build_launch_instructions(
     if let Some(global) = global {
         if let Some((sol_amount, token_amount)) = resolve_dev_buy_quote(config, global)? {
             let buy_slippage_bps = slippage_bps_from_percent(&config.execution.buySlippagePercent)?;
-            instructions.push(build_extend_account_instruction(
-                &bonding_curve_pda(&mint)?,
-                &creator,
-            )?);
             let token_2022 = token_2022_program_id()?;
             instructions.push(build_create_token_ata_instruction(
                 &creator,
@@ -3062,16 +3551,6 @@ fn build_launch_instructions(
                 build_launch_dev_buy_fee_transfer_instruction(config, creator, sol_amount);
         }
     }
-    if config.mode == "agent-custom" && !config.agent.splitAgentInit {
-        let authority = agent_authority
-            .ok_or_else(|| format!("agent authority is required for {} mode.", config.mode))?;
-        instructions.push(build_agent_initialize_instruction(
-            &mint,
-            &creator,
-            authority,
-            config.agent.buybackBps.unwrap_or(0) as u16,
-        )?);
-    }
     if let Some(fee_transfer) = launch_dev_buy_fee_transfer {
         instructions.push(fee_transfer);
     }
@@ -3079,15 +3558,15 @@ fn build_launch_instructions(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_usdc_launch_instructions(
+async fn build_usdc_launch_instruction_plan(
     rpc_url: &str,
     config: &NormalizedConfig,
     mint: Pubkey,
     creator: Pubkey,
     launch_creator: Pubkey,
-    agent_authority: Option<&Pubkey>,
+    _agent_authority: Option<&Pubkey>,
     global: Option<&PumpGlobalState>,
-) -> Result<Vec<Instruction>, String> {
+) -> Result<PumpUsdcLaunchInstructionPlan, String> {
     let mut instructions = vec![build_create_v2_instruction(
         &mint,
         &creator,
@@ -3099,134 +3578,90 @@ async fn build_usdc_launch_instructions(
         config.mode == "cashback",
         true,
     )?];
+    let mut pre_launch_instructions = Vec::new();
+    let mut pre_launch_signers = Vec::new();
     if let Some(global) = global {
         if config.devBuy.is_some() {
             let buy_slippage_bps = slippage_bps_from_percent(&config.execution.buySlippagePercent)?;
             let (conversion_slippage_bps, pump_slippage_bps) =
                 split_two_leg_slippage_bps(buy_slippage_bps);
-            let dev_buy = config
-                .devBuy
-                .as_ref()
-                .ok_or_else(|| "devBuy config disappeared while building Pump USDC launch.".to_string())?;
             let token_2022 = token_2022_program_id()?;
             let token_program = token_program_id()?;
             let usdc = usdc_mint()?;
-            let route_wsol_account = route_wsol_pda(&creator, 0);
             let user_usdc_account =
                 get_associated_token_address_with_program_id(&creator, &usdc, &token_program);
-            let user_base_account =
-                get_associated_token_address_with_program_id(&creator, &mint, &token_2022);
             let synthetic_curve = initial_bonding_curve_for_quote(global, &launch_creator, &usdc);
-            let token_target = if dev_buy.mode == "tokens" {
-                Some(parse_decimal_u64(
-                    &dev_buy.amount,
-                    TOKEN_DECIMALS,
-                    "devBuy.amount",
-                )?)
-            } else {
-                None
-            };
-            let sol_amount = if let Some(token_amount) = token_target {
-                if token_amount == 0 {
-                    return Err("Pump USDC launch dev-buy token amount resolved to zero.".to_string());
-                }
-                let required_usdc = quote_buy_quote_from_tokens(&synthetic_curve, global, token_amount);
-                quote_sol_input_for_usdc_output(
-                    rpc_url,
-                    &config.execution.commitment,
-                    &creator,
-                    &route_wsol_account,
-                    &user_usdc_account,
-                    required_usdc,
-                    conversion_slippage_bps,
-                    parse_decimal_u64("100", 9, "Pump USDC token-target dev-buy maximum SOL budget")?,
-                    config.wrapperDefaultFeeBps,
-                )
-                .await?
-            } else {
-                parse_decimal_u64(&dev_buy.amount, 9, "devBuy.amount")?
-            };
-            let net_sol_amount = wrapper_net_sol_input(sol_amount, config.wrapperDefaultFeeBps)?;
-            let conversion = build_trusted_raydium_clmm_swap_exact_in(
+            let (
+                desired_quote_amount,
+                desired_token_amount,
+                gross_sol_amount,
+                guaranteed_quote_amount,
+            ) = quote_usdc_for_launch_dev_buy(
                 rpc_url,
-                RAYDIUM_SOL_USDC_POOL,
-                &config.execution.commitment,
+                config,
                 &creator,
-                &route_wsol_account,
                 &user_usdc_account,
-                &wsol_mint()?,
-                &usdc,
-                net_sol_amount,
+                global,
+                &synthetic_curve,
                 conversion_slippage_bps,
             )
             .await?;
-            let (pump_ix, min_tokens_out, pump_input_patch_offset) = {
-                let min_tokens_out = if let Some(token_amount) = token_target {
-                    token_amount
-                } else {
-                    let token_amount =
-                        quote_buy_tokens_from_curve(&synthetic_curve, global, conversion.min_out);
-                    if token_amount == 0 {
-                        return Err("Pump USDC launch dev-buy quote resolved to zero tokens.".to_string());
-                    }
-                    apply_buy_token_slippage(token_amount, pump_slippage_bps)
-                };
+            let current_usdc = fetch_spl_token_account_amount(
+                rpc_url,
+                &config.execution.commitment,
+                &user_usdc_account,
+            )
+            .await?
+            .unwrap_or(0);
+            let (quote_amount, token_amount) = if current_usdc >= desired_quote_amount {
+                (desired_quote_amount, desired_token_amount)
+            } else {
                 (
-                    build_buy_exact_quote_in_v2_instruction(
-                        global,
-                        &mint,
-                        &launch_creator,
-                        &creator,
-                        conversion.min_out,
-                        min_tokens_out,
-                        &token_2022,
-                        &usdc,
-                        &token_program,
-                        config.token.mayhemMode,
-                    )?,
-                    min_tokens_out,
-                    8,
+                    guaranteed_quote_amount,
+                    quote_buy_tokens_from_curve(&synthetic_curve, global, guaranteed_quote_amount),
                 )
             };
-            instructions.push(build_extend_account_instruction(
-                &bonding_curve_pda(&mint)?,
+            if token_amount == 0 {
+                return Err("Pump USDC launch dev-buy quote resolved to zero tokens.".to_string());
+            }
+            let (funding_instructions, funding_signers) = build_usdc_prefund_plan_if_needed(
+                rpc_url,
+                config,
                 &creator,
-            )?);
-            instructions.push(build_create_token_ata_instruction(
-                &creator,
-                &usdc,
-                &token_program,
-            )?);
+                &user_usdc_account,
+                current_usdc,
+                quote_amount,
+                gross_sol_amount,
+                conversion_slippage_bps,
+            )
+            .await?;
+            pre_launch_instructions = funding_instructions;
+            pre_launch_signers = funding_signers;
+            let min_tokens_out = apply_buy_token_slippage(token_amount, pump_slippage_bps);
             instructions.push(build_create_token_ata_instruction(
                 &creator,
                 &mint,
                 &token_2022,
             )?);
-            instructions.push(build_pump_usdc_buy_from_sol_route_instruction(
+            instructions.push(build_buy_exact_quote_in_v2_instruction(
+                global,
+                &mint,
+                &launch_creator,
                 &creator,
-                sol_amount,
-                net_sol_amount,
-                conversion,
-                pump_ix,
-                &user_usdc_account,
-                &user_base_account,
+                quote_amount,
                 min_tokens_out,
-                pump_input_patch_offset,
-                config.wrapperDefaultFeeBps,
+                &token_2022,
+                &usdc,
+                &token_program,
+                config.token.mayhemMode,
             )?);
         }
     }
-    if config.mode == "agent-custom" && !config.agent.splitAgentInit {
-        let authority = agent_authority
-            .ok_or_else(|| format!("agent authority is required for {} mode.", config.mode))?;
-        instructions.push(build_agent_initialize_instruction(
-            &mint,
-            &creator,
-            authority,
-            config.agent.buybackBps.unwrap_or(0) as u16,
-        )?);
-    }
-    Ok(instructions)
+    Ok(PumpUsdcLaunchInstructionPlan {
+        launch_instructions: instructions,
+        pre_launch_instructions,
+        pre_launch_signers,
+    })
 }
 
 fn encode_borsh_string(buffer: &mut Vec<u8>, value: &str) {
@@ -3354,24 +3789,6 @@ fn build_agent_initialize_instruction(
     Ok(instruction)
 }
 
-fn build_extend_account_instruction(
-    account: &Pubkey,
-    user: &Pubkey,
-) -> Result<Instruction, String> {
-    let program_id = pump_program_id()?;
-    Ok(Instruction {
-        program_id,
-        accounts: vec![
-            AccountMeta::new(*account, false),
-            AccountMeta::new_readonly(*user, true),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(event_authority_pda(&program_id), false),
-            AccountMeta::new_readonly(program_id, false),
-        ],
-        data: vec![234, 102, 194, 203, 150, 72, 62, 229],
-    })
-}
-
 fn build_create_token_ata_instruction(
     owner: &Pubkey,
     mint: &Pubkey,
@@ -3394,6 +3811,42 @@ fn build_create_token_ata_for_owner_instruction(
             token_program,
         ),
     )
+}
+
+fn build_close_token_account_instruction(
+    account: &Pubkey,
+    owner: &Pubkey,
+) -> Result<Instruction, String> {
+    spl_token::instruction::close_account(&token_program_id()?, account, owner, owner, &[])
+        .map_err(|error| format!("Failed to build close token account instruction: {error}"))
+}
+
+fn build_wrapped_sol_open_instructions(
+    owner: &Pubkey,
+    wrapped_account: &Pubkey,
+    gross_sol_lamports: u64,
+) -> Result<Vec<Instruction>, String> {
+    let token_program = token_program_id()?;
+    Ok(vec![
+        solana_system_interface::instruction::create_account(
+            owner,
+            wrapped_account,
+            Rent::default()
+                .minimum_balance(SPL_TOKEN_ACCOUNT_LEN)
+                .saturating_add(gross_sol_lamports),
+            SPL_TOKEN_ACCOUNT_LEN as u64,
+            &token_program,
+        ),
+        spl_token::instruction::initialize_account3(
+            &token_program,
+            wrapped_account,
+            &wsol_mint()?,
+            owner,
+        )
+        .map_err(|error| format!("Failed to build wrapped SOL initialize instruction: {error}"))?,
+        spl_token::instruction::sync_native(&token_program, wrapped_account)
+            .map_err(|error| format!("Failed to build sync-native instruction: {error}"))?,
+    ])
 }
 
 fn build_buy_exact_sol_in_instruction(
@@ -3780,6 +4233,10 @@ fn encode_shareholders(recipients: &[NormalizedRecipient]) -> Result<Vec<u8>, St
     Ok(data)
 }
 
+fn recipient_pubkeys(recipients: &[NormalizedRecipient]) -> Result<Vec<Pubkey>, String> {
+    recipients.iter().map(recipient_pubkey).collect()
+}
+
 fn build_create_fee_sharing_config_instruction(
     mint: &Pubkey,
     payer: &Pubkey,
@@ -3806,37 +4263,59 @@ fn build_create_fee_sharing_config_instruction(
     })
 }
 
-fn build_update_fee_shares_instruction(
+fn quote_mint_for_config(config: &NormalizedConfig) -> Result<Pubkey, String> {
+    if config.quoteAsset.eq_ignore_ascii_case("usdc") {
+        return usdc_mint();
+    }
+    wsol_mint()
+}
+
+fn build_update_fee_shares_v2_instruction(
     mint: &Pubkey,
     authority: &Pubkey,
     current_shareholders: &[Pubkey],
     recipients: &[crate::config::NormalizedRecipient],
+    quote_mint: &Pubkey,
+    quote_token_program: &Pubkey,
 ) -> Result<Instruction, String> {
     let program_id = pump_fee_program_id()?;
     let sharing_config = fee_sharing_config_pda(mint)?;
+    let pump_creator_vault = creator_vault_pda(&sharing_config)?;
     let coin_creator_vault_authority = coin_creator_vault_authority_pda(&sharing_config)?;
-    let mut data = vec![189, 13, 136, 99, 187, 164, 237, 35];
+    let mut data = vec![111, 251, 49, 6, 78, 78, 106, 18];
     data.extend_from_slice(&encode_shareholders(recipients)?);
     let mut accounts = vec![
         AccountMeta::new_readonly(event_authority_pda(&program_id), false),
         AccountMeta::new_readonly(program_id, false),
-        AccountMeta::new_readonly(*authority, true),
+        AccountMeta::new(*authority, true),
         AccountMeta::new_readonly(global_pda()?, false),
         AccountMeta::new_readonly(*mint, false),
         AccountMeta::new(sharing_config, false),
         AccountMeta::new_readonly(bonding_curve_pda(mint)?, false),
-        AccountMeta::new(creator_vault_pda(&sharing_config)?, false),
+        AccountMeta::new(pump_creator_vault, false),
+        AccountMeta::new(
+            get_associated_token_address_with_program_id(
+                &pump_creator_vault,
+                quote_mint,
+                quote_token_program,
+            ),
+            false,
+        ),
         AccountMeta::new_readonly(system_program::id(), false),
         AccountMeta::new_readonly(pump_program_id()?, false),
         AccountMeta::new_readonly(event_authority_pda(&pump_program_id()?), false),
         AccountMeta::new_readonly(pump_amm_program_id()?, false),
         AccountMeta::new_readonly(event_authority_pda(&pump_amm_program_id()?), false),
-        AccountMeta::new_readonly(wsol_mint()?, false),
-        AccountMeta::new_readonly(token_program_id()?, false),
+        AccountMeta::new_readonly(*quote_mint, false),
+        AccountMeta::new_readonly(*quote_token_program, false),
         AccountMeta::new_readonly(spl_associated_token_account::id(), false),
         AccountMeta::new(coin_creator_vault_authority, false),
         AccountMeta::new(
-            coin_creator_vault_ata_pda(&coin_creator_vault_authority)?,
+            coin_creator_vault_ata_pda(
+                &coin_creator_vault_authority,
+                quote_mint,
+                quote_token_program,
+            )?,
             false,
         ),
     ];
@@ -3845,11 +4324,40 @@ fn build_update_fee_shares_instruction(
             .iter()
             .map(|shareholder| AccountMeta::new(*shareholder, false)),
     );
+    if *quote_mint != wsol_mint()? {
+        accounts.extend(current_shareholders.iter().map(|shareholder| {
+            AccountMeta::new(
+                get_associated_token_address_with_program_id(
+                    shareholder,
+                    quote_mint,
+                    quote_token_program,
+                ),
+                false,
+            )
+        }));
+    }
     Ok(Instruction {
         program_id,
         accounts,
         data,
     })
+}
+
+fn build_create_quote_ata_if_needed_instruction(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    quote_mint: &Pubkey,
+    quote_token_program: &Pubkey,
+) -> Result<Option<Instruction>, String> {
+    if *quote_mint == wsol_mint()? {
+        return Ok(None);
+    }
+    Ok(Some(build_create_token_ata_for_owner_instruction(
+        payer,
+        owner,
+        quote_mint,
+        quote_token_program,
+    )?))
 }
 
 fn build_create_social_fee_pda_instruction(
@@ -3914,12 +4422,17 @@ async fn build_fee_sharing_follow_up_instructions(
     mint: Pubkey,
     creator: Pubkey,
 ) -> Result<Vec<Instruction>, String> {
+    let quote_mint = quote_mint_for_config(config)?;
+    let quote_token_program = token_program_id()?;
     build_fee_sharing_setup_instructions(
         rpc_url,
         mint,
         creator,
         std::slice::from_ref(&creator),
         &config.feeSharing.recipients,
+        &quote_mint,
+        &quote_token_program,
+        false,
     )
     .await
 }
@@ -3930,20 +4443,55 @@ async fn build_fee_sharing_setup_instructions(
     creator: Pubkey,
     current_shareholders: &[Pubkey],
     recipients: &[NormalizedRecipient],
+    quote_mint: &Pubkey,
+    quote_token_program: &Pubkey,
+    precreate_recipient_quote_atas: bool,
 ) -> Result<Vec<Instruction>, String> {
     if recipients.is_empty() {
         return Err("fee sharing recipients are required for native follow-up setup.".to_string());
     }
+    let sharing_config = fee_sharing_config_pda(&mint)?;
+    let pump_creator_vault = creator_vault_pda(&sharing_config)?;
     let mut instructions = vec![build_create_fee_sharing_config_instruction(
         &mint, &creator,
     )?];
     instructions
         .extend(build_social_fee_pda_create_instructions(rpc_url, recipients, &creator).await?);
-    instructions.push(build_update_fee_shares_instruction(
+    if let Some(instruction) = build_create_quote_ata_if_needed_instruction(
+        &creator,
+        &pump_creator_vault,
+        quote_mint,
+        quote_token_program,
+    )? {
+        instructions.push(instruction);
+    }
+    if *quote_mint != wsol_mint()? {
+        let mut owners = Vec::from(current_shareholders);
+        if precreate_recipient_quote_atas {
+            owners.extend(recipient_pubkeys(recipients)?);
+        }
+        let mut seen = HashSet::new();
+        for owner in owners {
+            if !seen.insert(owner) {
+                continue;
+            }
+            if let Some(instruction) = build_create_quote_ata_if_needed_instruction(
+                &creator,
+                &owner,
+                quote_mint,
+                quote_token_program,
+            )? {
+                instructions.push(instruction);
+            }
+        }
+    }
+    instructions.push(build_update_fee_shares_v2_instruction(
         &mint,
         &creator,
         current_shareholders,
         recipients,
+        quote_mint,
+        quote_token_program,
     )?);
     Ok(instructions)
 }
@@ -4006,42 +4554,38 @@ fn native_follow_up_label(config: &NormalizedConfig) -> Option<&'static str> {
     launch_follow_up_label(config)
 }
 
+fn native_follow_up_labels(config: &NormalizedConfig) -> Vec<&'static str> {
+    native_follow_up_label(config).into_iter().collect()
+}
+
 async fn build_native_follow_up_instructions(
     rpc_url: &str,
     config: &NormalizedConfig,
+    follow_up_label: &str,
     mint: Pubkey,
     creator: Pubkey,
     agent_authority: Option<&Pubkey>,
 ) -> Result<Vec<Instruction>, String> {
-    match config.mode.as_str() {
-        "regular" | "cashback" => {
+    let mut instructions = Vec::new();
+    if follow_up_label == "agent-setup" && should_initialize_agent_in_setup(config) {
+        let authority = agent_authority
+            .ok_or_else(|| format!("agent authority is required for {} mode.", config.mode))?;
+        instructions.push(build_agent_initialize_instruction(
+            &mint,
+            &creator,
+            authority,
+            config.agent.buybackBps.unwrap_or(0) as u16,
+        )?);
+    }
+    match (config.mode.as_str(), follow_up_label) {
+        ("regular" | "cashback", "follow-up") => {
             build_fee_sharing_follow_up_instructions(rpc_url, config, mint, creator).await
         }
-        "agent-custom" => {
-            let authority = agent_authority
-                .ok_or_else(|| "agent authority is required for agent-custom mode.".to_string())?;
-            let recipients = resolve_agent_fee_recipients(config, &mint, &creator)?;
-            let mut instructions = vec![build_agent_initialize_instruction(
-                &mint,
-                &creator,
-                authority,
-                config.agent.buybackBps.unwrap_or(0) as u16,
-            )?];
-            instructions.extend(
-                build_fee_sharing_setup_instructions(
-                    rpc_url,
-                    mint,
-                    creator,
-                    std::slice::from_ref(&creator),
-                    &recipients,
-                )
-                .await?,
-            );
-            Ok(instructions)
-        }
-        "agent-locked" => {
-            let authority = agent_authority
-                .ok_or_else(|| "agent authority is required for agent-locked mode.".to_string())?;
+        ("agent-unlocked", "agent-setup") => Ok(instructions),
+        ("agent-custom", "agent-setup") => Ok(instructions),
+        ("agent-locked", "agent-setup") => {
+            let quote_mint = quote_mint_for_config(config)?;
+            let quote_token_program = token_program_id()?;
             let recipients = vec![NormalizedRecipient {
                 r#type: Some("wallet".to_string()),
                 address: token_agent_payments_pda(&mint)?.to_string(),
@@ -4049,12 +4593,6 @@ async fn build_native_follow_up_instructions(
                 githubUsername: String::new(),
                 shareBps: 10_000,
             }];
-            let mut instructions = vec![build_agent_initialize_instruction(
-                &mint,
-                &creator,
-                authority,
-                config.agent.buybackBps.unwrap_or(0) as u16,
-            )?];
             instructions.extend(
                 build_fee_sharing_setup_instructions(
                     rpc_url,
@@ -4062,13 +4600,16 @@ async fn build_native_follow_up_instructions(
                     creator,
                     std::slice::from_ref(&creator),
                     &recipients,
+                    &quote_mint,
+                    &quote_token_program,
+                    true,
                 )
                 .await?,
             );
             Ok(instructions)
         }
-        unsupported => Err(format!(
-            "Native Pump follow-up builder does not support mode={unsupported}."
+        (unsupported, label) => Err(format!(
+            "Native Pump follow-up builder does not support mode={unsupported} label={label}."
         )),
     }
 }
@@ -4536,6 +5077,7 @@ fn compile_transaction_with_metrics(
     last_valid_block_height: u64,
     payer: &Keypair,
     mint_signer: Option<&Keypair>,
+    extra_signers: &[&Keypair],
     instructions: Vec<Instruction>,
     tx_config: &NativeTxConfig,
     lookup_table_variants: &[Vec<AddressLookupTableAccount>],
@@ -4552,6 +5094,7 @@ fn compile_transaction_with_metrics(
             last_valid_block_height,
             payer,
             mint_signer,
+            extra_signers,
             instructions,
             tx_config,
             preferred_lookup_tables,
@@ -4570,6 +5113,7 @@ fn compile_transaction_with_metrics(
         last_valid_block_height,
         payer,
         mint_signer,
+        extra_signers,
         instructions.clone(),
         tx_config,
         &[],
@@ -4583,6 +5127,7 @@ fn compile_transaction_with_metrics(
             last_valid_block_height,
             payer,
             mint_signer,
+            extra_signers,
             instructions,
             tx_config,
             &[],
@@ -4615,6 +5160,7 @@ fn compile_transaction_with_metrics(
             last_valid_block_height,
             payer,
             mint_signer,
+            extra_signers,
             instructions.clone(),
             tx_config,
             variant,
@@ -4649,6 +5195,7 @@ fn compile_transaction_candidate(
     last_valid_block_height: u64,
     payer: &Keypair,
     mint_signer: Option<&Keypair>,
+    extra_signers: &[&Keypair],
     instructions: Vec<Instruction>,
     tx_config: &NativeTxConfig,
     lookup_tables: &[AddressLookupTableAccount],
@@ -4681,10 +5228,21 @@ fn compile_transaction_candidate(
             lookup_tables_used.join(", ")
         ));
     }
-    let signers: Vec<&Keypair> = match mint_signer {
-        Some(mint) => vec![payer, mint],
-        None => vec![payer],
-    };
+    let mut signers: Vec<&Keypair> =
+        Vec::with_capacity(1 + usize::from(mint_signer.is_some()) + extra_signers.len());
+    signers.push(payer);
+    if let Some(mint) = mint_signer {
+        signers.push(mint);
+    }
+    for signer in extra_signers {
+        if signer.pubkey() != payer.pubkey()
+            && !signers
+                .iter()
+                .any(|existing| existing.pubkey() == signer.pubkey())
+        {
+            signers.push(*signer);
+        }
+    }
     let message_for_diagnostics = message.clone();
     let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
         .map_err(|error| error.to_string())?;
@@ -4857,6 +5415,38 @@ mod tests {
             decoded,
             solana_system_interface::instruction::SystemInstruction::Transfer { lamports }
         );
+    }
+
+    fn decode_update_fee_shareholders(instruction: &Instruction) -> Vec<(Pubkey, u16)> {
+        assert_eq!(
+            &instruction.data[..8],
+            &[111, 251, 49, 6, 78, 78, 106, 18]
+        );
+        let mut offset = 8usize;
+        let count = u32::from_le_bytes(
+            instruction.data[offset..offset + 4]
+                .try_into()
+                .expect("shareholder count"),
+        ) as usize;
+        offset += 4;
+        let mut shareholders = Vec::with_capacity(count);
+        for _ in 0..count {
+            let pubkey = Pubkey::new_from_array(
+                instruction.data[offset..offset + 32]
+                    .try_into()
+                    .expect("shareholder pubkey"),
+            );
+            offset += 32;
+            let share_bps = u16::from_le_bytes(
+                instruction.data[offset..offset + 2]
+                    .try_into()
+                    .expect("shareholder share"),
+            );
+            offset += 2;
+            shareholders.push((pubkey, share_bps));
+        }
+        assert_eq!(offset, instruction.data.len());
+        shareholders
     }
 
     fn sample_global() -> PumpGlobalState {
@@ -5167,6 +5757,55 @@ mod tests {
             SwapLegInputSource::PreviousTokenDelta
         );
         assert_eq!(request.legs[1].input_patch_offset, 16);
+    }
+
+    #[test]
+    fn atomic_usdc_synthetic_curve_uses_initial_virtual_quote_reserves() {
+        let mut global = sample_global();
+        global.initial_virtual_sol_reserves = 30_000_000_000;
+        global.initial_virtual_quote_reserves = 90_000_000_000;
+        let creator = Pubkey::new_unique();
+        let usdc = usdc_mint().expect("usdc mint");
+
+        let initial_curve = initial_bonding_curve_for_quote(&global, &creator, &usdc);
+        assert_eq!(
+            initial_curve.virtual_sol_reserves,
+            global.initial_virtual_quote_reserves
+        );
+        assert_eq!(initial_curve.quote_mint, usdc);
+
+        let prior_buy_tokens = 1_000_000;
+        let advanced_curve = synthetic_curve_after_buy_tokens_for_quote(
+            &global,
+            &creator,
+            prior_buy_tokens,
+            true,
+            &usdc,
+        );
+
+        assert_eq!(advanced_curve.quote_mint, usdc);
+        assert!(advanced_curve.cashback_enabled);
+        assert!(advanced_curve.virtual_sol_reserves > global.initial_virtual_quote_reserves);
+        assert_ne!(
+            advanced_curve.virtual_sol_reserves,
+            global.initial_virtual_sol_reserves
+        );
+    }
+
+    #[test]
+    fn usdc_sniper_sell_synthetic_curve_preserves_quote_mint() {
+        let mut global = sample_global();
+        global.initial_virtual_sol_reserves = 30_000_000_000;
+        global.initial_virtual_quote_reserves = 90_000_000_000;
+        let creator = Pubkey::new_unique();
+        let usdc = usdc_mint().expect("usdc mint");
+
+        let curve =
+            synthetic_curve_after_buy_tokens_for_quote(&global, &creator, 1_000_000, false, &usdc);
+
+        assert_eq!(curve.quote_mint, usdc);
+        assert_eq!(resolved_curve_quote_mint(&curve.quote_mint).unwrap(), usdc);
+        assert!(curve.virtual_sol_reserves > global.initial_virtual_quote_reserves);
     }
 
     #[test]
@@ -5562,11 +6201,7 @@ mod tests {
         assert!(!instruction.accounts[16].is_writable);
         assert_eq!(
             instruction.accounts[17].pubkey,
-            get_associated_token_address_with_program_id(
-                &bonding_curve,
-                &usdc,
-                &token_program,
-            )
+            get_associated_token_address_with_program_id(&bonding_curve, &usdc, &token_program,)
         );
         assert!(instruction.accounts[17].is_writable);
         assert_eq!(instruction.accounts[18].pubkey, token_program);
@@ -5657,7 +6292,10 @@ mod tests {
 
         assert_eq!(instruction.program_id.to_string(), PUMP_PROGRAM_ID);
         assert_eq!(instruction.accounts.len(), 27);
-        assert_eq!(&instruction.data[..8], &[184, 23, 238, 97, 103, 197, 211, 61]);
+        assert_eq!(
+            &instruction.data[..8],
+            &[184, 23, 238, 97, 103, 197, 211, 61]
+        );
         assert_eq!(&instruction.data[8..16], &1_000_000u64.to_le_bytes());
         assert_eq!(&instruction.data[16..24], &100_000_000u64.to_le_bytes());
         assert_eq!(instruction.accounts[2].pubkey, usdc);
@@ -5666,6 +6304,48 @@ mod tests {
         assert_eq!(
             instruction.accounts[19].pubkey,
             global_volume_accumulator_pda().expect("global volume")
+        );
+    }
+
+    #[test]
+    fn pump_v2_fee_recipient_prefers_array_over_legacy_singleton() {
+        let legacy_fee_recipient = Pubkey::new_unique();
+        let array_fee_recipient = Pubkey::new_unique();
+        let legacy_reserved_fee_recipient = Pubkey::new_unique();
+        let array_reserved_fee_recipient = Pubkey::new_unique();
+        let mut global = sample_global();
+        global.fee_recipient = legacy_fee_recipient;
+        global.fee_recipients[0] = array_fee_recipient;
+        global.reserved_fee_recipient = legacy_reserved_fee_recipient;
+        global.reserved_fee_recipients[0] = array_reserved_fee_recipient;
+
+        assert_eq!(
+            select_buy_fee_recipient(&global, false),
+            array_fee_recipient
+        );
+        assert_eq!(
+            select_buy_fee_recipient(&global, true),
+            array_reserved_fee_recipient
+        );
+    }
+
+    #[test]
+    fn pump_v2_fee_recipient_falls_back_to_legacy_singleton() {
+        let legacy_fee_recipient = Pubkey::new_unique();
+        let legacy_reserved_fee_recipient = Pubkey::new_unique();
+        let mut global = sample_global();
+        global.fee_recipient = legacy_fee_recipient;
+        global.fee_recipients = [Pubkey::default(); 7];
+        global.reserved_fee_recipient = legacy_reserved_fee_recipient;
+        global.reserved_fee_recipients = [Pubkey::default(); 7];
+
+        assert_eq!(
+            select_buy_fee_recipient(&global, false),
+            legacy_fee_recipient
+        );
+        assert_eq!(
+            select_buy_fee_recipient(&global, true),
+            legacy_reserved_fee_recipient
         );
     }
 
@@ -5893,13 +6573,13 @@ mod tests {
         )
         .expect("launch instructions");
         assert_eq!(
-            &instructions[3].data[..8],
+            &instructions[2].data[..8],
             &[194, 171, 28, 70, 104, 77, 91, 47]
         );
-        assert_eq!(&instructions[3].data[8..16], &quoted_sol.to_le_bytes());
-        assert_eq!(&instructions[3].data[16..24], &1u64.to_le_bytes());
+        assert_eq!(&instructions[2].data[8..16], &quoted_sol.to_le_bytes());
+        assert_eq!(&instructions[2].data[16..24], &1u64.to_le_bytes());
         assert_sol_transfer_instruction(
-            &instructions[4],
+            &instructions[3],
             &instructions[0].accounts[5].pubkey,
             &wrapper_fee_vault(),
             estimate_sol_in_fee_lamports(quoted_sol, config.wrapperDefaultFeeBps),
@@ -5924,27 +6604,26 @@ mod tests {
             build_launch_instructions(&config, mint, creator, launch_creator, None, Some(&global))
                 .expect("launch instructions");
 
-        assert_eq!(instructions.len(), 5);
+        assert_eq!(instructions.len(), 4);
         assert_eq!(instructions[0].program_id.to_string(), PUMP_PROGRAM_ID);
-        assert_eq!(instructions[1].program_id.to_string(), PUMP_PROGRAM_ID);
         assert_eq!(
-            instructions[2].program_id.to_string(),
+            instructions[1].program_id.to_string(),
             spl_associated_token_account::id().to_string()
         );
-        assert_eq!(instructions[3].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(instructions[2].program_id.to_string(), PUMP_PROGRAM_ID);
         assert_eq!(
-            &instructions[3].data[..8],
+            &instructions[2].data[..8],
             &[194, 171, 28, 70, 104, 77, 91, 47]
         );
 
         let quoted_tokens = quote_buy_tokens_from_sol(&global, 500_000_000);
         let expected_min_tokens_out = apply_buy_token_slippage(quoted_tokens, 500);
-        assert_eq!(&instructions[3].data[8..16], &500_000_000u64.to_le_bytes());
+        assert_eq!(&instructions[2].data[8..16], &500_000_000u64.to_le_bytes());
         assert_eq!(
-            &instructions[3].data[16..24],
+            &instructions[2].data[16..24],
             &expected_min_tokens_out.to_le_bytes()
         );
-        assert_sol_transfer_instruction(&instructions[4], &creator, &wrapper_fee_vault(), 500_000);
+        assert_sol_transfer_instruction(&instructions[3], &creator, &wrapper_fee_vault(), 500_000);
     }
 
     #[test]
@@ -5969,8 +6648,8 @@ mod tests {
         )
         .expect("launch instructions");
 
-        assert_eq!(instructions.len(), 4);
-        assert_eq!(instructions[3].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(instructions[2].program_id.to_string(), PUMP_PROGRAM_ID);
     }
 
     #[test]
@@ -5996,8 +6675,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn usdc_launch_builder_uses_create_v2_quote_mint() {
+        let mut config = regular_config();
+        config.quoteAsset = "usdc".to_string();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let launch_creator = Pubkey::new_unique();
+
+        let plan = build_usdc_launch_instruction_plan(
+            "http://127.0.0.1:8899",
+            &config,
+            mint,
+            creator,
+            launch_creator,
+            None,
+            Some(&sample_global()),
+        )
+        .await
+        .expect("usdc launch instructions");
+        let instructions = plan.launch_instructions;
+
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_eq!(instructions[0].accounts.len(), 19);
+        assert_eq!(
+            instructions[0].accounts[16].pubkey,
+            usdc_mint().expect("usdc mint")
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_launch_builder_keeps_agent_init_out_of_launch_packet() {
+        for mode in ["agent-unlocked", "agent-locked", "agent-custom"] {
+            let mut config = regular_config();
+            config.mode = mode.to_string();
+            config.quoteAsset = "usdc".to_string();
+            config.agent.buybackBps = Some(2_500);
+            if mode == "agent-custom" {
+                config.agent.splitAgentInit = true;
+                config.agent.feeRecipients = vec![
+                    crate::config::NormalizedRecipient {
+                        r#type: Some("agent".to_string()),
+                        address: String::new(),
+                        githubUserId: String::new(),
+                        githubUsername: String::new(),
+                        shareBps: 2_500,
+                    },
+                    crate::config::NormalizedRecipient {
+                        r#type: Some("wallet".to_string()),
+                        address: Pubkey::new_unique().to_string(),
+                        githubUserId: String::new(),
+                        githubUsername: String::new(),
+                        shareBps: 7_500,
+                    },
+                ];
+            }
+
+            let plan = build_usdc_launch_instruction_plan(
+                "http://127.0.0.1:8899",
+                &config,
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                Some(&Pubkey::new_unique()),
+                Some(&sample_global()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("usdc {mode} launch instructions: {error}"));
+
+            assert_eq!(plan.launch_instructions.len(), 1, "mode={mode}");
+            assert_eq!(
+                plan.launch_instructions[0].program_id.to_string(),
+                PUMP_PROGRAM_ID,
+                "mode={mode}"
+            );
+        }
+    }
+
     #[test]
-    fn agent_locked_launch_with_dev_buy_defers_agent_initialize() {
+    fn agent_locked_launch_with_dev_buy_keeps_agent_init_out_of_launch_packet() {
         let mut config = regular_config();
         config.mode = "agent-locked".to_string();
         config.agent.buybackBps = Some(2_500);
@@ -6022,8 +6779,8 @@ mod tests {
         .expect("agent launch instructions");
 
         assert_eq!(instructions.len(), 5);
-        assert_eq!(instructions[3].program_id.to_string(), PUMP_PROGRAM_ID);
-        assert_sol_transfer_instruction(&instructions[4], &creator, &wrapper_fee_vault(), 100_000);
+        assert_eq!(instructions[2].program_id.to_string(), PUMP_PROGRAM_ID);
+        assert_sol_transfer_instruction(&instructions[3], &creator, &wrapper_fee_vault(), 100_000);
     }
 
     #[test]
@@ -6109,6 +6866,7 @@ mod tests {
                     0,
                     &payer,
                     Some(&mint),
+                    &[],
                     instructions,
                     &tx_config,
                     &[lookup_table],
@@ -6147,7 +6905,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_locked_launch_defers_agent_initialize_to_setup_tx() {
+    fn agent_locked_launch_keeps_agent_init_out_of_launch_packet() {
         let mut config = regular_config();
         config.mode = "agent-locked".to_string();
         config.agent.buybackBps = Some(2_500);
@@ -6172,7 +6930,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_custom_split_launch_defers_agent_initialize_to_setup_tx() {
+    fn agent_custom_split_launch_keeps_agent_init_out_of_launch_packet() {
         let mut config = regular_config();
         config.mode = "agent-custom".to_string();
         config.agent.buybackBps = Some(2_500);
@@ -6213,7 +6971,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_unlocked_launch_does_not_initialize_agent() {
+    fn agent_unlocked_launch_keeps_agent_init_out_of_launch_packet() {
         let mut config = regular_config();
         config.mode = "agent-unlocked".to_string();
         config.agent.buybackBps = Some(2_500);
@@ -6234,11 +6992,20 @@ mod tests {
 
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].program_id.to_string(), PUMP_PROGRAM_ID);
-        assert_eq!(native_follow_up_label(&config), None);
+        assert_eq!(native_follow_up_label(&config), Some("agent-setup"));
     }
 
     #[test]
-    fn agent_custom_without_split_keeps_agent_initialize_in_creation_tx() {
+    fn agent_locked_uses_single_setup_transaction() {
+        let mut config = regular_config();
+        config.mode = "agent-locked".to_string();
+        config.agent.buybackBps = Some(10_000);
+
+        assert_eq!(native_follow_up_labels(&config), vec!["agent-setup"]);
+    }
+
+    #[test]
+    fn agent_custom_without_split_uses_agent_setup_transaction() {
         let mut config = regular_config();
         config.mode = "agent-custom".to_string();
         config.agent.buybackBps = Some(2_500);
@@ -6258,12 +7025,9 @@ mod tests {
         )
         .expect("agent custom launch instructions");
 
-        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].program_id.to_string(), PUMP_PROGRAM_ID);
-        assert_eq!(
-            instructions[1].program_id.to_string(),
-            PUMP_AGENT_PAYMENTS_PROGRAM_ID
-        );
+        assert_eq!(native_follow_up_label(&config), Some("agent-setup"));
     }
 
     #[test]
@@ -6398,25 +7162,76 @@ mod tests {
         assert_eq!(instructions.len(), 2);
         assert_eq!(instructions[0].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
         assert_eq!(instructions[1].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
+        assert_eq!(instructions[1].accounts[14].pubkey, wsol_mint().expect("wsol mint"));
     }
 
     #[tokio::test]
-    async fn agent_locked_follow_up_contains_agent_initialize_and_fee_setup() {
+    async fn fee_sharing_follow_up_uses_usdc_quote_accounts_for_usdc() {
+        let mut config = regular_config();
+        config.quoteAsset = "usdc".to_string();
+        config.feeSharing.generateLaterSetup = true;
+        config.feeSharing.recipients = vec![crate::config::NormalizedRecipient {
+            r#type: Some("wallet".to_string()),
+            address: Pubkey::new_unique().to_string(),
+            githubUserId: String::new(),
+            githubUsername: String::new(),
+            shareBps: 10_000,
+        }];
+        let instructions = build_fee_sharing_follow_up_instructions(
+            "http://127.0.0.1:8899",
+            &config,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        )
+        .await
+        .expect("follow-up instructions");
+
+        let mint = instructions[0].accounts[4].pubkey;
+        let creator = instructions[0].accounts[2].pubkey;
+        let sharing_config = fee_sharing_config_pda(&mint).expect("sharing config");
+        let pump_creator_vault = creator_vault_pda(&sharing_config).expect("pump creator vault");
+        let quote_mint = usdc_mint().expect("usdc mint");
+        let quote_token_program = token_program_id().expect("token program id");
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(
+            instructions[1].program_id,
+            spl_associated_token_account::id()
+        );
+        assert_eq!(
+            instructions[2].program_id,
+            spl_associated_token_account::id()
+        );
+        assert_eq!(instructions[1].accounts[2].pubkey, pump_creator_vault);
+        assert_eq!(instructions[1].accounts[3].pubkey, quote_mint);
+        assert_eq!(instructions[2].accounts[2].pubkey, creator);
+        assert_eq!(instructions[2].accounts[3].pubkey, quote_mint);
+        assert_eq!(instructions[3].accounts[14].pubkey, quote_mint);
+        assert_eq!(
+            instructions[3].accounts[15].pubkey,
+            quote_token_program
+        );
+        assert_eq!(instructions[3].accounts.len(), 21);
+    }
+
+    #[tokio::test]
+    async fn agent_locked_agent_setup_initializes_and_sets_fee_sharing() {
         let mut config = regular_config();
         config.mode = "agent-locked".to_string();
         config.agent.buybackBps = Some(2_500);
         config.creatorFee.mode = "agent-escrow".to_string();
         let creator = Pubkey::new_unique();
         let agent_authority = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
         let instructions = build_native_follow_up_instructions(
             "http://127.0.0.1:8899",
             &config,
-            Pubkey::new_unique(),
+            "agent-setup",
+            mint,
             creator,
             Some(&agent_authority),
         )
         .await
-        .expect("agent locked follow-up instructions");
+        .expect("agent locked setup instructions");
 
         assert_eq!(instructions.len(), 3);
         assert_eq!(
@@ -6425,10 +7240,136 @@ mod tests {
         );
         assert_eq!(instructions[1].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
         assert_eq!(instructions[2].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
+        assert_eq!(
+            decode_update_fee_shareholders(&instructions[2]),
+            vec![(token_agent_payments_pda(&mint).expect("agent payments pda"), 10_000)]
+        );
     }
 
     #[tokio::test]
-    async fn agent_custom_follow_up_contains_agent_initialize_and_fee_setup() {
+    async fn agent_locked_setup_uses_agent_payments_as_fee_share_recipient() {
+        let mut config = regular_config();
+        config.mode = "agent-locked".to_string();
+        config.agent.buybackBps = Some(10_000);
+        config.creatorFee.mode = "agent-escrow".to_string();
+        let creator = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let instructions = build_native_follow_up_instructions(
+            "http://127.0.0.1:8899",
+            &config,
+            "agent-setup",
+            mint,
+            creator,
+            Some(&Pubkey::new_unique()),
+        )
+        .await
+        .expect("agent locked setup instructions");
+
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(
+            decode_update_fee_shareholders(&instructions[2]),
+            vec![(token_agent_payments_pda(&mint).expect("agent payments pda"), 10_000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_agent_locked_setup_creates_quote_vault_accounts_before_update() {
+        let mut config = regular_config();
+        config.mode = "agent-locked".to_string();
+        config.quoteAsset = "usdc".to_string();
+        config.agent.buybackBps = Some(10_000);
+        config.creatorFee.mode = "agent-escrow".to_string();
+        let creator = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let instructions = build_native_follow_up_instructions(
+            "http://127.0.0.1:8899",
+            &config,
+            "agent-setup",
+            mint,
+            creator,
+            Some(&Pubkey::new_unique()),
+        )
+        .await
+        .expect("agent locked setup instructions");
+
+        let sharing_config = fee_sharing_config_pda(&mint).expect("sharing config");
+        let pump_creator_vault = creator_vault_pda(&sharing_config).expect("pump creator vault");
+        let agent_payments = token_agent_payments_pda(&mint).expect("agent payments pda");
+        let quote_mint = usdc_mint().expect("usdc mint");
+
+        assert_eq!(instructions.len(), 6);
+        assert_eq!(
+            instructions[2].program_id,
+            spl_associated_token_account::id()
+        );
+        assert_eq!(
+            instructions[3].program_id,
+            spl_associated_token_account::id()
+        );
+        assert_eq!(instructions[2].accounts[2].pubkey, pump_creator_vault);
+        assert_eq!(instructions[2].accounts[3].pubkey, quote_mint);
+        assert_eq!(instructions[3].accounts[2].pubkey, creator);
+        assert_eq!(instructions[3].accounts[3].pubkey, quote_mint);
+        assert_eq!(instructions[4].accounts[2].pubkey, agent_payments);
+        assert_eq!(instructions[4].accounts[3].pubkey, quote_mint);
+        assert_eq!(instructions[5].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
+        assert_eq!(instructions[5].accounts[14].pubkey, quote_mint);
+        assert_eq!(
+            instructions[5].accounts[19].pubkey,
+            creator
+        );
+        assert_eq!(
+            instructions[5].accounts[20].pubkey,
+            get_associated_token_address_with_program_id(
+                &creator,
+                &quote_mint,
+                &token_program_id().expect("token program id"),
+            )
+        );
+    }
+
+    #[test]
+    fn agent_setup_defaults_to_launch_compute_unit_limit() {
+        let config = regular_config();
+
+        assert_eq!(
+            configured_follow_up_compute_unit_limit(&config, "agent-setup")
+                .expect("agent setup compute limit"),
+            configured_default_launch_compute_unit_limit() as u32
+        );
+    }
+
+    #[test]
+    fn usdc_agent_setup_defaults_to_usdc_launch_compute_unit_limit_when_dev_buy_routes() {
+        let mut config = regular_config();
+        config.quoteAsset = "usdc".to_string();
+        config.devBuy = Some(crate::config::NormalizedDevBuy {
+            mode: "sol".to_string(),
+            amount: "0.1".to_string(),
+            source: "test".to_string(),
+        });
+
+        assert_eq!(
+            configured_follow_up_compute_unit_limit(&config, "agent-setup")
+                .expect("agent setup compute limit"),
+            configured_launch_compute_unit_limit(&config).expect("launch compute limit")
+        );
+    }
+
+    #[test]
+    fn explicit_compute_unit_limit_overrides_agent_setup_default() {
+        let mut config = regular_config();
+        config.tx.computeUnitLimit = Some(123_456);
+
+        assert_eq!(
+            configured_follow_up_compute_unit_limit(&config, "agent-setup")
+                .expect("agent setup compute limit"),
+            123_456
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_custom_follow_up_only_initializes_agent() {
         let mut config = regular_config();
         config.mode = "agent-custom".to_string();
         config.agent.buybackBps = Some(2_500);
@@ -6454,6 +7395,7 @@ mod tests {
         let instructions = build_native_follow_up_instructions(
             "http://127.0.0.1:8899",
             &config,
+            "agent-setup",
             Pubkey::new_unique(),
             creator,
             Some(&agent_authority),
@@ -6461,22 +7403,20 @@ mod tests {
         .await
         .expect("agent custom follow-up instructions");
 
-        assert_eq!(instructions.len(), 3);
+        assert_eq!(instructions.len(), 1);
         assert_eq!(
             instructions[0].program_id.to_string(),
             PUMP_AGENT_PAYMENTS_PROGRAM_ID
         );
-        assert_eq!(instructions[1].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
-        assert_eq!(instructions[2].program_id.to_string(), PUMP_FEE_PROGRAM_ID);
     }
 
     #[test]
-    fn agent_unlocked_has_no_follow_up_transaction() {
+    fn agent_unlocked_has_agent_setup_transaction() {
         let mut config = regular_config();
         config.mode = "agent-unlocked".to_string();
         config.agent.buybackBps = Some(2_500);
 
-        assert_eq!(native_follow_up_label(&config), None);
+        assert_eq!(native_follow_up_label(&config), Some("agent-setup"));
     }
 
     #[test]
@@ -6514,6 +7454,19 @@ mod tests {
         let error = resolve_follow_tip_config("hellomoon", "0.0001", "tip-account", "buy tip")
             .expect_err("sub-minimum hellomoon tip should fail");
         assert!(error.contains("0.001 SOL"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn helius_sender_follow_tip_requires_sender_minimum() {
+        let (lamports, account) =
+            resolve_follow_tip_config("helius-sender", "0.0002", "tip-account", "buy tip")
+                .expect("valid helius sender tip");
+        assert_eq!(lamports, 200_000);
+        assert_eq!(account, "tip-account");
+
+        let error = resolve_follow_tip_config("helius-sender", "0.0001", "tip-account", "sell tip")
+            .expect_err("sub-minimum helius sender tip should fail");
+        assert!(error.contains("0.0002 SOL"), "unexpected: {error}");
     }
 
     #[test]
@@ -6556,7 +7509,7 @@ mod tests {
     }
 
     #[test]
-    fn update_fee_shares_uses_current_shareholders_as_remaining_accounts() {
+    fn update_fee_shares_v2_uses_current_shareholders_as_remaining_accounts() {
         let mint = Pubkey::new_unique();
         let authority = Pubkey::new_unique();
         let current_shareholder = Pubkey::new_unique();
@@ -6568,15 +7521,20 @@ mod tests {
             shareBps: 10_000,
         };
 
-        let instruction = build_update_fee_shares_instruction(
+        let quote_mint = wsol_mint().expect("wsol mint");
+        let token_program = token_program_id().expect("token program id");
+        let instruction = build_update_fee_shares_v2_instruction(
             &mint,
             &authority,
             &[current_shareholder],
             &[next_shareholder],
+            &quote_mint,
+            &token_program,
         )
         .expect("update fee shares instruction");
 
         assert_eq!(instruction.program_id.to_string(), PUMP_FEE_PROGRAM_ID);
+        assert_eq!(&instruction.data[..8], &[111, 251, 49, 6, 78, 78, 106, 18]);
         assert_eq!(
             instruction.accounts.last().map(|account| account.pubkey),
             Some(current_shareholder)
@@ -6594,6 +7552,54 @@ mod tests {
                 .last()
                 .map(|account| account.is_signer)
                 .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn update_fee_shares_v2_uses_quote_specific_vault_accounts() {
+        let mint = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let next_shareholder = NormalizedRecipient {
+            r#type: Some("wallet".to_string()),
+            address: Pubkey::new_unique().to_string(),
+            githubUserId: String::new(),
+            githubUsername: String::new(),
+            shareBps: 10_000,
+        };
+        let quote_mint = usdc_mint().expect("usdc mint");
+        let token_program = token_program_id().expect("token program id");
+
+        let instruction = build_update_fee_shares_v2_instruction(
+            &mint,
+            &authority,
+            &[],
+            &[next_shareholder],
+            &quote_mint,
+            &token_program,
+        )
+        .expect("update fee shares instruction");
+        let sharing_config = fee_sharing_config_pda(&mint).expect("sharing config");
+        let pump_creator_vault = creator_vault_pda(&sharing_config).expect("creator vault");
+        let coin_creator_vault_authority =
+            coin_creator_vault_authority_pda(&sharing_config).expect("coin creator authority");
+
+        assert_eq!(
+            instruction.accounts[8].pubkey,
+            get_associated_token_address_with_program_id(
+                &pump_creator_vault,
+                &quote_mint,
+                &token_program,
+            )
+        );
+        assert_eq!(instruction.accounts[14].pubkey, quote_mint);
+        assert_eq!(instruction.accounts[15].pubkey, token_program);
+        assert_eq!(
+            instruction.accounts[18].pubkey,
+            get_associated_token_address_with_program_id(
+                &coin_creator_vault_authority,
+                &quote_mint,
+                &token_program,
+            )
         );
     }
 
@@ -6643,6 +7649,72 @@ mod tests {
             current_market_cap_quote_units(1_000_000_000_000, 500_000_000, 250_000_000_000),
             2_000_000_000
         );
+    }
+
+    #[test]
+    fn pump_amm_pool_candidates_include_canonical_without_known_creator() {
+        let mint = Pubkey::new_unique();
+        let candidates =
+            pump_amm_pool_candidate_pubkeys(&mint, &[]).expect("derive canonical candidates");
+
+        assert_eq!(candidates.len(), 4);
+        let wsol_mint = parse_pubkey(WSOL_MINT, "wsol").expect("wsol mint");
+        let canonical_creator = pump_pool_authority_pda(&mint).expect("canonical creator");
+        let expected = derive_pump_amm_pool_address(&canonical_creator, &mint, &wsol_mint, 0)
+            .expect("canonical wsol pool")
+            .to_string();
+        assert!(candidates.contains(&expected));
+    }
+
+    #[test]
+    fn pump_amm_pool_candidates_include_launch_creator_indexes() {
+        let mint = Pubkey::new_unique();
+        let launch_creator = Pubkey::new_unique();
+        let candidates = pump_amm_pool_candidate_pubkeys(&mint, &[launch_creator])
+            .expect("derive launch creator candidates");
+
+        assert_eq!(candidates.len(), 20);
+        let usdc_mint = parse_pubkey(USDC_MINT, "usdc").expect("usdc mint");
+        let expected = derive_pump_amm_pool_address(&launch_creator, &mint, &usdc_mint, 3)
+            .expect("creator usdc pool")
+            .to_string();
+        assert!(candidates.contains(&expected));
+    }
+
+    #[test]
+    fn pump_amm_pool_candidates_include_canonical_creator_indexes_when_known() {
+        let mint = Pubkey::new_unique();
+        let canonical_creator = pump_pool_authority_pda(&mint).expect("canonical creator");
+        let candidates = pump_amm_pool_candidate_pubkeys(&mint, &[canonical_creator])
+            .expect("derive canonical creator candidates");
+
+        assert_eq!(candidates.len(), 16);
+        let usdt_mint = parse_pubkey(USDT_MINT, "usdt").expect("usdt mint");
+        let expected = derive_pump_amm_pool_address(&canonical_creator, &mint, &usdt_mint, 3)
+            .expect("canonical creator indexed pool")
+            .to_string();
+        assert!(candidates.contains(&expected));
+    }
+
+    #[test]
+    fn completed_pump_curve_requires_amm_snapshot() {
+        let curve_snapshot = PumpMarketSnapshot {
+            mint: "mint".to_string(),
+            creator: "creator".to_string(),
+            virtualTokenReserves: 0,
+            virtualSolReserves: 0,
+            realTokenReserves: 0,
+            realSolReserves: 0,
+            tokenTotalSupply: 0,
+            complete: true,
+            marketCapLamports: 0,
+            marketCapSol: "0".to_string(),
+            quoteAsset: "sol".to_string(),
+            quoteAssetLabel: "SOL".to_string(),
+        };
+        let amm_error = "No Pump AMM pool found";
+
+        assert!(completed_curve_amm_error(&curve_snapshot, amm_error).is_some());
     }
 
     #[test]

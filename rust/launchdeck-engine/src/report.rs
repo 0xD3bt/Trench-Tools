@@ -718,9 +718,16 @@ fn parse_lookup_table_addresses(config: &NormalizedConfig) -> Vec<String> {
 fn display_transaction_label(label: &str) -> String {
     match label.trim() {
         "follow-up" => "fee-sharing setup".to_string(),
-        "agent-setup" => "agent fee setup".to_string(),
+        "agent-setup" => "agent setup".to_string(),
         other if other.is_empty() => "transaction".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn planned_follow_up_labels(config: &NormalizedConfig) -> Vec<&'static str> {
+    match launch_follow_up_label(config) {
+        Some(label) => vec![label],
+        None => vec![],
     }
 }
 
@@ -729,7 +736,7 @@ fn planned_transactions(
     transport_plan: &TransportPlan,
     lookup_tables: &[String],
 ) -> Vec<TransactionSummary> {
-    let mut transactions = vec![TransactionSummary {
+    let launch_summary = TransactionSummary {
         label: "launch".to_string(),
         instructionSummary: vec![],
         legacyLength: None,
@@ -762,10 +769,19 @@ fn planned_transactions(
         },
         base64: None,
         warnings: vec![],
-    }];
+    };
+    let mut transactions = Vec::new();
+    if config.launchpad == "pump"
+        && config.quoteAsset.eq_ignore_ascii_case("usdc")
+        && config.devBuy.is_some()
+    {
+        let mut pre_launch_summary = launch_summary.clone();
+        pre_launch_summary.label = "pre-launch-usdc-funding".to_string();
+        transactions.push(pre_launch_summary);
+    }
+    transactions.push(launch_summary);
 
-    let follow_up = launch_follow_up_label(config);
-    if let Some(label) = follow_up {
+    for label in planned_follow_up_labels(config) {
         transactions.push(TransactionSummary {
             label: display_transaction_label(label),
             instructionSummary: vec![],
@@ -881,11 +897,6 @@ pub fn build_report(
     let creator_fee_receiver = match config.mode.as_str() {
         "cashback" => "cashback to traders".to_string(),
         "agent-locked" => "agent buyback escrow (locked after launch)".to_string(),
-        "agent-custom" if has_launch_follow_up(config) => summarize_recipients(
-            &config.agent.feeRecipients,
-            &creator,
-            config.agent.buybackBps,
-        ),
         _ if config.creatorFee.mode == "github" && !config.creatorFee.githubUsername.is_empty() => {
             format!("GitHub @{}", config.creatorFee.githubUsername)
         }
@@ -899,7 +910,7 @@ pub fn build_report(
     };
     let fee_sharing_status = match config.mode.as_str() {
         "agent-custom" if has_launch_follow_up(config) => {
-            "agent custom split bundled post-launch (final)".to_string()
+            "agent initialized post-launch; Pump fee sharing untouched".to_string()
         }
         "agent-custom" => "untouched on launch (configure later manually)".to_string(),
         "agent-unlocked" => "untouched on launch (configure later once)".to_string(),

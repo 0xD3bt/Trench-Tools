@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Trench Tools",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "description": "Trade, deploy and snipe through your own infrastructure. Same workflow, same interfaces - without the platform fee tax.",
   "icons": {
     "16": "assets/trench-tools-favicon.png",

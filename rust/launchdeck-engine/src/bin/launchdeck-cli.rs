@@ -316,6 +316,7 @@ async fn run_cli() -> Result<(), String> {
     })?;
 
     let mut compiled_transactions = native.compiled_transactions;
+    let pre_launch_transactions = native.pre_launch_transactions;
     let mut report = native.report;
     let text = native.text;
     let compile_timings = native.compile_timings;
@@ -327,6 +328,8 @@ async fn run_cli() -> Result<(), String> {
     let vanity_reservation = native.vanity_reservation;
     let bags_requires_prelaunch_setup = normalized.launchpad == "bagsapp"
         && (!setup_bundles.is_empty() || !setup_transactions.is_empty());
+    let pump_requires_prelaunch_funding =
+        normalized.launchpad == "pump" && !pre_launch_transactions.is_empty();
     set_report_timing(&mut report, "compileAltLoadMs", compile_timings.alt_load_ms);
     set_report_timing(
         &mut report,
@@ -353,6 +356,15 @@ async fn run_cli() -> Result<(), String> {
 
     if action == "simulate" {
         let mut simulation_transactions = compiled_transactions.clone();
+        if pump_requires_prelaunch_funding {
+            simulation_transactions = pre_launch_transactions.clone();
+            append_execution_warnings(
+                &mut report,
+                vec![
+                    "Simulation only ran the phased pre-launch funding transaction because Solana RPC does not apply its funded USDC state to the dependent launch simulation.".to_string(),
+                ],
+            );
+        }
         if bags_requires_prelaunch_setup {
             let launch_compiled = compile_bags_launch_transaction(
                 &rpc_url,
@@ -393,7 +405,55 @@ async fn run_cli() -> Result<(), String> {
     } else if action == "send" {
         mark_vanity_reservation_used(vanity_reservation.as_ref(), None)?;
         let mut bags_setup_timing = SendTimingBreakdown::default();
-        let (sent, warnings, send_timing) = if normalized.launchpad == "bagsapp" {
+        let (sent, warnings, send_timing) = if pump_requires_prelaunch_funding {
+            let post_pre_launch_transactions = compiled_transactions
+                .iter()
+                .skip(pre_launch_transactions.len())
+                .cloned()
+                .collect::<Vec<_>>();
+            let pre_launch_transport_plan = standard_rpc_transport_plan(&transport_plan, &rpc_url);
+            let (mut pre_launch_sent, mut pre_launch_warnings, pre_launch_timing) =
+                send_transactions_sequential_for_transport(
+                    &rpc_url,
+                    &pre_launch_transport_plan,
+                    &pre_launch_transactions,
+                    &normalized.execution.commitment,
+                    normalized.execution.skipPreflight,
+                    normalized.execution.trackSendBlockHeight,
+                )
+                .await?;
+            let (mut launch_sent, mut launch_warnings, launch_timing) =
+                send_transactions_for_transport(
+                    &rpc_url,
+                    &transport_plan,
+                    &post_pre_launch_transactions,
+                    &normalized.execution.commitment,
+                    normalized.execution.skipPreflight,
+                    normalized.execution.trackSendBlockHeight,
+                )
+                .await?;
+            pre_launch_sent.append(&mut launch_sent);
+            pre_launch_warnings.append(&mut launch_warnings);
+            let send_timing = SendTimingBreakdown {
+                submit_ms: pre_launch_timing
+                    .submit_ms
+                    .saturating_add(launch_timing.submit_ms),
+                confirm_ms: pre_launch_timing
+                    .confirm_ms
+                    .saturating_add(launch_timing.confirm_ms),
+            };
+            set_report_timing(
+                &mut report,
+                "preLaunchSubmitMs",
+                pre_launch_timing.submit_ms,
+            );
+            set_report_timing(
+                &mut report,
+                "preLaunchConfirmMs",
+                pre_launch_timing.confirm_ms,
+            );
+            (pre_launch_sent, pre_launch_warnings, send_timing)
+        } else if normalized.launchpad == "bagsapp" {
             let bags_setup_transport_plan = standard_rpc_transport_plan(&transport_plan, &rpc_url);
             let setup_gate_commitment = configured_bags_setup_gate_commitment();
             let mut all_sent = Vec::new();

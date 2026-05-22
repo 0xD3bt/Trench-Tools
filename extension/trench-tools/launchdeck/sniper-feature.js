@@ -61,6 +61,8 @@
       enabled: false,
       wallets: {},
     };
+    let committedSniperState = normalizeDraftState(sniperState);
+    let modalOpen = false;
     let sniperModalOverlayPointerDown = false;
     let eventsBound = false;
 
@@ -174,7 +176,7 @@
         const normalized = normalizeWalletState(entry || {});
         return normalized.selected
           || Boolean(normalized.amountSol)
-          || normalized.triggerMode !== "on-submit"
+          || normalized.triggerMode !== "block-offset"
           || normalized.submitDelayMs > 0
           || normalized.targetBlockOffset > 0
           || normalized.retryOnce
@@ -200,6 +202,25 @@
       } catch (_error) {
         // Ignore storage failures and keep sniper controls functional.
       }
+    }
+
+    function cloneDraftState(value) {
+      return normalizeDraftState(JSON.parse(JSON.stringify(normalizeDraftState(value))));
+    }
+
+    function commitState() {
+      committedSniperState = cloneDraftState(sniperState);
+      applyStateToForm();
+      persistDraft();
+      renderButtonState();
+      if (typeof onStateChange === "function") onStateChange();
+    }
+
+    function restoreCommittedState() {
+      sniperState = cloneDraftState(committedSniperState);
+      applyStateToForm();
+      renderButtonState();
+      if (typeof onStateChange === "function") onStateChange();
     }
 
     function parseSolInputValue(value) {
@@ -265,6 +286,58 @@
       return Math.max(0, Number(balance) - getExecutionReserveSol());
     }
 
+    function walletStatusWalletsLoaded() {
+      const appBootstrapState = getAppBootstrapState();
+      return Boolean(appBootstrapState && appBootstrapState.walletsLoaded);
+    }
+
+    function getWalletsFromStatus() {
+      const latestWalletStatus = getLatestWalletStatus();
+      return latestWalletStatus && Array.isArray(latestWalletStatus.wallets) ? latestWalletStatus.wallets : [];
+    }
+
+    function getWalletByEnvKey(envKey) {
+      const normalizedKey = String(envKey || "").trim();
+      if (!normalizedKey) return null;
+      return getWalletsFromStatus().find((wallet) => wallet && wallet.envKey === normalizedKey) || null;
+    }
+
+    function isWalletAvailableForSniper(envKey, options = {}) {
+      const normalizedKey = String(envKey || "").trim();
+      if (!normalizedKey) return false;
+      const latestWalletStatus = getLatestWalletStatus();
+      const selectedKey = latestWalletStatus && latestWalletStatus.selectedWalletKey ? latestWalletStatus.selectedWalletKey : "";
+      if (normalizedKey === selectedKey) return false;
+      if (!walletStatusWalletsLoaded()) return !options.requireLoaded;
+      const wallet = getWalletByEnvKey(normalizedKey);
+      if (!wallet || !wallet.publicKey) return false;
+      const balance = getWalletBalanceForSniper(wallet);
+      if (balance == null || !Number.isFinite(Number(balance))) return false;
+      const spendable = getSpendableBalanceSol(wallet);
+      return spendable != null && spendable > 0;
+    }
+
+    function getWalletAvailabilityError(envKey) {
+      if (!walletStatusWalletsLoaded()) return "Wallet balances are still loading.";
+      const index = walletIndexFromEnvKey(envKey);
+      if (!isWalletAvailableForSniper(envKey, { requireLoaded: true })) {
+        const latestWalletStatus = getLatestWalletStatus();
+        const selectedKey = latestWalletStatus && latestWalletStatus.selectedWalletKey ? latestWalletStatus.selectedWalletKey : "";
+        if (envKey === selectedKey) return `Sniper wallet #${index} is the deployer wallet and cannot snipe its own launch.`;
+        return `Sniper wallet #${index} is not available in the current wallet set.`;
+      }
+      const wallet = getWalletByEnvKey(envKey);
+      const balance = getWalletBalanceForSniper(wallet);
+      if (balance == null || !Number.isFinite(Number(balance))) {
+        return `Sniper wallet #${index} balance is unavailable. Refresh wallets before saving.`;
+      }
+      const spendable = getSpendableBalanceSol(wallet);
+      if (spendable == null || spendable <= 0) {
+        return `Sniper wallet #${index} has no spendable SOL after fee reserve.`;
+      }
+      return "";
+    }
+
     function floorDecimal(value, decimals = 6) {
       const numeric = Number(value);
       if (!Number.isFinite(numeric) || numeric <= 0) return 0;
@@ -319,10 +392,15 @@
       });
     }
 
-    function getSelectedEntries() {
+    function getSelectedEntries(options = {}) {
       return Object.entries(sniperState.wallets || {})
         .filter(([, entry]) => entry && entry.selected)
         .map(([envKey, entry]) => {
+          if (options.requireAvailable && !isWalletAvailableForSniper(envKey, {
+            requireLoaded: Boolean(options.requireLoaded),
+          })) {
+            return null;
+          }
           const normalized = normalizeWalletState(entry);
           const sellPercentNumeric = Number(normalized.sellPercent || 0);
           const sellEnabled = normalized.sellEnabled && sellPercentNumeric > 0;
@@ -351,7 +429,8 @@
               : "stop",
             sellMarketCapDirection: "gte",
           };
-        });
+        })
+        .filter(Boolean);
     }
 
     function getSameTimeFeeGuardNotice() {
@@ -413,11 +492,10 @@
         const total = selectedEntries.reduce((sum, entry) => sum + Number(entry.amountSol || 0), 0);
         snipeBuyAmountInput.value = total > 0 ? total.toFixed(6).replace(/\.?0+$/, "") : "";
       }
-      persistDraft();
     }
 
     function renderButtonState() {
-      const selectedEntries = getSelectedEntries().filter((entry) => Number(entry.amountSol) > 0);
+      const selectedEntries = getSelectedEntries({ requireAvailable: true }).filter((entry) => Number(entry.amountSol) > 0);
       if (modeSniperButton) {
         modeSniperButton.classList.toggle("active", sniperState.enabled && selectedEntries.length > 0);
       }
@@ -469,7 +547,22 @@
       }
 
       if (wallets.length === 0) {
-        const emptyMarkup = "<div class=\"sniper-wallet-empty muted\">No wallets found in `.env`.</div>";
+        const selectedRows = Object.entries(sniperState.wallets || {})
+          .filter(([, entry]) => entry && normalizeWalletState(entry).selected)
+          .map(([envKey]) => `
+      <div class="sniper-wallet-row is-disabled is-selected" data-sniper-wallet-row="${escapeHTML(envKey)}">
+        <label class="sniper-wallet-main">
+          <input type="checkbox" class="sniper-wallet-checkbox" data-sniper-wallet-checkbox="${escapeHTML(envKey)}" checked disabled>
+          <div class="sniper-wallet-info">
+            <div class="sniper-wallet-name">${escapeHTML(`#${walletIndexFromEnvKey(envKey)}`)}</div>
+            <div class="sniper-wallet-meta"><span class="sniper-wallet-pill">Unavailable</span></div>
+          </div>
+        </label>
+        <div class="sniper-wallet-warning">${escapeHTML(getWalletAvailabilityError(envKey) || "Sniper wallet is not available in the current wallet set.")}</div>
+      </div>
+    `)
+          .join("");
+        const emptyMarkup = selectedRows || "<div class=\"sniper-wallet-empty muted\">No wallets found in `.env`.</div>";
         if (global.RenderUtils && global.RenderUtils.setCachedHTML) {
           global.RenderUtils.setCachedHTML(renderCache, "sniperWalletList", sniperWalletList, emptyMarkup);
         } else {
@@ -479,13 +572,39 @@
       }
 
       const sortedWallets = sortWallets(wallets, selectedKey);
+      const renderedKeys = new Set(sortedWallets.map((wallet) => wallet && wallet.envKey).filter(Boolean));
+      const staleSelectedMarkup = Object.entries(sniperState.wallets || {})
+        .filter(([envKey, entry]) => entry && normalizeWalletState(entry).selected && !renderedKeys.has(envKey))
+        .map(([envKey]) => `
+      <div class="sniper-wallet-row is-disabled is-selected" data-sniper-wallet-row="${escapeHTML(envKey)}">
+        <label class="sniper-wallet-main">
+          <input type="checkbox" class="sniper-wallet-checkbox" data-sniper-wallet-checkbox="${escapeHTML(envKey)}" checked disabled>
+          <div class="sniper-wallet-info">
+            <div class="sniper-wallet-name">${escapeHTML(`#${walletIndexFromEnvKey(envKey)}`)}</div>
+            <div class="sniper-wallet-meta"><span class="sniper-wallet-pill">Unavailable</span></div>
+          </div>
+        </label>
+        <div class="sniper-wallet-warning">${escapeHTML(getWalletAvailabilityError(envKey))}</div>
+      </div>
+    `)
+        .join("");
       const feeGuardNotice = getSameTimeFeeGuardNotice();
       const markup = sortedWallets.map((wallet) => {
-        const disabled = wallet.envKey === selectedKey;
         const balanceSol = getWalletBalanceForSniper(wallet);
         const spendableBalanceSol = getSpendableBalanceSol(wallet);
+        const disabled = wallet.envKey === selectedKey
+          || !wallet.publicKey
+          || balanceSol == null
+          || spendableBalanceSol == null
+          || spendableBalanceSol <= 0;
         const state = normalizeWalletState(sniperState.wallets[wallet.envKey] || {});
         const amountWarning = state.selected && !disabled ? getWalletWarning(state, balanceSol, spendableBalanceSol) : "";
+        const availabilityError = state.selected && disabled ? getWalletAvailabilityError(wallet.envKey) : "";
+        const disabledPill = wallet.envKey === selectedKey
+          ? "Deployer"
+          : (!wallet.publicKey || balanceSol == null
+            ? "Unavailable"
+            : (spendableBalanceSol != null && spendableBalanceSol <= 0 ? "No spendable SOL" : ""));
         return `
       <div class="sniper-wallet-row${disabled ? " is-disabled" : ""}${state.selected ? " is-selected" : ""}" data-sniper-wallet-row="${escapeHTML(wallet.envKey)}">
         <label class="sniper-wallet-main">
@@ -501,7 +620,7 @@
             <div class="sniper-wallet-meta">
               <span>${escapeHTML(shortenAddress(wallet.publicKey || "invalid", 5))}</span>
               ${state.selected && !disabled ? `<span class="sniper-wallet-pill">${escapeHTML(getTriggerSummary(state))}</span>` : ""}
-              ${disabled ? "<span class=\"sniper-wallet-pill\">Deployer</span>" : ""}
+              ${disabledPill ? `<span class="sniper-wallet-pill">${escapeHTML(disabledPill)}</span>` : ""}
             </div>
           </div>
           <div class="sniper-wallet-balance">
@@ -509,6 +628,7 @@
             <span>${balanceSol == null ? "--" : Number(balanceSol).toFixed(3)}</span>
           </div>
         </label>
+        ${availabilityError ? `<div class="sniper-wallet-warning">${escapeHTML(availabilityError)}</div>` : ""}
         <div class="sniper-wallet-config"${!state.selected || disabled ? " hidden" : ""}>
           <div class="sniper-wallet-config-top">
             <label class="sniper-wallet-amount">
@@ -561,7 +681,7 @@
         </div>
       </div>
     `;
-      }).join("");
+      }).join("") + staleSelectedMarkup;
       if (global.RenderUtils && global.RenderUtils.setCachedHTML) {
         global.RenderUtils.setCachedHTML(renderCache, "sniperWalletList", sniperWalletList, markup);
       } else {
@@ -572,7 +692,7 @@
     function renderUI() {
       const hostState = getLaunchdeckHostConnectionState();
       const hostOffline = Boolean(hostState && hostState.checked && hostState.reachable === false);
-      applyStateToForm();
+      if (!modalOpen) applyStateToForm();
       renderButtonState();
       if (sniperHostBanner) {
         sniperHostBanner.hidden = !hostOffline;
@@ -590,6 +710,8 @@
 
     function showModal() {
       setModalError("");
+      committedSniperState = cloneDraftState(sniperState);
+      modalOpen = true;
       const appBootstrapState = getAppBootstrapState();
       if (!appBootstrapState.walletsLoaded) {
         metaNode.textContent = "Wallet balances are still loading.";
@@ -601,6 +723,10 @@
 
     function hideModal() {
       sniperModalOverlayPointerDown = false;
+      if (modalOpen) {
+        modalOpen = false;
+        restoreCommittedState();
+      }
       if (sniperModal) sniperModal.hidden = true;
     }
 
@@ -609,8 +735,45 @@
         enabled: false,
         wallets: {},
       };
-      applyStateToForm();
+      committedSniperState = cloneDraftState(sniperState);
+      commitState();
       renderUI();
+    }
+
+    function updateSaveState() {
+      if (sniperSave) sniperSave.disabled = validateState().length > 0;
+    }
+
+    function applyAutosellPatch(envKey, patch = {}, options = {}) {
+      const currentState = normalizeWalletState(sniperState.wallets[envKey] || {});
+      if (!currentState.selected) return false;
+      sniperState.wallets[envKey] = {
+        ...currentState,
+        ...patch,
+      };
+      setModalError("");
+      if (options.commit === true && !modalOpen) {
+        commitState();
+      } else {
+        updateSaveState();
+        if (typeof onStateChange === "function") onStateChange();
+      }
+      if (options.render !== false) renderUI();
+      return true;
+    }
+
+    function setWalletPatch(envKey, patch = {}, options = {}) {
+      sniperState.wallets[envKey] = {
+        ...normalizeWalletState(sniperState.wallets[envKey] || {}),
+        ...patch,
+      };
+      setModalError("");
+      if (options.commit === true && !modalOpen) {
+        commitState();
+      } else {
+        updateSaveState();
+      }
+      if (options.render !== false) renderUI();
     }
 
     function validateState() {
@@ -620,9 +783,21 @@
       const errors = [];
       const sniperAutosellMasterEnabled = isNamedChecked("automaticSniperSellEnabled");
       wallets.forEach((entry) => {
+        const availabilityError = getWalletAvailabilityError(entry.envKey);
+        if (availabilityError) {
+          errors.push(availabilityError);
+          return;
+        }
         const amount = Number(entry.amountSol);
         if (!entry.amountSol || !Number.isFinite(amount) || amount <= 0) {
           errors.push(`Sniper wallet #${walletIndexFromEnvKey(entry.envKey)} needs a positive buy amount.`);
+          return;
+        }
+        const wallet = getWalletByEnvKey(entry.envKey);
+        const spendableBalanceSol = getSpendableBalanceSol(wallet);
+        if (spendableBalanceSol != null && amount > spendableBalanceSol + 0.000001) {
+          errors.push(`Sniper wallet #${walletIndexFromEnvKey(entry.envKey)} amount exceeds spendable balance after fee reserve.`);
+          return;
         }
         const delayMs = Number(entry.submitDelayMs || 0);
         if (entry.targetBlockOffset != null) {
@@ -687,13 +862,9 @@
           if (!checkbox) return;
           const envKey = checkbox.getAttribute("data-sniper-wallet-checkbox");
           if (!envKey) return;
-          const currentState = normalizeWalletState(sniperState.wallets[envKey] || {});
-          sniperState.wallets[envKey] = {
-            ...currentState,
+          setWalletPatch(envKey, {
             selected: checkbox.checked,
-          };
-          setModalError("");
-          renderUI();
+          });
         });
         sniperWalletList.addEventListener("input", (event) => {
           const amountInput = event.target.closest("[data-sniper-wallet-amount]");
@@ -702,15 +873,11 @@
           if (!envKey) return;
           const normalized = normalizeDecimalInput(amountInput.value);
           amountInput.value = normalized;
-          sniperState.wallets[envKey] = {
-            ...normalizeWalletState(sniperState.wallets[envKey] || {}),
+          setWalletPatch(envKey, {
             selected: true,
             amountSol: normalized,
             triggerMode: normalizeTriggerMode((sniperState.wallets[envKey] && sniperState.wallets[envKey].triggerMode) || "block-offset"),
-          };
-          applyStateToForm();
-          renderButtonState();
-          setModalError("");
+          }, { render: false });
         });
         sniperWalletList.addEventListener("click", (event) => {
           const presetButton = event.target.closest("[data-sniper-preset]");
@@ -725,14 +892,11 @@
           const spendableBalance = getSpendableBalanceSol(wallet);
           if (spendableBalance == null) return;
           const amount = normalizeDecimalInput(String(floorDecimal(spendableBalance * ratio, 6)));
-          sniperState.wallets[envKey] = {
-            ...normalizeWalletState(sniperState.wallets[envKey] || {}),
+          setWalletPatch(envKey, {
             selected: true,
             amountSol: amount,
             triggerMode: normalizeTriggerMode((sniperState.wallets[envKey] && sniperState.wallets[envKey].triggerMode) || "block-offset"),
-          };
-          setModalError("");
-          renderUI();
+          });
         });
         sniperWalletList.addEventListener("input", (event) => {
           const delayInput = event.target.closest("[data-sniper-wallet-delay]");
@@ -740,14 +904,11 @@
           const envKey = delayInput.getAttribute("data-sniper-wallet-delay");
           if (!envKey) return;
           const normalizedDelayMs = normalizeDelayMs(delayInput.value);
-          sniperState.wallets[envKey] = {
-            ...normalizeWalletState(sniperState.wallets[envKey] || {}),
+          setWalletPatch(envKey, {
             selected: true,
             triggerMode: "on-submit",
             submitDelayMs: normalizedDelayMs,
-          };
-          applyStateToForm();
-          setModalError("");
+          }, { render: false });
           const valueLabel = delayInput
             .closest(".sniper-delay-slider-block")
             ?.querySelector(".auto-sell-slider-head strong");
@@ -758,15 +919,11 @@
           if (!delayInput) return;
           const envKey = delayInput.getAttribute("data-sniper-wallet-delay");
           if (!envKey) return;
-          sniperState.wallets[envKey] = {
-            ...normalizeWalletState(sniperState.wallets[envKey] || {}),
+          setWalletPatch(envKey, {
             selected: true,
             triggerMode: "on-submit",
             submitDelayMs: normalizeDelayMs(delayInput.value),
-          };
-          applyStateToForm();
-          setModalError("");
-          renderUI();
+          });
         });
         sniperWalletList.addEventListener("click", (event) => {
           const retryButton = event.target.closest("[data-sniper-wallet-retry]");
@@ -775,12 +932,9 @@
             const envKey = retryButton.getAttribute("data-sniper-wallet-retry");
             if (!envKey) return;
             const currentState = normalizeWalletState(sniperState.wallets[envKey] || {});
-            sniperState.wallets[envKey] = {
-              ...currentState,
+            setWalletPatch(envKey, {
               retryOnce: !currentState.retryOnce,
-            };
-            setModalError("");
-            renderUI();
+            });
             return;
           }
           const sellToggleButton = event.target.closest("[data-sniper-sell-toggle]");
@@ -789,14 +943,10 @@
             const envKey = sellToggleButton.getAttribute("data-sniper-sell-toggle");
             if (!envKey) return;
             const currentState = normalizeWalletState(sniperState.wallets[envKey] || {});
-            sniperState.wallets[envKey] = {
-              ...currentState,
-              selected: true,
+            applyAutosellPatch(envKey, {
               sellEnabled: !currentState.sellEnabled,
               sellPercent: currentState.sellPercent || "100",
-            };
-            setModalError("");
-            renderUI();
+            });
             return;
           }
           const triggerButton = event.target.closest("[data-sniper-trigger-mode]");
@@ -804,13 +954,10 @@
             const envKey = triggerButton.getAttribute("data-sniper-trigger-mode");
             const mode = triggerButton.getAttribute("data-sniper-trigger-value");
             if (!envKey) return;
-            sniperState.wallets[envKey] = {
-              ...normalizeWalletState(sniperState.wallets[envKey] || {}),
+            setWalletPatch(envKey, {
               selected: true,
               triggerMode: normalizeTriggerMode(mode),
-            };
-            setModalError("");
-            renderUI();
+            });
             return;
           }
           const sellTriggerButton = event.target.closest("[data-sniper-sell-trigger-mode]");
@@ -818,14 +965,10 @@
             const envKey = sellTriggerButton.getAttribute("data-sniper-sell-trigger-mode");
             const mode = sellTriggerButton.getAttribute("data-sniper-sell-trigger-value");
             if (!envKey) return;
-            sniperState.wallets[envKey] = {
-              ...normalizeWalletState(sniperState.wallets[envKey] || {}),
-              selected: true,
+            applyAutosellPatch(envKey, {
               sellEnabled: true,
               sellTriggerMode: normalizeSellTriggerMode(mode),
-            };
-            setModalError("");
-            renderUI();
+            });
             return;
           }
           const blockButton = event.target.closest("[data-sniper-block-offset]");
@@ -833,29 +976,22 @@
             const envKey = blockButton.getAttribute("data-sniper-block-offset");
             const value = blockButton.getAttribute("data-sniper-block-value");
             if (!envKey) return;
-            sniperState.wallets[envKey] = {
-              ...normalizeWalletState(sniperState.wallets[envKey] || {}),
+            setWalletPatch(envKey, {
               selected: true,
               triggerMode: "block-offset",
               targetBlockOffset: normalizeBuyBlockOffset(value),
-            };
-            setModalError("");
-            renderUI();
+            });
           }
           const sellBlockButton = event.target.closest("[data-sniper-sell-block-offset]");
           if (sellBlockButton) {
             const envKey = sellBlockButton.getAttribute("data-sniper-sell-block-offset");
             const value = sellBlockButton.getAttribute("data-sniper-sell-block-value");
             if (!envKey) return;
-            sniperState.wallets[envKey] = {
-              ...normalizeWalletState(sniperState.wallets[envKey] || {}),
-              selected: true,
+            applyAutosellPatch(envKey, {
               sellEnabled: true,
               sellTriggerMode: "block-offset",
               sellTargetBlockOffset: normalizeSellBlockOffset(value),
-            };
-            setModalError("");
-            renderUI();
+            });
           }
         });
         sniperWalletList.addEventListener("input", (event) => {
@@ -863,44 +999,32 @@
           if (sellPercentInput) {
             const envKey = sellPercentInput.getAttribute("data-sniper-sell-percent");
             if (!envKey) return;
-            sniperState.wallets[envKey] = {
-              ...normalizeWalletState(sniperState.wallets[envKey] || {}),
-              selected: true,
+            applyAutosellPatch(envKey, {
               sellEnabled: true,
               sellPercent: normalizeSellPercent(sellPercentInput.value),
-            };
-            applyStateToForm();
-            setModalError("");
+            }, { render: false });
             return;
           }
           const sellMarketThresholdInput = event.target.closest("[data-sniper-sell-market-cap-threshold]");
           if (sellMarketThresholdInput) {
             const envKey = sellMarketThresholdInput.getAttribute("data-sniper-sell-market-cap-threshold");
             if (!envKey) return;
-            sniperState.wallets[envKey] = {
-              ...normalizeWalletState(sniperState.wallets[envKey] || {}),
-              selected: true,
+            applyAutosellPatch(envKey, {
               sellEnabled: true,
               sellTriggerMode: "market-cap",
               sellMarketCapThreshold: String(sellMarketThresholdInput.value || "").trim(),
-            };
-            applyStateToForm();
-            setModalError("");
+            }, { render: false });
             return;
           }
           const sellMarketTimeoutInput = event.target.closest("[data-sniper-sell-market-cap-timeout]");
           if (sellMarketTimeoutInput) {
             const envKey = sellMarketTimeoutInput.getAttribute("data-sniper-sell-market-cap-timeout");
             if (!envKey) return;
-            sniperState.wallets[envKey] = {
-              ...normalizeWalletState(sniperState.wallets[envKey] || {}),
-              selected: true,
+            applyAutosellPatch(envKey, {
               sellEnabled: true,
               sellTriggerMode: "market-cap",
               sellMarketCapTimeoutSeconds: normalizeMarketCapTimeoutSeconds(sellMarketTimeoutInput.value),
-            };
-            applyStateToForm();
-            setModalError("");
+            }, { render: false });
           }
         });
         sniperWalletList.addEventListener("change", (event) => {
@@ -908,16 +1032,11 @@
           if (!sellMarketTimeoutAction) return;
           const envKey = sellMarketTimeoutAction.getAttribute("data-sniper-sell-market-cap-timeout-action");
           if (!envKey) return;
-          sniperState.wallets[envKey] = {
-            ...normalizeWalletState(sniperState.wallets[envKey] || {}),
-            selected: true,
+          applyAutosellPatch(envKey, {
             sellEnabled: true,
             sellTriggerMode: "market-cap",
             sellMarketCapTimeoutAction: normalizeMarketCapTimeoutAction(sellMarketTimeoutAction.value),
-          };
-          applyStateToForm();
-          setModalError("");
-          renderUI();
+          });
         });
       }
       if (sniperSave) {
@@ -928,6 +1047,8 @@
             return;
           }
           setModalError("");
+          modalOpen = false;
+          commitState();
           hideModal();
         });
       }
@@ -957,6 +1078,7 @@
       },
       setState(value) {
         sniperState = normalizeDraftState(value);
+        if (!modalOpen) committedSniperState = cloneDraftState(sniperState);
       },
       normalizeDraftState,
       getStoredDraft,
@@ -965,10 +1087,13 @@
       showModal,
       hideModal,
       validateState,
+      getWalletAvailabilityError,
       isSaveDisabled() {
         return validateState().length > 0;
       },
       applyStateToForm,
+      commitState,
+      applyAutosellPatch,
       setModalError,
       resetState,
     };

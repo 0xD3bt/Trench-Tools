@@ -129,7 +129,7 @@ use crate::{
     ui_config::{
         create_default_persistent_config, read_persistent_config, write_persistent_config,
     },
-    vamp::{fetch_imported_token_metadata, import_remote_image_to_library},
+    vamp::{fetch_imported_token_metadata, import_vamp_image_to_library},
     vanity_pool::{
         mark_vanity_reservation_used, preload_vanity_pool, refresh_vanity_pool_with_rpc,
         vanity_pool_status_payload,
@@ -2434,6 +2434,10 @@ fn standard_rpc_transport_plan(base: &TransportPlan, primary_rpc_url: &str) -> T
     plan
 }
 
+fn pre_launch_transport_plan(base: &TransportPlan, primary_rpc_url: &str) -> TransportPlan {
+    standard_rpc_transport_plan(base, primary_rpc_url)
+}
+
 fn build_buy_transport_plan(
     execution: &crate::config::NormalizedExecution,
     transaction_count: usize,
@@ -4381,6 +4385,7 @@ async fn execute_engine_action_payload(
     let NativeLaunchArtifacts {
         mut compiled_transactions,
         creation_transactions,
+        pre_launch_transactions,
         deferred_setup_transactions,
         setup_bundles,
         setup_transactions,
@@ -4402,6 +4407,8 @@ async fn execute_engine_action_payload(
         vec![selected_wallet_key.clone(); compiled_transactions.len()];
     let creation_transaction_wallet_keys =
         vec![selected_wallet_key.clone(); creation_transactions.len()];
+    let pre_launch_transaction_wallet_keys =
+        vec![selected_wallet_key.clone(); pre_launch_transactions.len()];
     let mut report_value = report;
     let text_value = Value::String(text);
     let assembly_executor = "rust-native".to_string();
@@ -4517,6 +4524,9 @@ async fn execute_engine_action_payload(
 
     if action == "simulate" {
         let mut simulation_transactions = compiled_transactions.clone();
+        if !pre_launch_transactions.is_empty() {
+            simulation_transactions = pre_launch_transactions.clone();
+        }
         if normalized.launchpad == "bagsapp"
             && (!setup_bundles.is_empty() || !setup_transactions.is_empty())
         {
@@ -4572,6 +4582,17 @@ async fn execute_engine_action_payload(
             simulation_transactions.push(launch_transaction);
         }
         let simulate_started_ms = current_time_ms();
+        if !pre_launch_transactions.is_empty() {
+            append_execution_warning(
+                &mut report_value,
+                "Simulation only ran the phased pre-launch funding transaction because Solana RPC does not apply its funded USDC state to the dependent launch simulation.",
+            );
+        }
+        let simulation_status = if !pre_launch_transactions.is_empty() {
+            "funding-only"
+        } else {
+            "full"
+        };
         let (simulation, warnings) = simulate_transactions(
             &configured_rpc_url(),
             &simulation_transactions,
@@ -4675,6 +4696,18 @@ async fn execute_engine_action_payload(
                 json!(warm_report.max_parallel_warm_fetches);
             execution["simulation"] =
                 serde_json::to_value(simulation).unwrap_or(Value::Array(vec![]));
+            execution["simulationStatus"] = json!(simulation_status);
+            execution["simulationPhases"] = if simulation_status == "funding-only" {
+                json!({
+                    "funding": "simulated",
+                    "launch": "not-simulated",
+                    "reason": "Solana RPC simulation does not apply funded USDC state to the dependent launch transaction."
+                })
+            } else {
+                json!({
+                    "launch": "simulated"
+                })
+            };
             let mut existing_warnings = execution
                 .get("warnings")
                 .and_then(Value::as_array)
@@ -5162,8 +5195,15 @@ async fn execute_engine_action_payload(
             }
         }
         if use_phased_follow_pipeline && !secure_hellomoon_bundle_transport {
-            compiled_transactions = creation_transactions.clone();
-            compiled_transaction_wallet_keys = creation_transaction_wallet_keys.clone();
+            if pre_launch_transactions.is_empty() {
+                compiled_transactions = creation_transactions.clone();
+                compiled_transaction_wallet_keys = creation_transaction_wallet_keys.clone();
+            } else {
+                compiled_transactions = pre_launch_transactions.clone();
+                compiled_transactions.extend(creation_transactions.clone());
+                compiled_transaction_wallet_keys = pre_launch_transaction_wallet_keys.clone();
+                compiled_transaction_wallet_keys.extend(creation_transaction_wallet_keys.clone());
+            }
         }
         if !same_time_snipes.is_empty() && !bags_same_time_compile_after_launch {
             let same_time_compile_started_ms = current_time_ms();
@@ -5245,7 +5285,25 @@ async fn execute_engine_action_payload(
                 reserved_follow_job = Some(reserved);
             }
         }
-        let launch_transaction_subscribe_account_required = compiled_transactions
+        let primary_launch_transactions = if pre_launch_transactions.is_empty() {
+            compiled_transactions.clone()
+        } else {
+            compiled_transactions
+                .iter()
+                .skip(pre_launch_transactions.len())
+                .cloned()
+                .collect()
+        };
+        let primary_launch_wallet_keys = if pre_launch_transactions.is_empty() {
+            compiled_transaction_wallet_keys.clone()
+        } else {
+            compiled_transaction_wallet_keys
+                .iter()
+                .skip(pre_launch_transactions.len())
+                .cloned()
+                .collect()
+        };
+        let launch_transaction_subscribe_account_required = primary_launch_transactions
             .first()
             .map(|transaction| {
                 derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64)
@@ -5261,7 +5319,49 @@ async fn execute_engine_action_payload(
                 })),
             )
         })?;
-        let submit_started_ms = current_time_ms();
+        let mut pre_launch_sent = Vec::new();
+        let mut pre_launch_submit_ms = 0u128;
+        let mut pre_launch_confirm_ms = 0u128;
+        let mut pre_launch_warnings = Vec::new();
+        if !pre_launch_transactions.is_empty() {
+            let pre_launch_transport_plan = pre_launch_transport_plan(&transport_plan, &rpc_url);
+            match send_transactions_sequential_for_transport(
+                &rpc_url,
+                &pre_launch_transport_plan,
+                &pre_launch_transactions,
+                &normalized.execution.commitment,
+                normalized.execution.skipPreflight,
+                normalized.execution.trackSendBlockHeight,
+                None,
+            )
+            .await
+            {
+                Ok((sent, warnings, timing)) => {
+                    pre_launch_sent = sent;
+                    pre_launch_warnings = warnings;
+                    pre_launch_submit_ms = timing.submit_ms;
+                    pre_launch_confirm_ms = timing.confirm_ms;
+                }
+                Err(error) => {
+                    cancel_reserved_follow_job_on_launch_failure(
+                        follow_daemon_client.as_ref(),
+                        &mut reserve_follow_job_task,
+                        &trace.traceId,
+                        &format!("Pre-launch USDC funding failed: {error}"),
+                    )
+                    .await;
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Pre-launch USDC funding failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    ));
+                }
+            }
+        }
+        let launch_submit_started_ms = current_time_ms();
         let (mut launch_sent, mut warnings, submit_ms) = if same_time_independent_compiled
             .is_empty()
         {
@@ -5269,7 +5369,7 @@ async fn execute_engine_action_payload(
                 match send_transactions_sequential_for_transport(
                     &rpc_url,
                     &transport_plan,
-                    &compiled_transactions,
+                    &primary_launch_transactions,
                     &normalized.execution.commitment,
                     false,
                     normalized.execution.trackSendBlockHeight,
@@ -5304,7 +5404,7 @@ async fn execute_engine_action_payload(
                 match submit_transactions_for_transport(
                     &rpc_url,
                     &transport_plan,
-                    &compiled_transactions,
+                    &primary_launch_transactions,
                     &normalized.execution.commitment,
                     normalized.execution.skipPreflight,
                     normalized.execution.trackSendBlockHeight,
@@ -5336,7 +5436,7 @@ async fn execute_engine_action_payload(
                 match submit_transactions_for_transport(
                     &rpc_url,
                     &transport_plan,
-                    &compiled_transactions,
+                    &primary_launch_transactions,
                     &normalized.execution.commitment,
                     normalized.execution.skipPreflight,
                     normalized.execution.trackSendBlockHeight,
@@ -5395,13 +5495,13 @@ async fn execute_engine_action_payload(
             (
                 launch_sent,
                 launch_warnings,
-                current_time_ms().saturating_sub(submit_started_ms),
+                current_time_ms().saturating_sub(launch_submit_started_ms),
             )
         } else {
             let launch_submit = submit_transactions_for_transport(
                 &rpc_url,
                 &transport_plan,
-                &compiled_transactions,
+                &primary_launch_transactions,
                 &normalized.execution.commitment,
                 normalized.execution.skipPreflight,
                 normalized.execution.trackSendBlockHeight,
@@ -5455,12 +5555,17 @@ async fn execute_engine_action_payload(
             (
                 launch_sent,
                 launch_warnings,
-                current_time_ms().saturating_sub(submit_started_ms),
+                current_time_ms().saturating_sub(launch_submit_started_ms),
             )
         };
         if !bags_setup_warnings.is_empty() {
             let launch_warnings = std::mem::take(&mut warnings);
             warnings = bags_setup_warnings;
+            warnings.extend(launch_warnings);
+        }
+        if !pre_launch_warnings.is_empty() {
+            let launch_warnings = std::mem::take(&mut warnings);
+            warnings = pre_launch_warnings;
             warnings.extend(launch_warnings);
         }
         let launch_signature = match launch_sent
@@ -5486,7 +5591,7 @@ async fn execute_engine_action_payload(
                 ));
             }
         };
-        let launch_submit_at_ms = submit_started_ms.saturating_add(submit_ms);
+        let launch_submit_at_ms = launch_submit_started_ms.saturating_add(submit_ms);
         let launch_send_observed_slot = launch_sent
             .first()
             .and_then(|result| result.sendObservedSlot);
@@ -5737,6 +5842,8 @@ async fn execute_engine_action_payload(
             bags_setup_submit_ms
                 .saturating_add(bags_setup_gate_ms)
                 .saturating_add(bags_launch_build_ms)
+                .saturating_add(pre_launch_submit_ms)
+                .saturating_add(pre_launch_confirm_ms)
                 .saturating_add(submit_ms)
                 .saturating_add(launch_transport_confirm_ms),
         );
@@ -5745,15 +5852,28 @@ async fn execute_engine_action_payload(
             "sendSubmitMs",
             bags_setup_submit_ms
                 .saturating_add(bags_launch_build_ms)
+                .saturating_add(pre_launch_submit_ms)
                 .saturating_add(submit_ms),
         );
-        set_report_timing(&mut report, "sendTransportSubmitMs", submit_ms);
-        set_report_timing(&mut report, "sendConfirmMs", launch_transport_confirm_ms);
+        set_report_timing(
+            &mut report,
+            "sendTransportSubmitMs",
+            pre_launch_submit_ms.saturating_add(submit_ms),
+        );
+        set_report_timing(
+            &mut report,
+            "sendConfirmMs",
+            pre_launch_confirm_ms.saturating_add(launch_transport_confirm_ms),
+        );
         set_report_timing(
             &mut report,
             "sendTransportConfirmMs",
-            launch_transport_confirm_ms,
+            pre_launch_confirm_ms.saturating_add(launch_transport_confirm_ms),
         );
+        if pre_launch_submit_ms > 0 || pre_launch_confirm_ms > 0 {
+            set_report_timing(&mut report, "preLaunchSubmitMs", pre_launch_submit_ms);
+            set_report_timing(&mut report, "preLaunchConfirmMs", pre_launch_confirm_ms);
+        }
         set_optional_report_timing(
             &mut report,
             "followDaemonReserveMs",
@@ -5954,7 +6074,7 @@ async fn execute_engine_action_payload(
         record_launchdeck_coin_trades_best_effort(
             &trace.traceId,
             &launch_sent,
-            &compiled_transaction_wallet_keys,
+            &primary_launch_wallet_keys,
             &compiled_mint,
             "launch-send",
         )
@@ -5968,6 +6088,7 @@ async fn execute_engine_action_payload(
         )
         .await;
         let mut sent = bags_setup_sent;
+        sent.append(&mut pre_launch_sent);
         sent.append(&mut launch_sent);
         sent.append(&mut same_time_sent);
         warnings.extend(confirm_warnings);
@@ -5978,6 +6099,8 @@ async fn execute_engine_action_payload(
             bags_setup_submit_ms
                 .saturating_add(bags_setup_gate_ms)
                 .saturating_add(bags_launch_build_ms)
+                .saturating_add(pre_launch_submit_ms)
+                .saturating_add(pre_launch_confirm_ms)
                 .saturating_add(submit_ms)
                 .saturating_add(confirm_ms),
         );
@@ -5986,13 +6109,30 @@ async fn execute_engine_action_payload(
             "sendSubmitMs",
             bags_setup_submit_ms
                 .saturating_add(bags_launch_build_ms)
+                .saturating_add(pre_launch_submit_ms)
                 .saturating_add(submit_ms),
         );
-        set_report_timing(&mut report, "sendTransportSubmitMs", submit_ms);
-        set_report_timing(&mut report, "sendConfirmMs", confirm_ms);
-        set_report_timing(&mut report, "sendTransportConfirmMs", confirm_ms);
+        set_report_timing(
+            &mut report,
+            "sendTransportSubmitMs",
+            pre_launch_submit_ms.saturating_add(submit_ms),
+        );
+        set_report_timing(
+            &mut report,
+            "sendConfirmMs",
+            pre_launch_confirm_ms.saturating_add(confirm_ms),
+        );
+        set_report_timing(
+            &mut report,
+            "sendTransportConfirmMs",
+            pre_launch_confirm_ms.saturating_add(confirm_ms),
+        );
         set_report_timing(&mut report, "sendCreationSubmitMs", submit_ms);
         set_report_timing(&mut report, "sendCreationConfirmMs", confirm_ms);
+        if pre_launch_submit_ms > 0 || pre_launch_confirm_ms > 0 {
+            set_report_timing(&mut report, "preLaunchSubmitMs", pre_launch_submit_ms);
+            set_report_timing(&mut report, "preLaunchConfirmMs", pre_launch_confirm_ms);
+        }
         if bags_setup_submit_ms > 0 || bags_setup_gate_ms > 0 {
             set_report_timing(&mut report, "bagsSetupSubmitMs", bags_setup_submit_ms);
             set_report_timing(&mut report, "bagsSetupConfirmMs", bags_setup_gate_ms);
@@ -6049,7 +6189,7 @@ async fn execute_engine_action_payload(
         set_report_timing(&mut report, "totalElapsedMs", backend_elapsed_ms);
         attach_follow_daemon_report(
             &mut report,
-            if deferred_follow_launch.enabled {
+            if should_reserve_deferred_follow_job {
                 Some(follow_daemon_transport.as_str())
             } else {
                 None
@@ -6148,7 +6288,7 @@ async fn execute_engine_action_payload(
                 "warnings": post_send_warnings,
                 "errors": send_phase_errors,
             },
-            "followDaemonTransport": if deferred_follow_launch.enabled {
+            "followDaemonTransport": if should_reserve_deferred_follow_job {
                 Some(follow_daemon_transport)
             } else {
                 None::<String>
@@ -8069,7 +8209,7 @@ async fn api_vamp_import(
     }
     if !image_candidates.is_empty() {
         for candidate in image_candidates {
-            match import_remote_image_to_library(
+            match import_vamp_image_to_library(
                 &candidate,
                 &format!(
                     "{}-vamp",
@@ -8405,6 +8545,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_modes_preserve_legacy_post_setup_creator_vault_matrix() {
+        assert!(launch_prefers_post_setup_creator_vault_for_follow(
+            "pump",
+            "agent-custom",
+            false,
+            false
+        ));
+        assert!(launch_prefers_post_setup_creator_vault_for_follow(
+            "pump",
+            "agent-locked",
+            false,
+            false
+        ));
+        assert!(!launch_prefers_post_setup_creator_vault_for_follow(
+            "pump",
+            "agent-unlocked",
+            false,
+            false
+        ));
+        assert!(!launch_prefers_post_setup_creator_vault_for_follow(
+            "pump", "cashback", true, true
+        ));
+    }
+
+    #[test]
     fn same_time_split_preserves_launch_buy_and_retry_fallback() {
         let follow_launch = NormalizedFollowLaunch {
             enabled: true,
@@ -8634,6 +8799,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,

@@ -20,8 +20,6 @@ pub struct RouteIndexKey {
     pub submitted_address: String,
     pub rpc_url: String,
     pub commitment: String,
-    pub side: String,
-    pub route_policy: String,
     pub pinned_pool: Option<String>,
     pub allow_non_canonical: bool,
     pub policy_version: String,
@@ -32,8 +30,6 @@ impl RouteIndexKey {
         submitted_address: &str,
         rpc_url: &str,
         commitment: &str,
-        side: &str,
-        route_policy: &str,
         pinned_pool: Option<&str>,
         allow_non_canonical: bool,
     ) -> Self {
@@ -41,8 +37,6 @@ impl RouteIndexKey {
             submitted_address: submitted_address.trim().to_string(),
             rpc_url: rpc_url.trim().to_string(),
             commitment: commitment.trim().to_ascii_lowercase(),
-            side: side.trim().to_ascii_lowercase(),
-            route_policy: route_policy.trim().to_ascii_lowercase(),
             pinned_pool: pinned_pool
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -133,6 +127,35 @@ impl RouteIndex {
         self.entries.write().await.remove(key);
     }
 
+    pub async fn invalidate_route_input(
+        &self,
+        rpc_url: &str,
+        commitment: &str,
+        submitted_address: &str,
+        pinned_pool: Option<&str>,
+        allow_non_canonical: bool,
+    ) {
+        let normalized_rpc = rpc_url.trim().to_string();
+        let normalized_commitment = commitment.trim().to_ascii_lowercase();
+        let submitted_address = submitted_address.trim().to_string();
+        let pinned_pool = pinned_pool
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.entries.write().await.retain(|key, entry| {
+            if key.rpc_url != normalized_rpc
+                || key.commitment != normalized_commitment
+                || key.allow_non_canonical != allow_non_canonical
+            {
+                return true;
+            }
+            !route_input_matches_entry(&submitted_address, key, entry)
+                && pinned_pool
+                    .as_deref()
+                    .is_none_or(|pool| !route_input_matches_entry(pool, key, entry))
+        });
+    }
+
     pub async fn invalidate_pre_migration_for_mint(
         &self,
         rpc_url: &str,
@@ -184,6 +207,16 @@ fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn route_input_matches_entry(input: &str, key: &RouteIndexKey, entry: &RouteIndexEntry) -> bool {
+    let input = input.trim();
+    !input.is_empty()
+        && (key.submitted_address == input
+            || key.pinned_pool.as_deref() == Some(input)
+            || entry.resolved_mint == input
+            || entry.resolved_pool.as_deref() == Some(input)
+            || entry.selector.canonical_market_key == input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,48 +255,16 @@ mod tests {
     }
 
     #[test]
-    fn route_index_key_includes_transport_and_side_policy() {
-        let buy = RouteIndexKey::new(
-            "Mint111",
-            "https://rpc-a",
-            "CONFIRMED",
-            "buy",
-            "buy:sol_only",
-            None,
-            false,
-        );
-        let usd1_buy = RouteIndexKey::new(
-            "Mint111",
-            "https://rpc-a",
-            "confirmed",
-            "buy",
-            "buy:usd1_only",
-            None,
-            false,
-        );
-        let sell = RouteIndexKey::new(
-            "Mint111",
-            "https://rpc-a",
-            "confirmed",
-            "sell",
-            "sell:sol",
-            None,
-            false,
-        );
-        let other_rpc = RouteIndexKey::new(
-            "Mint111",
-            "https://rpc-b",
-            "confirmed",
-            "buy",
-            "buy:sol_only",
-            None,
-            false,
-        );
+    fn route_index_key_ignores_side_policy_but_keeps_transport() {
+        let buy = RouteIndexKey::new("Mint111", "https://rpc-a", "CONFIRMED", None, false);
+        let usd1_buy = RouteIndexKey::new("Mint111", "https://rpc-a", "confirmed", None, false);
+        let sell = RouteIndexKey::new("Mint111", "https://rpc-a", "confirmed", None, false);
+        let other_rpc = RouteIndexKey::new("Mint111", "https://rpc-b", "confirmed", None, false);
 
         assert_eq!(buy.commitment, "confirmed");
         assert_eq!(buy.policy_version, ROUTE_INDEX_POLICY_VERSION);
-        assert_ne!(buy, usd1_buy);
-        assert_ne!(buy, sell);
+        assert_eq!(buy, usd1_buy);
+        assert_eq!(buy, sell);
         assert_ne!(buy, other_rpc);
     }
 
@@ -300,15 +301,7 @@ mod tests {
     #[tokio::test]
     async fn finish_flight_removes_completed_lock() {
         let index = RouteIndex::default();
-        let key = RouteIndexKey::new(
-            "Mint111",
-            "https://rpc-a",
-            "confirmed",
-            "buy",
-            "buy:sol_only",
-            None,
-            false,
-        );
+        let key = RouteIndexKey::new("Mint111", "https://rpc-a", "confirmed", None, false);
         let lock = index.flight_lock(&key).await;
         {
             let _guard = lock.lock().await;
@@ -323,15 +316,7 @@ mod tests {
     #[tokio::test]
     async fn finish_flight_keeps_lock_while_waiters_hold_clones() {
         let index = RouteIndex::default();
-        let key = RouteIndexKey::new(
-            "Mint111",
-            "https://rpc-a",
-            "confirmed",
-            "buy",
-            "buy:sol_only",
-            None,
-            false,
-        );
+        let key = RouteIndexKey::new("Mint111", "https://rpc-a", "confirmed", None, false);
         let lock = index.flight_lock(&key).await;
         let waiter = lock.clone();
 
@@ -344,5 +329,54 @@ mod tests {
         index.finish_flight(&key, &lock).await;
         let next = index.flight_lock(&key).await;
         assert!(!std::sync::Arc::ptr_eq(&lock, &next));
+    }
+
+    #[tokio::test]
+    async fn invalidate_route_input_removes_all_aliases_for_same_entry() {
+        let index = RouteIndex::default();
+        let plan = plan(TradeLifecycle::PostMigration);
+        index
+            .insert_plan(
+                RouteIndexKey::new("Mint111", "https://rpc-a", "confirmed", None, false),
+                &plan,
+                "test",
+            )
+            .await;
+        index
+            .insert_plan(
+                RouteIndexKey::new("Pool111", "https://rpc-a", "confirmed", None, false),
+                &plan,
+                "test",
+            )
+            .await;
+
+        index
+            .invalidate_route_input("https://rpc-a", "confirmed", "Mint111", None, false)
+            .await;
+
+        assert!(
+            index
+                .current(&RouteIndexKey::new(
+                    "Mint111",
+                    "https://rpc-a",
+                    "confirmed",
+                    None,
+                    false
+                ))
+                .await
+                .is_none()
+        );
+        assert!(
+            index
+                .current(&RouteIndexKey::new(
+                    "Pool111",
+                    "https://rpc-a",
+                    "confirmed",
+                    None,
+                    false
+                ))
+                .await
+                .is_none()
+        );
     }
 }

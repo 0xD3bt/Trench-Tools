@@ -11,7 +11,6 @@ const TOKEN_NAME_MAX_LENGTH: usize = 32;
 const TOKEN_SYMBOL_MAX_LENGTH: usize = 10;
 const MAX_FEE_SPLIT_RECIPIENTS: usize = 10;
 const DEFAULT_LAUNCH_COMPUTE_UNIT_LIMIT: u64 = 340_000;
-const DEFAULT_AGENT_SETUP_COMPUTE_UNIT_LIMIT: u64 = 280_000;
 const DEFAULT_FOLLOW_UP_COMPUTE_UNIT_LIMIT: u64 = 280_000;
 const DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT: u64 = 280_000;
 const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 280_000;
@@ -558,12 +557,12 @@ pub fn launch_follow_up_label(config: &NormalizedConfig) -> Option<&'static str>
             Some("follow-up")
         }
         "agent-custom"
-            if config.agent.splitAgentInit
-                && (config.agent.buybackBps.unwrap_or(0) > 0
-                    || !config.agent.feeRecipients.is_empty()) =>
+            if config.agent.buybackBps.unwrap_or(0) > 0
+                || !config.agent.feeRecipients.is_empty() =>
         {
             Some("agent-setup")
         }
+        "agent-unlocked" => Some("agent-setup"),
         "agent-locked" => Some("agent-setup"),
         _ => None,
     }
@@ -757,13 +756,6 @@ pub fn configured_default_launch_compute_unit_limit() -> u64 {
     configured_compute_unit_limit_env(
         "LAUNCHDECK_LAUNCH_COMPUTE_UNIT_LIMIT",
         DEFAULT_LAUNCH_COMPUTE_UNIT_LIMIT,
-    )
-}
-
-pub fn configured_default_agent_setup_compute_unit_limit() -> u64 {
-    configured_compute_unit_limit_env(
-        "LAUNCHDECK_AGENT_SETUP_COMPUTE_UNIT_LIMIT",
-        DEFAULT_AGENT_SETUP_COMPUTE_UNIT_LIMIT,
     )
 }
 
@@ -2154,12 +2146,17 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             "execution.buy",
         )?;
     }
-    if normalized
+    let any_follow_sell_enabled = normalized
         .followLaunch
         .devAutoSell
         .as_ref()
         .is_some_and(|sell| sell.enabled)
-    {
+        || normalized
+            .followLaunch
+            .snipes
+            .iter()
+            .any(|snipe| snipe.postBuySell.as_ref().is_some_and(|sell| sell.enabled));
+    if any_follow_sell_enabled {
         validate_manual_provider_fee_fields(
             &normalized.execution.sellProvider,
             normalized.execution.sellAutoGas,
@@ -2312,7 +2309,6 @@ mod tests {
         }
 
         assert_eq!(configured_default_launch_compute_unit_limit(), 340_000);
-        assert_eq!(configured_default_agent_setup_compute_unit_limit(), 280_000);
         assert_eq!(configured_default_follow_up_compute_unit_limit(), 280_000);
         assert_eq!(configured_default_sniper_buy_compute_unit_limit(), 280_000);
         assert_eq!(
@@ -2780,6 +2776,36 @@ mod tests {
     }
 
     #[test]
+    fn manual_helius_sniper_post_buy_sell_requires_explicit_sell_values() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch.enabled = Some(json!(true));
+        raw.followLaunch.snipes = vec![RawFollowLaunchSnipe {
+            enabled: Some(json!(true)),
+            walletEnvKey: "SOLANA_PRIVATE_KEY2".to_string(),
+            buyAmountSol: "0.1".to_string(),
+            postBuySell: Some(RawFollowLaunchSell {
+                enabled: Some(json!(true)),
+                percent: Some(json!(75)),
+                targetBlockOffset: Some(json!(0)),
+                ..RawFollowLaunchSell::default()
+            }),
+            ..RawFollowLaunchSnipe::default()
+        }];
+        raw.execution.sellProvider = "helius-sender".to_string();
+        raw.execution.sellAutoGas = Some(json!(false));
+        raw.execution.sellPriorityFeeSol = String::new();
+        raw.execution.sellTipSol = String::new();
+
+        let error = normalize_raw_config(raw)
+            .expect_err("manual helius sniper sell fees should be required");
+
+        assert_eq!(
+            error.to_string(),
+            "execution.sellPriorityFeeSol and execution.sellTipSol are required when execution.sellProvider is helius-sender and execution.sellAutoGas is false."
+        );
+    }
+
+    #[test]
     fn rejects_removed_auto_provider_values() {
         let mut raw = sample_raw_config();
         raw.execution.provider = "auto".to_string();
@@ -3025,6 +3051,7 @@ mod tests {
     #[test]
     fn normalizes_sniper_post_buy_sell_block_offset_trigger() {
         let mut raw = sample_raw_config();
+        raw.execution.sellProvider = "standard-rpc".to_string();
         raw.followLaunch = serde_json::from_value(json!({
             "enabled": true,
             "schemaVersion": 1,

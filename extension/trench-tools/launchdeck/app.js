@@ -2385,6 +2385,7 @@ const formDomain = FormDomainModule.createFormDomain({
   collectSubmittedFeeSplitRecipients,
   getImportedCreatorFeeState: () => importedCreatorFeeState,
   getLaunchpadUiCapabilities,
+  supportsQuoteAssetForMode,
   getAutoSellTriggerFamily,
   getAutoSellTriggerMode,
   getAutoSellDelayMs,
@@ -2642,9 +2643,14 @@ function getSniperAutosellRows() {
     .filter(([, entry]) => entry && entry.selected)
     .map(([envKey, entry]) => {
       const wallet = wallets.find((candidate) => candidate && candidate.envKey === envKey) || null;
+      const availabilityError = sniperFeature && typeof sniperFeature.getWalletAvailabilityError === "function"
+        ? sniperFeature.getWalletAvailabilityError(envKey)
+        : "";
       return {
         envKey,
         walletLabel: wallet ? walletDisplayName(wallet) : `#${walletIndexFromEnvKey(envKey)}`,
+        valid: !availabilityError,
+        validationError: availabilityError,
         buyAmountValue: entry.amountSol ? String(entry.amountSol) : "",
         buyAmountAssetLabel: getQuoteAssetLabel(),
         sellEnabled: Boolean(entry.sellEnabled),
@@ -2660,18 +2666,12 @@ function getSniperAutosellRows() {
     });
 }
 
-function updateSniperAutosellWallet(envKey, patch = {}) {
-  const state = normalizeSniperDraftState(sniperFeature.getState());
-  const current = state.wallets && state.wallets[envKey] ? state.wallets[envKey] : {};
-  if (!state.wallets) state.wallets = {};
-  state.wallets[envKey] = {
-    ...current,
-    selected: true,
-    ...patch,
-  };
-  sniperFeature.setState(state);
-  sniperFeature.applyStateToForm();
-  sniperFeature.renderUI();
+function updateSniperAutosellWallet(envKey, patch = {}, options = {}) {
+  if (!sniperFeature || typeof sniperFeature.applyAutosellPatch !== "function") return false;
+  return sniperFeature.applyAutosellPatch(envKey, patch, {
+    render: options.render,
+    commit: true,
+  });
 }
 
 function updateDescriptionDisclosure() {
@@ -3672,11 +3672,47 @@ function normalizeQuoteAsset(value) {
   return "sol";
 }
 
+function rawQuoteAsset(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isKnownQuoteAsset(value) {
+  return ["sol", "usdc", "usd1"].includes(rawQuoteAsset(value));
+}
+
+function supportsQuoteAssetForMode(launchpad = getLaunchpad(), mode = getMode(), quoteAsset = getQuoteAsset()) {
+  const normalizedLaunchpad = normalizeLaunchpad(launchpad);
+  const normalizedMode = normalizeLaunchMode(mode);
+  const asset = rawQuoteAsset(quoteAsset) || "sol";
+  if (normalizedLaunchpad === "pump") {
+    return ["regular", "cashback", "agent-custom", "agent-unlocked", "agent-locked"].includes(normalizedMode)
+      && ["sol", "usdc"].includes(asset);
+  }
+  if (normalizedLaunchpad === "bonk") {
+    return ["regular", "bonkers"].includes(normalizedMode) && ["sol", "usd1"].includes(asset);
+  }
+  return asset === "sol";
+}
+
+function supportsQuoteAssetToggleForMode(launchpad = getLaunchpad(), mode = getMode()) {
+  const normalizedLaunchpad = normalizeLaunchpad(launchpad);
+  const normalizedMode = normalizeLaunchMode(mode);
+  if (normalizedLaunchpad === "pump") {
+    return ["regular", "cashback", "agent-custom", "agent-unlocked", "agent-locked"].includes(normalizedMode);
+  }
+  if (normalizedLaunchpad === "bonk") {
+    return ["regular", "bonkers"].includes(normalizedMode);
+  }
+  return false;
+}
+
 function getQuoteAsset() {
   const launchpad = getLaunchpad();
-  const asset = normalizeQuoteAsset(getNamedValue("quoteAsset"));
-  if (launchpad === "pump") return asset === "usdc" ? "usdc" : "sol";
-  if (launchpad === "bonk") return asset === "usd1" ? "usd1" : "sol";
+  const rawAsset = rawQuoteAsset(getNamedValue("quoteAsset"));
+  if (rawAsset && !isKnownQuoteAsset(rawAsset)) return rawAsset;
+  const asset = normalizeQuoteAsset(rawAsset);
+  if (supportsQuoteAssetForMode(launchpad, getMode(), asset)) return asset;
+  if (rawAsset) return rawAsset;
   return "sol";
 }
 
@@ -3701,15 +3737,12 @@ function getQuoteAssetButtonLabel(asset = getQuoteAsset()) {
 function syncBonkQuoteAssetUI() {
   const launchpad = getLaunchpad();
   const mode = getMode();
-  const visible = (launchpad === "pump" && ["regular", "cashback"].includes(mode))
-    || (launchpad === "bonk" && ["regular", "bonkers"].includes(mode));
+  const visible = supportsQuoteAssetToggleForMode(launchpad, mode);
   const stored = launchpad === "pump" ? getStoredPumpQuoteAsset() : getStoredBonkQuoteAsset();
-  const rawCurrent = String(getNamedValue("quoteAsset") || "").trim().toLowerCase();
-  const current = rawCurrent === "usd1" || rawCurrent === "usdc" || rawCurrent === "sol" ? rawCurrent : "";
-  const currentMatchesLaunchpad = (launchpad === "pump" && (current === "usdc" || current === "sol"))
-    || (launchpad === "bonk" && (current === "usd1" || current === "sol"));
+  const current = rawQuoteAsset(getNamedValue("quoteAsset"));
+  const currentMatchesLaunchpad = isKnownQuoteAsset(current) && supportsQuoteAssetForMode(launchpad, mode, current);
   const asset = !visible
-    ? "sol"
+    ? (currentMatchesLaunchpad ? normalizeQuoteAsset(current) : "sol")
     : launchpad === "pump"
       ? normalizeStoredPumpQuoteAsset((currentMatchesLaunchpad ? current : "") || stored || "sol")
       : normalizeStoredBonkQuoteAsset((currentMatchesLaunchpad ? current : "") || stored || "sol");
@@ -3717,6 +3750,7 @@ function syncBonkQuoteAssetUI() {
   if (bonkQuoteAssetToggle) bonkQuoteAssetToggle.hidden = !visible;
   if (bonkQuoteAssetToggle) bonkQuoteAssetToggle.disabled = !visible;
   if (bonkQuoteAssetToggle) {
+    bonkQuoteAssetToggle.dataset.quoteAsset = asset;
     const nextAsset = launchpad === "pump"
       ? (asset === "usdc" ? "solana" : "usdc")
       : (asset === "usd1" ? "solana" : "usd1");
@@ -3791,9 +3825,18 @@ function applyImportedLaunchContext(token = {}) {
   withSuspendedFeeSplitDraftPersistence(() => {
     setLaunchpad(launchpad, { resetMode: true, persistMode: false });
   });
-  setMode(token.mode || defaultLaunchModeForLaunchpad(launchpad));
+  const importedMode = normalizeLaunchModeForLaunchpad(token.mode || defaultLaunchModeForLaunchpad(launchpad), launchpad);
+  setMode(importedMode);
+  const importedQuoteAsset = rawQuoteAsset(token.quoteAsset || "sol") || "sol";
   if (launchpad === "pump" || launchpad === "bonk") {
-    setNamedValue("quoteAsset", normalizeQuoteAsset(token.quoteAsset || "sol"));
+    if (supportsQuoteAssetForMode(launchpad, importedMode, importedQuoteAsset)) {
+      setNamedValue("quoteAsset", normalizeQuoteAsset(importedQuoteAsset));
+    } else {
+      setNamedValue("quoteAsset", importedQuoteAsset);
+      if (metaNode) {
+        metaNode.textContent = `${getQuoteAssetLabel(importedQuoteAsset)} quote asset is not supported for ${launchpad} ${importedMode}.`;
+      }
+    }
   } else {
     setNamedValue("quoteAsset", "sol");
   }
@@ -3817,7 +3860,7 @@ function getLaunchpadUiCapabilities(launchpad = getLaunchpad()) {
   const supportsStrategies = entry && entry.supportsStrategies ? entry.supportsStrategies : {};
   if (launchpad === "pump") {
     return {
-      allowedModes: ["regular", "cashback", "agent-custom", "agent-unlocked", "agent-locked"],
+      allowedModes: ["regular", "cashback", "agent-locked"],
       mayhem: true,
       feeSplit: true,
       vanity: true,
@@ -5982,7 +6025,7 @@ function buildDeployPreviewHTML() {
     cashback: "Cashback",
     "agent-custom": "Agent Custom",
     "agent-unlocked": "Agent Unlocked",
-    "agent-locked": "Agent Locked",
+    "agent-locked": "Agent",
     "bags-2-2": "2% / 2%",
     "bags-025-1": "0.25% / 1%",
     "bags-1-025": "1% / 0.25%",
@@ -5990,7 +6033,7 @@ function buildDeployPreviewHTML() {
 
   let feesText = "Default (deployer)";
   if (f.mode === "cashback") feesText = "Cashback to traders";
-  else if (f.mode === "agent-locked") feesText = "Agent escrow (locked)";
+  else if (f.mode === "agent-locked") feesText = "Agent escrow";
   else if (f.mode === "agent-custom") {
     const parts = (f.agentSplitRecipients || []).map((entry) => {
       const share = (Number(entry.shareBps || 0) / 100).toFixed(2).replace(/\.00$/, "");
@@ -6892,7 +6935,7 @@ function buildSniperWalletStateFromLaunch(launch) {
         ? entry.postBuySell.targetBlockOffset
         : 0,
       sellMarketCapThreshold: entry.postBuySell && entry.postBuySell.marketCap && entry.postBuySell.marketCap.threshold
-        ? String(entry.postBuySell.marketCap.threshold)
+        ? formatSavedMarketCapThresholdForUi(entry.postBuySell.marketCap.threshold)
         : "",
       sellMarketCapTimeoutSeconds: entry.postBuySell && entry.postBuySell.marketCap
         && (entry.postBuySell.marketCap.scanTimeoutSeconds != null || entry.postBuySell.marketCap.scanTimeoutMinutes != null)

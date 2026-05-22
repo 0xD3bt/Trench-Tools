@@ -86,7 +86,10 @@ fn object_value(value: Option<&Value>) -> Value {
 }
 
 fn raw_string_value(value: Option<&Value>) -> String {
-    value.and_then(Value::as_str).unwrap_or_default().to_string()
+    value
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn raw_string_value_or_fallback(value: Option<&Value>, fallback: Option<&Value>) -> String {
@@ -358,7 +361,11 @@ fn default_name_preset_buttons() -> Vec<Value> {
     ]
 }
 
-fn normalize_name_preset_button(raw: Option<&Value>, fallback: Option<&Value>, index: usize) -> Value {
+fn normalize_name_preset_button(
+    raw: Option<&Value>,
+    fallback: Option<&Value>,
+    index: usize,
+) -> Value {
     let raw = raw.unwrap_or(&Value::Null);
     let fallback = fallback.unwrap_or(&Value::Null);
     let ticker_abbreviate = bool_value(
@@ -396,7 +403,9 @@ fn normalize_name_preset_buttons(raw: Option<&Value>) -> Vec<Value> {
     raw_items
         .iter()
         .enumerate()
-        .map(|(index, entry)| normalize_name_preset_button(Some(entry), fallbacks.get(index), index))
+        .map(|(index, entry)| {
+            normalize_name_preset_button(Some(entry), fallbacks.get(index), index)
+        })
         .collect()
 }
 

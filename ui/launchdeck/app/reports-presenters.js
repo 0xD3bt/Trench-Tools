@@ -920,7 +920,7 @@
       const normalized = String(label || "").trim();
       if (!normalized) return "transaction";
       if (normalized === "follow-up") return "fee-sharing setup";
-      if (normalized === "agent-setup") return "agent fee setup";
+      if (normalized === "agent-setup") return "agent setup";
       return normalized;
     }
 

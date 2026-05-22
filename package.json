@@ -1,6 +1,6 @@
 {
   "name": "launchdeck",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "private": true,
   "description": "Production-grade Solana launch deck for Pump, Bonk, and Bags-style launch flows.",
   "workspaces": [

@@ -387,6 +387,11 @@ pub struct TrustedRaydiumClmmSwap {
 }
 
 #[derive(Debug, Clone)]
+pub struct TrustedRaydiumClmmRouteSetup {
+    setup: BonkUsd1RouteSetup,
+}
+
+#[derive(Debug, Clone)]
 struct BonkUsd1RouteSetupCacheEntry {
     fetched_at: std::time::Instant,
     setup: BonkUsd1RouteSetup,
@@ -2217,18 +2222,11 @@ async fn load_bonk_usd1_route_setup(rpc_url: &str) -> Result<BonkUsd1RouteSetup,
     load_bonk_usd1_route_setup_with_metrics(rpc_url, None, false).await
 }
 
-pub async fn build_trusted_raydium_clmm_swap_exact_in(
+pub async fn load_trusted_raydium_clmm_route_setup(
     rpc_url: &str,
     pool_id_input: &str,
     commitment: &str,
-    owner: &Pubkey,
-    input_account: &Pubkey,
-    output_account: &Pubkey,
-    input_mint: &Pubkey,
-    output_mint: &Pubkey,
-    amount_in: u64,
-    slippage_bps: u64,
-) -> Result<TrustedRaydiumClmmSwap, String> {
+) -> Result<TrustedRaydiumClmmRouteSetup, String> {
     let pool_id = Pubkey::from_str(pool_id_input)
         .map_err(|error| format!("Invalid trusted Raydium CLMM pool id: {error}"))?;
     let (pool_data, owner_string) =
@@ -2241,13 +2239,6 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
         ));
     }
     let pool = decode_bonk_clmm_pool(&pool_data)?;
-    if !((*input_mint == pool.mint_a && *output_mint == pool.mint_b)
-        || (*input_mint == pool.mint_b && *output_mint == pool.mint_a))
-    {
-        return Err(format!(
-            "Trusted Raydium CLMM pool {pool_id_input} mint pair mismatch."
-        ));
-    }
     let current_array_start =
         bonk_get_tick_array_start_index_by_tick(pool.tick_current, i32::from(pool.tick_spacing));
     let current_bit_position =
@@ -2278,8 +2269,11 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
             bonk_derive_clmm_tick_array_address(&program_id, &pool_id, *start_index).to_string()
         })
         .collect::<Vec<_>>();
-    let tick_array_account_datas =
-        rpc_get_multiple_accounts_data(rpc_url, &tick_array_addresses, commitment).await?;
+    let amm_config = pool.amm_config.to_string();
+    let (tick_array_account_datas, config_data) = tokio::try_join!(
+        rpc_get_multiple_accounts_data(rpc_url, &tick_array_addresses, commitment),
+        fetch_account_data(rpc_url, &amm_config, commitment),
+    )?;
     let tick_arrays = tick_array_account_datas
         .into_iter()
         .map(|data| decode_bonk_clmm_tick_array(&data))
@@ -2290,7 +2284,6 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
     if !tick_arrays.contains_key(&current_array_start) {
         return Err("Trusted Raydium CLMM current tick array could not be decoded.".to_string());
     }
-    let config_data = fetch_account_data(rpc_url, &pool.amm_config.to_string(), commitment).await?;
     let config = decode_bonk_clmm_config(&config_data)?;
     if config.tick_spacing != pool.tick_spacing {
         return Err("Trusted Raydium CLMM tick spacing no longer matches config.".to_string());
@@ -2320,8 +2313,30 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
         tick_arrays_asc: tick_array_starts_asc,
         tick_arrays,
     };
+    Ok(TrustedRaydiumClmmRouteSetup { setup })
+}
+
+pub fn build_trusted_raydium_clmm_swap_exact_in_from_setup(
+    route_setup: &TrustedRaydiumClmmRouteSetup,
+    owner: &Pubkey,
+    input_account: &Pubkey,
+    output_account: &Pubkey,
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount_in: u64,
+    slippage_bps: u64,
+) -> Result<TrustedRaydiumClmmSwap, String> {
+    let setup = &route_setup.setup;
+    if !((*input_mint == setup.mint_a && *output_mint == setup.mint_b)
+        || (*input_mint == setup.mint_b && *output_mint == setup.mint_a))
+    {
+        return Err(format!(
+            "Trusted Raydium CLMM pool {} mint pair mismatch.",
+            setup.pool_id
+        ));
+    }
     let quote = bonk_quote_clmm_exact_input(
-        &setup,
+        setup,
         input_mint,
         &bonk_biguint_from_u64(amount_in),
         slippage_bps,
@@ -2333,7 +2348,7 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
     }
     let instruction = build_bonk_clmm_swap_exact_in_instruction_for_setup(
         owner,
-        &setup,
+        setup,
         input_account,
         output_account,
         amount_in,
@@ -2347,6 +2362,31 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
         expected_out,
         min_out,
     })
+}
+
+pub async fn build_trusted_raydium_clmm_swap_exact_in(
+    rpc_url: &str,
+    pool_id_input: &str,
+    commitment: &str,
+    owner: &Pubkey,
+    input_account: &Pubkey,
+    output_account: &Pubkey,
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount_in: u64,
+    slippage_bps: u64,
+) -> Result<TrustedRaydiumClmmSwap, String> {
+    let setup = load_trusted_raydium_clmm_route_setup(rpc_url, pool_id_input, commitment).await?;
+    build_trusted_raydium_clmm_swap_exact_in_from_setup(
+        &setup,
+        owner,
+        input_account,
+        output_account,
+        input_mint,
+        output_mint,
+        amount_in,
+        slippage_bps,
+    )
 }
 
 async fn load_bonk_usd1_route_setup_fresh(rpc_url: &str) -> Result<BonkUsd1RouteSetup, String> {

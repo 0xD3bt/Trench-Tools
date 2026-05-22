@@ -6250,7 +6250,8 @@ async fn build_bonk_clmm_pool_context_from_data(
     if !tick_arrays.contains_key(&current_array_start) {
         return Err("Bonk CLMM current tick array could not be decoded.".to_string());
     }
-    let config_data = fetch_account_data(rpc_url, &pool.amm_config.to_string(), commitment).await?;
+    let amm_config = pool.amm_config.to_string();
+    let config_data = fetch_account_data(rpc_url, &amm_config, commitment).await?;
     let config = decode_bonk_clmm_config(&config_data)?;
     if config.tick_spacing != pool.tick_spacing {
         return Err("Bonk CLMM tick spacing no longer matches its config.".to_string());
@@ -6575,8 +6576,11 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
             bonk_derive_clmm_tick_array_address(&program_id, &pool_id, *start_index).to_string()
         })
         .collect::<Vec<_>>();
-    let tick_array_account_datas =
-        rpc_get_multiple_accounts_data(rpc_url, &tick_array_addresses, commitment).await?;
+    let amm_config = pool.amm_config.to_string();
+    let (tick_array_account_datas, config_data) = tokio::try_join!(
+        rpc_get_multiple_accounts_data(rpc_url, &tick_array_addresses, commitment),
+        fetch_account_data(rpc_url, &amm_config, commitment),
+    )?;
     let tick_arrays = tick_array_account_datas
         .into_iter()
         .map(|data| decode_bonk_clmm_tick_array(&data))
@@ -6587,7 +6591,6 @@ pub async fn build_trusted_raydium_clmm_swap_exact_in(
     if !tick_arrays.contains_key(&current_array_start) {
         return Err("Trusted stable Raydium current tick array could not be decoded.".to_string());
     }
-    let config_data = fetch_account_data(rpc_url, &pool.amm_config.to_string(), commitment).await?;
     let config = decode_bonk_clmm_config(&config_data)?;
     if config.tick_spacing != pool.tick_spacing {
         return Err("Trusted stable Raydium tick spacing no longer matches config.".to_string());
@@ -6675,11 +6678,6 @@ pub async fn quote_trusted_raydium_clmm_exact_in(
             "Trusted stable Raydium pool {pool_id_input} mint pair mismatch."
         ));
     }
-    let config_data = fetch_account_data(rpc_url, &pool.amm_config.to_string(), commitment).await?;
-    let config = decode_bonk_clmm_config(&config_data)?;
-    if config.tick_spacing != pool.tick_spacing {
-        return Err("Trusted stable Raydium tick spacing no longer matches config.".to_string());
-    }
     let current_array_start =
         bonk_get_tick_array_start_index_by_tick(pool.tick_current, i32::from(pool.tick_spacing));
     let current_bit_position =
@@ -6708,8 +6706,15 @@ pub async fn quote_trusted_raydium_clmm_exact_in(
             bonk_derive_clmm_tick_array_address(&program_id, &pool_id, *start_index).to_string()
         })
         .collect::<Vec<_>>();
-    let tick_array_account_datas =
-        rpc_get_multiple_accounts_data(rpc_url, &tick_array_addresses, commitment).await?;
+    let amm_config = pool.amm_config.to_string();
+    let (tick_array_account_datas, config_data) = tokio::try_join!(
+        rpc_get_multiple_accounts_data(rpc_url, &tick_array_addresses, commitment),
+        fetch_account_data(rpc_url, &amm_config, commitment),
+    )?;
+    let config = decode_bonk_clmm_config(&config_data)?;
+    if config.tick_spacing != pool.tick_spacing {
+        return Err("Trusted stable Raydium tick spacing no longer matches config.".to_string());
+    }
     let tick_arrays = tick_array_account_datas
         .into_iter()
         .map(|data| decode_bonk_clmm_tick_array(&data))

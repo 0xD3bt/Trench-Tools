@@ -5,7 +5,7 @@ use shared_execution_routing::transport::{ProviderRegionConfig, TransportEnviron
 use std::env;
 
 use crate::{
-    config::{NormalizedConfig, NormalizedExecution, has_launch_follow_up},
+    config::{NormalizedConfig, NormalizedExecution, launch_follow_up_label},
     endpoint_profile::{
         metro_token_canonical, normalize_user_region, parse_config_endpoint_profile,
     },
@@ -851,8 +851,11 @@ pub fn build_transport_plan(
 
 pub fn estimate_transaction_count(config: &NormalizedConfig) -> usize {
     let mut transaction_count = 1usize;
-    if has_launch_follow_up(config) {
-        transaction_count += 1;
+    match launch_follow_up_label(config) {
+        Some(_) => {
+            transaction_count += 1;
+        }
+        None => {}
     }
     if normalize_provider(&config.execution.provider) == "jito-bundle"
         && config.tx.jitoTipLamports > 0
@@ -896,6 +899,13 @@ mod tests {
         }))
         .expect("sample config");
         normalize_raw_config(raw).expect("normalized config")
+    }
+
+    fn sample_agent_locked_config(provider: &str) -> NormalizedConfig {
+        let mut config = sample_config(provider);
+        config.mode = "agent-locked".to_string();
+        config.agent.buybackBps = Some(10_000);
+        config
     }
 
     #[test]
@@ -993,6 +1003,13 @@ mod tests {
         assert_eq!(plan.transportType, "jito-bundle");
         assert_eq!(plan.executionClass, "bundle");
         assert!(plan.separateTipTransaction);
+    }
+
+    #[test]
+    fn agent_locked_counts_single_setup_transaction() {
+        let config = sample_agent_locked_config("helius-sender");
+
+        assert_eq!(estimate_transaction_count(&config), 2);
     }
 
     #[test]

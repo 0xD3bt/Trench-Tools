@@ -41,8 +41,8 @@ use launchdeck_engine::{
     paths,
     pump_native::{
         PreparedFollowBuyRuntime, PreparedFollowBuyStatic, compile_follow_sell_transaction,
-        fetch_pump_market_snapshot, finalize_follow_buy_transaction, prepare_follow_buy_runtime,
-        prepare_follow_buy_static, pump_bonding_curve_address,
+        fetch_pump_market_snapshot_for_follow, finalize_follow_buy_transaction,
+        prepare_follow_buy_runtime, prepare_follow_buy_static, pump_bonding_curve_address,
     },
     report::{FollowActionTimings, FollowJobTimings, configured_benchmark_mode},
     rpc::{
@@ -73,7 +73,7 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     net::SocketAddr,
     str::FromStr,
@@ -83,7 +83,7 @@ use std::{
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch},
     task::{JoinHandle, JoinSet},
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
@@ -442,6 +442,7 @@ const OFFSET_SAME_BLOCK_REPOLL_DELAY_MS: u64 = 25;
 #[allow(dead_code)]
 const OFFSET_SAME_BLOCK_REPOLL_LIMIT: usize = 3;
 const FOLLOW_TRIGGER_COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS: u64 = 20;
+const SNIPER_SELL_BATCH_ELIGIBILITY_DRAIN_MS: u64 = 150;
 const DEFERRED_SETUP_CONFIRMATION_TIMEOUT_SECS: u64 = 10;
 
 fn now_ms() -> u128 {
@@ -1879,6 +1880,7 @@ fn build_follow_buy_precheck_action(
         transportType: None,
         watcherMode: None,
         watcherFallbackReason: None,
+        confirmationSource: None,
         sendObservedSlot: None,
         confirmedObservedSlot: None,
         confirmedTokenBalanceRaw: None,
@@ -3006,10 +3008,7 @@ async fn run_job(state: Arc<AppState>, trace_id: String) {
     let mut grouped_action_ids: Vec<Vec<String>> = Vec::new();
     let mut grouped_by_trigger: HashMap<String, Vec<FollowActionRecord>> = HashMap::new();
     for action in &job.actions {
-        let key = action
-            .triggerKey
-            .clone()
-            .unwrap_or_else(|| action.actionId.clone());
+        let key = action_batch_trigger_key(action);
         grouped_by_trigger
             .entry(key)
             .or_default()
@@ -3133,6 +3132,104 @@ fn action_group_sort_key(action: &FollowActionRecord) -> (u8, u32, String) {
         FollowActionKind::SniperSell => 2,
     };
     (class_rank, action.orderIndex, action.actionId.clone())
+}
+
+fn action_batch_trigger_key(action: &FollowActionRecord) -> String {
+    let trigger_key = action.triggerKey.as_deref().unwrap_or(&action.actionId);
+    if matches!(action.kind, FollowActionKind::SniperSell)
+        && let Some((_, base)) = trigger_key
+            .strip_prefix("sniper-sell:")
+            .and_then(|value| value.split_once(':'))
+    {
+        return format!("sniper-sell:{base}");
+    }
+    trigger_key.to_string()
+}
+
+fn retain_eligible_batch_actions(
+    actions: &mut Vec<FollowActionRecord>,
+    eligibility_by_action: &HashMap<String, EligibilityTiming>,
+) {
+    actions.retain(|action| eligibility_by_action.contains_key(&action.actionId));
+}
+
+struct BatchEligibility {
+    eligible: HashMap<String, EligibilityTiming>,
+    pending_action_ids: Vec<String>,
+}
+
+async fn wait_for_batch_action_eligibility(
+    state: Arc<AppState>,
+    job: FollowJobRecord,
+    actions: &[FollowActionRecord],
+) -> BatchEligibility {
+    let mut pending_action_ids = actions
+        .iter()
+        .map(|action| action.actionId.clone())
+        .collect::<HashSet<_>>();
+    let mut tasks = JoinSet::new();
+    for action in actions.iter().cloned() {
+        let state = state.clone();
+        let job = job.clone();
+        tasks.spawn(async move {
+            let action_id = action.actionId.clone();
+            (
+                action_id,
+                wait_for_action_eligibility(state, &job, &action).await,
+            )
+        });
+    }
+
+    let mut eligibility_by_action = HashMap::new();
+    let mut drain_deadline = None;
+    while !tasks.is_empty() {
+        let next_result = if let Some(deadline) = drain_deadline {
+            match timeout_at(deadline, tasks.join_next()).await {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        } else {
+            tasks.join_next().await
+        };
+        let Some(task_result) = next_result else {
+            break;
+        };
+        let Ok((action_id, result)) = task_result else {
+            continue;
+        };
+        pending_action_ids.remove(&action_id);
+        match result {
+            Ok(timing) => {
+                eligibility_by_action.insert(action_id, timing);
+                if drain_deadline.is_none() {
+                    drain_deadline = Some(
+                        Instant::now()
+                            + Duration::from_millis(SNIPER_SELL_BATCH_ELIGIBILITY_DRAIN_MS),
+                    );
+                }
+            }
+            Err(error) => {
+                if let Some(action) = actions
+                    .iter()
+                    .find(|candidate| candidate.actionId == action_id)
+                {
+                    if is_stopped_action_error(&error) {
+                        let stop_reason = normalized_stopped_action_reason(Some(&error));
+                        record_action_stopped(&state, &job, action, stop_reason.as_deref()).await;
+                    } else if is_expired_action_error(&error) {
+                        record_action_expired(&state, &job, action, &error).await;
+                    } else {
+                        record_action_failure(&state, &job, action, &error).await;
+                    }
+                }
+            }
+        }
+    }
+
+    BatchEligibility {
+        eligible: eligibility_by_action,
+        pending_action_ids: pending_action_ids.into_iter().collect(),
+    }
 }
 
 fn matching_sniper_buy_action<'a>(
@@ -3498,20 +3595,50 @@ async fn run_action_batch_task(
         return Ok(());
     }
     actions.sort_by_key(action_group_sort_key);
-    let lead_action = actions[0].clone();
-    let eligibility_timing =
-        match wait_for_action_eligibility(state.clone(), &job, &lead_action).await {
-            Ok(timing) => timing,
-            Err(error) => {
-                for action in &actions {
-                    record_action_failure(&state, &job, action, &error).await;
-                }
-                return Err(error);
+    let mut pending_action_ids = Vec::new();
+    let eligibility_by_action =
+        if actions
+            .iter()
+            .any(|action| matches!(action.kind, FollowActionKind::SniperSell))
+        {
+            let batch_eligibility =
+                wait_for_batch_action_eligibility(state.clone(), job.clone(), &actions).await;
+            let eligibility_by_action = batch_eligibility.eligible;
+            pending_action_ids = batch_eligibility.pending_action_ids;
+            if eligibility_by_action.is_empty() {
+                let pending_tasks = pending_action_ids.into_iter().map(|action_id| {
+                    let state = state.clone();
+                    let trace_id = trace_id.clone();
+                    async move { execute_action_with_retry(state, trace_id, action_id).await }
+                });
+                let _ = join_all(pending_tasks).await;
+                return Ok(());
             }
+            eligibility_by_action
+        } else {
+            let lead_action = actions[0].clone();
+            let eligibility_timing =
+                match wait_for_action_eligibility(state.clone(), &job, &lead_action).await {
+                    Ok(timing) => timing,
+                    Err(error) => {
+                        for action in &actions {
+                            record_action_failure(&state, &job, action, &error).await;
+                        }
+                        return Err(error);
+                    }
+                };
+            actions
+                .iter()
+                .map(|action| (action.actionId.clone(), eligibility_timing))
+                .collect::<HashMap<_, _>>()
         };
     let eligible_at_ms = now_ms();
+    retain_eligible_batch_actions(&mut actions, &eligibility_by_action);
     for action in &actions {
         let transport_plan = follow_action_transport_plan(&job, action);
+        let Some(eligibility_timing) = eligibility_by_action.get(&action.actionId) else {
+            continue;
+        };
         let _ = state
             .store
             .update_action(&trace_id, &action.actionId, |record| {
@@ -3532,20 +3659,31 @@ async fn run_action_batch_task(
         })
         .await;
     }
+    let shared_observed_slot = eligibility_by_action
+        .values()
+        .filter_map(|timing| timing.observed_slot)
+        .min();
     prepare_trigger_time_buy_compile_batch(
         &state,
         &job,
         &actions,
-        eligibility_timing.observed_slot,
+        shared_observed_slot,
     )
     .await;
     sync_follow_job_report(&state, &trace_id).await;
-    let batch_tasks = actions.into_iter().map(|action| {
+    let mut execution_tasks = JoinSet::new();
+    for action in actions {
         let state = state.clone();
         let trace_id = trace_id.clone();
-        async move { execute_action_with_retry(state, trace_id, action.actionId).await }
-    });
-    let _ = join_all(batch_tasks).await;
+        execution_tasks
+            .spawn(async move { execute_action_with_retry(state, trace_id, action.actionId).await });
+    }
+    for action_id in pending_action_ids {
+        let state = state.clone();
+        let trace_id = trace_id.clone();
+        execution_tasks.spawn(async move { execute_action_with_retry(state, trace_id, action_id).await });
+    }
+    while execution_tasks.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -4031,6 +4169,23 @@ async fn execute_action(
         .mint
         .as_deref()
         .ok_or_else(|| "Follow job missing mint.".to_string())?;
+    let owner_token_account = if matches!(
+        effective_action.kind,
+        FollowActionKind::DevAutoSell | FollowActionKind::SniperSell
+    ) {
+        Some(
+            derive_follow_owner_token_account_for_launchpad_with_rpc(
+                &job.launchpad,
+                &state.rpc_url,
+                &job.execution.commitment,
+                &wallet_owner_pubkey,
+                mint,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     if skip_retry_if_wallet_already_holds_token(&state, job, &effective_action, &wallet_key, mint)
         .await?
     {
@@ -4270,6 +4425,7 @@ async fn execute_action(
                 } else {
                     compile_follow_sell_transaction(
                         &state.rpc_url,
+                        &job.quoteAsset,
                         &job.execution,
                         job.tokenMayhemMode,
                         &job.sellTipAccount,
@@ -4290,10 +4446,46 @@ async fn execute_action(
         }
     };
     let Some(compiled) = compiled else {
+        if matches!(
+            effective_action.kind,
+            FollowActionKind::DevAutoSell | FollowActionKind::SniperSell
+        ) {
+            return Err(format!(
+                "{} resolved zero token balance; wallet_env_key={} wallet={} mint={} ata={} source={}.",
+                follow_action_kind_label(&effective_action.kind),
+                effective_action.walletEnvKey,
+                wallet_owner_pubkey,
+                mint,
+                owner_token_account.as_deref().unwrap_or("unknown"),
+                if sell_token_amount_override.is_some() {
+                    "buy-confirmation override"
+                } else {
+                    "live balance lookup"
+                }
+            ));
+        }
         return Err("Action had nothing to send for the current wallet state.".to_string());
     };
     let mut compiled_transactions = compiled.transactions;
     if compiled_transactions.is_empty() {
+        if matches!(
+            effective_action.kind,
+            FollowActionKind::DevAutoSell | FollowActionKind::SniperSell
+        ) {
+            return Err(format!(
+                "{} resolved zero token balance; wallet_env_key={} wallet={} mint={} ata={} source={}.",
+                follow_action_kind_label(&effective_action.kind),
+                effective_action.walletEnvKey,
+                wallet_owner_pubkey,
+                mint,
+                owner_token_account.as_deref().unwrap_or("unknown"),
+                if sell_token_amount_override.is_some() {
+                    "buy-confirmation override"
+                } else {
+                    "live balance lookup"
+                }
+            ));
+        }
         return Err("Action had nothing to send for the current wallet state.".to_string());
     }
     let primary_tx_index = compiled.primary_tx_index;
@@ -4520,6 +4712,7 @@ async fn execute_action(
             record.confirmedAtMs = Some(now_ms());
             record.confirmedObservedSlot = confirmed_action_slot;
             record.confirmedTokenBalanceRaw = confirmed_post_token_balance_raw.clone();
+            record.confirmationSource = confirmed.confirmationSource.clone();
             record.slotsToConfirm = match (record.sendObservedSlot, confirmed_action_slot) {
                 (Some(send_slot), Some(confirm_slot)) if confirm_slot >= send_slot => {
                     Some(confirm_slot - send_slot)
@@ -4775,6 +4968,14 @@ fn follow_action_execution(
     execution
 }
 
+fn follow_action_kind_label(kind: &FollowActionKind) -> &'static str {
+    match kind {
+        FollowActionKind::SniperBuy => "sniper buy",
+        FollowActionKind::DevAutoSell => "dev autosell",
+        FollowActionKind::SniperSell => "sniper sell",
+    }
+}
+
 fn follow_action_transport_plan(
     job: &FollowJobRecord,
     action: &FollowActionRecord,
@@ -4859,7 +5060,7 @@ fn is_pump_custom_2006_seed_mismatch(error: &str) -> bool {
             || normalized.contains("custom: 2006"))
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct EligibilityTiming {
     watcher_wait_ms: u128,
     total_ms: u128,
@@ -5071,6 +5272,35 @@ async fn ensure_job_not_cancelled(state: &Arc<AppState>, trace_id: &str) -> Resu
     } else {
         Ok(())
     }
+}
+
+fn follow_job_state_is_terminal(state: &FollowJobState) -> bool {
+    matches!(
+        state,
+        FollowJobState::Completed
+            | FollowJobState::CompletedWithFailures
+            | FollowJobState::Cancelled
+            | FollowJobState::Failed
+    )
+}
+
+async fn ensure_watcher_job_active(state: &Arc<AppState>, trace_id: &str) -> Result<(), String> {
+    let Some(job) = get_job(state, trace_id).await else {
+        return Err("Follow job disappeared while watching.".to_string());
+    };
+    if job.cancelRequested || matches!(job.state, FollowJobState::Cancelled) {
+        return Err("Follow job was cancelled.".to_string());
+    }
+    if follow_job_state_is_terminal(&job.state) {
+        return Err("Follow job reached a terminal state.".to_string());
+    }
+    Ok(())
+}
+
+fn is_watcher_job_stopped_error(error: &str) -> bool {
+    error.contains("Follow job disappeared while watching")
+        || error.contains("Follow job reached a terminal state")
+        || error.contains("Follow job was cancelled")
 }
 
 async fn ensure_action_not_cancelled(
@@ -5549,8 +5779,8 @@ async fn run_slot_watcher_ws_session(
     let mut ws = open_subscription_socket(endpoint).await?;
     subscribe(&mut ws, "slotSubscribe", json!([])).await?;
     loop {
-        ensure_job_not_cancelled(state, &job.traceId).await?;
-        let message = next_json_message(&mut ws).await?;
+        ensure_watcher_job_active(state, &job.traceId).await?;
+        let message = next_watcher_json_message(state, &job.traceId, &mut ws).await?;
         if message.get("params").is_none() {
             continue;
         }
@@ -5581,8 +5811,8 @@ async fn run_helius_transaction_slot_watcher_session(
     let mut ws = open_subscription_socket(endpoint).await?;
     subscribe(&mut ws, "slotSubscribe", json!([])).await?;
     loop {
-        ensure_job_not_cancelled(state, &job.traceId).await?;
-        let message = next_json_message(&mut ws).await?;
+        ensure_watcher_job_active(state, &job.traceId).await?;
+        let message = next_watcher_json_message(state, &job.traceId, &mut ws).await?;
         if message.get("params").is_none() {
             continue;
         }
@@ -5611,7 +5841,7 @@ async fn run_slot_watcher_polling_session(
     note: Option<String>,
 ) -> Result<(), String> {
     loop {
-        ensure_job_not_cancelled(state, &job.traceId).await?;
+        ensure_watcher_job_active(state, &job.traceId).await?;
         let slot = fetch_current_slot(&state.rpc_url, "confirmed").await?;
         let _ = tx.send(Some(Ok(slot)));
         set_watcher_health(
@@ -5711,7 +5941,9 @@ async fn recompute_market_cap_for_job(
         )
         .await;
     }
-    let snapshot = fetch_pump_market_snapshot(&state.rpc_url, mint).await?;
+    let snapshot =
+        fetch_pump_market_snapshot_for_follow(&state.rpc_url, mint, job.launchCreator.as_deref())
+            .await?;
     quote_units_to_usd_micros(
         &state.rpc_url,
         snapshot.marketCapLamports,
@@ -5747,8 +5979,8 @@ async fn run_slot_driven_market_watcher_session(
     let mut ws = open_subscription_socket(endpoint).await?;
     subscribe(&mut ws, "slotSubscribe", json!([])).await?;
     loop {
-        ensure_job_not_cancelled(state, &job.traceId).await?;
-        let message = next_json_message(&mut ws).await?;
+        ensure_watcher_job_active(state, &job.traceId).await?;
+        let message = next_watcher_json_message(state, &job.traceId, &mut ws).await?;
         if message.get("params").is_none() {
             continue;
         }
@@ -5802,8 +6034,8 @@ async fn run_standard_market_watcher_session(
         )
         .await?;
         loop {
-            ensure_job_not_cancelled(state, &job.traceId).await?;
-            let message = next_json_message(&mut ws).await?;
+            ensure_watcher_job_active(state, &job.traceId).await?;
+            let message = next_watcher_json_message(state, &job.traceId, &mut ws).await?;
             if message.get("params").is_none() {
                 continue;
             }
@@ -5835,8 +6067,8 @@ async fn run_standard_market_watcher_session(
     )
     .await?;
     loop {
-        ensure_job_not_cancelled(state, &job.traceId).await?;
-        let message = next_json_message(&mut ws).await?;
+        ensure_watcher_job_active(state, &job.traceId).await?;
+        let message = next_watcher_json_message(state, &job.traceId, &mut ws).await?;
         if message.get("params").is_none() {
             continue;
         }
@@ -5912,8 +6144,8 @@ async fn run_helius_transaction_market_watcher_session(
         "helius-transaction-subscribe"
     };
     loop {
-        ensure_job_not_cancelled(state, &job.traceId).await?;
-        let message = next_json_message(&mut ws).await?;
+        ensure_watcher_job_active(state, &job.traceId).await?;
+        let message = next_watcher_json_message(state, &job.traceId, &mut ws).await?;
         if message.get("params").is_none() {
             continue;
         }
@@ -5939,7 +6171,7 @@ async fn run_market_watcher_polling_session(
     note: Option<String>,
 ) -> Result<(), String> {
     loop {
-        ensure_job_not_cancelled(state, &job.traceId).await?;
+        ensure_watcher_job_active(state, &job.traceId).await?;
         let market_cap = recompute_market_cap_for_job(state, job, mint).await?;
         let _ = tx.send(Some(Ok(market_cap)));
         set_watcher_health(
@@ -6334,6 +6566,9 @@ async fn run_slot_watcher(
         match session {
             Ok(()) => return,
             Err(error) => {
+                if is_watcher_job_stopped_error(&error) {
+                    return;
+                }
                 attempt = attempt.saturating_add(1);
                 let terminal_error = error.clone();
                 if handle_watcher_retry(
@@ -6485,6 +6720,9 @@ async fn run_market_watcher(
         match session {
             Ok(()) => return,
             Err(error) => {
+                if is_watcher_job_stopped_error(&error) {
+                    return;
+                }
                 attempt = attempt.saturating_add(1);
                 let terminal_error = error.clone();
                 if handle_watcher_retry(
@@ -7067,6 +7305,24 @@ async fn next_json_message(ws: &mut WsStream) -> Result<Value, String> {
     }
 }
 
+async fn next_watcher_json_message(
+    state: &Arc<AppState>,
+    trace_id: &str,
+    ws: &mut WsStream,
+) -> Result<Value, String> {
+    loop {
+        match timeout(
+            Duration::from_millis(FOLLOW_WATCHER_RPC_POLL_INTERVAL_MS),
+            next_json_message(ws),
+        )
+        .await
+        {
+            Ok(result) => return result,
+            Err(_) => ensure_watcher_job_active(state, trace_id).await?,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
@@ -7584,6 +7840,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -7635,6 +7892,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -7664,6 +7922,149 @@ mod tests {
         assert!(should_request_full_transaction_details(&buy));
         assert!(should_request_full_transaction_details(&sniper_sell));
         assert!(should_request_full_transaction_details(&dev_auto_sell));
+    }
+
+    #[test]
+    fn same_slot_sniper_sells_share_batch_trigger_key() {
+        let mut first = sample_sniper_sell_action("snipe-1-sell", "SOLANA_PRIVATE_KEY2", 0);
+        first.triggerKey = Some("sniper-sell:snipe-1-sell:slot:0".to_string());
+        let mut second = sample_sniper_sell_action("snipe-2-sell", "SOLANA_PRIVATE_KEY3", 1);
+        second.triggerKey = Some("sniper-sell:snipe-2-sell:slot:0".to_string());
+        let mut later = sample_sniper_sell_action("snipe-3-sell", "SOLANA_PRIVATE_KEY4", 2);
+        later.triggerKey = Some("sniper-sell:snipe-3-sell:slot:1".to_string());
+
+        assert_eq!(action_batch_trigger_key(&first), "sniper-sell:slot:0");
+        assert_eq!(action_batch_trigger_key(&second), "sniper-sell:slot:0");
+        assert_eq!(action_batch_trigger_key(&later), "sniper-sell:slot:1");
+    }
+
+    #[test]
+    fn batched_actions_drop_ineligible_members_without_dropping_eligible_members() {
+        let mut actions = vec![
+            sample_sniper_sell_action("snipe-1-sell", "SOLANA_PRIVATE_KEY2", 0),
+            sample_sniper_sell_action("snipe-2-sell", "SOLANA_PRIVATE_KEY3", 1),
+            sample_sniper_sell_action("snipe-3-sell", "SOLANA_PRIVATE_KEY4", 2),
+        ];
+        let eligibility_by_action = HashMap::from([
+            ("snipe-1-sell".to_string(), EligibilityTiming::default()),
+            ("snipe-3-sell".to_string(), EligibilityTiming::default()),
+        ]);
+
+        retain_eligible_batch_actions(&mut actions, &eligibility_by_action);
+
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| action.actionId.as_str())
+                .collect::<Vec<_>>(),
+            vec!["snipe-1-sell", "snipe-3-sell"]
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_sell_eligibility_drains_ready_members_without_waiting_for_pending_siblings() {
+        let state_path = test_state_path();
+        let state = test_app_state("http://127.0.0.1:9/".to_string(), state_path.clone());
+        let trace_id = "trace-batch-drain".to_string();
+        let mut buy_ready = sample_sniper_buy_action("buy-ready", "SOLANA_PRIVATE_KEY2", 0);
+        buy_ready.state = FollowActionState::Confirmed;
+        buy_ready.confirmedObservedSlot = Some(700);
+        let buy_pending = sample_sniper_buy_action("buy-pending", "SOLANA_PRIVATE_KEY3", 1);
+        let mut sell_ready = sample_sniper_sell_action("sell-ready", "SOLANA_PRIVATE_KEY2", 0);
+        sell_ready.preSignedTransactions = vec![CompiledTransaction {
+            label: "sell-ready".to_string(),
+            format: "v0".to_string(),
+            blockhash: "hash".to_string(),
+            lastValidBlockHeight: 10_000,
+            serializedBase64: BASE64.encode([0u8; 64]),
+            signature: None,
+            lookupTablesUsed: vec![],
+            computeUnitLimit: None,
+            computeUnitPriceMicroLamports: None,
+            inlineTipLamports: None,
+            inlineTipAccount: None,
+        }];
+        let sell_pending = sample_sniper_sell_action("sell-pending", "SOLANA_PRIVATE_KEY3", 1);
+        state
+            .store
+            .reserve_job(FollowReserveRequest {
+                traceId: trace_id.clone(),
+                launchpad: "pump".to_string(),
+                quoteAsset: "sol".to_string(),
+                launchMode: "regular".to_string(),
+                selectedWalletKey: "SOLANA_PRIVATE_KEY".to_string(),
+                followLaunch: sample_follow_launch(),
+                execution: sample_execution(),
+                tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
+                jitoTipAccount: String::new(),
+                buyTipAccount: String::new(),
+                sellTipAccount: String::new(),
+                preferPostSetupCreatorVaultForSell: false,
+                bagsLaunch: None,
+                prebuiltActions: vec![
+                    buy_ready,
+                    sell_ready.clone(),
+                    buy_pending,
+                    sell_pending.clone(),
+                ],
+                deferredSetupTransactions: vec![],
+            })
+            .await
+            .expect("reserve");
+        let job = get_job(&state, &trace_id).await.expect("job");
+        let actions = vec![sell_ready, sell_pending];
+
+        let started = Instant::now();
+        let batch_eligibility =
+            wait_for_batch_action_eligibility(state.clone(), job, &actions).await;
+
+        assert!(started.elapsed() < Duration::from_millis(1_000));
+        assert!(batch_eligibility.eligible.contains_key("sell-ready"));
+        assert!(!batch_eligibility.eligible.contains_key("sell-pending"));
+        assert_eq!(batch_eligibility.pending_action_ids.len(), 1);
+        assert!(batch_eligibility.pending_action_ids.contains(&"sell-pending".to_string()));
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn watcher_job_active_rejects_terminal_follow_jobs() {
+        let state_path = test_state_path();
+        let state = test_app_state("http://127.0.0.1:9/".to_string(), state_path.clone());
+        let trace_id = "trace-terminal-watcher".to_string();
+        state
+            .store
+            .reserve_job(FollowReserveRequest {
+                traceId: trace_id.clone(),
+                launchpad: "pump".to_string(),
+                quoteAsset: "sol".to_string(),
+                launchMode: "regular".to_string(),
+                selectedWalletKey: "SOLANA_PRIVATE_KEY".to_string(),
+                followLaunch: sample_follow_launch(),
+                execution: sample_execution(),
+                tokenMayhemMode: false,
+                wrapperDefaultFeeBps: 10,
+                jitoTipAccount: String::new(),
+                buyTipAccount: String::new(),
+                sellTipAccount: String::new(),
+                preferPostSetupCreatorVaultForSell: false,
+                bagsLaunch: None,
+                prebuiltActions: vec![],
+                deferredSetupTransactions: vec![],
+            })
+            .await
+            .expect("reserve");
+        state
+            .store
+            .finalize_job_state(&trace_id, FollowJobState::Completed, None)
+            .await
+            .expect("complete job");
+
+        let error = ensure_watcher_job_active(&state, &trace_id)
+            .await
+            .expect_err("terminal job should stop watchers");
+        assert!(error.contains("terminal state"));
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
@@ -8298,6 +8699,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8349,6 +8751,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8464,6 +8867,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8521,6 +8925,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8580,6 +8985,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8639,6 +9045,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8695,6 +9102,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8763,6 +9171,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8831,6 +9240,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8907,6 +9317,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -8982,6 +9393,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
@@ -9071,6 +9483,7 @@ mod tests {
             transportType: None,
             watcherMode: None,
             watcherFallbackReason: None,
+            confirmationSource: None,
             sendObservedSlot: None,
             confirmedObservedSlot: None,
             confirmedTokenBalanceRaw: None,
