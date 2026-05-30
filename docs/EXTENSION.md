@@ -1,6 +1,6 @@
 # Trench Tools Extension
 
-The Trench Tools extension is the browser surface for the execution engine. It injects trading controls into supported terminals, reads your local presets and wallet groups, and sends trades through your local `execution-engine`.
+The Trench Tools extension is the browser surface for the execution engine. It injects trading controls into supported platforms, reads your local presets and wallet groups, and sends trades through your local `execution-engine`.
 
 When `LaunchDeck` is running too, the extension also gives you an embedded LaunchDeck popout for launch, snipe, and reports.
 
@@ -29,13 +29,16 @@ Unpacked Chrome/Edge extensions do not auto-update. Until Trench Tools is publis
 
 Current status:
 
-- Live: `axiom.trade`
+- Live: `axiom.trade` / `backup.axiom.trade`
 - Live: `j7tracker.io`
-- Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, X, and many more platforms
+- Live: `x.com`
+- Coming soon: Terminal (formerly Padre), GMGN, Telegram web, Discord web, and many more platforms
 
-Axiom currently includes token-page instant trade, Pulse quick buy, Pulse manual panel, watchlist quick buy, wallet-tracker quick buy, floating launcher, embedded LaunchDeck popout, Pulse/Token Vamp helpers, and DexScreener shortcuts.
+Axiom includes token-page instant trade, Pulse quick buy, Pulse manual panel, watchlist quick buy, wallet-tracker quick buy, floating launcher, embedded LaunchDeck popout, Pulse/Token Vamp helpers, and DexScreener shortcuts.
 
 J7 includes contract-address quick actions, tweet-card Deploy/Vamp buttons, LaunchDeck context handoff, and configurable after-deploy behavior.
+
+X includes Solana address quick buy, manual panel, Vamp controls, tweet-card LaunchDeck Deploy buttons, X Deploy context/media handoff, and configurable after-buy actions.
 
 The foundation is ready. Adding more terminals, trackers, and web apps should be incremental rather than a rewrite.
 
@@ -59,7 +62,7 @@ The popup, floating panel, and Axiom inline controls share the same quick-trade 
 
 ## Axiom Surfaces
 
-Axiom is the live production site integration today. Depending on which toggles are enabled in Options -> `Sites`, Trench Tools can show:
+Axiom support is live on `axiom.trade` and `backup.axiom.trade`. Depending on which toggles are enabled in Options -> `Sites`, Trench Tools can show:
 
 - token-page instant-trade controls
 - floating token panel
@@ -86,6 +89,17 @@ J7 support is live on `j7tracker.io`. Depending on which J7 toggles are enabled 
 - after-deploy behavior controls, including toast-only and Axiom open-tab/open-window actions
 
 LaunchDeck deploys opened from J7 can carry tweet context into the launch form. When images are detected from that context, LaunchDeck can offer image candidates that can be selected, cropped, or saved to the local image library.
+
+## X Surfaces
+
+X support is live on `x.com`. Depending on which X toggles are enabled in Options -> `Sites`, Trench Tools can show:
+
+- quick-buy, manual-panel, and Vamp buttons after detected Solana contract addresses
+- LaunchDeck Deploy buttons on tweet cards
+- optional Axiom logo buttons after detected contract-address controls
+- after-buy behavior controls, including toast-only and Axiom open-tab/open-window actions
+
+LaunchDeck deploys opened from X can prefill the clicked post URL and import visible media, video thumbnails, link-card images, and profile/avatar images from the clicked post's visible thread context. X-imported images stay session-only until you explicitly save, crop, or deploy with them.
 
 ## Which Backend Mode?
 

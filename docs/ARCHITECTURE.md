@@ -5,7 +5,7 @@ Trench Tools is local-first. The browser talks to local Rust hosts, those hosts 
 ## The Three Pieces
 
 - `execution engine` (`execution-engine`, port `8788`) - local Rust trading host. Owns wallets, presets, fee/route resolution, transaction build/sign/send, confirmations, PnL, local ledger, event stream, and the voluntary Trench Tools fee setting.
-- `Trench Tools extension` - Chrome/Edge extension. Injects into supported terminals, owns popup/options/panel browser UI, and sends trade requests to the execution engine. It also embeds LaunchDeck when the LaunchDeck host is running.
+- `Trench Tools extension` - Chrome/Edge extension. Injects into supported platforms, owns popup/options/panel browser UI, and sends trade requests to the execution engine. It also embeds LaunchDeck when the LaunchDeck host is running.
 - `LaunchDeck` (`launchdeck-engine`, port `8789`, plus `launchdeck-follow-daemon`, port `8790`) - launchpad feature. Owns deploy, snipe, dev-buy, dev-sell, follow, launch reports, and launchpad-specific UI routes.
 
 ## Process Map

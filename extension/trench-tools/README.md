@@ -17,7 +17,7 @@ Operator setup lives in the root docs:
 
 - `src/background/` - MV3 service worker, HTTP client, balance stream, active-mint registry
 - `src/content/` - content-script runtime and platform adapters
-- `src/content/platforms/` - terminal-specific adapters such as Axiom and J7
+- `src/content/platforms/` - platform-specific adapters such as Axiom, J7, and X
 - `src/content/platforms/axiom-override.js` - page-world bridge used for Axiom Pulse metadata capture and native hover/page behavior
 - `src/panel/` - floating iframe trading panel, including persistent and quick anchored modes
 - `src/options/` - Options page for connection, presets, wallets, wallet groups, sites, rewards, appearance
@@ -45,7 +45,7 @@ Local smoke/debug helpers should stay untracked when they are tied to a develope
 - Token split/consolidate UI routes should go through the execution-engine token-distribution endpoints, not browser-side transfer construction.
 - The embedded LaunchDeck shell talks to `launchdeck-engine` for Launch, Snipe, Reports, and LaunchDeck-native routes.
 - Do not import LaunchDeck UI internals directly into the trading-panel side.
-- Keep terminal adapters as the only place that scrapes platform DOM.
+- Keep platform adapters as the only place that scrapes platform DOM.
 - Keep Axiom page-world capture code in the Axiom adapter/override boundary; do not spread site-specific DOM or React-prop handling into generic panel/background code.
 - Keep storage keys product-owned (`trenchTools.*`) and runtime messages namespaced (`trench:*`).
 - Keep private reverse-engineering notes out of the repo.

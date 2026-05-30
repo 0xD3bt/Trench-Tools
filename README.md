@@ -28,7 +28,7 @@
 
 Trench Tools is an open-source, self-hosted execution stack for Solana trading and launch workflows.
 
-The stack is built around a local Rust execution engine, a browser extension for supported terminals, and LaunchDeck for launchpad operations. The runtime keeps wallets, presets, RPC configuration, transaction construction, signing, and send policy on infrastructure you control.
+The stack is built around a local Rust execution engine, a browser extension for supported platforms, and LaunchDeck for launchpad operations. The runtime keeps wallets, presets, RPC configuration, transaction construction, signing, and send policy on infrastructure you control.
 
 Use it locally for setup and testing. For lower latency and a cleaner security boundary in live trading, run it on a cheap private VPS near your closest RPC and execution-provider endpoints.
 
@@ -39,7 +39,7 @@ The project is under active development. Make sure your setup is configured and 
 Trench Tools separates the browser surface from execution:
 
 - Run `execution-engine` and `LaunchDeck` on your own machine or a private VPS. For live trading, the recommended setup is a cheap VPS near your RPC and execution-provider endpoints.
-- Install the Chrome/Edge extension in your local browser. It injects Trench Tools controls into supported platforms such as Axiom and J7Tracker.
+- Install the Chrome/Edge extension in your local browser. It injects Trench Tools controls into supported platforms such as Axiom, J7Tracker, and X.
 - When you trade from a supported platform, the extension sends the trade intent to your own execution engine. The engine handles route validation, transaction build/sign/send, confirmations, and PnL events using your configured wallets, presets, RPCs, and providers.
 - If the runtime is on a VPS, keep the raw ports private and connect your local browser through SSH forwards to `127.0.0.1:8788` and `127.0.0.1:8789`.
 
@@ -123,7 +123,8 @@ The extension site list is moving fast. Current shipped support:
 
 - Live: `axiom.trade` / `backup.axiom.trade`
 - Live: `j7tracker.io`
-- Planned: Terminal (formerly Padre), GMGN, Telegram web, Discord web, X, and more terminals
+- Live: `x.com`
+- Planned: Terminal (formerly Padre), GMGN, Telegram web, Discord web, and more terminals
 
 See [docs/EXTENSION.md](docs/EXTENSION.md) for current install steps, site toggles, and platform-specific surfaces.
 
@@ -168,7 +169,7 @@ After setup:
 - `launchdeck-follow-daemon` is running behind LaunchDeck when running `both` or `ld`
 - the token file exists at `.local/trench-tools/default-engine-token.txt`
 - Extension Options -> Global settings shows the expected host connection state
-- Axiom shows the enabled Trench Tools surfaces
+- Axiom, J7Tracker, or X show the enabled Trench Tools surfaces
 - the toolbar popup shows the expected preset, wallet/group, and quick-buy controls
 
 If the runtime is on a VPS and your browser is on your own computer, add both forwards to your SSH config so [Cursor](https://cursor.com/referral?code=5M7HRMNQT5VI)/SSH opens them automatically:

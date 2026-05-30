@@ -7,7 +7,7 @@ If setup feels annoying, it is completely fine to use an AI coding assistant to 
 ## What You Are Starting
 
 - `execution engine` (`execution-engine`, `http://127.0.0.1:8788`) handles extension trades, wallets, presets, fee/route resolution, sends, confirmations, and PnL events.
-- `Trench Tools extension` injects into supported terminals and talks to the execution engine for trading.
+- `Trench Tools extension` injects into supported platforms and talks to the execution engine for trading.
 - `LaunchDeck` (`launchdeck-engine`, `http://127.0.0.1:8789`, plus `launchdeck-follow-daemon` on `8790`) handles launchpad deploy/snipe/follow flows.
 
 Run `both` when you want the full stack. Run `ee` when you only need extension trading.
