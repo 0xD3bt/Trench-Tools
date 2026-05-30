@@ -458,6 +458,7 @@ let j7TweetContext = null;
 let j7ImageCandidateState = {
   candidates: [],
   selectedId: "",
+  source: "",
 };
 let j7ImagePersistPromise = null;
 
@@ -1368,10 +1369,16 @@ function normalizeAutoSellDraft(value) {
     : (legacyTimeoutMinutesRaw
       ? Math.max(1, Math.min(86400, Math.round((Number(legacyTimeoutMinutesRaw || 15) || 15) * 60)))
       : 30);
+  const rawPercent = value.percent == null ? "" : String(value.percent).trim();
+  const normalizedPercent = rawPercent ? normalizeDecimalInput(rawPercent, 2) : "100";
+  const percentNumber = Number(normalizedPercent);
+  const percent = Number.isInteger(percentNumber) && percentNumber > 0 && percentNumber <= 100
+    ? String(percentNumber)
+    : rawPercent;
   return {
     enabled: Boolean(value.enabled),
     sniperEnabled: Boolean(value.sniperEnabled),
-    percent: Math.max(1, Math.min(100, Number(normalizeDecimalInput(value.percent || 100, 2)) || 100)),
+    percent: percent || "100",
     triggerFamily,
     triggerMode: normalizeAutoSellTriggerMode(value.triggerMode),
     delayMs: Math.max(0, Number(value.delayMs || 0) || 0),
@@ -1636,14 +1643,11 @@ function applyImportedRouteState({
 }
 
 function normalizeDecimalInput(value, maxDecimals = 6) {
-  const raw = String(value || "").replace(/,/g, ".").trim();
-  if (!raw) return "";
-  const sanitized = raw.replace(/[^\d.]/g, "");
-  const [whole = "", fractional = ""] = sanitized.split(".");
-  const safeWhole = whole.replace(/^0+(?=\d)/, "") || (whole ? "0" : "");
-  return fractional !== undefined && sanitized.includes(".")
-    ? `${safeWhole || "0"}.${fractional.slice(0, maxDecimals)}`
-    : safeWhole;
+  const parser = window.TrenchNumericInput?.normalizeUnsignedDecimalInput;
+  if (typeof parser === "function") {
+    return parser(value, { maxDecimals });
+  }
+  return String(value || "").trim();
 }
 
 walletRuntimeDomain = WalletRuntimeDomainModule.create({
@@ -3452,17 +3456,24 @@ function setTickerCapsEnabled(enabled, { persist = false } = {}) {
 }
 
 function getLaunchpadTokenMetadata(launchpad = getLaunchpad()) {
-  const entry = latestLaunchpadRegistry && latestLaunchpadRegistry[launchpad];
+  const normalizedLaunchpad = normalizeLaunchpad(launchpad);
+  const fallbackMetadata = normalizedLaunchpad === "pump"
+    ? { nameMaxLength: 32, symbolMaxLength: 13 }
+    : DEFAULT_LAUNCHPAD_TOKEN_METADATA;
+  const entry = latestLaunchpadRegistry && latestLaunchpadRegistry[normalizedLaunchpad];
   const metadata = entry && entry.tokenMetadata ? entry.tokenMetadata : {};
-  const nameMaxLength = Number(metadata.nameMaxLength || DEFAULT_LAUNCHPAD_TOKEN_METADATA.nameMaxLength);
-  const symbolMaxLength = Number(metadata.symbolMaxLength || DEFAULT_LAUNCHPAD_TOKEN_METADATA.symbolMaxLength);
+  const nameMaxLength = Number(metadata.nameMaxLength || fallbackMetadata.nameMaxLength);
+  const rawSymbolMaxLength = Number(metadata.symbolMaxLength || fallbackMetadata.symbolMaxLength);
+  const symbolMaxLength = normalizedLaunchpad === "pump"
+    ? Math.max(rawSymbolMaxLength, fallbackMetadata.symbolMaxLength)
+    : rawSymbolMaxLength;
   return {
     nameMaxLength: Number.isFinite(nameMaxLength) && nameMaxLength > 0
       ? nameMaxLength
-      : DEFAULT_LAUNCHPAD_TOKEN_METADATA.nameMaxLength,
+      : fallbackMetadata.nameMaxLength,
     symbolMaxLength: Number.isFinite(symbolMaxLength) && symbolMaxLength > 0
       ? symbolMaxLength
-      : DEFAULT_LAUNCHPAD_TOKEN_METADATA.symbolMaxLength,
+      : fallbackMetadata.symbolMaxLength,
   };
 }
 
@@ -4212,10 +4223,6 @@ function setVampStatus(message = "") {
   vampStatus.textContent = message;
 }
 
-function looksLikeSolanaAddress(value) {
-  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(value || "").trim());
-}
-
 function extractSolanaAddressFromText(value) {
   const match = String(value || "").match(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/);
   return match ? match[0] : "";
@@ -4609,8 +4616,8 @@ function normalizeJ7ImageCandidate(candidate, index) {
 }
 
 function selectedJ7Candidate() {
-  return j7ImageCandidateState.candidates.find((candidate) => candidate.id === j7ImageCandidateState.selectedId)
-    || j7ImageCandidateState.candidates.find((candidate) => !candidate.removed)
+  if (!j7ImageCandidateState.selectedId) return null;
+  return j7ImageCandidateState.candidates.find((candidate) => candidate.id === j7ImageCandidateState.selectedId && !candidate.removed)
     || null;
 }
 
@@ -4723,7 +4730,11 @@ function setJ7ImagePickerActive(isActive) {
   if (j7OpenImageLibraryButton) j7OpenImageLibraryButton.hidden = !isActive;
 }
 
-function selectJ7ImageCandidate(candidateId) {
+function isXImageCandidateContext() {
+  return String(j7ImageCandidateState.source || "").trim().toLowerCase() === "x";
+}
+
+function selectJ7ImageCandidate(candidateId, { persistForMetadata = false } = {}) {
   const candidate = j7ImageCandidateState.candidates.find((entry) => entry.id === candidateId && !entry.removed);
   if (!candidate) return;
   if (uploadedImage?.j7CandidateId !== candidate.id) {
@@ -4740,14 +4751,16 @@ function selectJ7ImageCandidate(candidateId) {
   };
   clearMetadataUploadCache({ clearInput: true });
   setImagePreview(j7CandidatePreviewUrl(candidate));
-  if (imageStatus) imageStatus.textContent = "J7 image selected for this deploy session.";
+  if (imageStatus) imageStatus.textContent = "Image selected for this deploy session.";
   if (imagePath) imagePath.textContent = "";
   setJ7ImagePickerActive(true);
   renderJ7ImageCandidates();
-  persistSelectedJ7ImageForMetadata().catch((error) => {
-    if (imageStatus) imageStatus.textContent = error.message;
-    if (imagePath) imagePath.textContent = "";
-  });
+  if (persistForMetadata) {
+    persistSelectedJ7ImageForMetadata().catch((error) => {
+      if (imageStatus) imageStatus.textContent = error.message;
+      if (imagePath) imagePath.textContent = "";
+    });
+  }
 }
 
 function removeJ7ImageCandidate(candidateId) {
@@ -4756,8 +4769,8 @@ function removeJ7ImageCandidate(candidateId) {
   candidate.removed = true;
   if (j7ImageCandidateState.selectedId === candidateId) {
     const next = j7ImageCandidateState.candidates.find((entry) => !entry.removed);
-    if (next) {
-      selectJ7ImageCandidate(next.id);
+    if (next && !isXImageCandidateContext()) {
+      selectJ7ImageCandidate(next.id, { persistForMetadata: true });
       return;
     }
     j7ImageCandidateState.selectedId = "";
@@ -4903,6 +4916,10 @@ function saveJ7CroppedCandidate(candidate, dataUrl) {
   j7ImageCandidateState.candidates.unshift(cropped);
   closeJ7CropModal();
   selectJ7ImageCandidate(cropped.id);
+  persistSelectedJ7ImageForMetadata().catch((error) => {
+    if (imageStatus) imageStatus.textContent = error.message;
+    if (imagePath) imagePath.textContent = "";
+  });
 }
 
 async function loadJ7TweetContextFromShell() {
@@ -4914,21 +4931,24 @@ async function loadJ7TweetContextFromShell() {
     await chrome.storage.local.remove(key);
     if (!context || typeof context !== "object") return;
     j7TweetContext = context;
+    j7ImageCandidateState.source = String(context.source || "j7").trim().toLowerCase();
     const images = Array.isArray(context.images) ? context.images : [];
     j7ImageCandidateState.candidates = images
       .map((candidate, index) => normalizeJ7ImageCandidate(candidate, index))
       .filter(Boolean)
       .sort((a, b) => a.order - b.order);
-    if (j7ImageCandidateState.candidates.length) {
-      selectJ7ImageCandidate(j7ImageCandidateState.candidates[0].id);
+    if (j7ImageCandidateState.candidates.length && !isXImageCandidateContext()) {
+      selectJ7ImageCandidate(j7ImageCandidateState.candidates[0].id, { persistForMetadata: true });
     } else {
+      j7ImageCandidateState.selectedId = "";
+      uploadedImage = null;
       renderJ7ImageCandidates();
     }
     if (context.text && descriptionInput && !descriptionInput.value.trim()) {
       descriptionInput.value = String(context.text).slice(0, descriptionInput.maxLength || 1000);
       updateTokenFieldCounts();
     }
-    applyJ7ContextLinks(context);
+    applyJ7ContextLinks(context, { preferExisting: context.source !== "x" });
     if (String(extensionShellConfig?.action || "") === "vamp-with-tweet") {
       showVampModal({ tweetUrl: context.tweetUrl || "" });
     }
@@ -5519,10 +5539,6 @@ function surfaceMetadataWarning(warning) {
 function scheduleMetadataPreupload({ immediate = false } = {}) {
   if (!imageMetadataDomain) return;
   if (uploadedImage?.j7SessionOnly) {
-    persistSelectedJ7ImageForMetadata().catch((error) => {
-      if (imageStatus) imageStatus.textContent = error.message;
-      if (imagePath) imagePath.textContent = "";
-    });
     return;
   }
   imageMetadataDomain.scheduleMetadataPreupload({ immediate });
@@ -5867,7 +5883,7 @@ const fieldValidators = {
   automaticDevSellPercent(v) {
     if (!isNamedChecked("automaticDevSellEnabled")) return "";
     const n = Number(normalizeDecimalInput(v, 2));
-    if (isNaN(n) || n <= 0 || n > 100) return "Must be between 1 and 100";
+    if (!Number.isInteger(n) || n <= 0 || n > 100) return "Must be a whole number from 1 to 100";
     return "";
   },
   automaticDevSellDelayMs(v) {

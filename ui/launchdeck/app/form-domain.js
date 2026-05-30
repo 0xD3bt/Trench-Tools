@@ -247,6 +247,16 @@
       return metadataUploadState.completedFingerprint === metadataFingerprintFromForm(formValues);
     }
 
+    function normalizeAutoSellPercentForDraft(value) {
+      const rawPercent = value == null ? "" : String(value).trim();
+      const normalizedPercent = rawPercent ? normalizeDecimalInput(rawPercent, 2) : "100";
+      const percentNumber = Number(normalizedPercent);
+      if (Number.isInteger(percentNumber) && percentNumber > 0 && percentNumber <= 100) {
+        return String(percentNumber);
+      }
+      return rawPercent || "100";
+    }
+
     function buildSavedConfigFromForm() {
       const current = cloneConfig(getConfig());
       const base = current || createFallbackConfig();
@@ -304,7 +314,7 @@
         ? {
           enabled: Boolean(f.automaticDevSellEnabled),
           sniperEnabled: Boolean(f.automaticSniperSellEnabled),
-          percent: Number(normalizeDecimalInput(f.automaticDevSellPercent || 100, 2) || 100),
+          percent: normalizeAutoSellPercentForDraft(f.automaticDevSellPercent),
           triggerFamily: normalizeAutoSellTriggerFamily(f.automaticDevSellTriggerFamily),
           triggerMode: normalizeAutoSellTriggerMode(f.automaticDevSellTriggerMode),
           delayMs: Number(f.automaticDevSellDelayMs || 0),

@@ -139,7 +139,7 @@ pub fn launchpad_registry(
                     .expect("pump runtime capabilities"),
                 tokenMetadata: TokenMetadataLimits {
                     nameMaxLength: 32,
-                    symbolMaxLength: 10,
+                    symbolMaxLength: 13,
                 },
                 supportsStrategies: StrategySupport {
                     snipe_own_launch: true,

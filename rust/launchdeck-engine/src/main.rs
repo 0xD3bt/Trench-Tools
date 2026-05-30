@@ -1941,11 +1941,9 @@ fn file_response(path: std::path::PathBuf) -> Result<Response<Body>, (StatusCode
         })
 }
 
-fn launchdeck_index_response(
-    state: &AppState,
-) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+fn launchdeck_index_response() -> Result<Response<Body>, (StatusCode, Json<Value>)> {
     let path = paths::ui_dir().join("launchdeck").join("index.html");
-    let mut body = std::fs::read_to_string(&path).map_err(|_| {
+    let body = std::fs::read_to_string(&path).map_err(|_| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -1954,28 +1952,6 @@ fn launchdeck_index_response(
             })),
         )
     })?;
-    if let Some(auth) = &state.auth {
-        let token = auth.default_token().map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "ok": false,
-                    "error": error,
-                })),
-            )
-        })?;
-        let injected = format!(
-            "<script>window.__ldToken = {};</script>",
-            serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".to_string())
-        );
-        if let Some(index) = body.rfind("<script") {
-            body.insert_str(index, &injected);
-        } else if let Some(index) = body.rfind("</body>") {
-            body.insert_str(index, &injected);
-        } else {
-            body.push_str(&injected);
-        }
-    }
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, guess_content_type(&path))
@@ -1992,10 +1968,8 @@ fn launchdeck_index_response(
         })
 }
 
-async fn serve_launchdeck_index(
-    State(state): State<Arc<AppState>>,
-) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
-    launchdeck_index_response(&state)
+async fn serve_launchdeck_index() -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    launchdeck_index_response()
 }
 
 fn static_not_found() -> (StatusCode, Json<Value>) {
@@ -8335,15 +8309,14 @@ async fn api_vanity_status() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
 }
 
 async fn static_handler(
-    State(state): State<Arc<AppState>>,
     AxumPath(requested): AxumPath<String>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
     let normalized = requested.trim().trim_matches('/').to_string();
     if normalized.is_empty() || normalized == "index.html" {
-        return launchdeck_index_response(&state);
+        return launchdeck_index_response();
     }
     if normalized == "launchdeck" || normalized == "launchdeck/index.html" {
-        return launchdeck_index_response(&state);
+        return launchdeck_index_response();
     }
     if normalized == "legacy" || normalized.starts_with("legacy/") {
         return Err(static_not_found());

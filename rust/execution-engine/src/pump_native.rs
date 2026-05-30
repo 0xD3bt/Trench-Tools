@@ -35,9 +35,9 @@ use uuid::Uuid;
 
 use crate::{
     bonk_execution_support::build_trusted_raydium_clmm_swap_exact_in,
-    extension_api::{MevMode, TradeSide},
+    extension_api::{TradeSide, jitodontfront_enabled_for_provider},
     paths,
-    provider_tip::pick_tip_account_for_provider,
+    provider_tip::{pick_tip_account_for_provider, provider_required_tip_lamports},
     rollout::{wrapper_default_fee_bps, wrapper_fee_vault_pubkey},
     rpc_client::{
         CompiledTransaction, configured_rpc_url, fetch_account_data, fetch_account_exists,
@@ -65,30 +65,17 @@ use crate::{
     wrapper_compile::estimate_sol_in_fee_lamports,
 };
 
-/// Minimum inline tip lamports per provider. These match the provider's
-/// server-side enforcement — if we submit below these thresholds the
-/// transport rejects the request with a JSON-RPC error.
-/// - Helius Sender requires 200_000 lamports (0.0002 SOL) to one of their
-///   configured tip accounts (source: Helius 500 error body).
-/// - Hello Moon QUIC requires 1_000_000 lamports (0.001 SOL) — see
-///   `launchdeck-engine::rpc::validate_hellomoon_transaction`.
-const HELIUS_SENDER_MIN_TIP_LAMPORTS: u64 = 200_000;
-const HELLO_MOON_MIN_TIP_LAMPORTS: u64 = 1_000_000;
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 
 fn provider_min_tip_lamports(provider: &str) -> u64 {
-    match provider.trim() {
-        "helius-sender" => HELIUS_SENDER_MIN_TIP_LAMPORTS,
-        "hellomoon" => HELLO_MOON_MIN_TIP_LAMPORTS,
-        _ => 0,
-    }
+    provider_required_tip_lamports(provider).unwrap_or(0)
 }
 
 /// Resolves the inline tip (instruction + lamports + tip-account string) for a
 /// compiled trade. If the chosen provider carries a minimum tip requirement
-/// (Helius Sender, Hello Moon) the returned lamports value is floor-clamped to
-/// that minimum, even when the preset's `tip_sol` is lower or empty, because
-/// the transport will otherwise reject the transaction with an HTTP 500.
+/// the returned lamports value is floor-clamped to that minimum, even when the
+/// preset's `tip_sol` is lower or empty, because the transport will otherwise
+/// reject the transaction.
 ///
 /// Returns `None` when no tip should be attached (e.g. provider has no tip
 /// account configured — `standard-rpc`).
@@ -613,7 +600,7 @@ pub async fn compile_pump_trade(
     let compute_unit_price_micro_lamports =
         priority_fee_sol_to_micro_lamports(&request.policy.fee_sol)?;
     let jitodontfront_enabled =
-        matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure);
+        jitodontfront_enabled_for_provider(&request.policy.provider, &request.policy.mev_mode);
     let mut core_instructions = match request.side {
         TradeSide::Buy => {
             let spend_lamports = parse_decimal_units(
@@ -1420,7 +1407,7 @@ async fn compile_pump_amm_trade(
     let compute_unit_price_micro_lamports =
         priority_fee_sol_to_micro_lamports(&request.policy.fee_sol)?;
     let jitodontfront_enabled =
-        matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure);
+        jitodontfront_enabled_for_provider(&request.policy.provider, &request.policy.mev_mode);
 
     let (
         protocol_fee_recipient,
@@ -1670,7 +1657,7 @@ async fn compile_pump_amm_trade(
         &request.policy.provider,
         &request.policy.tip_sol,
     )?;
-    if matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure) {
+    if jitodontfront_enabled {
         apply_jitodontfront(&mut instructions, &owner_pubkey)?;
     }
 
@@ -4162,7 +4149,12 @@ fn apply_jitodontfront(instructions: &mut Vec<Instruction>, payer: &Pubkey) -> R
     instruction
         .accounts
         .push(AccountMeta::new_readonly(dontfront, false));
-    instructions.insert(0, instruction);
+    let compute_budget = compute_budget_program_id()?;
+    let insert_index = instructions
+        .iter()
+        .take_while(|instruction| instruction.program_id == compute_budget)
+        .count();
+    instructions.insert(insert_index, instruction);
     Ok(())
 }
 
@@ -4792,6 +4784,41 @@ mod tests {
         assert_eq!(
             instruction.accounts[14].pubkey,
             get_associated_token_address_with_program_id(user, mint, token_program)
+        );
+    }
+
+    #[test]
+    fn jito_bundle_tip_is_floor_clamped_for_manual_pump_trades() {
+        let payer = Pubkey::new_unique();
+        let (_instruction, lamports, tip_account) = resolve_inline_tip(&payer, "jito-bundle", "")
+            .expect("jito tip should resolve")
+            .expect("jito tip should be present");
+
+        assert_eq!(lamports, 1_000);
+        assert!(!tip_account.is_empty());
+    }
+
+    #[test]
+    fn jitodontfront_is_inserted_after_compute_budget_instructions() {
+        let payer = Pubkey::new_unique();
+        let mut instructions = vec![
+            build_compute_unit_limit_instruction(100_000).expect("compute limit"),
+            build_compute_unit_price_instruction(1).expect("compute price"),
+            transfer(&payer, &payer, 0),
+        ];
+
+        apply_jitodontfront(&mut instructions, &payer).expect("jitodontfront");
+        apply_jitodontfront(&mut instructions, &payer).expect("idempotent jitodontfront");
+
+        let compute_budget = compute_budget_program_id().expect("compute budget program");
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions[0].program_id, compute_budget);
+        assert_eq!(instructions[1].program_id, compute_budget);
+        assert!(
+            instructions[2]
+                .accounts
+                .iter()
+                .any(|account| account.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
         );
     }
 

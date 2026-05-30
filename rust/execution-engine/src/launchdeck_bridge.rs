@@ -6,14 +6,14 @@ use shared_transaction_submit::{
 };
 
 use crate::{
-    extension_api::MevMode,
+    extension_api::{MevMode, jitodontfront_enabled_for_provider},
     rpc_client::{CompiledTransaction, SentResult},
     trade_runtime::RuntimeExecutionPolicy,
     transport::TransportPlan,
 };
 
 pub fn to_launchdeck_execution(policy: &RuntimeExecutionPolicy) -> NormalizedExecution {
-    let jitodontfront = matches!(policy.mev_mode, MevMode::Reduced | MevMode::Secure);
+    let jitodontfront = jitodontfront_enabled_for_provider(&policy.provider, &policy.mev_mode);
     NormalizedExecution {
         simulate: false,
         send: true,
@@ -255,6 +255,16 @@ mod tests {
         assert!(execution.jitodontfront);
         assert!(execution.buyJitodontfront);
         assert!(execution.sellJitodontfront);
+    }
+
+    #[test]
+    fn reduced_mev_does_not_enable_jitodontfront_for_helius() {
+        let mut policy = sample_policy(MevMode::Reduced);
+        policy.provider = "helius-sender".to_string();
+        let execution = to_launchdeck_execution(&policy);
+        assert!(!execution.jitodontfront);
+        assert!(!execution.buyJitodontfront);
+        assert!(!execution.sellJitodontfront);
     }
 
     #[test]

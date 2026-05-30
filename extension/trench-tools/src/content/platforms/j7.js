@@ -75,6 +75,7 @@
       let lastBodyClass = "";
       let compactMql = null;
       let compactMqlListener = null;
+      let lastButtonScale = 1;
 
       function getCurrentTokenCandidate() {
         const address = firstSolanaAddress();
@@ -139,10 +140,17 @@
           return;
         }
 
+        const scale = j7ButtonScale();
+        if (scale !== lastButtonScale) {
+          lastButtonScale = scale;
+          removeNoTwitchStyle();
+          scheduleRestamp();
+        }
         ensureNoTwitchStyle();
         ensureCompactObserver();
         mountContractAddressControls(document);
         mountCardLaunchdeckControls(document);
+        applyExistingPlatformActionButtonDesigns();
         ensureBodyClassObserver();
       }
 
@@ -159,8 +167,8 @@
           ".tweet-card.deploy-right .tweet-vamp-btn-standalone:not([" + TT_VAMP_SHIFTED_ATTR + "]):not([data-trench-tools-j7-card-action])," +
           ".tweet-card.deploy-right .tweet-vamp-btn:not([" + TT_VAMP_SHIFTED_ATTR + "]):not([data-trench-tools-j7-card-action])" +
           "{visibility:hidden!important}";
-        const w = COMPACT_BUTTON_SIZE_PX + "px";
-        const ico = COMPACT_ICON_SIZE_PX + "px";
+        const w = scaledPx(COMPACT_BUTTON_SIZE_PX);
+        const ico = scaledPx(COMPACT_ICON_SIZE_PX);
         const compactPrepaintRule =
           "@media (max-width:" + TOP_RIGHT_NARROW_BREAKPOINT_PX + "px){" +
             ".tweet-card.deploy-top-right .tweet-vamp-btn-topright," +
@@ -208,6 +216,64 @@
         return Boolean(compactMql && compactMql.matches);
       }
 
+      function j7ButtonScale() {
+        const platformScale = helpers.resolvePlatformButtonScale?.("j7");
+        const raw = platformScale ?? helpers.state.appearance?.platformButtonScales?.j7 ?? 1;
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) ? Math.min(1.5, Math.max(0.75, parsed)) : 1;
+      }
+
+      function scaledPx(value) {
+        return `${Math.round(Number(value || 0) * j7ButtonScale())}px`;
+      }
+
+      function scaledCssLength(value, fallbackPx) {
+        const text = String(value || "").trim();
+        const match = /^(-?\d+(?:\.\d+)?)px$/i.exec(text);
+        if (match) {
+          return scaledPx(Number(match[1]));
+        }
+        return scaledPx(fallbackPx);
+      }
+
+      function platformButtonDesign(type) {
+        const design = helpers.resolvePlatformButtonDesign?.(type);
+        return design && typeof design === "object"
+          ? design
+          : { color: TT_BRAND_FG, backgroundColor: TT_BRAND_BG, borderColor: "rgba(255,255,255,0.18)" };
+      }
+
+      function platformButtonHoverBackground(type) {
+        const background = String(platformButtonDesign(type).backgroundColor || TT_BRAND_BG).trim();
+        return /^#[0-9a-f]{6,8}$/i.test(background) ? `${background.slice(0, 7)}cc` : TT_BRAND_HOVER_BG;
+      }
+
+      function platformButtonDesignSignature() {
+        const design = platformButtonDesign("deploy");
+        return [design.color || "", design.backgroundColor || "", design.borderColor || ""].join(":");
+      }
+
+      function applyPlatformButtonStyleSet(styleSet, type) {
+        return helpers.applyPlatformButtonDesign?.(styleSet, type) || styleSet;
+      }
+
+      function applyPlatformButtonDomDesign(button, type) {
+        if (!(button instanceof HTMLElement)) return;
+        const design = platformButtonDesign(type);
+        button.style.setProperty("background", design.backgroundColor || TT_BRAND_BG, "important");
+        button.style.setProperty("color", design.color || TT_BRAND_FG, "important");
+        button.style.setProperty("border", `1px solid ${design.borderColor || "rgba(255,255,255,0.18)"}`, "important");
+      }
+
+      function applyExistingPlatformActionButtonDesigns() {
+        document.querySelectorAll("[data-trench-tools-j7-card-action='deploy']").forEach((button) => {
+          applyPlatformButtonDomDesign(button, "deploy");
+        });
+        document.querySelectorAll("[data-trench-tools-j7-card-action='vamp']").forEach((button) => {
+          applyPlatformButtonDomDesign(button, "vamp");
+        });
+      }
+
       function compactStyleKey(property) {
         return property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
       }
@@ -246,10 +312,12 @@
         for (const property of COMPACT_BUTTON_PROPS) {
           rememberInlineStyle(button, property);
         }
-        button.style.setProperty("width", COMPACT_BUTTON_SIZE_PX + "px", "important");
-        button.style.setProperty("min-width", COMPACT_BUTTON_SIZE_PX + "px", "important");
-        button.style.setProperty("max-width", COMPACT_BUTTON_SIZE_PX + "px", "important");
-        button.style.setProperty("flex", "0 0 " + COMPACT_BUTTON_SIZE_PX + "px", "important");
+        const compactButtonSize = scaledPx(COMPACT_BUTTON_SIZE_PX);
+        const compactIconSize = scaledPx(COMPACT_ICON_SIZE_PX);
+        button.style.setProperty("width", compactButtonSize, "important");
+        button.style.setProperty("min-width", compactButtonSize, "important");
+        button.style.setProperty("max-width", compactButtonSize, "important");
+        button.style.setProperty("flex", "0 0 " + compactButtonSize, "important");
         button.style.setProperty("padding-left", "0", "important");
         button.style.setProperty("padding-right", "0", "important");
         button.style.setProperty("gap", "0", "important");
@@ -259,8 +327,8 @@
             rememberInlineStyle(child, "width");
             rememberInlineStyle(child, "height");
             rememberInlineStyle(child, "flex");
-            child.style.setProperty("width", COMPACT_ICON_SIZE_PX + "px", "important");
-            child.style.setProperty("height", COMPACT_ICON_SIZE_PX + "px", "important");
+            child.style.setProperty("width", compactIconSize, "important");
+            child.style.setProperty("height", compactIconSize, "important");
             child.style.setProperty("flex", "0 0 auto", "important");
           } else if (child instanceof HTMLElement) {
             rememberInlineStyle(child, "display");
@@ -346,7 +414,7 @@
 
       function mountContractAddressControls(root) {
         const features = j7Features();
-        if (!features.contractQuickBuy && !features.contractQuickPanel && !features.contractVamp) {
+        if (!features.contractQuickBuy && !features.contractQuickPanel && !features.contractVamp && !features.contractAxiom) {
           document.querySelectorAll(TT_CONTRACT_WRAPPER_SELECTOR).forEach((element) => element.remove());
           return;
         }
@@ -437,7 +505,10 @@
         return [
           features.contractQuickBuy ? "buy" : "",
           features.contractQuickPanel ? "panel" : "",
-          features.contractVamp ? "vamp" : ""
+          features.contractVamp ? "vamp" : "",
+          features.contractAxiom ? "axiom" : "",
+          j7ButtonScale(),
+          platformButtonDesignSignature()
         ].filter(Boolean).join("|");
       }
 
@@ -482,50 +553,61 @@
           vamp.setAttribute("data-trench-tools-j7-contract-action", "vamp");
           wrapper.appendChild(vamp);
         }
+        if (features.contractAxiom) {
+          const axiom = buildAxiomContractButton(async () => {
+            const tokenContext = await helpers.resolveInlineToken(mint, "contract_address");
+            if (!tokenContext) throw new Error("Token not found.");
+            await helpers.openAxiomRoute(tokenContext);
+          });
+          axiom.setAttribute("data-trench-tools-j7-contract-action", "axiom");
+          wrapper.appendChild(axiom);
+        }
         return wrapper;
       }
 
       function contractButtonStyles() {
         const base = helpers.getQuickBuyBaseStyles();
-        return {
+        const styleSet = {
           ...base,
           base: {
             ...base.base,
-            height: "20px",
-            minHeight: "20px",
-            padding: "0 7px",
-            borderRadius: "5px",
-            fontSize: "11px",
+            height: scaledPx(20),
+            minHeight: scaledPx(20),
+            padding: `0 ${scaledPx(7)}`,
+            borderRadius: scaledPx(5),
+            fontSize: scaledPx(11),
             lineHeight: "1"
           },
           hover: {
             ...base.hover,
-            height: "20px",
-            minHeight: "20px"
+            height: scaledPx(20),
+            minHeight: scaledPx(20)
           },
-          logoSize: "12px",
-          logoGap: "3px"
+          logoSize: scaledPx(12),
+          logoGap: scaledPx(3)
         };
+        return applyPlatformButtonStyleSet(styleSet, "deploy");
       }
 
       function contractIconButtonStyles() {
         const styles = contractButtonStyles();
-        return {
+        const styleSet = {
           ...styles,
           base: {
             ...styles.base,
-            width: "22px",
-            minWidth: "22px",
+            width: scaledPx(22),
+            minWidth: scaledPx(22),
             padding: "0"
           },
           hover: {
             ...styles.hover,
-            width: "22px",
-            minWidth: "22px",
+            width: scaledPx(22),
+            minWidth: scaledPx(22),
             padding: "0"
           },
           logoGap: "0px"
         };
+        return applyPlatformButtonStyleSet(styleSet, "panel");
       }
 
       function mountCardLaunchdeckControls(root) {
@@ -770,14 +852,13 @@
         const innerHeight = Math.max(0, heightVal - padTop - padBottom);
         const iconSize = Math.max(12, Math.min(20, Math.round(innerHeight * 0.7))) || 14;
         button.innerHTML = vampIconSvg(String(iconSize));
+        applyPlatformButtonDomDesign(button, "vamp");
 
         button.addEventListener("mouseenter", () => {
-          button.style.setProperty("background", TT_BRAND_HOVER_BG, "important");
-          button.style.setProperty("border-color", "rgba(255,255,255,0.32)", "important");
+          button.style.setProperty("background", platformButtonHoverBackground("vamp"), "important");
         });
         button.addEventListener("mouseleave", () => {
-          button.style.setProperty("background", TT_BRAND_BG, "important");
-          button.style.setProperty("border-color", "rgba(255,255,255,0.18)", "important");
+          applyPlatformButtonDomDesign(button, "vamp");
         });
         button.addEventListener("click", async (event) => {
           event.preventDefault();
@@ -856,8 +937,6 @@
         clone.setAttribute("data-trench-tools-j7-card-action", "deploy");
         clone.setAttribute("type", "button");
         clone.title = "Trench Tools deploy from this tweet";
-        clone.style.background = TT_BRAND_BG;
-        clone.style.color = TT_BRAND_FG;
 
         const parentClass = nativeButton.parentElement && typeof nativeButton.parentElement.className === "string"
           ? nativeButton.parentElement.className
@@ -874,12 +953,13 @@
           const iconSize = nativeStyle.fontSize ? Math.max(14, Math.round(parseFloat(nativeStyle.fontSize) * 1.3)) : 18;
           clone.innerHTML = `${deployIconSvg(String(iconSize))}<span data-trench-tools-deploy-text style="font-weight:inherit;letter-spacing:0.04em">DEPLOY</span>`;
         }
+        applyPlatformButtonDomDesign(clone, "deploy");
 
         clone.addEventListener("mouseenter", () => {
-          clone.style.background = TT_BRAND_HOVER_BG;
+          clone.style.setProperty("background", platformButtonHoverBackground("deploy"), "important");
         });
         clone.addEventListener("mouseleave", () => {
-          clone.style.background = TT_BRAND_BG;
+          applyPlatformButtonDomDesign(clone, "deploy");
         });
         clone.addEventListener("click", async (event) => {
           event.preventDefault();
@@ -908,8 +988,9 @@
       }
 
       function applySideRailDeployWidth(button) {
+        const width = scaledPx(SIDE_RAIL_DEPLOY_WIDTH_PX);
         for (const property of ["width", "min-width", "max-width"]) {
-          button.style.setProperty(property, SIDE_RAIL_DEPLOY_WIDTH, "important");
+          button.style.setProperty(property, width, "important");
         }
         button.style.setProperty("border-radius", SIDE_RAIL_BORDER_RADIUS, "important");
       }
@@ -920,8 +1001,8 @@
           ["display", "inline-flex"],
           ["align-items", "center"],
           ["justify-content", "center"],
-          ["height", nativeStyle.height || "40px"],
-          ["min-height", nativeStyle.height || "40px"],
+          ["height", scaledCssLength(nativeStyle.height, 40)],
+          ["min-height", scaledCssLength(nativeStyle.height, 40)],
           ["line-height", "1"],
           ["cursor", "pointer"],
           ["flex", "0 0 auto"],
@@ -937,7 +1018,7 @@
           ["gap", nativeStyle.gap && nativeStyle.gap !== "normal" ? nativeStyle.gap : "8px"],
           ["padding", nativeStyle.padding || "11px 38px"],
           ["font-family", nativeStyle.fontFamily || "inherit"],
-          ["font-size", nativeStyle.fontSize || "14px"],
+          ["font-size", scaledCssLength(nativeStyle.fontSize, 14)],
           ["font-weight", nativeStyle.fontWeight || "700"]
         ];
         for (const [property, value] of important) {
@@ -953,10 +1034,11 @@
       }
 
       function styleSideRailDeployButton(button) {
+        const width = scaledPx(SIDE_RAIL_DEPLOY_WIDTH_PX);
         const declarations = [
-          ["width", SIDE_RAIL_DEPLOY_WIDTH],
-          ["min-width", SIDE_RAIL_DEPLOY_WIDTH],
-          ["max-width", SIDE_RAIL_DEPLOY_WIDTH],
+          ["width", width],
+          ["min-width", width],
+          ["max-width", width],
           ["height", "100%"],
           ["min-height", "100%"],
           ["display", "flex"],
@@ -994,21 +1076,23 @@
       function positionTtSideRailButton(button, section) {
         if (!(button instanceof HTMLElement) || !(section instanceof HTMLElement)) return;
         const side = getSideRailSide(section);
+        const width = scaledPx(SIDE_RAIL_DEPLOY_WIDTH_PX);
+        const offset = Math.round((SIDE_RAIL_DEPLOY_WIDTH_PX + SIDE_RAIL_DEPLOY_GAP_PX) * j7ButtonScale());
         button.style.setProperty("position", "absolute", "important");
         button.style.setProperty("top", "0", "important");
         button.style.setProperty("bottom", "0", "important");
         button.style.setProperty("height", "auto", "important");
         button.style.setProperty("min-height", "0", "important");
         button.style.setProperty("max-height", "none", "important");
-        button.style.setProperty("width", SIDE_RAIL_DEPLOY_WIDTH, "important");
-        button.style.setProperty("min-width", SIDE_RAIL_DEPLOY_WIDTH, "important");
-        button.style.setProperty("max-width", SIDE_RAIL_DEPLOY_WIDTH, "important");
+        button.style.setProperty("width", width, "important");
+        button.style.setProperty("min-width", width, "important");
+        button.style.setProperty("max-width", width, "important");
         button.style.setProperty("margin", "0", "important");
         if (side === "left") {
-          button.style.setProperty("left", `${SIDE_RAIL_TT_OFFSET_PX}px`, "important");
+          button.style.setProperty("left", `${offset}px`, "important");
           button.style.removeProperty("right");
         } else {
-          button.style.setProperty("right", `${SIDE_RAIL_TT_OFFSET_PX}px`, "important");
+          button.style.setProperty("right", `${offset}px`, "important");
           button.style.removeProperty("left");
         }
       }
@@ -1024,7 +1108,7 @@
         const originalLeft = section.style.getPropertyValue("left");
         const originalRight = section.style.getPropertyValue("right");
         section.setAttribute(TT_RAIL_RESIZED_ATTR, JSON.stringify({ width: original, left: originalLeft, right: originalRight }));
-        section.style.setProperty("width", SIDE_RAIL_DEPLOY_WIDTH, "important");
+        section.style.setProperty("width", scaledPx(SIDE_RAIL_DEPLOY_WIDTH_PX), "important");
         if (side === "left" && Number.isFinite(left)) {
           section.style.setProperty("left", `${left - SIDE_RAIL_OUTER_TRIM_PX}px`, "important");
         } else if (side === "right" && Number.isFinite(right)) {
@@ -1120,14 +1204,15 @@
         button.setAttribute("data-trench-tools-j7-card-action", "deploy");
         button.title = "Trench Tools deploy from this tweet";
         styleSideRailDeployButton(button);
+        applyPlatformButtonDomDesign(button, "deploy");
         button.innerHTML = ttLogoUrl
           ? `<img src="${ttLogoUrl}" alt="TT" style="width:16px;height:16px;display:block;flex:none;object-fit:contain;filter:brightness(0) invert(1);pointer-events:none"/><span style="font-size:9px;font-weight:700;letter-spacing:0.04em;line-height:1">DEPLOY</span>`
           : `${deployIconSvg("14")}<span style="font-size:9px;font-weight:700;letter-spacing:0.04em;line-height:1">DEPLOY</span>`;
         button.addEventListener("mouseenter", () => {
-          button.style.background = TT_BRAND_HOVER_BG;
+          button.style.setProperty("background", platformButtonHoverBackground("deploy"), "important");
         });
         button.addEventListener("mouseleave", () => {
-          button.style.background = TT_BRAND_BG;
+          applyPlatformButtonDomDesign(button, "deploy");
         });
         button.addEventListener("click", async (event) => {
           event.preventDefault();
@@ -1157,22 +1242,29 @@
       }
 
       function buildMiniActionButton(label, onClick) {
+        const design = platformButtonDesign("vamp");
         const button = document.createElement("button");
         button.type = "button";
         button.textContent = label;
         button.title = "Vamp token in LaunchDeck";
         Object.assign(button.style, {
-          height: "20px",
-          minHeight: "20px",
-          borderRadius: "5px",
-          border: "1px solid rgba(255,255,255,0.18)",
-          background: "#000",
-          color: "#fff",
-          padding: "0 7px",
-          fontSize: "11px",
+          height: scaledPx(20),
+          minHeight: scaledPx(20),
+          borderRadius: scaledPx(5),
+          border: `1px solid ${design.borderColor || "rgba(255,255,255,0.18)"}`,
+          background: design.backgroundColor || "#000",
+          color: design.color || "#fff",
+          padding: `0 ${scaledPx(7)}`,
+          fontSize: scaledPx(11),
           fontWeight: "700",
           cursor: "pointer",
           lineHeight: "1"
+        });
+        button.addEventListener("mouseenter", () => {
+          button.style.background = platformButtonHoverBackground("vamp");
+        });
+        button.addEventListener("mouseleave", () => {
+          button.style.background = platformButtonDesign("vamp").backgroundColor || "#000";
         });
         button.addEventListener("click", (event) => {
           event.preventDefault();
@@ -1180,6 +1272,41 @@
           onClick().catch((error) => helpers.showToast?.(error?.message || "Vamp failed.", "error"));
         });
         return button;
+      }
+
+      function buildAxiomContractButton(onClick) {
+        const button = helpers.buildInlineIconButton(onClick, contractIconButtonStyles());
+        button.title = "Open on Axiom";
+        button.setAttribute("aria-label", "Open on Axiom");
+        applyAxiomLogo(button);
+        return button;
+      }
+
+      function applyAxiomLogo(button) {
+        const logo = button?._trenchInlineLogo;
+        const content = button?._trenchInlineContent;
+        const logoUrl = safeRuntimeGetUrl("assets/Axiom-logo.jpg");
+        if (!(logo instanceof HTMLElement) || !logoUrl) return;
+        if (content instanceof HTMLElement) {
+          Object.assign(content.style, {
+            width: "100%",
+            height: "100%"
+          });
+        }
+        Object.assign(logo.style, {
+          width: "100%",
+          height: "100%",
+          display: "block",
+          flex: "1 1 auto",
+          borderRadius: scaledPx(5),
+          backgroundColor: "transparent",
+          backgroundImage: `url("${logoUrl}")`,
+          backgroundPosition: "center",
+          backgroundRepeat: "no-repeat",
+          backgroundSize: "cover",
+          maskImage: "none",
+          webkitMaskImage: "none"
+        });
       }
 
       function queryAll(root, selector) {

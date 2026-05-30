@@ -3336,7 +3336,7 @@ mod tests {
             AccountMeta::new(user_wsol_ata, false);
         venue_accounts[PUMP_V2_BUY_PROGRAM_INDEX] = AccountMeta::new_readonly(pump_program, false);
         let mut data = PUMP_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR.to_vec();
-        data.extend_from_slice(&99_900_000u64.to_le_bytes());
+        data.extend_from_slice(&100_000_000u64.to_le_bytes());
         data.extend_from_slice(&1u64.to_le_bytes());
         let venue_ix = Instruction {
             program_id: pump_program,

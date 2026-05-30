@@ -1,4 +1,4 @@
-(async function trenchToolsAxiomLoader() {
+(async function trenchToolsXLoader() {
   const injectTime = performance.now();
   const loadSession = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const RECONNECT_FALLBACK_DELAY_MS = 2500;
@@ -16,23 +16,7 @@
   }
 
   async function loadModule(path) {
-    const url = buildModuleUrl(path);
-    try {
-      await import(url);
-    } catch (error) {
-      console.error(`Failed to load Trench Tools module: ${path}`, { url, error });
-      throw error;
-    }
-  }
-
-  async function importModule(path) {
-    const url = buildModuleUrl(path);
-    try {
-      return await import(url);
-    } catch (error) {
-      console.error(`Failed to load Trench Tools module: ${path}`, { url, error });
-      throw error;
-    }
+    return import(buildModuleUrl(path));
   }
 
   function removeAll(selector) {
@@ -153,7 +137,6 @@
       textOverflow: "clip",
       overflowWrap: "anywhere"
     });
-    title.textContent = RECONNECT_TITLE;
     Object.assign(detail.style, {
       marginTop: "2px",
       color: "#a1a1aa",
@@ -162,7 +145,6 @@
       wordBreak: "break-word",
       overflowWrap: "anywhere"
     });
-    detail.textContent = RECONNECT_DETAIL;
     Object.assign(action.style, {
       display: "inline-flex",
       marginLeft: "8px",
@@ -196,6 +178,8 @@
     } else {
       action.style.display = "none";
     }
+    title.textContent = titleText || "";
+    detail.textContent = detailText || "";
     copy.append(title, detail);
     header.append(icon, copy, action);
     toast.appendChild(header);
@@ -215,8 +199,6 @@
         action.style.transform = "translateY(0)";
       });
     }
-    title.textContent = titleText || "";
-    detail.textContent = detailText || "";
     requestAnimationFrame(() => {
       toast.style.opacity = "1";
       toast.style.transform = "translateY(0)";
@@ -306,85 +288,26 @@
       "#trench-tools-launchdeck-overlay",
       "#trench-tools-vamp-overlay",
       "[data-trench-tools-inline]",
-      "[data-trench-tools-token-detail-inline]",
-      "[data-trench-tools-pulse-inline]",
-      "[data-trench-tools-pulse-panel-inline]",
-      "[data-trench-tools-pulse-vamp-inline]",
-      "[data-trench-tools-pulse-dex-inline]",
-      "[data-trench-tools-wallet-tracker-inline]",
-      "[data-trench-tools-axiom-watchlist-inline]",
-      "[data-trench-tools-launchdeck-shell]"
+      "[data-trench-tools-x-address-controls]",
+      "[data-trench-tools-x-deploy]"
     ].forEach(removeAll);
 
-    document.querySelectorAll(".trench-tools-pulse-panel-owner").forEach((element) => {
-      element.classList.remove("trench-tools-pulse-panel-owner");
-    });
-
     clearMarker("[data-trench-tools-mounted]", "data-trench-tools-mounted");
-    clearMarker("[data-trench-tools-j7-prewarm-wired]", "data-trench-tools-j7-prewarm-wired");
-    clearMarker("[data-trench-tools-pulse-anchor-id]", "data-trench-tools-pulse-anchor-id");
-    clearMarker("[data-trench-tools-pulse-card-id]", "data-trench-tools-pulse-card-id");
-    clearMarker("[data-trench-tools-watchlist-anchor-id]", "data-trench-tools-watchlist-anchor-id");
-    clearMarker("[data-trench-tools-wallet-row-id]", "data-trench-tools-wallet-row-id");
-
-    document
-      .querySelectorAll('[data-trench-tools-pulse-parent-managed="true"]')
-      .forEach((element) => {
-        if (!(element instanceof HTMLElement)) return;
-        element.style.display = element.dataset.trenchToolsPulseParentPrevDisplay || "";
-        element.style.flexWrap = element.dataset.trenchToolsPulseParentPrevFlexWrap || "";
-        element.style.alignItems = element.dataset.trenchToolsPulseParentPrevAlignItems || "";
-        element.style.gap = element.dataset.trenchToolsPulseParentPrevGap || "";
-        element.style.width = element.dataset.trenchToolsPulseParentPrevWidth || "";
-        element.style.maxWidth = element.dataset.trenchToolsPulseParentPrevMaxWidth || "";
-        element.style.marginBottom = element.dataset.trenchToolsPulseParentPrevMarginBottom || "";
-        delete element.dataset.trenchToolsPulseParentManaged;
-        delete element.dataset.trenchToolsPulseParentPrevDisplay;
-        delete element.dataset.trenchToolsPulseParentPrevFlexWrap;
-        delete element.dataset.trenchToolsPulseParentPrevAlignItems;
-        delete element.dataset.trenchToolsPulseParentPrevGap;
-        delete element.dataset.trenchToolsPulseParentPrevWidth;
-        delete element.dataset.trenchToolsPulseParentPrevMaxWidth;
-        delete element.dataset.trenchToolsPulseParentPrevMarginBottom;
-      });
-    document
-      .querySelectorAll('[data-trench-tools-pulse-native-managed="true"]')
-      .forEach((element) => {
-        if (!(element instanceof HTMLElement)) return;
-        element.style.flex = element.dataset.trenchToolsPulseNativePrevFlex || "";
-        element.style.width = element.dataset.trenchToolsPulseNativePrevWidth || "";
-        element.style.minWidth = element.dataset.trenchToolsPulseNativePrevMinWidth || "";
-        element.style.overflow = element.dataset.trenchToolsPulseNativePrevOverflow || "";
-        element.style.padding = element.dataset.trenchToolsPulseNativePrevPadding || "";
-        delete element.dataset.trenchToolsPulseNativeManaged;
-        delete element.dataset.trenchToolsPulseNativePrevFlex;
-        delete element.dataset.trenchToolsPulseNativePrevWidth;
-        delete element.dataset.trenchToolsPulseNativePrevMinWidth;
-        delete element.dataset.trenchToolsPulseNativePrevOverflow;
-        delete element.dataset.trenchToolsPulseNativePrevPadding;
-      });
-    document
-      .querySelectorAll('[data-trench-tools-pulse-native-button-managed="true"]')
-      .forEach((element) => {
-        if (!(element instanceof HTMLElement)) return;
-        element.style.width = element.dataset.trenchToolsPulseNativeButtonPrevWidth || "";
-        element.style.minWidth = element.dataset.trenchToolsPulseNativeButtonPrevMinWidth || "";
-        delete element.dataset.trenchToolsPulseNativeButtonManaged;
-        delete element.dataset.trenchToolsPulseNativeButtonPrevWidth;
-        delete element.dataset.trenchToolsPulseNativeButtonPrevMinWidth;
-      });
+    clearMarker("[data-trench-tools-x-address-processed]", "data-trench-tools-x-address-processed");
+    clearMarker("[data-trench-tools-x-deploy-processed]", "data-trench-tools-x-deploy-processed");
+    clearMarker("[data-trench-tools-x-prewarm-wired]", "data-trench-tools-x-prewarm-wired");
   }
 
   try {
     cleanupStaleArtifacts();
     scheduleReconnectFallback();
-    const backgroundRpc = await importModule("src/shared/background-rpc.js");
-    const runtimeMode = await importModule("src/shared/runtime-mode.js");
-    const numericInput = await importModule("src/shared/numeric-input-module.js");
-    const tradePreferences = await importModule("src/shared/trade-preferences.js");
-    const siteFeatures = await importModule("src/shared/site-features.js");
-    const appearance = await importModule("src/shared/appearance.js");
-    const launchdeckShell = await importModule("src/content/launchdeck-shell.js");
+    const backgroundRpc = await loadModule("src/shared/background-rpc.js");
+    const runtimeMode = await loadModule("src/shared/runtime-mode.js");
+    const numericInput = await loadModule("src/shared/numeric-input-module.js");
+    const tradePreferences = await loadModule("src/shared/trade-preferences.js");
+    const siteFeatures = await loadModule("src/shared/site-features.js");
+    const appearance = await loadModule("src/shared/appearance.js");
+    const launchdeckShell = await loadModule("src/content/launchdeck-shell.js");
     window.__trenchToolsContentModules = {
       callBackground: backgroundRpc.callBackground,
       numericInput,
@@ -396,16 +319,16 @@
       isLdOnlyTrenchToolsMode: runtimeMode.isLdOnlyTrenchToolsMode
     };
     await loadModule("src/content/runtime.js");
-    await loadModule("src/content/platforms/axiom.js");
+    await loadModule("src/content/platforms/x.js");
     await loadModule("src/content/index.js");
     markLoadHealthy();
-    window.__trenchToolsAxiomLoadPerf = {
+    window.__trenchToolsXLoadPerf = {
       injectTime,
       loadTime: performance.now() - injectTime,
       session: loadSession
     };
   } catch (error) {
-    console.error("Failed to load Trench Tools Axiom bundle", error);
+    console.error("Failed to load Trench Tools X bundle", error);
     renderLoadFailureToast();
   }
 })();

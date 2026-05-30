@@ -93,9 +93,10 @@
     }
 
     function normalizeSellPercent(value) {
-      const numeric = Number(normalizeDecimalInput(value, 2) || 0);
-      if (!Number.isFinite(numeric) || numeric <= 0) return "";
-      return String(Math.max(1, Math.min(100, numeric)));
+      const normalized = normalizeDecimalInput(value, 2);
+      const numeric = Number(normalized || 0);
+      if (!Number.isInteger(numeric) || numeric <= 0 || numeric > 100) return "";
+      return String(numeric);
     }
 
     function normalizeSellTriggerMode(value, fallbackEntry = {}) {
@@ -506,6 +507,98 @@
       }
     }
 
+    function isSniperWalletUnavailable(wallet, selectedKey) {
+      if (!wallet) {
+        return true;
+      }
+      const balanceSol = getWalletBalanceForSniper(wallet);
+      const spendableBalanceSol = getSpendableBalanceSol(wallet);
+      return wallet.envKey === selectedKey
+        || !wallet.publicKey
+        || balanceSol == null
+        || spendableBalanceSol == null
+        || spendableBalanceSol <= 0;
+    }
+
+    function buildSniperWalletConfigMarkup(envKey, state, feeGuardNotice, options = {}) {
+      const balanceSol = options.balanceSol ?? null;
+      const spendableBalanceSol = options.spendableBalanceSol ?? null;
+      const presetsDisabled = spendableBalanceSol == null || spendableBalanceSol <= 0;
+      const amountWarning = balanceSol != null && spendableBalanceSol != null
+        ? getWalletWarning(state, balanceSol, spendableBalanceSol)
+        : "";
+      return `
+        <div class="sniper-wallet-config">
+          <div class="sniper-wallet-config-top">
+            <label class="sniper-wallet-amount">
+              <span class="sniper-wallet-amount-input-wrap">
+                <img src="/images/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo sniper-wallet-amount-icon">
+                <input type="text" inputmode="decimal" value="${escapeHTML(state.amountSol || "")}" data-sniper-wallet-amount="${escapeHTML(envKey)}" placeholder="0">
+              </span>
+            </label>
+            <div class="sniper-wallet-presets">
+              ${balancePresets.map((preset) => `
+                <button type="button" class="button subtle sniper-preset-button" data-sniper-preset="${escapeHTML(envKey)}" data-sniper-ratio="${preset.ratio}"${presetsDisabled ? " disabled" : ""}>
+                  ${escapeHTML(preset.label)}
+                </button>
+              `).join("")}
+            </div>
+          </div>
+          ${amountWarning ? `<div class="sniper-wallet-warning">${escapeHTML(amountWarning)}</div>` : ""}
+          <div class="sniper-wallet-trigger">
+            <div class="sniper-wallet-trigger-grid">
+              <button type="button" class="sniper-trigger-chip${state.triggerMode === "same-time" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(envKey)}" data-sniper-trigger-value="same-time" title="${escapeHTML(getTriggerTooltip("same-time", state))}">Same Time</button>
+              <button type="button" class="sniper-trigger-chip${state.triggerMode === "on-submit" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(envKey)}" data-sniper-trigger-value="on-submit" title="${escapeHTML(getTriggerTooltip("on-submit", state))}">On Submit + Delay</button>
+              <button type="button" class="sniper-trigger-chip${state.triggerMode === "block-offset" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(envKey)}" data-sniper-trigger-value="block-offset" title="${escapeHTML(getTriggerTooltip("block-offset", state))}">On Confirmed Slot</button>
+            </div>
+            ${state.triggerMode === "same-time" && feeGuardNotice ? `<div class="sniper-modal-notice${feeGuardNotice.kind === "warning" ? " is-warning" : ""}">${escapeHTML(feeGuardNotice.message)}</div>` : ""}
+            <div class="sniper-wallet-trigger-detail"${state.triggerMode === "on-submit" ? "" : " hidden"}>
+              <div class="auto-sell-slider-block sniper-delay-slider-block">
+                <div class="auto-sell-slider-head">
+                  <span>Delay</span>
+                  <strong>${escapeHTML(`${state.submitDelayMs}ms`)}</strong>
+                </div>
+                <input class="auto-sell-slider" type="range" min="0" max="1500" step="25" value="${state.submitDelayMs}" data-sniper-wallet-delay="${escapeHTML(envKey)}">
+              </div>
+            </div>
+            <div class="sniper-wallet-trigger-detail sniper-wallet-retry-row"${state.triggerMode === "same-time" ? "" : " hidden"}>
+              <button
+                type="button"
+                class="button subtle sniper-retry-button${state.retryOnce ? " active" : ""}"
+                data-sniper-wallet-retry="${escapeHTML(envKey)}"
+                aria-pressed="${state.retryOnce ? "true" : "false"}"
+              >${state.retryOnce ? "Retry On" : "Retry Off"}</button>
+            </div>
+            <div class="sniper-wallet-trigger-detail"${state.triggerMode === "block-offset" ? "" : " hidden"}>
+              <div class="sniper-wallet-trigger-grid sniper-wallet-block-grid">
+                ${SNIPER_BUY_BLOCK_OFFSETS.map((offset) => `
+                  <button type="button" class="sniper-trigger-chip${state.targetBlockOffset === offset ? " active" : ""}" data-sniper-block-offset="${escapeHTML(envKey)}" data-sniper-block-value="${offset}">${offset}</button>
+                `).join("")}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderUnavailableSelectedSniperWalletRow(envKey, feeGuardNotice) {
+      const state = normalizeWalletState(sniperState.wallets[envKey] || {});
+      const availabilityError = getWalletAvailabilityError(envKey) || "Sniper wallet is not available in the current wallet set.";
+      return `
+      <div class="sniper-wallet-row is-selected" data-sniper-wallet-row="${escapeHTML(envKey)}">
+        <label class="sniper-wallet-main">
+          <input type="checkbox" class="sniper-wallet-checkbox" data-sniper-wallet-checkbox="${escapeHTML(envKey)}" checked>
+          <div class="sniper-wallet-info">
+            <div class="sniper-wallet-name">${escapeHTML(`#${walletIndexFromEnvKey(envKey)}`)}</div>
+            <div class="sniper-wallet-meta"><span class="sniper-wallet-pill">Unavailable</span></div>
+          </div>
+        </label>
+        <div class="sniper-wallet-warning">${escapeHTML(availabilityError)}</div>
+        ${buildSniperWalletConfigMarkup(envKey, state, feeGuardNotice)}
+      </div>
+    `;
+    }
+
     function renderWalletList() {
       if (!sniperWalletList) return;
       const latestWalletStatus = getLatestWalletStatus();
@@ -546,21 +639,11 @@
         return;
       }
 
+      const feeGuardNotice = getSameTimeFeeGuardNotice();
       if (wallets.length === 0) {
         const selectedRows = Object.entries(sniperState.wallets || {})
           .filter(([, entry]) => entry && normalizeWalletState(entry).selected)
-          .map(([envKey]) => `
-      <div class="sniper-wallet-row is-disabled is-selected" data-sniper-wallet-row="${escapeHTML(envKey)}">
-        <label class="sniper-wallet-main">
-          <input type="checkbox" class="sniper-wallet-checkbox" data-sniper-wallet-checkbox="${escapeHTML(envKey)}" checked disabled>
-          <div class="sniper-wallet-info">
-            <div class="sniper-wallet-name">${escapeHTML(`#${walletIndexFromEnvKey(envKey)}`)}</div>
-            <div class="sniper-wallet-meta"><span class="sniper-wallet-pill">Unavailable</span></div>
-          </div>
-        </label>
-        <div class="sniper-wallet-warning">${escapeHTML(getWalletAvailabilityError(envKey) || "Sniper wallet is not available in the current wallet set.")}</div>
-      </div>
-    `)
+          .map(([envKey]) => renderUnavailableSelectedSniperWalletRow(envKey, feeGuardNotice))
           .join("");
         const emptyMarkup = selectedRows || "<div class=\"sniper-wallet-empty muted\">No wallets found in `.env`.</div>";
         if (global.RenderUtils && global.RenderUtils.setCachedHTML) {
@@ -575,51 +658,35 @@
       const renderedKeys = new Set(sortedWallets.map((wallet) => wallet && wallet.envKey).filter(Boolean));
       const staleSelectedMarkup = Object.entries(sniperState.wallets || {})
         .filter(([envKey, entry]) => entry && normalizeWalletState(entry).selected && !renderedKeys.has(envKey))
-        .map(([envKey]) => `
-      <div class="sniper-wallet-row is-disabled is-selected" data-sniper-wallet-row="${escapeHTML(envKey)}">
-        <label class="sniper-wallet-main">
-          <input type="checkbox" class="sniper-wallet-checkbox" data-sniper-wallet-checkbox="${escapeHTML(envKey)}" checked disabled>
-          <div class="sniper-wallet-info">
-            <div class="sniper-wallet-name">${escapeHTML(`#${walletIndexFromEnvKey(envKey)}`)}</div>
-            <div class="sniper-wallet-meta"><span class="sniper-wallet-pill">Unavailable</span></div>
-          </div>
-        </label>
-        <div class="sniper-wallet-warning">${escapeHTML(getWalletAvailabilityError(envKey))}</div>
-      </div>
-    `)
+        .map(([envKey]) => renderUnavailableSelectedSniperWalletRow(envKey, feeGuardNotice))
         .join("");
-      const feeGuardNotice = getSameTimeFeeGuardNotice();
       const markup = sortedWallets.map((wallet) => {
         const balanceSol = getWalletBalanceForSniper(wallet);
         const spendableBalanceSol = getSpendableBalanceSol(wallet);
-        const disabled = wallet.envKey === selectedKey
-          || !wallet.publicKey
-          || balanceSol == null
-          || spendableBalanceSol == null
-          || spendableBalanceSol <= 0;
+        const unavailable = isSniperWalletUnavailable(wallet, selectedKey);
         const state = normalizeWalletState(sniperState.wallets[wallet.envKey] || {});
-        const amountWarning = state.selected && !disabled ? getWalletWarning(state, balanceSol, spendableBalanceSol) : "";
-        const availabilityError = state.selected && disabled ? getWalletAvailabilityError(wallet.envKey) : "";
+        const checkboxDisabled = unavailable && !state.selected;
+        const availabilityError = state.selected && unavailable ? getWalletAvailabilityError(wallet.envKey) : "";
         const disabledPill = wallet.envKey === selectedKey
           ? "Deployer"
           : (!wallet.publicKey || balanceSol == null
             ? "Unavailable"
             : (spendableBalanceSol != null && spendableBalanceSol <= 0 ? "No spendable SOL" : ""));
         return `
-      <div class="sniper-wallet-row${disabled ? " is-disabled" : ""}${state.selected ? " is-selected" : ""}" data-sniper-wallet-row="${escapeHTML(wallet.envKey)}">
+      <div class="sniper-wallet-row${unavailable && !state.selected ? " is-disabled" : ""}${state.selected ? " is-selected" : ""}" data-sniper-wallet-row="${escapeHTML(wallet.envKey)}">
         <label class="sniper-wallet-main">
           <input
             type="checkbox"
             class="sniper-wallet-checkbox"
             data-sniper-wallet-checkbox="${escapeHTML(wallet.envKey)}"
             ${state.selected ? "checked" : ""}
-            ${disabled ? "disabled" : ""}
+            ${checkboxDisabled ? "disabled" : ""}
           >
           <div class="sniper-wallet-info">
             <div class="sniper-wallet-name">${escapeHTML(walletDisplayName(wallet))}</div>
             <div class="sniper-wallet-meta">
               <span>${escapeHTML(shortenAddress(wallet.publicKey || "invalid", 5))}</span>
-              ${state.selected && !disabled ? `<span class="sniper-wallet-pill">${escapeHTML(getTriggerSummary(state))}</span>` : ""}
+              ${state.selected ? `<span class="sniper-wallet-pill">${escapeHTML(getTriggerSummary(state))}</span>` : ""}
               ${disabledPill ? `<span class="sniper-wallet-pill">${escapeHTML(disabledPill)}</span>` : ""}
             </div>
           </div>
@@ -629,56 +696,7 @@
           </div>
         </label>
         ${availabilityError ? `<div class="sniper-wallet-warning">${escapeHTML(availabilityError)}</div>` : ""}
-        <div class="sniper-wallet-config"${!state.selected || disabled ? " hidden" : ""}>
-          <div class="sniper-wallet-config-top">
-            <label class="sniper-wallet-amount">
-              <span class="sniper-wallet-amount-input-wrap">
-                <img src="/images/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo sniper-wallet-amount-icon">
-                <input type="text" inputmode="decimal" value="${escapeHTML(state.amountSol || "")}" data-sniper-wallet-amount="${escapeHTML(wallet.envKey)}" placeholder="0">
-              </span>
-            </label>
-            <div class="sniper-wallet-presets">
-              ${balancePresets.map((preset) => `
-                <button type="button" class="button subtle sniper-preset-button" data-sniper-preset="${escapeHTML(wallet.envKey)}" data-sniper-ratio="${preset.ratio}">
-                  ${escapeHTML(preset.label)}
-                </button>
-              `).join("")}
-            </div>
-          </div>
-          ${amountWarning ? `<div class="sniper-wallet-warning">${escapeHTML(amountWarning)}</div>` : ""}
-          <div class="sniper-wallet-trigger">
-            <div class="sniper-wallet-trigger-grid">
-              <button type="button" class="sniper-trigger-chip${state.triggerMode === "same-time" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="same-time" title="${escapeHTML(getTriggerTooltip("same-time", state))}">Same Time</button>
-              <button type="button" class="sniper-trigger-chip${state.triggerMode === "on-submit" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="on-submit" title="${escapeHTML(getTriggerTooltip("on-submit", state))}">On Submit + Delay</button>
-              <button type="button" class="sniper-trigger-chip${state.triggerMode === "block-offset" ? " active" : ""}" data-sniper-trigger-mode="${escapeHTML(wallet.envKey)}" data-sniper-trigger-value="block-offset" title="${escapeHTML(getTriggerTooltip("block-offset", state))}">On Confirmed Slot</button>
-            </div>
-            ${state.triggerMode === "same-time" && feeGuardNotice ? `<div class="sniper-modal-notice${feeGuardNotice.kind === "warning" ? " is-warning" : ""}">${escapeHTML(feeGuardNotice.message)}</div>` : ""}
-            <div class="sniper-wallet-trigger-detail"${state.triggerMode === "on-submit" ? "" : " hidden"}>
-              <div class="auto-sell-slider-block sniper-delay-slider-block">
-                <div class="auto-sell-slider-head">
-                  <span>Delay</span>
-                  <strong>${escapeHTML(`${state.submitDelayMs}ms`)}</strong>
-                </div>
-                <input class="auto-sell-slider" type="range" min="0" max="1500" step="25" value="${state.submitDelayMs}" data-sniper-wallet-delay="${escapeHTML(wallet.envKey)}">
-              </div>
-            </div>
-            <div class="sniper-wallet-trigger-detail sniper-wallet-retry-row"${state.triggerMode === "same-time" ? "" : " hidden"}>
-              <button
-                type="button"
-                class="button subtle sniper-retry-button${state.retryOnce ? " active" : ""}"
-                data-sniper-wallet-retry="${escapeHTML(wallet.envKey)}"
-                aria-pressed="${state.retryOnce ? "true" : "false"}"
-              >${state.retryOnce ? "Retry On" : "Retry Off"}</button>
-            </div>
-            <div class="sniper-wallet-trigger-detail"${state.triggerMode === "block-offset" ? "" : " hidden"}>
-              <div class="sniper-wallet-trigger-grid sniper-wallet-block-grid">
-                ${SNIPER_BUY_BLOCK_OFFSETS.map((offset) => `
-                  <button type="button" class="sniper-trigger-chip${state.targetBlockOffset === offset ? " active" : ""}" data-sniper-block-offset="${escapeHTML(wallet.envKey)}" data-sniper-block-value="${offset}">${offset}</button>
-                `).join("")}
-              </div>
-            </div>
-          </div>
-        </div>
+        ${state.selected ? buildSniperWalletConfigMarkup(wallet.envKey, state, feeGuardNotice, { balanceSol, spendableBalanceSol }) : ""}
       </div>
     `;
       }).join("") + staleSelectedMarkup;

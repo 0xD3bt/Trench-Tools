@@ -1,5 +1,6 @@
 #![allow(non_snake_case, dead_code)]
 
+use crate::fs_utils;
 use crate::paths;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
@@ -94,8 +95,8 @@ fn supported_extension(content_type: &str) -> Option<&'static str> {
 }
 
 pub fn ensure_local_dirs() -> Result<(), String> {
-    fs::create_dir_all(paths::local_root_dir()).map_err(|error| error.to_string())?;
-    fs::create_dir_all(paths::uploads_dir()).map_err(|error| error.to_string())?;
+    fs_utils::create_private_dir_all(&paths::local_root_dir())?;
+    fs_utils::create_private_dir_all(&paths::uploads_dir())?;
     Ok(())
 }
 
@@ -192,11 +193,10 @@ pub fn read_image_library() -> Result<ImageLibrary, String> {
 
 pub fn write_image_library(library: &ImageLibrary) -> Result<(), String> {
     ensure_local_dirs()?;
-    fs::write(
-        paths::image_library_path(),
-        serde_json::to_vec_pretty(library).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    fs_utils::atomic_write(
+        &paths::image_library_path(),
+        &serde_json::to_vec_pretty(library).map_err(|error| error.to_string())?,
+    )?;
     invalidate_image_library_cache();
     Ok(())
 }
@@ -323,6 +323,7 @@ pub fn save_image_bytes(
     );
     let file_path = paths::uploads_dir().join(&file_name);
     fs::write(&file_path, bytes).map_err(|error| error.to_string())?;
+    fs_utils::restrict_file_permissions(&file_path);
     let mut library = read_image_library()?;
     let mut record = create_image_record(&file_name, original_name);
     if let Some(name) = record_name {
@@ -364,6 +365,7 @@ pub fn replace_image_file_bytes(
     );
     let file_path = paths::uploads_dir().join(&file_name);
     fs::write(&file_path, bytes).map_err(|error| error.to_string())?;
+    fs_utils::restrict_file_permissions(&file_path);
     record.fileName = file_name.clone();
     record.updatedAt = now_ms();
     let serialized = serialize_image_record(record);

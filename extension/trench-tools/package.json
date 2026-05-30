@@ -1,6 +1,6 @@
 {
   "name": "trench-tools-extension",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "private": true,
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -10,7 +10,8 @@
     "check:launchdeck-package": "node ./scripts/check-launchdeck-package.mjs",
     "package:launchdeck-shell": "node ./scripts/package-launchdeck-shell.mjs",
     "test:runtime-mode": "node ./tests/runtime-mode.mjs",
-    "test:layout": "node ./tests/layout-invariants.mjs"
+    "test:layout": "node ./tests/layout-invariants.mjs",
+    "test:numeric-input": "node ./tests/numeric-input.mjs"
   },
   "devDependencies": {
     "playwright": "^1.59.1"

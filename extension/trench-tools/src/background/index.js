@@ -444,13 +444,18 @@ const CONTENT_REINJECTION_TARGETS = [
   {
     matches: ["https://j7tracker.io/*"],
     loader: "src/content/loaders/j7-loader.js"
+  },
+  {
+    matches: ["https://x.com/*"],
+    loader: "src/content/loaders/x-loader.js"
   }
 ];
 
 const SUPPORTED_CONTENT_ORIGINS = new Set([
   "https://axiom.trade",
   "https://backup.axiom.trade",
-  "https://j7tracker.io"
+  "https://j7tracker.io",
+  "https://x.com"
 ]);
 
 const EXTENSION_PAGE_PATH_PREFIXES = [

@@ -25,8 +25,8 @@ use spl_token::instruction::{
 };
 
 use crate::{
-    extension_api::{MevMode, TradeSide},
-    provider_tip::pick_tip_account_for_provider,
+    extension_api::{TradeSide, jitodontfront_enabled_for_provider},
+    provider_tip::{pick_tip_account_for_provider, provider_required_tip_lamports},
     rpc_client::{
         CompiledTransaction, fetch_account_data, fetch_account_owner_and_data,
         fetch_minimum_balance_for_rent_exemption,
@@ -72,9 +72,6 @@ const SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const RAYDIUM_AMM_V4_BUY_COMPUTE_UNIT_LIMIT: u32 = 340_000;
 const RAYDIUM_AMM_V4_SELL_COMPUTE_UNIT_LIMIT: u32 = 340_000;
-const HELIUS_SENDER_MIN_TIP_LAMPORTS: u64 = 200_000;
-const HELLO_MOON_MIN_TIP_LAMPORTS: u64 = 1_000_000;
-
 fn raydium_amm_v4_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new)
@@ -374,7 +371,7 @@ pub(crate) async fn compile_raydium_amm_v4_trade(
         } else {
             (None, None)
         };
-    if matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure) {
+    if jitodontfront_enabled_for_provider(&request.policy.provider, &request.policy.mev_mode) {
         apply_jitodontfront(&mut instructions, &owner_pubkey)?;
     }
 
@@ -1271,11 +1268,7 @@ fn resolve_inline_tip(
 }
 
 fn provider_min_tip_lamports(provider: &str) -> u64 {
-    match provider.trim() {
-        "helius-sender" => HELIUS_SENDER_MIN_TIP_LAMPORTS,
-        "hellomoon" => HELLO_MOON_MIN_TIP_LAMPORTS,
-        _ => 0,
-    }
+    provider_required_tip_lamports(provider).unwrap_or(0)
 }
 
 fn configured_tip_account() -> Result<Option<Pubkey>, String> {
@@ -1305,7 +1298,12 @@ fn apply_jitodontfront(instructions: &mut Vec<Instruction>, payer: &Pubkey) -> R
     instruction
         .accounts
         .push(AccountMeta::new_readonly(dontfront, false));
-    instructions.insert(0, instruction);
+    let compute_budget = parse_pubkey(COMPUTE_BUDGET_PROGRAM_ID, "compute budget program")?;
+    let insert_index = instructions
+        .iter()
+        .take_while(|instruction| instruction.program_id == compute_budget)
+        .count();
+    instructions.insert(insert_index, instruction);
     Ok(())
 }
 
@@ -1597,21 +1595,40 @@ mod tests {
         )
         .expect("raydium amm v4 instruction");
         let original_accounts = swap.accounts.clone();
-        let mut instructions = vec![swap];
+        let compute_budget = build_compute_unit_limit_instruction(100_000).expect("compute budget");
+        let mut instructions = vec![compute_budget, swap];
 
         apply_jitodontfront(&mut instructions, &owner).expect("jitodontfront");
 
-        assert_eq!(instructions.len(), 2);
-        assert_eq!(instructions[1].accounts, original_accounts);
-        assert_eq!(instructions[1].accounts.len(), 18);
+        assert_eq!(instructions.len(), 3);
         assert_eq!(
             instructions[0].program_id,
+            parse_pubkey(COMPUTE_BUDGET_PROGRAM_ID, "compute budget").unwrap()
+        );
+        assert_eq!(instructions[2].accounts, original_accounts);
+        assert_eq!(instructions[2].accounts.len(), 18);
+        assert_eq!(
+            instructions[1].program_id,
             solana_system_interface::program::ID
         );
-        assert_eq!(instructions[0].accounts.len(), 3);
+        assert_eq!(instructions[1].accounts.len(), 3);
         assert_eq!(
-            instructions[0].accounts[2].pubkey,
+            instructions[1].accounts[2].pubkey,
             parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront").unwrap()
         );
+    }
+
+    #[test]
+    fn jito_inline_tip_uses_provider_minimum() {
+        let payer = Pubkey::new_unique();
+        let (_instruction, lamports, account) = resolve_inline_tip(&payer, "jito-bundle", "0")
+            .expect("tip")
+            .expect("tip");
+
+        assert_eq!(
+            lamports,
+            provider_required_tip_lamports("jito-bundle").unwrap()
+        );
+        assert!(!account.is_empty());
     }
 }

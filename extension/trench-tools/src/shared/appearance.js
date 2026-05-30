@@ -29,6 +29,9 @@ export const QUICK_BUY_BUTTON_SLOTS = Object.freeze([1, 2]);
 export const QUICK_BUY_BUTTON_DEFAULT_COLOR = "#ffffff";
 export const QUICK_BUY_BUTTON_DEFAULT_BACKGROUND = "#000000";
 export const QUICK_BUY_BUTTON_DEFAULT_BORDER = "#ffffff80";
+export const PLATFORM_BUTTON_SCALE_MIN = 0.75;
+export const PLATFORM_BUTTON_SCALE_MAX = 1.5;
+export const PLATFORM_BUTTON_SCALE_STEP = 0.05;
 
 function defaultSoundFor(side) {
   return {
@@ -53,12 +56,22 @@ function defaultQuickBuyButtons() {
   };
 }
 
+function defaultPlatformButtonScales() {
+  return {
+    j7: 1,
+    x: 1
+  };
+}
+
 export function defaultAppearance() {
   return {
     volume: DEFAULT_VOLUME,
     buySound: defaultSoundFor("buy"),
     sellSound: defaultSoundFor("sell"),
-    quickBuyButtons: defaultQuickBuyButtons()
+    quickBuyButtons: defaultQuickBuyButtons(),
+    axiomListButton: defaultQuickBuyButtonDesign(),
+    platformButtonDesign: defaultQuickBuyButtonDesign(),
+    platformButtonScales: defaultPlatformButtonScales()
   };
 }
 
@@ -160,6 +173,22 @@ function normalizeQuickBuyButtons(value) {
   };
 }
 
+export function normalizePlatformButtonScale(value, fallback = 1) {
+  const parsed = Number(value);
+  const scale = Number.isFinite(parsed) ? parsed : Number(fallback);
+  const normalized = Number.isFinite(scale) ? scale : 1;
+  return Math.min(PLATFORM_BUTTON_SCALE_MAX, Math.max(PLATFORM_BUTTON_SCALE_MIN, Number(normalized.toFixed(2))));
+}
+
+function normalizePlatformButtonScales(value) {
+  const defaults = defaultPlatformButtonScales();
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    j7: normalizePlatformButtonScale(source.j7, defaults.j7),
+    x: normalizePlatformButtonScale(source.x, defaults.x)
+  };
+}
+
 // Pick the shared volume from the new top-level field, falling back to any
 // legacy per-side volume so users who set a buy/sell volume in an older build
 // don't get reset to 70.
@@ -184,7 +213,13 @@ export function normalizeAppearance(value) {
     volume: pickSharedVolume(value, defaults.volume),
     buySound: normalizeSound(value?.buySound, defaults.buySound),
     sellSound: normalizeSound(value?.sellSound, defaults.sellSound),
-    quickBuyButtons: normalizeQuickBuyButtons(value?.quickBuyButtons)
+    quickBuyButtons: normalizeQuickBuyButtons(value?.quickBuyButtons),
+    axiomListButton: normalizeQuickBuyButtonDesign(value?.axiomListButton, defaults.axiomListButton),
+    platformButtonDesign: normalizeQuickBuyButtonDesign(
+      value?.platformButtonDesign ?? value?.platformButtonDesigns?.deploy,
+      defaults.platformButtonDesign
+    ),
+    platformButtonScales: normalizePlatformButtonScales(value?.platformButtonScales)
   };
 }
 
@@ -197,6 +232,16 @@ export function resolveQuickBuyButtonDesign(appearance, index = 1) {
   const normalized = normalizeAppearance(appearance);
   const slot = QUICK_BUY_BUTTON_SLOTS.includes(Number(index)) ? Number(index) : 1;
   return normalized.quickBuyButtons[slot] || normalized.quickBuyButtons[1];
+}
+
+export function resolveAxiomListButtonDesign(appearance) {
+  const normalized = normalizeAppearance(appearance);
+  return normalized.axiomListButton || resolveQuickBuyButtonDesign(normalized, 1);
+}
+
+export function resolvePlatformButtonDesign(appearance, _type = "deploy") {
+  const normalized = normalizeAppearance(appearance);
+  return normalized.platformButtonDesign || resolveQuickBuyButtonDesign(normalized, 1);
 }
 
 export async function getAppearance() {

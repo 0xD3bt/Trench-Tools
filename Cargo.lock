@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "execution-engine"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "axum",
  "base64",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "launchdeck-engine"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "axum",
  "base64",

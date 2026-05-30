@@ -17,15 +17,21 @@ import {
   QUICK_BUY_BUTTON_DEFAULT_BORDER,
   QUICK_BUY_BUTTON_DEFAULT_COLOR,
   QUICK_BUY_BUTTON_SLOTS,
+  PLATFORM_BUTTON_SCALE_MAX,
+  PLATFORM_BUTTON_SCALE_MIN,
+  PLATFORM_BUTTON_SCALE_STEP,
   SOUND_CUSTOM_ID,
   SOUND_CUSTOM_MAX_BYTES,
   SOUND_TEMPLATES,
   defaultAppearance,
   getAppearance,
   normalizeAppearance,
+  normalizePlatformButtonScale,
   normalizeQuickBuyButtonBackgroundColor,
   normalizeQuickBuyButtonBorderColor,
   normalizeQuickBuyButtonColor,
+  resolveAxiomListButtonDesign,
+  resolvePlatformButtonDesign,
   resolveQuickBuyButtonDesign,
   resolveSoundUrl,
   saveAppearance
@@ -37,6 +43,7 @@ import {
   RUNTIME_DIAGNOSTICS_SNAPSHOT_KEY
 } from "../shared/constants.js";
 import { isEeOnlyTrenchToolsMode } from "../shared/runtime-mode.js";
+import { normalizeUnsignedDecimalInput } from "../shared/numeric-input-module.js";
 
 const BOOTSTRAP_REVISION_KEY = "trenchTools.bootstrapRevision";
 const WALLET_STATUS_REVISION_KEY = "trenchTools.walletStatusRevision";
@@ -222,6 +229,8 @@ const elements = {
   siteAxiomVampIconMode: document.getElementById("site-axiom-vamp-icon-mode"),
   siteAxiomPulseVampMode: document.getElementById("site-axiom-pulse-vamp-mode"),
   siteAxiomDexScreenerIconMode: document.getElementById("site-axiom-dexscreener-icon-mode"),
+  siteAxiomAfterBuyAction: document.getElementById("site-axiom-after-buy-action"),
+  siteAxiomAfterListBuyAction: document.getElementById("site-axiom-after-list-buy-action"),
   siteAxiomPostDeployAction: document.getElementById("site-axiom-post-deploy-action"),
   siteAxiomWalletTracker: document.getElementById("site-axiom-wallet-tracker"),
   siteAxiomWatchlist: document.getElementById("site-axiom-watchlist"),
@@ -229,9 +238,19 @@ const elements = {
   siteJ7ContractQuickBuy: document.getElementById("site-j7-contract-quick-buy"),
   siteJ7ContractQuickPanel: document.getElementById("site-j7-contract-quick-panel"),
   siteJ7ContractVamp: document.getElementById("site-j7-contract-vamp"),
+  siteJ7ContractAxiom: document.getElementById("site-j7-contract-axiom"),
   siteJ7CardLaunchdeck: document.getElementById("site-j7-card-launchdeck"),
   siteJ7HideNativeCardActions: document.getElementById("site-j7-hide-native-card-actions"),
+  siteJ7AfterBuyAction: document.getElementById("site-j7-after-buy-action"),
   siteJ7PostDeployAction: document.getElementById("site-j7-post-deploy-action"),
+  siteXEnabled: document.getElementById("site-x-enabled"),
+  siteXAddressQuickBuy: document.getElementById("site-x-address-quick-buy"),
+  siteXAddressQuickPanel: document.getElementById("site-x-address-quick-panel"),
+  siteXAddressVamp: document.getElementById("site-x-address-vamp"),
+  siteXAddressAxiom: document.getElementById("site-x-address-axiom"),
+  siteXAfterBuyAction: document.getElementById("site-x-after-buy-action"),
+  siteXTweetDeploy: document.getElementById("site-x-tweet-deploy"),
+  siteXPostDeployAction: document.getElementById("site-x-post-deploy-action"),
   executionPresetList: document.getElementById("execution-preset-list"),
   launchdeckPresetList: document.getElementById("launchdeck-preset-list"),
   launchdeckPresetModal: document.getElementById("launchdeck-preset-modal"),
@@ -281,7 +300,10 @@ const elements = {
     input: document.getElementById("appearance-sound-volume-input"),
     value: document.getElementById("appearance-sound-volume-value")
   },
+  appearancePlatformScales: buildAppearancePlatformScaleElements(),
+  appearancePlatformButtonDesigns: buildAppearancePlatformButtonDesignElements(),
   appearanceQuickBuyButtons: buildAppearanceQuickBuyElements(),
+  appearanceAxiomListButton: buildAppearanceAxiomListButtonElements(),
   appearanceColorPopover: {
     root: document.getElementById("appearance-color-popover"),
     preview: document.querySelector("#appearance-color-popover .appearance-color-popover-preview"),
@@ -311,6 +333,34 @@ function buildAppearanceSoundElements(side) {
   };
 }
 
+function buildAppearancePlatformScaleElements() {
+  return {
+    j7: {
+      slider: document.getElementById("appearance-platform-scale-j7-slider"),
+      value: document.getElementById("appearance-platform-scale-j7-value"),
+      preview: document.getElementById("appearance-platform-scale-j7-preview"),
+      reset: document.getElementById("appearance-platform-scale-j7-reset")
+    },
+    x: {
+      slider: document.getElementById("appearance-platform-scale-x-slider"),
+      value: document.getElementById("appearance-platform-scale-x-value"),
+      preview: document.getElementById("appearance-platform-scale-x-preview"),
+      reset: document.getElementById("appearance-platform-scale-x-reset")
+    }
+  };
+}
+
+function buildAppearancePlatformButtonDesignElements() {
+  return {
+    panel: document.querySelector(".appearance-platform-design-row"),
+    backgroundSwatch: document.getElementById("appearance-platform-action-background-swatch"),
+    colorSwatch: document.getElementById("appearance-platform-action-color-swatch"),
+    borderSwatch: document.getElementById("appearance-platform-action-border-swatch"),
+    reset: document.getElementById("appearance-platform-action-reset"),
+    previewButtons: Array.from(document.querySelectorAll("[data-platform-action-preview]"))
+  };
+}
+
 function buildAppearanceQuickBuyElements() {
   const result = {};
   const logoImageUrl = `url(${chrome.runtime.getURL("assets/TT-compact.png")})`;
@@ -323,7 +373,7 @@ function buildAppearanceQuickBuyElements() {
     }
     result[slot] = {
       slot,
-      panel: document.querySelector(`.appearance-quick-buy-panel[data-quick-buy-slot="${slot}"]`),
+      panel: document.querySelector(`.appearance-quick-buy-item[data-quick-buy-slot="${slot}"]`),
       backgroundSwatch: document.getElementById(`appearance-quick-buy-${slot}-background-swatch`),
       colorSwatch: document.getElementById(`appearance-quick-buy-${slot}-color-swatch`),
       borderSwatch: document.getElementById(`appearance-quick-buy-${slot}-border-swatch`),
@@ -336,6 +386,28 @@ function buildAppearanceQuickBuyElements() {
     };
   }
   return result;
+}
+
+function buildAppearanceAxiomListButtonElements() {
+  const logoImageUrl = `url(${chrome.runtime.getURL("assets/TT-compact.png")})`;
+  const previewLogo = document.querySelector(
+    "#appearance-axiom-list-preview-button .appearance-quick-buy-preview-logo"
+  );
+  if (previewLogo instanceof HTMLElement) {
+    previewLogo.style.setProperty("--quick-buy-logo-image", logoImageUrl);
+  }
+  return {
+    panel: document.querySelector(".appearance-quick-buy-item[data-axiom-button-design='list']"),
+    backgroundSwatch: document.getElementById("appearance-axiom-list-background-swatch"),
+    colorSwatch: document.getElementById("appearance-axiom-list-color-swatch"),
+    borderSwatch: document.getElementById("appearance-axiom-list-border-swatch"),
+    reset: document.getElementById("appearance-axiom-list-reset"),
+    previewButton: document.getElementById("appearance-axiom-list-preview-button"),
+    previewLogo,
+    previewAmount: document.querySelector(
+      "#appearance-axiom-list-preview-button .appearance-quick-buy-preview-amount"
+    )
+  };
 }
 
 const PROVIDER_LABELS = {
@@ -478,21 +550,7 @@ function sanitizePresetNumericValue(value) {
 }
 
 function normalizedPresetNumericValue(value) {
-  let normalized = sanitizePresetNumericValue(value).replace(/,/g, ".");
-  const firstDotIndex = normalized.indexOf(".");
-  if (firstDotIndex >= 0) {
-    normalized =
-      normalized.slice(0, firstDotIndex + 1) +
-      normalized.slice(firstDotIndex + 1).replace(/\./g, "");
-  }
-  if (normalized.startsWith(".")) {
-    normalized = `0${normalized}`;
-  }
-  if (normalized.includes(".")) {
-    const [whole, fractional] = normalized.split(".");
-    return `${whole.replace(/^0+(?=\d)/, "") || "0"}.${fractional}`;
-  }
-  return normalized.replace(/^0+(?=\d)/, "");
+  return normalizeUnsignedDecimalInput(value);
 }
 
 function sanitizePresetNumericInput(input) {
@@ -1260,15 +1318,28 @@ for (const input of [
   elements.siteAxiomVampIconMode,
   elements.siteAxiomPulseVampMode,
   elements.siteAxiomDexScreenerIconMode,
+  elements.siteAxiomAfterBuyAction,
+  elements.siteAxiomAfterListBuyAction,
+  elements.siteAxiomPostDeployAction,
   elements.siteAxiomWalletTracker,
   elements.siteAxiomWatchlist,
   elements.siteJ7Enabled,
   elements.siteJ7ContractQuickBuy,
   elements.siteJ7ContractQuickPanel,
   elements.siteJ7ContractVamp,
+  elements.siteJ7ContractAxiom,
   elements.siteJ7CardLaunchdeck,
   elements.siteJ7HideNativeCardActions,
-  elements.siteJ7PostDeployAction
+  elements.siteJ7AfterBuyAction,
+  elements.siteJ7PostDeployAction,
+  elements.siteXEnabled,
+  elements.siteXAddressQuickBuy,
+  elements.siteXAddressQuickPanel,
+  elements.siteXAddressVamp,
+  elements.siteXAddressAxiom,
+  elements.siteXAfterBuyAction,
+  elements.siteXTweetDeploy,
+  elements.siteXPostDeployAction
 ]) {
   if (!input) continue;
   input.addEventListener("change", () => {
@@ -2055,6 +2126,16 @@ function renderSections() {
   }
 }
 
+function normalizeAxiomAfterBuyAction(value) {
+  const action = String(value || "").trim().toLowerCase();
+  return action === "open_tab" || action === "open_window" ? action : "nothing";
+}
+
+function normalizePlatformAfterBuyAction(value) {
+  const action = String(value || "").trim().toLowerCase();
+  return action === "open_axiom_tab" || action === "open_axiom_window" ? action : "toast";
+}
+
 function renderSiteSettings() {
   const siteFeatures = state.siteFeatures;
   if (!siteFeatures) {
@@ -2118,6 +2199,12 @@ function renderSiteSettings() {
     elements.siteAxiomDexScreenerIconMode.value =
       mode === "pulse" || mode === "token" || mode === "off" ? mode : "both";
   }
+  if (elements.siteAxiomAfterBuyAction) {
+    elements.siteAxiomAfterBuyAction.value = normalizeAxiomAfterBuyAction(siteFeatures.axiom?.afterBuyAction);
+  }
+  if (elements.siteAxiomAfterListBuyAction) {
+    elements.siteAxiomAfterListBuyAction.value = normalizeAxiomAfterBuyAction(siteFeatures.axiom?.afterListBuyAction);
+  }
   if (elements.siteAxiomPostDeployAction) {
     const action = String(siteFeatures.axiom?.postDeployAction || "close_modal_toast").trim().toLowerCase();
     elements.siteAxiomPostDeployAction.value =
@@ -2138,15 +2225,50 @@ function renderSiteSettings() {
   if (elements.siteJ7ContractVamp) {
     elements.siteJ7ContractVamp.checked = Boolean(siteFeatures.j7?.contractVamp);
   }
+  if (elements.siteJ7ContractAxiom) {
+    elements.siteJ7ContractAxiom.checked = Boolean(siteFeatures.j7?.contractAxiom);
+  }
   if (elements.siteJ7CardLaunchdeck) {
     elements.siteJ7CardLaunchdeck.checked = Boolean(siteFeatures.j7?.cardLaunchdeck);
   }
   if (elements.siteJ7HideNativeCardActions) {
     elements.siteJ7HideNativeCardActions.checked = Boolean(siteFeatures.j7?.hideNativeCardActions);
   }
+  if (elements.siteJ7AfterBuyAction) {
+    elements.siteJ7AfterBuyAction.value = normalizePlatformAfterBuyAction(siteFeatures.j7?.afterBuyAction);
+  }
   if (elements.siteJ7PostDeployAction) {
     const action = String(siteFeatures.j7?.postDeployAction || "close_modal_toast").trim().toLowerCase();
     elements.siteJ7PostDeployAction.value =
+      action === "toast_only" || action === "open_tab_toast" || action === "open_window_toast"
+        ? action
+        : "close_modal_toast";
+  }
+  if (elements.siteXEnabled) {
+    elements.siteXEnabled.checked = Boolean(siteFeatures.x?.enabled);
+    elements.siteXEnabled.disabled = false;
+  }
+  if (elements.siteXAddressQuickBuy) {
+    elements.siteXAddressQuickBuy.checked = Boolean(siteFeatures.x?.addressQuickBuy);
+  }
+  if (elements.siteXAddressQuickPanel) {
+    elements.siteXAddressQuickPanel.checked = Boolean(siteFeatures.x?.addressQuickPanel);
+  }
+  if (elements.siteXAddressVamp) {
+    elements.siteXAddressVamp.checked = Boolean(siteFeatures.x?.addressVamp);
+  }
+  if (elements.siteXAddressAxiom) {
+    elements.siteXAddressAxiom.checked = Boolean(siteFeatures.x?.addressAxiom);
+  }
+  if (elements.siteXAfterBuyAction) {
+    elements.siteXAfterBuyAction.value = normalizePlatformAfterBuyAction(siteFeatures.x?.afterBuyAction);
+  }
+  if (elements.siteXTweetDeploy) {
+    elements.siteXTweetDeploy.checked = Boolean(siteFeatures.x?.tweetDeploy);
+  }
+  if (elements.siteXPostDeployAction) {
+    const action = String(siteFeatures.x?.postDeployAction || "close_modal_toast").trim().toLowerCase();
+    elements.siteXPostDeployAction.value =
       action === "toast_only" || action === "open_tab_toast" || action === "open_window_toast"
         ? action
         : "close_modal_toast";
@@ -2239,12 +2361,40 @@ function renderAppearanceVolume() {
   refs.value.textContent = String(volume);
 }
 
+function renderAppearancePlatformScales() {
+  const appearance = normalizeAppearance(state.appearance);
+  for (const platformId of ["j7", "x"]) {
+    const refs = elements.appearancePlatformScales?.[platformId];
+    if (!refs?.slider) {
+      continue;
+    }
+    const scale = normalizePlatformButtonScale(appearance.platformButtonScales?.[platformId], 1);
+    refs.slider.min = String(PLATFORM_BUTTON_SCALE_MIN);
+    refs.slider.max = String(PLATFORM_BUTTON_SCALE_MAX);
+    refs.slider.step = String(PLATFORM_BUTTON_SCALE_STEP);
+    refs.slider.value = String(scale);
+    if (refs.value) {
+      refs.value.textContent = `${Math.round(scale * 100)}%`;
+    }
+    if (refs.preview) {
+      refs.preview.style.height = `${Math.round(26 * scale)}px`;
+      refs.preview.style.minHeight = `${Math.round(26 * scale)}px`;
+      refs.preview.style.padding = `0 ${Math.round(10 * scale)}px`;
+      refs.preview.style.borderRadius = `${Math.round(7 * scale)}px`;
+      refs.preview.style.fontSize = `${Math.round(13 * scale)}px`;
+    }
+  }
+}
+
 function renderAppearanceSettings() {
   renderAppearanceVolume();
   renderAppearanceSoundSide("buy");
   renderAppearanceSoundSide("sell");
   renderAppearanceQuickBuyButton(1);
   renderAppearanceQuickBuyButton(2);
+  renderAppearanceAxiomListButton();
+  renderAppearancePlatformScales();
+  renderAppearancePlatformButtonDesigns();
 }
 
 function renderAppearanceQuickBuyButton(slot) {
@@ -2253,6 +2403,34 @@ function renderAppearanceQuickBuyButton(slot) {
     return;
   }
   const design = resolveQuickBuyButtonDesign(state.appearance, slot);
+  renderAppearanceButtonDesign(refs, design, slot === 2 ? "2.0" : "1.0");
+}
+
+function renderAppearanceAxiomListButton() {
+  const refs = elements.appearanceAxiomListButton;
+  if (!refs?.previewButton) {
+    return;
+  }
+  renderAppearanceButtonDesign(refs, resolveAxiomListButtonDesign(state.appearance), "1.0");
+}
+
+function renderAppearancePlatformButtonDesigns() {
+  const refs = elements.appearancePlatformButtonDesigns;
+  if (!refs?.panel) {
+    return;
+  }
+  const design = resolvePlatformButtonDesign(state.appearance);
+  renderAppearanceButtonDesign(refs, design, "");
+  for (const button of refs.previewButtons || []) {
+    if (button instanceof HTMLElement) {
+      button.style.backgroundColor = design.backgroundColor || QUICK_BUY_BUTTON_DEFAULT_BACKGROUND;
+      button.style.color = design.color || QUICK_BUY_BUTTON_DEFAULT_COLOR;
+      button.style.border = `1px solid ${design.borderColor || QUICK_BUY_BUTTON_DEFAULT_BORDER}`;
+    }
+  }
+}
+
+function renderAppearanceButtonDesign(refs, design, previewAmountText) {
   const backgroundColor = design.backgroundColor || QUICK_BUY_BUTTON_DEFAULT_BACKGROUND;
   const color = design.color || QUICK_BUY_BUTTON_DEFAULT_COLOR;
   const borderColor = design.borderColor || QUICK_BUY_BUTTON_DEFAULT_BORDER;
@@ -2271,14 +2449,18 @@ function renderAppearanceQuickBuyButton(slot) {
     refs.borderSwatch.dataset.color = borderColor;
   }
 
-  refs.previewButton.style.backgroundColor = backgroundColor;
-  refs.previewButton.style.color = color;
-  refs.previewButton.style.border = border;
+  if (refs.previewButton) {
+    refs.previewButton.style.backgroundColor = backgroundColor;
+    refs.previewButton.style.color = color;
+    refs.previewButton.style.border = border;
+  }
   if (refs.previewLogo) {
     refs.previewLogo.style.backgroundColor = color;
   }
   if (refs.previewAmount) {
-    refs.previewAmount.textContent = slot === 2 ? "2.0" : "1.0";
+    refs.previewAmount.textContent = previewAmountText;
+  } else if (refs.previewButton) {
+    refs.previewButton.textContent = previewAmountText;
   }
 }
 
@@ -2489,17 +2671,50 @@ function registerAppearanceVolumeHandlers() {
   refs.input.addEventListener("change", (event) => applyVolume(event.target.value, { immediate: true }));
 }
 
+function registerAppearancePlatformScaleHandlers() {
+  for (const platformId of ["j7", "x"]) {
+    const refs = elements.appearancePlatformScales?.[platformId];
+    if (!refs?.slider) {
+      continue;
+    }
+    let persistTimer = null;
+    const applyScale = (rawValue, { immediate = false } = {}) => {
+      const scale = normalizePlatformButtonScale(rawValue, 1);
+      const next = normalizeAppearance(state.appearance);
+      next.platformButtonScales[platformId] = scale;
+      state.appearance = next;
+      renderAppearancePlatformScales();
+      if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+      }
+      if (immediate) {
+        void saveAppearance(next);
+        return;
+      }
+      persistTimer = setTimeout(() => {
+        persistTimer = null;
+        void saveAppearance(state.appearance);
+      }, 180);
+    };
+    refs.slider.addEventListener("input", (event) => applyScale(event.target.value));
+    refs.slider.addEventListener("change", (event) => applyScale(event.target.value, { immediate: true }));
+    refs.reset?.addEventListener("click", () => applyScale(1, { immediate: true }));
+  }
+}
+
 function registerAppearanceHandlers() {
   registerAppearanceVolumeHandlers();
   registerAppearanceHandlersForSide("buy");
   registerAppearanceHandlersForSide("sell");
   registerAppearanceQuickBuyHandlers();
+  registerAppearancePlatformScaleHandlers();
   registerAppearanceColorPopoverHandlers();
 }
 
 const appearanceColorPopoverState = {
   open: false,
-  slot: 0,
+  target: "",
   field: "",
   anchor: null,
   pendingValue: ""
@@ -2537,41 +2752,89 @@ function normalizeAlphaPercent(value, fallback = 100) {
   return Math.max(0, Math.min(100, Math.round(resolved)));
 }
 
+function defaultAppearanceButtonDesign() {
+  return {
+    color: QUICK_BUY_BUTTON_DEFAULT_COLOR,
+    backgroundColor: QUICK_BUY_BUTTON_DEFAULT_BACKGROUND,
+    borderColor: QUICK_BUY_BUTTON_DEFAULT_BORDER
+  };
+}
+
+function isAxiomListButtonTarget(target) {
+  return String(target || "") === "axiomListButton";
+}
+
+function isPlatformButtonDesignTarget(target) {
+  return String(target || "") === "platformButton";
+}
+
+function resolveAppearanceButtonDesign(appearance, target) {
+  if (isPlatformButtonDesignTarget(target)) {
+    return resolvePlatformButtonDesign(appearance);
+  }
+  if (isAxiomListButtonTarget(target)) {
+    return resolveAxiomListButtonDesign(appearance);
+  }
+  return resolveQuickBuyButtonDesign(appearance, target);
+}
+
+function setAppearanceButtonDesign(next, target, design) {
+  if (isPlatformButtonDesignTarget(target)) {
+    next.platformButtonDesign = { ...defaultAppearanceButtonDesign(), ...design };
+    return;
+  }
+  if (isAxiomListButtonTarget(target)) {
+    next.axiomListButton = { ...defaultAppearanceButtonDesign(), ...design };
+    return;
+  }
+  next.quickBuyButtons[target] = { ...defaultAppearanceButtonDesign(), ...design };
+}
+
+function setAppearanceButtonDesignField(next, target, field, value) {
+  const current = resolveAppearanceButtonDesign(next, target);
+  setAppearanceButtonDesign(next, target, {
+    ...current,
+    [field]: value
+  });
+}
+
 function registerAppearanceQuickBuyHandlers() {
   for (const slot of QUICK_BUY_BUTTON_SLOTS) {
     const refs = elements.appearanceQuickBuyButtons?.[slot];
-    if (!refs?.panel) {
-      continue;
-    }
-    if (refs.backgroundSwatch) {
-      refs.backgroundSwatch.addEventListener("click", (event) => {
-        event.preventDefault();
-        openAppearanceColorPopover(slot, "backgroundColor", refs.backgroundSwatch);
-      });
-    }
-    if (refs.colorSwatch) {
-      refs.colorSwatch.addEventListener("click", (event) => {
-        event.preventDefault();
-        openAppearanceColorPopover(slot, "color", refs.colorSwatch);
-      });
-    }
-    if (refs.borderSwatch) {
-      refs.borderSwatch.addEventListener("click", (event) => {
-        event.preventDefault();
-        openAppearanceColorPopover(slot, "borderColor", refs.borderSwatch);
-      });
-    }
-    if (refs.reset) {
-      refs.reset.addEventListener("click", () => {
-        const next = normalizeAppearance(state.appearance);
-        next.quickBuyButtons[slot] = {
-          color: QUICK_BUY_BUTTON_DEFAULT_COLOR,
-          backgroundColor: QUICK_BUY_BUTTON_DEFAULT_BACKGROUND,
-          borderColor: QUICK_BUY_BUTTON_DEFAULT_BORDER
-        };
-        void persistAppearance(next);
-      });
-    }
+    registerAppearanceButtonDesignHandlers(refs, slot);
+  }
+  registerAppearanceButtonDesignHandlers(elements.appearanceAxiomListButton, "axiomListButton");
+  registerAppearanceButtonDesignHandlers(elements.appearancePlatformButtonDesigns, "platformButton");
+}
+
+function registerAppearanceButtonDesignHandlers(refs, target) {
+  if (!refs?.panel) {
+    return;
+  }
+  if (refs.backgroundSwatch) {
+    refs.backgroundSwatch.addEventListener("click", (event) => {
+      event.preventDefault();
+      openAppearanceColorPopover(target, "backgroundColor", refs.backgroundSwatch);
+    });
+  }
+  if (refs.colorSwatch) {
+    refs.colorSwatch.addEventListener("click", (event) => {
+      event.preventDefault();
+      openAppearanceColorPopover(target, "color", refs.colorSwatch);
+    });
+  }
+  if (refs.borderSwatch) {
+    refs.borderSwatch.addEventListener("click", (event) => {
+      event.preventDefault();
+      openAppearanceColorPopover(target, "borderColor", refs.borderSwatch);
+    });
+  }
+  if (refs.reset) {
+    refs.reset.addEventListener("click", () => {
+      const next = normalizeAppearance(state.appearance);
+      setAppearanceButtonDesign(next, target, defaultAppearanceButtonDesign());
+      void persistAppearance(next);
+    });
   }
 }
 
@@ -2646,12 +2909,12 @@ function registerAppearanceColorPopoverHandlers() {
   });
 }
 
-function openAppearanceColorPopover(slot, field, anchor) {
+function openAppearanceColorPopover(target, field, anchor) {
   const refs = elements.appearanceColorPopover;
   if (!refs?.root) {
     return;
   }
-  const design = resolveQuickBuyButtonDesign(state.appearance, slot);
+  const design = resolveAppearanceButtonDesign(state.appearance, target);
   let currentValue;
   if (field === "backgroundColor") {
     currentValue = design.backgroundColor;
@@ -2662,7 +2925,7 @@ function openAppearanceColorPopover(slot, field, anchor) {
   }
   const supportsAlpha = appearanceColorFieldSupportsAlpha(field);
   appearanceColorPopoverState.open = true;
-  appearanceColorPopoverState.slot = slot;
+  appearanceColorPopoverState.target = target;
   appearanceColorPopoverState.field = field;
   appearanceColorPopoverState.anchor = anchor;
   appearanceColorPopoverState.pendingValue = currentValue;
@@ -2687,6 +2950,7 @@ function closeAppearanceColorPopover() {
   refs.root.hidden = true;
   refs.root.classList.add("hidden");
   appearanceColorPopoverState.open = false;
+  appearanceColorPopoverState.target = "";
   appearanceColorPopoverState.anchor = null;
 }
 
@@ -2712,22 +2976,23 @@ function positionAppearanceColorPopover() {
 }
 
 function applyAppearanceColorPopoverValue(rawValue, { fromColorInput, fromHexInput, fromAlphaInput } = {}) {
-  const slot = appearanceColorPopoverState.slot;
+  const target = appearanceColorPopoverState.target;
   const field = appearanceColorPopoverState.field;
-  if (!slot || !field) {
+  if (!target || !field) {
     return;
   }
   const next = normalizeAppearance(state.appearance);
+  const currentDesign = resolveAppearanceButtonDesign(next, target);
   let normalizedValue;
   if (field === "backgroundColor") {
-    normalizedValue = normalizeQuickBuyButtonBackgroundColor(rawValue, next.quickBuyButtons[slot].backgroundColor);
-    next.quickBuyButtons[slot].backgroundColor = normalizedValue;
+    normalizedValue = normalizeQuickBuyButtonBackgroundColor(rawValue, currentDesign.backgroundColor);
+    setAppearanceButtonDesignField(next, target, "backgroundColor", normalizedValue);
   } else if (field === "borderColor") {
-    normalizedValue = normalizeQuickBuyButtonBorderColor(rawValue, next.quickBuyButtons[slot].borderColor);
-    next.quickBuyButtons[slot].borderColor = normalizedValue;
+    normalizedValue = normalizeQuickBuyButtonBorderColor(rawValue, currentDesign.borderColor);
+    setAppearanceButtonDesignField(next, target, "borderColor", normalizedValue);
   } else {
-    normalizedValue = normalizeQuickBuyButtonColor(rawValue, next.quickBuyButtons[slot].color);
-    next.quickBuyButtons[slot].color = normalizedValue;
+    normalizedValue = normalizeQuickBuyButtonColor(rawValue, currentDesign.color);
+    setAppearanceButtonDesignField(next, target, "color", normalizedValue);
   }
   appearanceColorPopoverState.pendingValue = normalizedValue;
   const refs = elements.appearanceColorPopover;
@@ -3409,6 +3674,8 @@ function collectSiteSettings() {
     instantTradeButtonModeCountRaw === 1 || instantTradeButtonModeCountRaw === 2
       ? instantTradeButtonModeCountRaw
       : 3;
+  const afterBuyAction = normalizeAxiomAfterBuyAction(elements.siteAxiomAfterBuyAction?.value);
+  const afterListBuyAction = normalizeAxiomAfterBuyAction(elements.siteAxiomAfterListBuyAction?.value);
   const postDeployActionRaw = String(elements.siteAxiomPostDeployAction?.value || "").trim().toLowerCase();
   const postDeployAction =
     postDeployActionRaw === "toast_only" ||
@@ -3416,12 +3683,21 @@ function collectSiteSettings() {
     postDeployActionRaw === "open_window_toast"
       ? postDeployActionRaw
       : "close_modal_toast";
+  const j7AfterBuyAction = normalizePlatformAfterBuyAction(elements.siteJ7AfterBuyAction?.value);
   const j7PostDeployActionRaw = String(elements.siteJ7PostDeployAction?.value || "").trim().toLowerCase();
   const j7PostDeployAction =
     j7PostDeployActionRaw === "toast_only" ||
     j7PostDeployActionRaw === "open_tab_toast" ||
     j7PostDeployActionRaw === "open_window_toast"
       ? j7PostDeployActionRaw
+      : "close_modal_toast";
+  const xAfterBuyAction = normalizePlatformAfterBuyAction(elements.siteXAfterBuyAction?.value);
+  const xPostDeployActionRaw = String(elements.siteXPostDeployAction?.value || "").trim().toLowerCase();
+  const xPostDeployAction =
+    xPostDeployActionRaw === "toast_only" ||
+    xPostDeployActionRaw === "open_tab_toast" ||
+    xPostDeployActionRaw === "open_window_toast"
+      ? xPostDeployActionRaw
       : "close_modal_toast";
   const pulseQuickBuyButtonCountRaw = Number(
     elements.siteAxiomPulseQuickBuyButtonCount?.checked ? 2 : 1
@@ -3447,6 +3723,8 @@ function collectSiteSettings() {
       pulseVampMode,
       vampIconMode,
       dexScreenerIconMode,
+      afterBuyAction,
+      afterListBuyAction,
       postDeployAction,
       postDeployDestination: "axiom",
       walletTracker: elements.siteAxiomWalletTracker.checked,
@@ -3457,11 +3735,24 @@ function collectSiteSettings() {
       contractQuickBuy: elements.siteJ7ContractQuickBuy ? elements.siteJ7ContractQuickBuy.checked : true,
       contractQuickPanel: elements.siteJ7ContractQuickPanel ? elements.siteJ7ContractQuickPanel.checked : true,
       contractVamp: elements.siteJ7ContractVamp ? elements.siteJ7ContractVamp.checked : true,
+      contractAxiom: elements.siteJ7ContractAxiom ? elements.siteJ7ContractAxiom.checked : true,
       cardLaunchdeck: elements.siteJ7CardLaunchdeck ? elements.siteJ7CardLaunchdeck.checked : true,
       hideNativeCardActions: elements.siteJ7HideNativeCardActions
         ? elements.siteJ7HideNativeCardActions.checked
         : false,
+      afterBuyAction: j7AfterBuyAction,
       postDeployAction: j7PostDeployAction,
+      postDeployDestination: "axiom"
+    },
+    x: {
+      enabled: Boolean(elements.siteXEnabled?.checked),
+      addressQuickBuy: elements.siteXAddressQuickBuy ? elements.siteXAddressQuickBuy.checked : true,
+      addressQuickPanel: elements.siteXAddressQuickPanel ? elements.siteXAddressQuickPanel.checked : true,
+      addressVamp: elements.siteXAddressVamp ? elements.siteXAddressVamp.checked : true,
+      addressAxiom: elements.siteXAddressAxiom ? elements.siteXAddressAxiom.checked : true,
+      tweetDeploy: elements.siteXTweetDeploy ? elements.siteXTweetDeploy.checked : true,
+      afterBuyAction: xAfterBuyAction,
+      postDeployAction: xPostDeployAction,
       postDeployDestination: "axiom"
     }
   };

@@ -1,3 +1,5 @@
+import { normalizeUnsignedDecimalInput } from "./numeric-input-module.js";
+
 const TRADE_PREFERENCES_KEYS = {
   presetId: "presetId",
   selectionSource: "selectionSource",
@@ -31,31 +33,7 @@ export function defaultTradePreferences() {
 }
 
 export function normalizeQuickBuyAmountInput(value) {
-  const trimmed = String(value || "").trim();
-  if (!trimmed) {
-    return "";
-  }
-
-  let normalized = trimmed.replace(/,/g, ".").replace(/[^\d.]/g, "");
-  const firstDotIndex = normalized.indexOf(".");
-  if (firstDotIndex >= 0) {
-    normalized =
-      normalized.slice(0, firstDotIndex + 1) +
-      normalized.slice(firstDotIndex + 1).replace(/\./g, "");
-  }
-
-  if (normalized.startsWith(".")) {
-    normalized = `0${normalized}`;
-  }
-
-  if (normalized.includes(".")) {
-    const [whole, fractional] = normalized.split(".");
-    normalized = `${whole.replace(/^0+(?=\d)/, "") || "0"}.${fractional}`;
-  } else {
-    normalized = normalized.replace(/^0+(?=\d)/, "");
-  }
-
-  return normalized;
+  return normalizeUnsignedDecimalInput(value);
 }
 
 export function normalizeSelectionTarget(value) {

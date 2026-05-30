@@ -24,8 +24,8 @@ use spl_associated_token_account::{
 use spl_token::instruction::{close_account as close_spl_account, initialize_account3};
 
 use crate::{
-    extension_api::{TradeSettlementAsset, TradeSide},
-    provider_tip::pick_tip_account_for_provider,
+    extension_api::{TradeSettlementAsset, TradeSide, jitodontfront_enabled_for_provider},
+    provider_tip::{pick_tip_account_for_provider, provider_required_tip_lamports},
     raydium_amm_v4_native::{
         find_raydium_amm_v4_pool_for_pair, plan_raydium_amm_v4_trade_for_pool_id,
     },
@@ -52,8 +52,6 @@ const SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const LAUNCHLAB_BUY_COMPUTE_UNIT_LIMIT: u32 = 280_000;
 const LAUNCHLAB_SELL_COMPUTE_UNIT_LIMIT: u32 = 280_000;
 const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
-const HELIUS_SENDER_MIN_TIP_LAMPORTS: u64 = 200_000;
-const HELLO_MOON_MIN_TIP_LAMPORTS: u64 = 1_000_000;
 const LAUNCHLAB_MIGRATE_TO_AMM_V4: u8 = 0;
 const LAUNCHLAB_MIGRATE_TO_CPMM: u8 = 1;
 
@@ -620,10 +618,7 @@ async fn finalize_launchlab_transaction(
         } else {
             (None, None)
         };
-    if matches!(
-        request.policy.mev_mode,
-        crate::extension_api::MevMode::Reduced | crate::extension_api::MevMode::Secure
-    ) {
+    if jitodontfront_enabled_for_provider(&request.policy.provider, &request.policy.mev_mode) {
         apply_jitodontfront(&mut instructions, &owner_pubkey)?;
     }
     instructions.push(build_uniqueness_memo_instruction(label)?);
@@ -937,11 +932,7 @@ fn resolve_inline_tip(
 }
 
 fn provider_min_tip_lamports(provider: &str) -> u64 {
-    match provider.trim() {
-        "helius-sender" => HELIUS_SENDER_MIN_TIP_LAMPORTS,
-        "hellomoon" => HELLO_MOON_MIN_TIP_LAMPORTS,
-        _ => 0,
-    }
+    provider_required_tip_lamports(provider).unwrap_or(0)
 }
 
 fn configured_tip_account() -> Result<Option<Pubkey>, String> {
@@ -971,7 +962,12 @@ fn apply_jitodontfront(instructions: &mut Vec<Instruction>, payer: &Pubkey) -> R
     instruction
         .accounts
         .push(AccountMeta::new_readonly(dontfront, false));
-    instructions.insert(0, instruction);
+    let compute_budget = parse_pubkey(COMPUTE_BUDGET_PROGRAM_ID, "compute budget program")?;
+    let insert_index = instructions
+        .iter()
+        .take_while(|instruction| instruction.program_id == compute_budget)
+        .count();
+    instructions.insert(insert_index, instruction);
     Ok(())
 }
 
@@ -1184,5 +1180,48 @@ mod tests {
 
         sell.policy.sell_settlement_asset = TradeSettlementAsset::Usd1;
         assert!(validate_launchlab_policy_for_side(&sell).is_err());
+    }
+
+    #[test]
+    fn jito_inline_tip_uses_provider_minimum() {
+        let payer = Pubkey::new_unique();
+        let (_instruction, lamports, account) = resolve_inline_tip(&payer, "jito-bundle", "0")
+            .expect("tip")
+            .expect("tip");
+
+        assert_eq!(
+            lamports,
+            provider_required_tip_lamports("jito-bundle").unwrap()
+        );
+        assert!(!account.is_empty());
+    }
+
+    #[test]
+    fn jitodontfront_is_inserted_after_compute_budget_instructions() {
+        let payer = Pubkey::new_unique();
+        let swap = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![AccountMeta::new(Pubkey::new_unique(), false)],
+            data: vec![1],
+        };
+        let mut instructions = vec![
+            build_compute_unit_limit_instruction(100_000).expect("compute budget"),
+            swap.clone(),
+        ];
+
+        apply_jitodontfront(&mut instructions, &payer).expect("jitodontfront");
+
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(
+            instructions[0].program_id,
+            parse_pubkey(COMPUTE_BUDGET_PROGRAM_ID, "compute budget").unwrap()
+        );
+        assert_eq!(instructions[2], swap);
+        assert!(
+            instructions[1]
+                .accounts
+                .iter()
+                .any(|account| account.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+        );
     }
 }

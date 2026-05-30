@@ -28,6 +28,8 @@
       const AXIOM_TOKEN_DETAIL_BUTTON_MODE_STORAGE_KEY = "trenchToolsAxiomTokenDetailButtonMode";
       const AXIOM_TOKEN_DETAIL_COMPACT_STORAGE_KEY = "trenchToolsAxiomTokenDetailCompactButtons";
       const AXIOM_TOKEN_DETAIL_PANEL_SIZE_STORAGE_KEY = "trenchToolsAxiomTokenDetailPanelSizes";
+      const AXIOM_TOKEN_DETAIL_SOL_BUY_PRESET_CACHE_KEY = "trenchToolsAxiomTokenDetailSolBuyPresets";
+      const AXIOM_TOKEN_DETAIL_FIXED_SELL_PRESET_CACHE_KEY = "trenchToolsAxiomTokenDetailFixedSellPresets";
       const AXIOM_TOKEN_DETAIL_INITIAL_SIZE_STYLE_ID = "trench-tools-axiom-token-detail-initial-size";
       const AXIOM_TOKEN_DETAIL_COMPACT_POSITION_STORAGE_KEY = "trenchToolsAxiomInstantTradeCompactPosition";
       const AXIOM_NATIVE_INSTANT_TRADE_MODAL_SIZE_KEY = "instantTradeModalSize";
@@ -51,6 +53,10 @@
       let targetedObserverRetryTimer = 0;
       let targetedObserverRetryCount = 0;
       let axiomTokenDetailButtonMode = readAxiomTokenDetailButtonModePreference();
+      let axiomTokenDetailSolBuyPresetCachePresetKey = "";
+      let axiomTokenDetailSolBuyPresetCache = [];
+      let axiomTokenDetailFixedSellPresetCachePresetKey = "";
+      let axiomTokenDetailFixedSellPresetCache = [];
       let axiomTokenDetailPanelSizes = readAxiomTokenDetailPanelSizePreference();
       let axiomTokenDetailPanelSizeResizeObserver = null;
       let axiomTokenDetailPanelSizeMutationObserver = null;
@@ -62,6 +68,8 @@
       let axiomTokenDetailCompactDragState = null;
       let axiomTokenDetailWalletControl = null;
       let axiomTokenDetailWalletControlCleanup = null;
+      let axiomTokenDetailWalletOptimisticKeys = null;
+      let axiomTokenDetailWalletOptimisticRevision = 0;
       let axiomTokenDetailSellHoverState = null;
       let axiomTokenDetailNativeSellHoverControl = null;
       let axiomTokenDetailSellHoverMonitorInstalled = false;
@@ -3393,10 +3401,8 @@
           side: "buy"
         });
         const nextLabel = helpers.quickBuyLabel();
-        if (button.getAttribute("data-style-anchor") !== "wallet-tracker-absolute-v2") {
-          helpers.setInlineButtonStyleSet(button, walletTrackerQuickBuyStyles(endSlot));
-          button.setAttribute("data-style-anchor", "wallet-tracker-absolute-v2");
-        }
+        helpers.setInlineButtonStyleSet(button, walletTrackerQuickBuyStyles(endSlot));
+        button.setAttribute("data-style-anchor", "wallet-tracker-absolute-v2");
         if (button.getAttribute("data-label") !== nextLabel) {
           helpers.setInlineButtonLabel(button, nextLabel);
           button.setAttribute("data-label", nextLabel);
@@ -3985,6 +3991,7 @@
         ).forEach((element) => {
           helpers.teardownInlineSizeSync(element);
           element._trenchInlineCleanup?.();
+          element._trenchAxiomHoverShieldCleanup?.();
           element._trenchAxiomHoverBridgeCleanup?.();
           element._trenchAxiomPresetClickCleanup?.();
           element._trenchAxiomSellHoverEstimateCleanup?.();
@@ -3997,7 +4004,10 @@
         disconnectAxiomTokenDetailHardpanelRefreshBridge();
         document.querySelectorAll(
           "[data-trench-tools-token-detail-hardpanel-action], [data-trench-tools-token-detail-hardpanel-action-wrapper]"
-        ).forEach((element) => element.remove());
+        ).forEach((element) => {
+          element._trenchAxiomHoverShieldCleanup?.();
+          element.remove();
+        });
       }
 
       function mountAxiomTokenDetailPresetButtons(route) {
@@ -4012,11 +4022,13 @@
         document.querySelectorAll("[data-trench-tools-token-detail-preload-inline]").forEach((element) => element.remove());
         const mountedButtons = new Set();
         const rows = findAxiomTokenDetailControlRows();
+        let buyPresetRowOrdinal = 0;
+        let solSellPresetRowOrdinal = 0;
         rows.forEach((row, rowIndex) => {
           const rowSide = resolveAxiomTokenDetailRowSide(row, rowIndex, rows);
           const nativeControls = findAxiomTokenDetailNativeControls(row, rowSide);
           nativeControls.forEach(markAxiomTokenDetailNativeControl);
-          const actions = nativeControls
+          let actions = nativeControls
             .map((nativeControl, index) => ({
               nativeControl,
               index,
@@ -4024,6 +4036,24 @@
               action: readAxiomTokenDetailAction(nativeControl, row, rowSide)
             }))
             .filter((entry) => entry.action);
+          if (isAxiomTokenDetailBuyPresetRow(row, rowSide)) {
+            const buyRowIndex = buyPresetRowOrdinal;
+            buyPresetRowOrdinal += 1;
+            if (hasUnsupportedAxiomTokenDetailQuoteControls(row)) {
+              actions = hydrateAxiomTokenDetailCachedSolBuyActions(row, rowIndex, route, buyRowIndex);
+            } else {
+              writeAxiomTokenDetailSolBuyPresetCache(actions, buyRowIndex);
+            }
+          }
+          if (isAxiomTokenDetailSellPresetRow(row)) {
+            const sellRowIndex = solSellPresetRowOrdinal;
+            solSellPresetRowOrdinal += 1;
+            if (hasUnsupportedAxiomTokenDetailQuoteControls(row)) {
+              actions = hydrateAxiomTokenDetailCachedFixedSellActions(row, rowIndex, route, sellRowIndex);
+            } else {
+              writeAxiomTokenDetailFixedSellPresetCache(actions, sellRowIndex);
+            }
+          }
           actions.forEach((entry) => {
             installAxiomTokenDetailNativeSellHoverSummaryBridge(entry.nativeControl, entry.action);
             installAxiomTokenDetailNativeTradeRefreshBridge(entry.nativeControl, entry.action, route);
@@ -4062,6 +4092,7 @@
           existingButtons.forEach((element) => {
             helpers.teardownInlineSizeSync(element);
             element._trenchInlineCleanup?.();
+            element._trenchAxiomHoverShieldCleanup?.();
             element._trenchAxiomHoverBridgeCleanup?.();
             element._trenchAxiomPresetClickCleanup?.();
             element._trenchAxiomSellHoverEstimateCleanup?.();
@@ -4095,6 +4126,7 @@
           if (!mountedButtons.has(element)) {
             helpers.teardownInlineSizeSync(element);
             element._trenchInlineCleanup?.();
+            element._trenchAxiomHoverShieldCleanup?.();
             element._trenchAxiomHoverBridgeCleanup?.();
             element._trenchAxiomPresetClickCleanup?.();
             element._trenchAxiomSellHoverEstimateCleanup?.();
@@ -5533,6 +5565,8 @@
 
       function cleanupAxiomTokenDetailWalletSelector() {
         clearAxiomTokenDetailSellHoverState();
+        axiomTokenDetailWalletOptimisticKeys = null;
+        axiomTokenDetailWalletOptimisticRevision = 0;
         document.querySelectorAll(
           "[data-trench-tools-token-detail-wallet-selector], [data-trench-tools-token-detail-wallet-menu], [data-trench-tools-token-detail-wallet-summary]"
         ).forEach((element) => element.remove());
@@ -6963,13 +6997,8 @@
 
         content.append(identity, balanceColumn, countColumn);
         item.append(checkbox, content);
-        item.addEventListener("mousedown", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-        });
-        item.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
+        let toggledOnPointer = false;
+        const toggleWallet = () => {
           const nextKeys = new Set(selectedKeys);
           if (nextKeys.has(option.id)) {
             nextKeys.delete(option.id);
@@ -6978,6 +7007,22 @@
           }
           saveAxiomTokenDetailWalletKeys(Array.from(nextKeys));
           mountAxiomTokenDetailWalletSidecar(nativeWalletControl);
+        };
+        item.addEventListener("mousedown", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation?.();
+          toggledOnPointer = true;
+          toggleWallet();
+        });
+        item.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation?.();
+          if (!toggledOnPointer) {
+            toggleWallet();
+          }
+          toggledOnPointer = false;
         });
         return item;
       }
@@ -7258,18 +7303,54 @@
         }
         const optionKeys = new Set(options.map((option) => option.id));
         const preferenceKeys = axiomTokenDetailWalletKeysFromPreferences(optionKeys);
+        let optimisticKeys = Array.isArray(axiomTokenDetailWalletOptimisticKeys)
+          ? axiomTokenDetailWalletOptimisticKeys.filter((key) => optionKeys.has(key))
+          : null;
+        const selectionRevision = Math.max(0, Number(helpers.state.preferences?.selectionRevision || 0) || 0);
+        if (
+          optimisticKeys &&
+          axiomTokenDetailWalletOptimisticRevision > 0 &&
+          selectionRevision > axiomTokenDetailWalletOptimisticRevision
+        ) {
+          axiomTokenDetailWalletOptimisticKeys = null;
+          axiomTokenDetailWalletOptimisticRevision = 0;
+          optimisticKeys = null;
+        }
+        if (
+          optimisticKeys &&
+          arraysEqualAsSets(optimisticKeys, preferenceKeys) &&
+          String(helpers.state.preferences?.selectionSource || "").trim().toLowerCase() === "manual" &&
+          selectionRevision >= axiomTokenDetailWalletOptimisticRevision
+        ) {
+          axiomTokenDetailWalletOptimisticKeys = null;
+          axiomTokenDetailWalletOptimisticRevision = 0;
+          optimisticKeys = null;
+        }
         // A manual selection is the user's explicit choice, including an empty
         // list (deselect-all). Only fall back to the first wallet when nothing
         // resolves AND the source isn't an explicit manual pick.
         const selectionSource = String(helpers.state.preferences?.selectionSource || "").trim().toLowerCase();
-        const resolvedKeys = preferenceKeys.length || selectionSource === "manual"
-          ? preferenceKeys
-          : [options[0].id];
+        const resolvedKeys = optimisticKeys ||
+          (preferenceKeys.length || selectionSource === "manual" ? preferenceKeys : [options[0].id]);
         return {
           type: "manual",
           manualWalletKeys: resolvedKeys,
           value: `manual:${resolvedKeys.join(",")}`
         };
+      }
+
+      function arraysEqualAsSets(left, right) {
+        const leftSet = new Set(Array.isArray(left) ? left : []);
+        const rightSet = new Set(Array.isArray(right) ? right : []);
+        if (leftSet.size !== rightSet.size) {
+          return false;
+        }
+        for (const value of leftSet) {
+          if (!rightSet.has(value)) {
+            return false;
+          }
+        }
+        return true;
       }
 
       function axiomTokenDetailWalletKeysFromPreferences(knownWalletKeys) {
@@ -7365,13 +7446,15 @@
             .map((key) => String(key || "").trim())
             .filter(Boolean)
         ));
+        const nextRevision =
+          Math.max(0, Number(helpers.state.preferences?.selectionRevision || 0) || 0) + 1;
+        axiomTokenDetailWalletOptimisticKeys = normalized;
+        axiomTokenDetailWalletOptimisticRevision = nextRevision;
         // The Axiom in-page wallet selector is just another surface for editing
         // the same selection used by the Trench Tools panel. Routing the write
         // through panel preferences keeps both surfaces in sync (and trades
         // fired from the panel use the wallets the user just picked here).
         if (typeof helpers.savePreferences === "function") {
-          const nextRevision =
-            Math.max(0, Number(helpers.state.preferences?.selectionRevision || 0) || 0) + 1;
           void helpers.savePreferences({
             selectionSource: "manual",
             activeWalletGroupId: helpers.state.preferences?.activeWalletGroupId || "",
@@ -7488,6 +7571,8 @@
           const sellUnitMatches = action?.side !== "sell" ||
             String(button.getAttribute("data-sell-unit") || "") === String(action?.sellUnit || "");
           const editableMatches = button.hasAttribute("data-trench-tools-token-detail-editable") === Boolean(action?.editable);
+          const fixedLabelMatches = !action?.fixedSolPreset ||
+            String(button.textContent || "").trim() === formatAxiomTokenDetailFixedPresetLabel(action);
           return action &&
             button.getAttribute("data-route-key") === route.routeKey &&
             String(button.getAttribute("data-mint") || "") === route.tokenMint &&
@@ -7496,7 +7581,8 @@
             button.getAttribute("data-side") === action.side &&
             amountMatches &&
             sellUnitMatches &&
-            editableMatches;
+            editableMatches &&
+            fixedLabelMatches;
         });
       }
 
@@ -8182,6 +8268,14 @@
       }
 
       function isAxiomTokenDetailControlRow(row) {
+        if (
+          row instanceof HTMLElement &&
+          row.closest("div#instant-trade") &&
+          hasUnsupportedAxiomTokenDetailQuoteControls(row) &&
+          (isAxiomTokenDetailBuyPresetRow(row) || isAxiomTokenDetailSellPresetRow(row))
+        ) {
+          return true;
+        }
         const controls = findAxiomTokenDetailNativeControls(row);
         if (controls.length < 2) {
           return false;
@@ -8206,6 +8300,7 @@
           element instanceof HTMLElement &&
           !element.hasAttribute("data-trench-tools-token-detail-inline") &&
           !element.hasAttribute("data-trench-tools-token-detail-preload-inline") &&
+          !isUnsupportedAxiomTokenDetailQuoteControl(element) &&
           readAxiomTokenDetailAction(element, row, rowSide) &&
           (
             isAxiomTokenDetailRoundedControl(element) ||
@@ -8220,6 +8315,289 @@
         );
       }
 
+      function isAxiomTokenDetailBuyPresetRow(row, rowSide = null) {
+        if (!(row instanceof HTMLElement)) {
+          return false;
+        }
+        if (isAxiomTokenDetailSellPresetRow(row)) {
+          return false;
+        }
+        const text = String(row.textContent || "");
+        if (text.includes("%")) {
+          return false;
+        }
+        const className = String(row.className || "");
+        const childClassName = Array.from(row.children)
+          .map((child) => String(child instanceof HTMLElement ? child.className || "" : ""))
+          .join(" ");
+        const classBlob = `${className} ${childClassName}`;
+        if (/decrease/.test(classBlob)) {
+          return false;
+        }
+        if (/increase/.test(classBlob) && /\d/.test(text)) {
+          return true;
+        }
+        if (/^\s*(?:\$?\d+(?:\.\d+)?\s*){2,}$/i.test(text)) {
+          return true;
+        }
+        return false;
+      }
+
+      function isAxiomTokenDetailSellPresetRow(row) {
+        if (!(row instanceof HTMLElement)) {
+          return false;
+        }
+        const text = String(row.textContent || "");
+        if (!/\d/.test(text)) {
+          return false;
+        }
+        const className = String(row.className || "");
+        const childClassName = Array.from(row.children)
+          .map((child) => String(child instanceof HTMLElement ? child.className || "" : ""))
+          .join(" ");
+        if (!/decrease/.test(`${className} ${childClassName}`)) {
+          return false;
+        }
+        return true;
+      }
+
+      function hasUnsupportedAxiomTokenDetailQuoteControls(row) {
+        if (!(row instanceof HTMLElement)) {
+          return false;
+        }
+        return Array.from(row.children).some(isUnsupportedAxiomTokenDetailQuoteControl);
+      }
+
+      function resolveAxiomTokenDetailInstantTradePresetKey(instantTrade = findAxiomTokenDetailInstantTradePanel()) {
+        if (!(instantTrade instanceof HTMLElement)) {
+          return "0";
+        }
+        const presetCandidates = Array.from(instantTrade.querySelectorAll("button, [role='button'], div"))
+          .filter((element) => element instanceof HTMLElement)
+          .filter((element) => {
+            const text = String(element.textContent || "").replace(/\s+/g, "").trim();
+            return /^P?[1-3]$/i.test(text);
+          });
+        const activePreset = presetCandidates.find((element) =>
+          element.getAttribute("aria-selected") === "true" ||
+          element.getAttribute("aria-pressed") === "true" ||
+          element.getAttribute("data-state") === "active" ||
+          element.matches("[data-state='active'], [data-active='true']")
+        ) || presetCandidates.find((element) => /\bactive\b/i.test(String(element.className || "")));
+        if (activePreset instanceof HTMLElement) {
+          const match = String(activePreset.textContent || "").replace(/\s+/g, "").trim().match(/^P?([1-3])$/i);
+          if (match) {
+            return match[1];
+          }
+        }
+        try {
+          const keys = Object.keys(window.localStorage || {});
+          for (const key of keys) {
+            if (!/preset/i.test(key) || !/instant/i.test(key)) {
+              continue;
+            }
+            const raw = String(window.localStorage.getItem(key) || "").trim();
+            if (/^[0-2]$/.test(raw)) {
+              return String(Number(raw) + 1);
+            }
+            if (/^[1-3]$/.test(raw)) {
+              return raw;
+            }
+          }
+        } catch (_error) {
+          // ignore storage access errors
+        }
+        return "0";
+      }
+
+      function readAxiomTokenDetailPresetCacheBlob(storageKey) {
+        try {
+          const raw = window.localStorage.getItem(storageKey);
+          const parsed = JSON.parse(raw || "{}");
+          if (Array.isArray(parsed)) {
+            return { 0: parsed };
+          }
+          if (parsed && typeof parsed === "object") {
+            return parsed;
+          }
+        } catch (_error) {
+          // ignore malformed cache payloads
+        }
+        return {};
+      }
+
+      function writeAxiomTokenDetailPresetCacheBlob(storageKey, blob) {
+        try {
+          window.localStorage.setItem(storageKey, JSON.stringify(blob && typeof blob === "object" ? blob : {}));
+        } catch (_error) {
+          // Keep the in-memory cache for this page session.
+        }
+      }
+
+      function normalizeAxiomTokenDetailSolBuyPresetCacheRows(values) {
+        return (Array.isArray(values) ? values : []).map((row) =>
+          (Array.isArray(row) ? row : [])
+            .map((value) => normalizeAxiomTokenDetailTradeAmount(value))
+            .filter((value, index, list) => value && Number(value) > 0 && list.indexOf(value) === index)
+        ).filter((row) => row.length);
+      }
+
+      function normalizeAxiomTokenDetailFixedSellPresetCacheRows(values) {
+        return (Array.isArray(values) ? values : []).map((row) =>
+          (Array.isArray(row) ? row : [])
+            .map((entry) => ({
+              amount: normalizeAxiomTokenDetailTradeAmount(entry?.amount),
+              sellUnit: String(entry?.sellUnit || "").trim().toLowerCase() === "sol" ? "sol" : "percent"
+            }))
+            .filter((entry, index, list) =>
+              entry.amount &&
+              Number(entry.amount) > 0 &&
+              list.findIndex((candidate) =>
+                candidate.amount === entry.amount && candidate.sellUnit === entry.sellUnit
+              ) === index
+            )
+        ).filter((row) => row.length);
+      }
+
+      function ensureAxiomTokenDetailSolBuyPresetCacheLoaded() {
+        const presetKey = resolveAxiomTokenDetailInstantTradePresetKey();
+        if (presetKey === axiomTokenDetailSolBuyPresetCachePresetKey) {
+          return;
+        }
+        axiomTokenDetailSolBuyPresetCachePresetKey = presetKey;
+        const blob = readAxiomTokenDetailPresetCacheBlob(AXIOM_TOKEN_DETAIL_SOL_BUY_PRESET_CACHE_KEY);
+        axiomTokenDetailSolBuyPresetCache = normalizeAxiomTokenDetailSolBuyPresetCacheRows(
+          blob[presetKey] ?? blob[0] ?? []
+        );
+      }
+
+      function ensureAxiomTokenDetailFixedSellPresetCacheLoaded() {
+        const presetKey = resolveAxiomTokenDetailInstantTradePresetKey();
+        if (presetKey === axiomTokenDetailFixedSellPresetCachePresetKey) {
+          return;
+        }
+        axiomTokenDetailFixedSellPresetCachePresetKey = presetKey;
+        const blob = readAxiomTokenDetailPresetCacheBlob(AXIOM_TOKEN_DETAIL_FIXED_SELL_PRESET_CACHE_KEY);
+        axiomTokenDetailFixedSellPresetCache = normalizeAxiomTokenDetailFixedSellPresetCacheRows(
+          blob[presetKey] ?? blob[0] ?? []
+        );
+      }
+
+      function saveAxiomTokenDetailSolBuyPresetCache(values) {
+        ensureAxiomTokenDetailSolBuyPresetCacheLoaded();
+        axiomTokenDetailSolBuyPresetCache = Array.isArray(values) ? values : [];
+        const blob = readAxiomTokenDetailPresetCacheBlob(AXIOM_TOKEN_DETAIL_SOL_BUY_PRESET_CACHE_KEY);
+        blob[axiomTokenDetailSolBuyPresetCachePresetKey] = axiomTokenDetailSolBuyPresetCache;
+        writeAxiomTokenDetailPresetCacheBlob(AXIOM_TOKEN_DETAIL_SOL_BUY_PRESET_CACHE_KEY, blob);
+      }
+
+      function saveAxiomTokenDetailFixedSellPresetCache(values) {
+        ensureAxiomTokenDetailFixedSellPresetCacheLoaded();
+        axiomTokenDetailFixedSellPresetCache = Array.isArray(values) ? values : [];
+        const blob = readAxiomTokenDetailPresetCacheBlob(AXIOM_TOKEN_DETAIL_FIXED_SELL_PRESET_CACHE_KEY);
+        blob[axiomTokenDetailFixedSellPresetCachePresetKey] = axiomTokenDetailFixedSellPresetCache;
+        writeAxiomTokenDetailPresetCacheBlob(AXIOM_TOKEN_DETAIL_FIXED_SELL_PRESET_CACHE_KEY, blob);
+      }
+
+      function formatAxiomTokenDetailFixedPresetLabel(action) {
+        if (!action?.fixedSolPreset) {
+          return "";
+        }
+        if (action.side === "sell" && action.sellUnit === "percent") {
+          return `${action.amount}%`;
+        }
+        return String(action.amount || "");
+      }
+
+      function writeAxiomTokenDetailSolBuyPresetCache(actions, rowIndex) {
+        const values = (Array.isArray(actions) ? actions : [])
+          .filter((entry) => entry?.action?.side === "buy")
+          .map((entry) => entry?.action?.amount)
+          .map((value) => normalizeAxiomTokenDetailTradeAmount(value))
+          .filter((value, index, list) => value && Number(value) > 0 && list.indexOf(value) === index);
+        if (values.length) {
+          const next = axiomTokenDetailSolBuyPresetCache.map((row) => [...row]);
+          next[Math.max(0, Number(rowIndex) || 0)] = values;
+          saveAxiomTokenDetailSolBuyPresetCache(next);
+        }
+      }
+
+      function writeAxiomTokenDetailFixedSellPresetCache(actions, rowIndex) {
+        const values = (Array.isArray(actions) ? actions : [])
+          .filter((entry) => entry?.action?.side === "sell" && (entry.action.sellUnit === "sol" || entry.action.sellUnit === "percent"))
+          .map((entry) => ({
+            amount: normalizeAxiomTokenDetailTradeAmount(entry.action.amount),
+            sellUnit: entry.action.sellUnit
+          }))
+          .filter((entry, index, list) =>
+            entry.amount &&
+            Number(entry.amount) > 0 &&
+            list.findIndex((candidate) =>
+              candidate.amount === entry.amount && candidate.sellUnit === entry.sellUnit
+            ) === index
+          );
+        if (values.length) {
+          const next = axiomTokenDetailFixedSellPresetCache.map((row) => [...row]);
+          next[Math.max(0, Number(rowIndex) || 0)] = values;
+          saveAxiomTokenDetailFixedSellPresetCache(next);
+        }
+      }
+
+      function hydrateAxiomTokenDetailCachedSolBuyActions(row, rowIndex, route, buyRowIndex) {
+        ensureAxiomTokenDetailSolBuyPresetCacheLoaded();
+        const fallbackControl = Array.from(row.children).find((element) =>
+          element instanceof HTMLElement &&
+          !element.hasAttribute("data-trench-tools-token-detail-inline") &&
+          !element.hasAttribute("data-trench-tools-token-detail-preload-inline")
+        );
+        if (!(fallbackControl instanceof HTMLElement)) {
+          return [];
+        }
+        const cachedRow = axiomTokenDetailSolBuyPresetCache[Math.max(0, Number(buyRowIndex) || 0)] || [];
+        return cachedRow.map((amount, index) => ({
+          nativeControl: fallbackControl,
+          index,
+          rowIndex,
+          action: {
+            side: "buy",
+            amount,
+            editable: false,
+            routeKey: route?.routeKey || "",
+            tokenMint: route?.tokenMint || "",
+            companionPair: route?.companionPair || "",
+            fixedSolPreset: true
+          }
+        }));
+      }
+
+      function hydrateAxiomTokenDetailCachedFixedSellActions(row, rowIndex, route, sellRowIndex) {
+        ensureAxiomTokenDetailFixedSellPresetCacheLoaded();
+        const fallbackControl = Array.from(row.children).find((element) =>
+          element instanceof HTMLElement &&
+          !element.hasAttribute("data-trench-tools-token-detail-inline") &&
+          !element.hasAttribute("data-trench-tools-token-detail-preload-inline")
+        );
+        if (!(fallbackControl instanceof HTMLElement)) {
+          return [];
+        }
+        const cachedRow = axiomTokenDetailFixedSellPresetCache[Math.max(0, Number(sellRowIndex) || 0)] || [];
+        return cachedRow.map((entry, index) => ({
+          nativeControl: fallbackControl,
+          index,
+          rowIndex,
+          action: {
+            side: "sell",
+            amount: entry.amount,
+            editable: false,
+            sellUnit: entry.sellUnit,
+            routeKey: route?.routeKey || "",
+            tokenMint: route?.tokenMint || "",
+            companionPair: route?.companionPair || "",
+            fixedSolPreset: true
+          }
+        }));
+      }
+
       function isAxiomTokenDetailRoundedControl(element) {
         if (!(element instanceof HTMLElement)) {
           return false;
@@ -8227,22 +8605,35 @@
         return element.matches("div.rounded-full") && !String(element.className || "").includes("group/wallets");
       }
 
+      function isUnsupportedAxiomTokenDetailQuoteControl(element) {
+        if (!(element instanceof HTMLElement)) {
+          return false;
+        }
+        const ownText = String(element.textContent || "").trim();
+        if (/^\$\s*\d+(?:\.\d+)?$/i.test(ownText)) {
+          return true;
+        }
+        const values = [
+          element.textContent,
+          element.getAttribute("aria-label"),
+          element.getAttribute("title"),
+          ...Array.from(element.querySelectorAll("[alt], [aria-label], [title]")).flatMap((child) => [
+            child.getAttribute("alt"),
+            child.getAttribute("aria-label"),
+            child.getAttribute("title")
+          ])
+        ];
+        return values.some((value) => /\b(?:USDC|USD1)\b/i.test(String(value || "")));
+      }
+
       function normalizeAxiomTokenDetailTradeAmount(value) {
-        let normalized = String(value || "")
-          .replace(/\s+/g, "")
+        const raw = String(value || "")
+          .trim()
           .replace(/%/g, "")
-          .replace(/,/g, ".")
-          .replace(/[^\d.]/g, "");
-        const firstDotIndex = normalized.indexOf(".");
-        if (firstDotIndex >= 0) {
-          normalized =
-            normalized.slice(0, firstDotIndex + 1) +
-            normalized.slice(firstDotIndex + 1).replace(/\./g, "");
-        }
-        if (normalized.startsWith(".")) {
-          normalized = `0${normalized}`;
-        }
-        return normalized;
+          .replace(/\s*(?:uSOL|SOL)\s*$/i, "");
+        return helpers.numericInput?.normalizeUnsignedDecimalInput
+          ? helpers.numericInput.normalizeUnsignedDecimalInput(raw)
+          : raw.replace(/,/g, ".");
       }
 
       function readAxiomTokenDetailAction(control, row = null, rowSide = null) {
@@ -8327,6 +8718,7 @@
 
       function resolveAxiomTokenDetailActionSide(control, row, rowSide, text = "") {
         const explicitSide = inferAxiomTokenDetailSideFromElement(control) ||
+          (String(text || "").includes("%") ? "sell" : null) ||
           inferAxiomTokenDetailSideFromElement(row) ||
           normalizeAxiomTokenDetailSide(rowSide);
         if (explicitSide) {
@@ -8388,10 +8780,36 @@
         return rect.width > 0 && rect.height > 0;
       }
 
+      function shieldAxiomTokenDetailInjectedHover(control) {
+        if (!(control instanceof HTMLElement) || control.dataset.trenchToolsAxiomHoverShield === "1") {
+          return;
+        }
+        control.dataset.trenchToolsAxiomHoverShield = "1";
+        const stopHoverPropagation = (event) => {
+          event.stopPropagation();
+        };
+        ["pointerover", "mouseover", "mousemove"].forEach((eventType) => {
+          control.addEventListener(eventType, stopHoverPropagation);
+        });
+        control._trenchAxiomHoverShieldCleanup = () => {
+          ["pointerover", "mouseover", "mousemove"].forEach((eventType) => {
+            control.removeEventListener(eventType, stopHoverPropagation);
+          });
+          delete control.dataset.trenchToolsAxiomHoverShield;
+          delete control._trenchAxiomHoverShieldCleanup;
+        };
+      }
+
       function buildAxiomTokenDetailCloneButton(nativeControl, action) {
         const button = nativeControl.cloneNode(true);
         button.classList.add("trench-tools-axiom-token-detail-clone");
         button.setAttribute("data-trench-tools-token-detail-inline", "true");
+        if (action.fixedSolPreset) {
+          button.setAttribute("data-trench-tools-token-detail-fixed-sol", "true");
+          button.textContent = formatAxiomTokenDetailFixedPresetLabel(action);
+        } else {
+          button.removeAttribute("data-trench-tools-token-detail-fixed-sol");
+        }
         button.removeAttribute("data-trench-tools-token-detail-native-control");
         button.removeAttribute("data-trench-tools-token-detail-native-hidden");
         button.setAttribute("data-route-key", action.routeKey);
@@ -8432,6 +8850,7 @@
           pointerEvents: "auto",
           zIndex: "1000"
         });
+        shieldAxiomTokenDetailInjectedHover(button);
         if (action.editable) {
           installAxiomTokenDetailEditablePresetBridge(button, nativeControl, action);
         } else {
@@ -9141,6 +9560,7 @@
         if (action.companionPair) {
           button.setAttribute("data-pair", action.companionPair);
         }
+        shieldAxiomTokenDetailInjectedHover(button);
         syncAxiomTokenDetailHardpanelActionButton(button, nativeSubmitButton, action.side);
         bindAxiomTokenDetailImmediateAction(button, (event) => {
           event.preventDefault();
@@ -10237,10 +10657,20 @@
         };
       }
 
+      function applyAxiomListButtonDesign(styleSet) {
+        if (typeof helpers.applyAxiomListButtonDesign === "function") {
+          return helpers.applyAxiomListButtonDesign(styleSet);
+        }
+        if (typeof helpers.applyQuickBuyButtonDesign === "function") {
+          return helpers.applyQuickBuyButtonDesign(styleSet, 1);
+        }
+        return styleSet;
+      }
+
       function axiomWatchlistQuickBuyStyles() {
         const styles = helpers.getQuickBuyBaseStyles();
 
-        return {
+        const styleSet = {
           base: {
             ...styles.base,
             display: "inline-flex",
@@ -10279,6 +10709,7 @@
           logoSize: "16px",
           logoGap: "4px"
         };
+        return applyAxiomListButtonDesign(styleSet);
       }
 
       function axiomSearchQuickBuyStyles() {
@@ -10351,7 +10782,7 @@
           transition: "background-color 0.2s ease"
         };
 
-        return {
+        const styleSet = {
           base: {
             ...styles.base,
             ...stableLayout,
@@ -10380,6 +10811,7 @@
           logoSize: "16px",
           logoGap: "4px"
         };
+        return applyAxiomListButtonDesign(styleSet);
       }
 
       return {

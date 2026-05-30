@@ -1,6 +1,9 @@
 const trenchToolsContentModules = window.__trenchToolsContentModules || {};
 const callBackground = trenchToolsContentModules.callBackground;
 const tradePreferences = trenchToolsContentModules.tradePreferences || {};
+const numericInput = trenchToolsContentModules.numericInput || {};
+const siteFeaturesModule = trenchToolsContentModules.siteFeatures || {};
+const appearanceModule = trenchToolsContentModules.appearance || {};
 const createLaunchdeckShellController = trenchToolsContentModules.createLaunchdeckShellController;
 const isEeOnlyTrenchToolsMode =
   trenchToolsContentModules.isEeOnlyTrenchToolsMode ||
@@ -70,6 +73,8 @@ const isLdOnlyTrenchToolsMode =
   const QUICK_PANEL_DEFAULT_WIDTH = 375;
   const QUICK_PANEL_DEFAULT_HEIGHT = 453;
   const EXTENSION_RELOAD_TOAST_FALLBACK_DELAY_MS = 1800;
+  const PLATFORM_BUTTON_SCALE_MIN = 0.75;
+  const PLATFORM_BUTTON_SCALE_MAX = 1.5;
   const WALLET_STATUS_QUOTE_REFRESH_MS = 1250;
   const WALLET_STATUS_FAST_QUOTE_REFRESH_MS = 75;
   const WALLET_STATUS_VISIBLE_STALE_MS = 7000;
@@ -300,6 +305,11 @@ const isLdOnlyTrenchToolsMode =
         ...normalized.j7,
         contractQuickBuy: false,
         contractQuickPanel: false
+      },
+      x: {
+        ...normalized.x,
+        addressQuickBuy: false,
+        addressQuickPanel: false
       }
     };
   }
@@ -351,6 +361,7 @@ const isLdOnlyTrenchToolsMode =
       resolveInlineToken,
       setInlineTokenContext,
       handleInlineTradeRequest,
+      openAxiomRoute,
       openPnlCardEditorForMint,
       openInlinePanelForMint,
       prewarmForMint,
@@ -364,6 +375,12 @@ const isLdOnlyTrenchToolsMode =
       quickBuyLabel,
       resolveQuickBuyButtonDesign,
       applyQuickBuyButtonDesign,
+      resolveAxiomListButtonDesign,
+      applyAxiomListButtonDesign,
+      resolvePlatformButtonDesign,
+      applyPlatformButtonDesign,
+      numericInput,
+      resolvePlatformButtonScale,
       openPanel,
       async openLaunchdeckOverlay(options = {}) {
         if (!(await ensureLaunchdeckEnabledForExtension())) {
@@ -553,7 +570,7 @@ const isLdOnlyTrenchToolsMode =
 
   function launchdeckSourcePlatform(value) {
     const normalized = String(value || "").trim().toLowerCase();
-    return normalized === "j7" ? "j7" : "axiom";
+    return normalized === "j7" || normalized === "x" ? normalized : "axiom";
   }
 
   function launchdeckPostDeployPreferences(sourcePlatform = "") {
@@ -842,6 +859,9 @@ const isLdOnlyTrenchToolsMode =
   }
 
   function defaultSiteFeatures() {
+    if (typeof siteFeaturesModule.defaultSiteFeatures === "function") {
+      return siteFeaturesModule.defaultSiteFeatures();
+    }
     return {
       axiom: {
         enabled: true,
@@ -860,6 +880,8 @@ const isLdOnlyTrenchToolsMode =
         dexScreenerIconMode: "both",
         postDeployAction: "close_modal_toast",
         postDeployDestination: "axiom",
+        afterBuyAction: "nothing",
+        afterListBuyAction: "nothing",
         walletTracker: true,
         watchlist: true
       },
@@ -868,10 +890,23 @@ const isLdOnlyTrenchToolsMode =
         contractQuickBuy: true,
         contractQuickPanel: true,
         contractVamp: true,
+        contractAxiom: true,
         cardLaunchdeck: true,
         hideNativeCardActions: false,
         postDeployAction: "close_modal_toast",
-        postDeployDestination: "axiom"
+        postDeployDestination: "axiom",
+        afterBuyAction: "toast"
+      },
+      x: {
+        enabled: false,
+        addressQuickBuy: true,
+        addressQuickPanel: true,
+        addressVamp: true,
+        addressAxiom: true,
+        tweetDeploy: true,
+        postDeployAction: "close_modal_toast",
+        postDeployDestination: "axiom",
+        afterBuyAction: "toast"
       }
     };
   }
@@ -966,6 +1001,16 @@ const isLdOnlyTrenchToolsMode =
   function normalizeAxiomPostDeployDestination(value, fallback = "axiom") {
     const destination = String(value || "").trim().toLowerCase();
     return destination === "axiom" ? destination : fallback;
+  }
+
+  function normalizeAxiomAfterBuyAction(value, fallback = "nothing") {
+    const action = String(value || "").trim().toLowerCase();
+    return action === "open_tab" || action === "open_window" ? action : fallback;
+  }
+
+  function normalizePlatformAfterBuyAction(value, fallback = "toast") {
+    const action = String(value || "").trim().toLowerCase();
+    return action === "open_axiom_tab" || action === "open_axiom_window" ? action : fallback;
   }
 
   function panelStorageScope() {
@@ -2109,31 +2154,10 @@ const isLdOnlyTrenchToolsMode =
   }
 
   function normalizeQuickBuyAmountInput(value) {
-    const trimmed = String(value || "").trim();
-    if (!trimmed) {
-      return "";
+    if (typeof numericInput.normalizeUnsignedDecimalInput === "function") {
+      return numericInput.normalizeUnsignedDecimalInput(value);
     }
-
-    let normalized = trimmed.replace(/,/g, ".").replace(/[^\d.]/g, "");
-    const firstDotIndex = normalized.indexOf(".");
-    if (firstDotIndex >= 0) {
-      normalized =
-        normalized.slice(0, firstDotIndex + 1) +
-        normalized.slice(firstDotIndex + 1).replace(/\./g, "");
-    }
-
-    if (normalized.startsWith(".")) {
-      normalized = `0${normalized}`;
-    }
-
-    if (normalized.includes(".")) {
-      const [whole, fractional] = normalized.split(".");
-      normalized = `${whole.replace(/^0+(?=\d)/, "") || "0"}.${fractional}`;
-    } else {
-      normalized = normalized.replace(/^0+(?=\d)/, "");
-    }
-
-    return normalized;
+    return String(value || "").trim().replace(/,/g, ".");
   }
 
   function getValidQuickBuyAmount(value) {
@@ -2327,6 +2351,9 @@ const isLdOnlyTrenchToolsMode =
   }
 
   function normalizeSiteFeaturesValue(value) {
+    if (typeof siteFeaturesModule.normalizeSiteFeatures === "function") {
+      return siteFeaturesModule.normalizeSiteFeatures(value);
+    }
     const defaults = defaultSiteFeatures();
     return {
       axiom: {
@@ -2366,6 +2393,14 @@ const isLdOnlyTrenchToolsMode =
           value.axiom?.postDeployDestination,
           defaults.axiom.postDeployDestination
         ),
+        afterBuyAction: normalizeAxiomAfterBuyAction(
+          value.axiom?.afterBuyAction,
+          defaults.axiom.afterBuyAction
+        ),
+        afterListBuyAction: normalizeAxiomAfterBuyAction(
+          value.axiom?.afterListBuyAction,
+          defaults.axiom.afterListBuyAction
+        ),
         walletTracker: value.axiom?.walletTracker ?? defaults.axiom.walletTracker,
         watchlist: value.axiom?.watchlist ?? defaults.axiom.watchlist
       },
@@ -2376,6 +2411,7 @@ const isLdOnlyTrenchToolsMode =
         contractQuickBuy: value.j7?.contractQuickBuy ?? defaults.j7.contractQuickBuy,
         contractQuickPanel: value.j7?.contractQuickPanel ?? defaults.j7.contractQuickPanel,
         contractVamp: value.j7?.contractVamp ?? defaults.j7.contractVamp,
+        contractAxiom: value.j7?.contractAxiom ?? defaults.j7.contractAxiom,
         cardLaunchdeck: value.j7?.cardLaunchdeck ?? defaults.j7.cardLaunchdeck,
         hideNativeCardActions: value.j7?.hideNativeCardActions ?? defaults.j7.hideNativeCardActions,
         postDeployAction: normalizeAxiomPostDeployAction(
@@ -2385,6 +2421,32 @@ const isLdOnlyTrenchToolsMode =
         postDeployDestination: normalizeAxiomPostDeployDestination(
           value.j7?.postDeployDestination,
           defaults.j7.postDeployDestination
+        ),
+        afterBuyAction: normalizePlatformAfterBuyAction(
+          value.j7?.afterBuyAction,
+          defaults.j7.afterBuyAction
+        )
+      },
+      x: {
+        ...defaults.x,
+        ...(value.x || {}),
+        enabled: value.x?.enabled ?? defaults.x.enabled,
+        addressQuickBuy: value.x?.addressQuickBuy ?? defaults.x.addressQuickBuy,
+        addressQuickPanel: value.x?.addressQuickPanel ?? defaults.x.addressQuickPanel,
+        addressVamp: value.x?.addressVamp ?? defaults.x.addressVamp,
+        addressAxiom: value.x?.addressAxiom ?? defaults.x.addressAxiom,
+        tweetDeploy: value.x?.tweetDeploy ?? defaults.x.tweetDeploy,
+        postDeployAction: normalizeAxiomPostDeployAction(
+          value.x?.postDeployAction,
+          defaults.x.postDeployAction
+        ),
+        postDeployDestination: normalizeAxiomPostDeployDestination(
+          value.x?.postDeployDestination,
+          defaults.x.postDeployDestination
+        ),
+        afterBuyAction: normalizePlatformAfterBuyAction(
+          value.x?.afterBuyAction,
+          defaults.x.afterBuyAction
         )
       }
     };
@@ -2410,6 +2472,13 @@ const isLdOnlyTrenchToolsMode =
     return {
       1: defaultQuickBuyButtonDesign(),
       2: defaultQuickBuyButtonDesign()
+    };
+  }
+
+  function defaultPlatformButtonScales() {
+    return {
+      j7: 1,
+      x: 1
     };
   }
 
@@ -2472,7 +2541,11 @@ const isLdOnlyTrenchToolsMode =
 
   function quickBuyButtonDesignSignature(appearanceValue) {
     const buttons = normalizeQuickBuyButtonsAppearance(appearanceValue?.quickBuyButtons);
-    return [1, 2]
+    const axiomListButton = normalizeQuickBuyButtonDesignValue(
+      appearanceValue?.axiomListButton,
+      defaultQuickBuyButtonDesign()
+    );
+    const quickBuySignature = [1, 2]
       .map((slot) => {
         const design = buttons[slot] || {};
         return [
@@ -2482,14 +2555,38 @@ const isLdOnlyTrenchToolsMode =
         ].join("|");
       })
       .join("||");
+    return [
+      quickBuySignature,
+      axiomListButton.color || "",
+      axiomListButton.backgroundColor || "",
+      axiomListButton.borderColor || ""
+    ].join("||");
+  }
+
+  function platformButtonDesignSignature(appearanceValue) {
+    const design = normalizeQuickBuyButtonDesignValue(
+      appearanceValue?.platformButtonDesign ?? appearanceValue?.platformButtonDesigns?.deploy,
+      defaultQuickBuyButtonDesign()
+    );
+    return [
+      design.color || "",
+      design.backgroundColor || "",
+      design.borderColor || ""
+    ].join("|");
   }
 
   function defaultAppearance() {
+    if (typeof appearanceModule.defaultAppearance === "function") {
+      return appearanceModule.defaultAppearance();
+    }
     return {
       volume: 70,
       buySound: defaultSoundSettings("buy"),
       sellSound: defaultSoundSettings("sell"),
-      quickBuyButtons: defaultQuickBuyButtonsAppearance()
+      quickBuyButtons: defaultQuickBuyButtonsAppearance(),
+      axiomListButton: defaultQuickBuyButtonDesign(),
+      platformButtonDesign: defaultQuickBuyButtonDesign(),
+      platformButtonScales: defaultPlatformButtonScales()
     };
   }
 
@@ -2532,7 +2629,37 @@ const isLdOnlyTrenchToolsMode =
     return defaultVolume;
   }
 
+  function normalizePlatformButtonScaleValue(value, fallback = 1) {
+    if (typeof appearanceModule.normalizePlatformButtonScale === "function") {
+      return appearanceModule.normalizePlatformButtonScale(value, fallback);
+    }
+    const parsed = Number(value);
+    const scale = Number.isFinite(parsed) ? parsed : Number(fallback);
+    const normalized = Number.isFinite(scale) ? scale : 1;
+    return Math.min(
+      PLATFORM_BUTTON_SCALE_MAX,
+      Math.max(PLATFORM_BUTTON_SCALE_MIN, Number(normalized.toFixed(2)))
+    );
+  }
+
+  function normalizePlatformButtonScales(value) {
+    const defaults = defaultPlatformButtonScales();
+    const source = value && typeof value === "object" ? value : {};
+    return {
+      j7: normalizePlatformButtonScaleValue(source.j7, defaults.j7),
+      x: normalizePlatformButtonScaleValue(source.x, defaults.x)
+    };
+  }
+
+  function resolvePlatformButtonScale(platformId) {
+    const scales = normalizePlatformButtonScales(state.appearance?.platformButtonScales);
+    return scales[String(platformId || "").trim().toLowerCase()] || 1;
+  }
+
   function normalizeAppearanceValue(value) {
+    if (typeof appearanceModule.normalizeAppearance === "function") {
+      return appearanceModule.normalizeAppearance(value);
+    }
     const defaults = defaultAppearance();
     const source = value && typeof value === "object" ? value : {};
     return {
@@ -2540,7 +2667,13 @@ const isLdOnlyTrenchToolsMode =
       volume: pickSharedVolume(value, defaults.volume),
       buySound: normalizeSoundValue(value?.buySound, defaults.buySound),
       sellSound: normalizeSoundValue(value?.sellSound, defaults.sellSound),
-      quickBuyButtons: normalizeQuickBuyButtonsAppearance(value?.quickBuyButtons)
+      quickBuyButtons: normalizeQuickBuyButtonsAppearance(value?.quickBuyButtons),
+      axiomListButton: normalizeQuickBuyButtonDesignValue(value?.axiomListButton, defaults.axiomListButton),
+      platformButtonDesign: normalizeQuickBuyButtonDesignValue(
+        value?.platformButtonDesign ?? value?.platformButtonDesigns?.deploy,
+        defaults.platformButtonDesign
+      ),
+      platformButtonScales: normalizePlatformButtonScales(value?.platformButtonScales)
     };
   }
 
@@ -2766,10 +2899,10 @@ const isLdOnlyTrenchToolsMode =
         payload.walletKeys = manualWalletKeys;
       }
     }
+    payload.includeSolBalance = true;
+    payload.includeUsd1Balance = shouldIncludeUsd1BalanceForWalletStatus({ tokenContext });
     if (tokenContext?.mint) {
       payload.mint = tokenContext.mint;
-      payload.includeSolBalance = true;
-      payload.includeUsd1Balance = shouldIncludeUsd1BalanceForWalletStatus({ tokenContext });
     }
     if (tokenContext?.surface) {
       payload.surface = tokenContext.surface;
@@ -5230,13 +5363,24 @@ const isLdOnlyTrenchToolsMode =
       }
       if (changes[APPEARANCE_KEY]) {
         const previousSignature = quickBuyButtonDesignSignature(state.appearance);
+        const previousPlatformScales = JSON.stringify(normalizePlatformButtonScales(state.appearance?.platformButtonScales));
+        const previousPlatformButtonDesigns = platformButtonDesignSignature(state.appearance);
         const nextAppearance = normalizeAppearanceValue(changes[APPEARANCE_KEY].newValue || {});
         const nextSignature = quickBuyButtonDesignSignature(nextAppearance);
+        const nextPlatformScales = JSON.stringify(normalizePlatformButtonScales(nextAppearance.platformButtonScales));
+        const nextPlatformButtonDesigns = platformButtonDesignSignature(nextAppearance);
         state.appearance = nextAppearance;
         if (previousSignature !== nextSignature) {
           state.axiomQuickBuyDesignRevision += 1;
         }
         if (platformInitialized && platform === "axiom" && previousSignature !== nextSignature) {
+          scanAndMount();
+        }
+        if (
+          platformInitialized &&
+          (platform === "j7" || platform === "x") &&
+          (previousPlatformScales !== nextPlatformScales || previousPlatformButtonDesigns !== nextPlatformButtonDesigns)
+        ) {
           scanAndMount();
         }
       }
@@ -5577,6 +5721,7 @@ const isLdOnlyTrenchToolsMode =
 
   async function handleTradeRequest(side, payload, options = {}) {
     const requestEntryStartedAt = Date.now();
+    const requestRouteIdentity = tokenContextRouteIdentity(currentExecutionTokenContextForGuard(options));
     let clientRequestId = "";
     try {
       if (!(await ensureExecutionEnabledForExtension({ refresh: false }))) {
@@ -5601,14 +5746,27 @@ const isLdOnlyTrenchToolsMode =
       if (!selection.walletKey && !selection.walletGroupId && !selection.walletKeys?.length) {
         throw new Error("Select at least one wallet.");
       }
-      const tokenContext =
-        options.tokenContextOverride ||
-        (await refreshPanelTokenContext({ silent: true })) ||
-        currentActivePanelTokenContext() ||
-        state.tokenContext ||
-        (await refreshCurrentToken());
+      const tokenContext = await resolveTradeTokenContext(options);
       if (!tokenContext) {
         throw new Error("No token selected.");
+      }
+      const tokenRouteIdentity = tokenContextRouteIdentity(tokenContext);
+      const currentRouteIdentity = tokenContextRouteIdentity(currentExecutionTokenContextForGuard(options));
+      if (
+        !options.tokenContextOverride &&
+        requestRouteIdentity &&
+        currentRouteIdentity &&
+        requestRouteIdentity !== currentRouteIdentity
+      ) {
+        return;
+      }
+      if (
+        !options.tokenContextOverride &&
+        tokenRouteIdentity &&
+        currentRouteIdentity &&
+        tokenRouteIdentity !== currentRouteIdentity
+      ) {
+        return;
       }
       clientRequestId = crypto.randomUUID();
       const warmReuseFields = await resolveTradeWarmReuseFields(tokenContext, {
@@ -5616,16 +5774,29 @@ const isLdOnlyTrenchToolsMode =
         side,
         skipBlockingPrewarm: true
       });
-      const routeRequest = getTokenContextRouteRequest(tokenContext);
+      const warmedRouteIdentity = tokenContextRouteIdentity(currentExecutionTokenContextForGuard(options));
+      if (
+        !options.tokenContextOverride &&
+        tokenRouteIdentity &&
+        warmedRouteIdentity &&
+        tokenRouteIdentity !== warmedRouteIdentity
+      ) {
+        return;
+      }
+      const routeRequest = buildExecutionRouteRequest(tokenContext);
+      const afterBuy = buildAfterBuyMetadata(side, tokenContext, routeRequest);
       const requestAddress = routeRequest.address;
       const request = {
         clientRequestId,
         clientStartedAtUnixMs: requestEntryStartedAt,
         clientRequestStartedAtUnixMs: requestEntryStartedAt,
         address: requestAddress,
-        mint: normalizeRouteValue(tokenContext?.mint) || undefined,
+        mint: routeRequest.mint,
         platform: String(tokenContext?.platform || state.platform || "").trim() || undefined,
-        pair: routeRequest.pair || undefined,
+        surface: String(tokenContext?.surface || "").trim() || undefined,
+        source: String(tokenContext?.source || "").trim() || undefined,
+        pageUrl: String(tokenContext?.url || window.location.href || "").trim() || undefined,
+        pair: routeRequest.pair,
         presetId: activePreset.id,
         ...selection,
         ...warmReuseFields
@@ -5644,7 +5815,8 @@ const isLdOnlyTrenchToolsMode =
       rememberLocalExecutionPending({
         clientRequestId,
         side,
-        walletCount: selectedWalletCountForRequest(selection)
+        walletCount: selectedWalletCountForRequest(selection),
+        afterBuy
       });
       const dispatchStartedAt = Date.now();
       console.debug(
@@ -5657,6 +5829,18 @@ const isLdOnlyTrenchToolsMode =
         side === "buy"
           ? await callBackground("trench:buy", hostPayload)
           : await callBackground("trench:sell", hostPayload);
+      if (!localExecutionPendingForBatch("", clientRequestId)) {
+        const acceptedRouteIdentity = tokenContextRouteIdentity(currentExecutionTokenContextForGuard(options));
+        if (!tokenRouteIdentity || !acceptedRouteIdentity || tokenRouteIdentity !== acceptedRouteIdentity) {
+          return;
+        }
+        rememberLocalExecutionPending({
+          clientRequestId,
+          side,
+          walletCount: selectedWalletCountForRequest(selection),
+          afterBuy
+        });
+      }
       console.debug(
         "[trench][latency] phase=content-accepted clientRequestId=%s batch=%s click_to_accepted_ms=%s background_roundtrip_ms=%s",
         clientRequestId,
@@ -5673,6 +5857,9 @@ const isLdOnlyTrenchToolsMode =
       pushPanelBatchStatus();
       await pollBatchStatus(result.batchId, side, result.walletCount, result.clientRequestId);
     } catch (error) {
+      if (clientRequestId && !localExecutionPendingForBatch("", clientRequestId)) {
+        return;
+      }
       dismissLocalExecutionPending({ clientRequestId });
       state.hostError = isHostAvailabilityError(error) ? userFacingErrorMessage(error) : "";
       surfaceUserFacingError(error, { pushToPanel: true, side });
@@ -6076,6 +6263,9 @@ const isLdOnlyTrenchToolsMode =
       }
       try {
         const batchStatus = await callBackground("trench:get-batch-status", { batchId });
+        if (!shouldContinueExecutionStatusUpdates(batchId, clientRequestId)) {
+          return;
+        }
         const latestStatus = String(batchStatus?.status || "").toLowerCase();
         updatePanelBatchStatus(batchStatus);
         syncExecutionToastsFromBatchStatus(batchStatus, { side, walletCount, clientRequestId });
@@ -6120,6 +6310,9 @@ const isLdOnlyTrenchToolsMode =
     clearBatchStatusPoller(batchId);
     try {
       const batchStatus = await callBackground("trench:get-batch-status", { batchId });
+      if (!shouldContinueExecutionStatusUpdates(batchId, clientRequestId)) {
+        return;
+      }
       const latestStatus = String(batchStatus?.status || "").toLowerCase();
       updatePanelBatchStatus(batchStatus);
       syncExecutionToastsFromBatchStatus(batchStatus, { side, walletCount, clientRequestId });
@@ -6307,6 +6500,39 @@ const isLdOnlyTrenchToolsMode =
     ].join("|");
   }
 
+  function triggerAfterBuyActionIfNeeded(localPending, { side = "", anyConfirmed = false } = {}) {
+    if (!localPending || String(side || localPending.side || "").trim().toLowerCase() !== "buy" || !anyConfirmed) {
+      return;
+    }
+    const afterBuy = localPending.afterBuy;
+    if (!afterBuy || afterBuy.opened || afterBuy.resolving) {
+      return;
+    }
+    const mode = afterBuyOpenMode(afterBuy.action);
+    if (!mode) {
+      afterBuy.opened = true;
+      return;
+    }
+    const url = String(afterBuy.url || "").trim();
+    if (url) {
+      afterBuy.opened = true;
+      openLaunchdeckPostDeployUrl(url, mode);
+      return;
+    }
+    afterBuy.resolving = true;
+    resolveAfterBuyAxiomUrl(afterBuy).then((resolvedUrl) => {
+      afterBuy.resolving = false;
+      afterBuy.url = resolvedUrl;
+      afterBuy.opened = true;
+      if (resolvedUrl) {
+        openLaunchdeckPostDeployUrl(resolvedUrl, mode);
+      }
+    }).catch(() => {
+      afterBuy.resolving = false;
+      afterBuy.opened = true;
+    });
+  }
+
   function syncExecutionToastsFromBatchStatus(batchStatus, fallback = {}) {
     const wallets = Array.isArray(batchStatus?.wallets) ? batchStatus.wallets : [];
     const totalWallets = Number(
@@ -6380,6 +6606,7 @@ const isLdOnlyTrenchToolsMode =
         const anyConfirmed = wallets.some(
           (walletState) => String(walletState?.status || "").toLowerCase() === "confirmed"
         );
+        triggerAfterBuyActionIfNeeded(localPending, { side, anyConfirmed });
         if (batchId && anyConfirmed && rememberBuySoundPlayed(`${side}:${batchId}`)) {
           playSideConfirmationSound(side);
         }
@@ -6410,6 +6637,7 @@ const isLdOnlyTrenchToolsMode =
       const anyConfirmed = wallets.some(
         (walletState) => String(walletState?.status || "").toLowerCase() === "confirmed"
       );
+      triggerAfterBuyActionIfNeeded(localPending, { side, anyConfirmed });
       if (batchId && anyConfirmed && rememberBuySoundPlayed(`${side}:${batchId}`)) {
         playSideConfirmationSound(side);
       }
@@ -6419,6 +6647,108 @@ const isLdOnlyTrenchToolsMode =
   function normalizeRouteValue(value) {
     const normalized = String(value || "").trim();
     return normalized || "";
+  }
+
+  function isBase58AddressShape(value) {
+    return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(normalizeRouteValue(value));
+  }
+
+  function extractAxiomMemeRouteFromUrl(url = window.location.href) {
+    if (platform !== "axiom") {
+      return "";
+    }
+    try {
+      const parsed = new URL(url, window.location.href);
+      const match = parsed.pathname.match(/^\/meme\/([^/?#]+)/);
+      const routeAddress = normalizeRouteValue(match?.[1]);
+      return isBase58AddressShape(routeAddress) ? routeAddress : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function readAxiomMintHintFromRouteContexts(routeAddress) {
+    const normalizedRoute = normalizeRouteValue(routeAddress);
+    if (!normalizedRoute) {
+      return "";
+    }
+    const contexts = [
+      currentActivePanelTokenContext(),
+      state.tokenContext,
+      state.quickPanelTokenContext,
+      state.panelTokenContext
+    ];
+    for (const context of contexts) {
+      if (!context || getTokenContextRouteAddress(context) !== normalizedRoute) {
+        continue;
+      }
+      const mint = normalizeRouteValue(context.mint);
+      if (mint && mint !== normalizedRoute && isBase58AddressShape(mint)) {
+        return mint;
+      }
+    }
+    return "";
+  }
+
+  function readAxiomMintHintFromRouteElements(routeAddress) {
+    const normalizedRoute = normalizeRouteValue(routeAddress);
+    if (!normalizedRoute) {
+      return "";
+    }
+    const elements = Array.from(document.querySelectorAll("[data-route-key][data-mint]"));
+    for (const element of elements) {
+      if (normalizeRouteValue(element.getAttribute("data-route-key")) !== normalizedRoute) {
+        continue;
+      }
+      const mint = normalizeRouteValue(element.getAttribute("data-mint"));
+      if (mint && mint !== normalizedRoute && isBase58AddressShape(mint)) {
+        return mint;
+      }
+    }
+    return "";
+  }
+
+  function readAxiomMintHintFromPulseCache(routeAddress) {
+    const normalizedRoute = normalizeRouteValue(routeAddress);
+    if (!normalizedRoute) {
+      return "";
+    }
+    try {
+      const pulse = JSON.parse(localStorage.getItem("axiom.pulse") || "{}");
+      const content = Array.isArray(pulse?.content) ? pulse.content : [];
+      const entry = content.find((item) =>
+        item &&
+        normalizeRouteValue(item.pairAddress) === normalizedRoute
+      );
+      const mint = normalizeRouteValue(entry?.tokenAddress);
+      return mint && mint !== normalizedRoute && isBase58AddressShape(mint) ? mint : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function readAxiomMintHintForRoute(routeAddress) {
+    return readAxiomMintHintFromRouteElements(routeAddress) ||
+      readAxiomMintHintFromPulseCache(routeAddress) ||
+      readAxiomMintHintFromRouteContexts(routeAddress);
+  }
+
+  function currentAxiomTokenDetailUrlRoute() {
+    const routeAddress = extractAxiomMemeRouteFromUrl();
+    if (!routeAddress) {
+      return null;
+    }
+    const mint = readAxiomMintHintForRoute(routeAddress);
+    return enrichTokenContextWithPriceHint({
+      platform: "axiom",
+      surface: "token_detail",
+      source: "page",
+      url: window.location.href,
+      routeAddress,
+      rawAddress: routeAddress,
+      address: routeAddress,
+      mint: mint || undefined
+    });
   }
 
   function getCandidateRouteAddress(candidate) {
@@ -6672,8 +7002,6 @@ const isLdOnlyTrenchToolsMode =
   function getTokenContextRouteRequest(tokenContext) {
     const routeAddress = getTokenContextRouteAddress(tokenContext) || normalizeRouteValue(tokenContext?.mint);
     const pairAddress = getTokenContextPairAddress(tokenContext);
-    // Axiom supplies pair + mint identities; execute against the pair so the
-    // engine takes the direct pair-classifier route instead of mint+pair.
     const address = shouldPreferPairRouteForTokenContext(tokenContext) && pairAddress
       ? pairAddress
       : routeAddress;
@@ -6681,6 +7009,236 @@ const isLdOnlyTrenchToolsMode =
       address,
       pair: normalizeCompanionPair(address, pairAddress)
     };
+  }
+
+  function buildExecutionRouteRequest(tokenContext) {
+    const routeRequest = getTokenContextRouteRequest(tokenContext);
+    const address = normalizeRouteValue(routeRequest.address);
+    const mint = normalizeRouteValue(tokenContext?.mint);
+    const pair = normalizeRouteValue(routeRequest.pair);
+    if (!isBase58AddressShape(address)) {
+      throw new Error("Token route not ready.");
+    }
+    if (mint && !isBase58AddressShape(mint)) {
+      throw new Error("Token mint hint is invalid.");
+    }
+    if (pair && !isBase58AddressShape(pair)) {
+      throw new Error("Token pair hint is invalid.");
+    }
+    return {
+      address,
+      mint: mint || undefined,
+      pair: pair || undefined
+    };
+  }
+
+  function getAxiomPairRouteAddress(routeOrAddress) {
+    if (!routeOrAddress || typeof routeOrAddress !== "object") {
+      return normalizePostDeployAddress(routeOrAddress);
+    }
+    const mint = normalizeRouteValue(routeOrAddress.mint);
+    const explicitPair = normalizePostDeployAddress(
+      routeOrAddress.pair ||
+      routeOrAddress.pairAddress ||
+      routeOrAddress.resolvedPair ||
+      routeOrAddress.canonicalMarketKey
+    );
+    if (explicitPair && explicitPair !== mint) {
+      return explicitPair;
+    }
+    const route = normalizePostDeployAddress(
+      routeOrAddress.routeAddress ||
+      routeOrAddress.rawAddress ||
+      routeOrAddress.address
+    );
+    return route && route !== mint ? route : "";
+  }
+
+  function buildAxiomRouteUrl(routeOrAddress) {
+    const route = getAxiomPairRouteAddress(routeOrAddress);
+    return route ? `https://axiom.trade/meme/${encodeURIComponent(route)}` : "";
+  }
+
+  async function resolveCanonicalAxiomPair(routeOrAddress) {
+    const tokenContext = routeOrAddress && typeof routeOrAddress === "object"
+      ? routeOrAddress
+      : tokenContextFromRouteReference(routeOrAddress, "contract_address");
+    const resolvedPair = getAxiomPairRouteAddress(tokenContext);
+    if (resolvedPair) {
+      return resolvedPair;
+    }
+    const payload = buildPrewarmPayload(tokenContext, "buy");
+    if (!payload?.address) {
+      return "";
+    }
+    const response = await requestAndRememberPrewarm(payload);
+    return getAxiomPairRouteAddress({
+      pair: response?.resolvedPair,
+      canonicalMarketKey: response?.canonicalMarketKey,
+      mint: response?.resolvedMint || tokenContext?.mint
+    });
+  }
+
+  async function openAxiomRoute(routeOrAddress, { mode = "tab" } = {}) {
+    const pair = await resolveCanonicalAxiomPair(routeOrAddress);
+    if (!pair) {
+      throw new Error("Axiom pair not found.");
+    }
+    const url = buildAxiomRouteUrl(pair);
+    openLaunchdeckPostDeployUrl(url, mode);
+    return { opened: true, url };
+  }
+
+  async function resolveAfterBuyAxiomUrl(afterBuy) {
+    const existingUrl = normalizePostDeployUrl(afterBuy?.url);
+    if (existingUrl) {
+      return existingUrl;
+    }
+    const pair = await resolveCanonicalAxiomPair(afterBuy?.routeContext);
+    return pair ? buildAxiomRouteUrl(pair) : "";
+  }
+
+  function resolveAfterBuyAction(tokenContext) {
+    const platformId = String(tokenContext?.platform || state.platform || platform || "").trim().toLowerCase();
+    const surface = String(tokenContext?.surface || "").trim().toLowerCase();
+    if (platformId === "axiom") {
+      if (surface === "pulse") {
+        return normalizeAxiomAfterBuyAction(state.siteFeatures?.axiom?.afterBuyAction, "nothing");
+      }
+      if (surface === "watchlist" || surface === "wallet_tracker") {
+        return normalizeAxiomAfterBuyAction(state.siteFeatures?.axiom?.afterListBuyAction, "nothing");
+      }
+      return "nothing";
+    }
+    if (platformId === "j7" || platformId === "x") {
+      return normalizePlatformAfterBuyAction(state.siteFeatures?.[platformId]?.afterBuyAction, "toast");
+    }
+    return "nothing";
+  }
+
+  function afterBuyOpenMode(action) {
+    const normalized = String(action || "").trim().toLowerCase();
+    if (normalized === "open_tab" || normalized === "open_axiom_tab") return "tab";
+    if (normalized === "open_window" || normalized === "open_axiom_window") return "window";
+    return "";
+  }
+
+  function buildAfterBuyMetadata(side, tokenContext, routeRequest) {
+    if (String(side || "").trim().toLowerCase() !== "buy") {
+      return null;
+    }
+    const action = resolveAfterBuyAction(tokenContext);
+    const mode = afterBuyOpenMode(action);
+    if (!mode) {
+      return { action, url: "", opened: false };
+    }
+    const routeContext = {
+      platform: tokenContext?.platform || state.platform || platform || undefined,
+      surface: tokenContext?.surface || undefined,
+      source: tokenContext?.source || undefined,
+      url: tokenContext?.url || window.location.href,
+      address: routeRequest?.address || tokenContext?.address || undefined,
+      routeAddress: getTokenContextRouteAddress(tokenContext) || routeRequest?.address || undefined,
+      rawAddress: tokenContext?.rawAddress || routeRequest?.address || undefined,
+      mint: tokenContext?.mint || routeRequest?.mint || undefined,
+      pair: routeRequest?.pair || tokenContext?.pair || undefined,
+      pairAddress: getTokenContextPairAddress(tokenContext, routeRequest?.pair) || undefined,
+      resolvedPair: tokenContext?.resolvedPair || undefined,
+      canonicalMarketKey: tokenContext?.canonicalMarketKey || tokenContext?.canonical_market_key || undefined
+    };
+    return {
+      action,
+      url: buildAxiomRouteUrl(routeContext) || buildAxiomRouteUrl(routeRequest),
+      routeContext,
+      opened: false,
+      resolving: false
+    };
+  }
+
+  function tokenContextFromRouteReference(routeOrAddress, surface, url = window.location.href, options = {}) {
+    const routeRef = normalizeInlineRouteReference(routeOrAddress, surface, url, options);
+    if (!routeRef.address) {
+      return null;
+    }
+    return enrichResolvedTokenContext({
+      platform,
+      source: routeRef.source || "page",
+      surface: routeRef.surface,
+      mint: routeRef.mint || undefined,
+      routeAddress: routeRef.address,
+      rawAddress: routeRef.address,
+      pairAddress: routeRef.pair || undefined,
+      url: routeRef.url
+    }, {
+      address: routeRef.address,
+      mint: routeRef.mint,
+      pair: routeRef.pair
+    });
+  }
+
+  function currentQuickPanelTokenContextWithStableRoute() {
+    if (!state.quickPanelOpen) {
+      return null;
+    }
+    return isBase58AddressShape(getTokenContextRouteAddress(state.quickPanelTokenContext))
+      ? state.quickPanelTokenContext
+      : null;
+  }
+
+  function currentPersistentPanelTokenContextWithStableRoute() {
+    if (!state.panelOpen) {
+      return null;
+    }
+    return isBase58AddressShape(getTokenContextRouteAddress(state.panelTokenContext))
+      ? state.panelTokenContext
+      : null;
+  }
+
+  function currentPageRouteFromPlatformAdapter() {
+    try {
+      const candidate = getPlatformAdapter()?.getCurrentTokenCandidate?.();
+      const address = getCandidateRouteAddress(candidate);
+      if (!isBase58AddressShape(address)) {
+        return null;
+      }
+      return tokenContextFromRouteReference(
+        candidate,
+        String(candidate?.surface || "").trim(),
+        candidate?.url || window.location.href
+      );
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function resolveTradeTokenContext(options = {}) {
+    if (options.tokenContextOverride) {
+      return options.tokenContextOverride;
+    }
+    if (platform === "axiom") {
+      return currentQuickPanelTokenContextWithStableRoute() ||
+        currentAxiomTokenDetailUrlRoute() ||
+        currentPersistentPanelTokenContextWithStableRoute() ||
+        currentPageRouteFromPlatformAdapter();
+    }
+    return (await refreshPanelTokenContext({ silent: true })) ||
+      currentActivePanelTokenContext() ||
+      state.tokenContext ||
+      (await refreshCurrentToken());
+  }
+
+  function currentExecutionTokenContextForGuard(options = {}) {
+    if (options.tokenContextOverride) {
+      return options.tokenContextOverride;
+    }
+    if (platform === "axiom") {
+      return currentQuickPanelTokenContextWithStableRoute() ||
+        currentAxiomTokenDetailUrlRoute() ||
+        currentPersistentPanelTokenContextWithStableRoute() ||
+        currentPageRouteFromPlatformAdapter() ||
+        state.tokenContext;
+    }
+    return currentActivePanelTokenContext() || state.tokenContext;
   }
 
   function buildRouteRequestKey(surface, address, pair = "") {
@@ -7696,6 +8254,13 @@ const isLdOnlyTrenchToolsMode =
     return null;
   }
 
+  function shouldContinueExecutionStatusUpdates(batchId = "", clientRequestId = "") {
+    return Boolean(
+      localExecutionPendingForBatch(batchId, clientRequestId) ||
+      state.batchStatuses.has(String(batchId || "").trim())
+    );
+  }
+
   function selectedWalletCountForRequest(selection = {}) {
     if (Array.isArray(selection.walletKeys) && selection.walletKeys.length) {
       return selection.walletKeys.length;
@@ -7713,13 +8278,23 @@ const isLdOnlyTrenchToolsMode =
     return 0;
   }
 
-  function rememberLocalExecutionPending({ clientRequestId, side, walletCount = 1 }) {
+  function rememberLocalExecutionPending({ clientRequestId, side, walletCount = 1, afterBuy = null }) {
     const normalizedClientRequestId = String(clientRequestId || "").trim();
     if (!normalizedClientRequestId) {
       return;
     }
     const existing = state.localExecutionPendings.get(normalizedClientRequestId);
     if (existing) {
+      if (afterBuy && typeof afterBuy === "object") {
+        existing.afterBuy = {
+          ...existing.afterBuy,
+          action: String(afterBuy.action || existing.afterBuy?.action || "").trim(),
+          url: String(afterBuy.url || existing.afterBuy?.url || "").trim(),
+          routeContext: afterBuy.routeContext || existing.afterBuy?.routeContext || null,
+          opened: Boolean(existing.afterBuy?.opened),
+          resolving: Boolean(existing.afterBuy?.resolving)
+        };
+      }
       return existing;
     }
     const toastId = `execution-local-${normalizedClientRequestId}`;
@@ -7739,7 +8314,16 @@ const isLdOnlyTrenchToolsMode =
       clientRequestId: normalizedClientRequestId,
       toastId,
       side: String(side || "trade").trim().toLowerCase(),
-      batchId: ""
+      batchId: "",
+      afterBuy: afterBuy && typeof afterBuy === "object"
+        ? {
+            action: String(afterBuy.action || "").trim(),
+            url: String(afterBuy.url || "").trim(),
+            routeContext: afterBuy.routeContext || null,
+            opened: false,
+            resolving: false
+          }
+        : null
     };
     state.localExecutionPendings.set(normalizedClientRequestId, record);
     return record;
@@ -7776,6 +8360,11 @@ const isLdOnlyTrenchToolsMode =
   function clearExecutionPendingToasts() {
     for (const record of state.localExecutionPendings.values()) {
       dismissToast(record.toastId);
+    }
+    for (const [toastId, entry] of state.activeToasts.entries()) {
+      if (String(toastId || "").startsWith("execution-") && entry?.pending) {
+        dismissToast(toastId);
+      }
     }
     state.localExecutionPendings.clear();
     state.localExecutionPendingBatchIds.clear();
@@ -8917,6 +9506,9 @@ const isLdOnlyTrenchToolsMode =
     entry.detail.textContent = detail || "";
     entry.detail.style.display = detail ? "block" : "none";
     entry.progress.style.background = "rgba(255, 255, 255, 0.92)";
+    entry.pending = Boolean(pending);
+    entry.persistent = Boolean(persistent);
+    entry.kind = kind;
     entry.actionHandler = !linkHref && typeof actionHandler === "function" ? actionHandler : null;
     entry.clickHandler = typeof clickHandler === "function" ? clickHandler : null;
     entry.element.style.cursor = entry.clickHandler ? "pointer" : "default";
@@ -9087,16 +9679,31 @@ const isLdOnlyTrenchToolsMode =
     return fallback;
   }
 
+  function resolveAxiomListButtonDesign() {
+    if (typeof appearanceModule.resolveAxiomListButtonDesign === "function") {
+      return appearanceModule.resolveAxiomListButtonDesign(state.appearance);
+    }
+    const normalized = normalizeAppearanceValue(state.appearance);
+    return normalized.axiomListButton || resolveQuickBuyButtonDesign(1);
+  }
+
+  function resolvePlatformButtonDesign(_type = "deploy") {
+    if (typeof appearanceModule.resolvePlatformButtonDesign === "function") {
+      return appearanceModule.resolvePlatformButtonDesign(state.appearance);
+    }
+    const normalized = normalizeAppearanceValue(state.appearance);
+    return normalized.platformButtonDesign || resolveQuickBuyButtonDesign(1);
+  }
+
   function deriveQuickBuyButtonHoverBackground(backgroundColor) {
     const normalized = String(backgroundColor || "").trim().toLowerCase();
     return `${normalized.slice(0, 7)}cc`;
   }
 
-  function applyQuickBuyButtonDesign(styleSet, index = 1) {
+  function applyButtonDesign(styleSet, design) {
     if (!styleSet || typeof styleSet !== "object") {
       return styleSet;
     }
-    const design = resolveQuickBuyButtonDesign(index);
     const backgroundColor = design.backgroundColor;
     const color = design.color;
     const borderColor = design.borderColor || "#ffffff80";
@@ -9114,6 +9721,18 @@ const isLdOnlyTrenchToolsMode =
     }
     styleSet.logoColor = color;
     return styleSet;
+  }
+
+  function applyQuickBuyButtonDesign(styleSet, index = 1) {
+    return applyButtonDesign(styleSet, resolveQuickBuyButtonDesign(index));
+  }
+
+  function applyAxiomListButtonDesign(styleSet) {
+    return applyButtonDesign(styleSet, resolveAxiomListButtonDesign());
+  }
+
+  function applyPlatformButtonDesign(styleSet, type = "deploy") {
+    return applyButtonDesign(styleSet, resolvePlatformButtonDesign(type));
   }
 
   function getQuickBuyBaseStylesForPlatform(platformId = platform) {

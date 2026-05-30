@@ -224,8 +224,44 @@
                   </div>
                 </section>
                 <section class="site-feature-group">
-                  <h4>LaunchDeck Deploy</h4>
-                  <div class="site-feature-grid">
+                  <h4>After Actions</h4>
+                  <div class="site-feature-grid site-feature-grid-axiom-after">
+                    <label
+                      class="site-feature-chip site-feature-chip-compound"
+                      for="site-axiom-after-buy-action"
+                      title="Controls what happens after a successful Axiom Pulse quick-buy confirmation."
+                    >
+                      <span class="site-feature-chip-main">
+                        <span>After Pulse Quick Buy</span>
+                      </span>
+                      <select
+                        id="site-axiom-after-buy-action"
+                        class="site-feature-chip-select"
+                        aria-label="Axiom after buy behavior"
+                      >
+                        <option value="nothing">Do nothing</option>
+                        <option value="open_tab">Open coin in new tab</option>
+                        <option value="open_window">Open coin in new window</option>
+                      </select>
+                    </label>
+                    <label
+                      class="site-feature-chip site-feature-chip-compound"
+                      for="site-axiom-after-list-buy-action"
+                      title="Controls what happens after a successful Axiom Watchlist or Wallet Tracker quick-buy confirmation."
+                    >
+                      <span class="site-feature-chip-main">
+                        <span>After Watchlist / Wallet Tracker Buy</span>
+                      </span>
+                      <select
+                        id="site-axiom-after-list-buy-action"
+                        class="site-feature-chip-select"
+                        aria-label="Axiom after watchlist or wallet tracker buy behavior"
+                      >
+                        <option value="nothing">Do nothing</option>
+                        <option value="open_tab">Open coin in new tab</option>
+                        <option value="open_window">Open coin in new window</option>
+                      </select>
+                    </label>
                     <label
                       class="site-feature-chip site-feature-chip-compound"
                       for="site-axiom-post-deploy-action"
@@ -241,8 +277,8 @@
                       >
                         <option value="close_modal_toast">Close modal + toast</option>
                         <option value="toast_only">Toast only</option>
-                        <option value="open_tab_toast">Open Axiom in new tab + toast</option>
-                        <option value="open_window_toast">Open Axiom in new window + toast</option>
+                        <option value="open_tab_toast">Open deployed coin in new tab + toast</option>
+                        <option value="open_window_toast">Open deployed coin in new window + toast</option>
                       </select>
                     </label>
                   </div>
@@ -268,7 +304,7 @@
                 <div class="site-feature-groups">
                   <section class="site-feature-group">
                     <h4>Contract addresses</h4>
-                    <div class="site-feature-grid site-feature-grid-three">
+                    <div class="site-feature-grid site-feature-grid-compact">
                       <label
                         class="site-feature-chip"
                         for="site-j7-contract-quick-buy"
@@ -292,6 +328,14 @@
                       >
                         <span>Vamp</span>
                         <input id="site-j7-contract-vamp" class="site-toggle" type="checkbox" />
+                      </label>
+                      <label
+                        class="site-feature-chip"
+                        for="site-j7-contract-axiom"
+                        title="Adds an Axiom logo button after Solana contract addresses on J7Tracker."
+                      >
+                        <span>Axiom</span>
+                        <input id="site-j7-contract-axiom" class="site-toggle" type="checkbox" />
                       </label>
                     </div>
                   </section>
@@ -317,8 +361,26 @@
                     </div>
                   </section>
                   <section class="site-feature-group">
-                    <h4>LaunchDeck Deploy</h4>
+                    <h4>After Actions</h4>
                     <div class="site-feature-grid">
+                      <label
+                        class="site-feature-chip site-feature-chip-compound"
+                        for="site-j7-after-buy-action"
+                        title="Controls what happens after a successful J7Tracker quick-buy confirmation."
+                      >
+                        <span class="site-feature-chip-main">
+                          <span>After Buy</span>
+                        </span>
+                        <select
+                          id="site-j7-after-buy-action"
+                          class="site-feature-chip-select"
+                          aria-label="J7 after buy behavior"
+                        >
+                          <option value="toast">Show toast only</option>
+                          <option value="open_axiom_tab">Open coin on Axiom in new tab</option>
+                          <option value="open_axiom_window">Open coin on Axiom in new window</option>
+                        </select>
+                      </label>
                       <label
                         class="site-feature-chip site-feature-chip-compound"
                         for="site-j7-post-deploy-action"
@@ -334,8 +396,119 @@
                         >
                           <option value="close_modal_toast">Close modal + toast</option>
                           <option value="toast_only">Toast only</option>
-                          <option value="open_tab_toast">Open Axiom in new tab + toast</option>
-                          <option value="open_window_toast">Open Axiom in new window + toast</option>
+                          <option value="open_tab_toast">Open deployed coin on Axiom in new tab + toast</option>
+                          <option value="open_window_toast">Open deployed coin on Axiom in new window + toast</option>
+                        </select>
+                      </label>
+                    </div>
+                  </section>
+                </div>
+              </section>
+              <section class="card site-platform-card">
+                <div class="site-platform-row">
+                  <div class="site-platform-brand">
+                    <div class="site-platform-icon site-platform-icon-x" aria-hidden="true">
+                      <img class="site-platform-icon-x-logo" src="../../assets/xlogo-icon.png" alt="" />
+                    </div>
+                    <div class="site-platform-meta">
+                      <h3>X</h3>
+                      <p class="muted">x.com</p>
+                    </div>
+                  </div>
+                  <label class="site-switch-row" for="site-x-enabled">
+                    <span>Enabled</span>
+                    <input id="site-x-enabled" class="site-toggle" type="checkbox" />
+                  </label>
+                </div>
+                <div class="site-feature-groups">
+                  <section class="site-feature-group">
+                    <h4>Address controls</h4>
+                    <div class="site-feature-grid site-feature-grid-compact">
+                      <label
+                        class="site-feature-chip"
+                        for="site-x-address-quick-buy"
+                        title="Adds a compact Trench Tools quick-buy button after Solana addresses in X posts and profile bios."
+                      >
+                        <span>Quick Buy</span>
+                        <input id="site-x-address-quick-buy" class="site-toggle" type="checkbox" />
+                      </label>
+                      <label
+                        class="site-feature-chip"
+                        for="site-x-address-quick-panel"
+                        title="Adds a compact manual-panel button after Solana addresses in X posts and profile bios."
+                      >
+                        <span>Quick Panel</span>
+                        <input id="site-x-address-quick-panel" class="site-toggle" type="checkbox" />
+                      </label>
+                      <label
+                        class="site-feature-chip"
+                        for="site-x-address-vamp"
+                        title="Adds a compact Vamp button after Solana addresses in X posts and profile bios."
+                      >
+                        <span>Vamp</span>
+                        <input id="site-x-address-vamp" class="site-toggle" type="checkbox" />
+                      </label>
+                      <label
+                        class="site-feature-chip"
+                        for="site-x-address-axiom"
+                        title="Adds an Axiom logo button after Solana addresses in X posts and profile bios."
+                      >
+                        <span>Axiom</span>
+                        <input id="site-x-address-axiom" class="site-toggle" type="checkbox" />
+                      </label>
+                    </div>
+                  </section>
+                  <section class="site-feature-group">
+                    <h4>Tweet cards</h4>
+                    <div class="site-feature-grid">
+                      <label
+                        class="site-feature-chip"
+                        for="site-x-tweet-deploy"
+                        title="Adds a Trench Tools Deploy button to top-level X tweet cards."
+                      >
+                        <span>Deploy Button</span>
+                        <input id="site-x-tweet-deploy" class="site-toggle" type="checkbox" />
+                      </label>
+                    </div>
+                  </section>
+                  <section class="site-feature-group">
+                    <h4>After Actions</h4>
+                    <div class="site-feature-grid">
+                      <label
+                        class="site-feature-chip site-feature-chip-compound"
+                        for="site-x-after-buy-action"
+                        title="Controls what happens after a successful X quick-buy confirmation."
+                      >
+                        <span class="site-feature-chip-main">
+                          <span>After Buy</span>
+                        </span>
+                        <select
+                          id="site-x-after-buy-action"
+                          class="site-feature-chip-select"
+                          aria-label="X after buy behavior"
+                        >
+                          <option value="toast">Show toast only</option>
+                          <option value="open_axiom_tab">Open coin on Axiom in new tab</option>
+                          <option value="open_axiom_window">Open coin on Axiom in new window</option>
+                        </select>
+                      </label>
+                      <label
+                        class="site-feature-chip site-feature-chip-compound"
+                        for="site-x-post-deploy-action"
+                        title="Controls what LaunchDeck does after a successful deploy from X."
+                      >
+                        <span class="site-feature-chip-main">
+                          <span>After Deploy</span>
+                        </span>
+                        <select
+                          id="site-x-post-deploy-action"
+                          class="site-feature-chip-select"
+                          aria-label="X after deploy behavior"
+                        >
+                          <option value="close_modal_toast">Close modal + toast</option>
+                          <option value="toast_only">Toast only</option>
+                          <option value="open_tab_toast">Open deployed coin on Axiom in new tab + toast</option>
+                          <option value="open_window_toast">Open deployed coin on Axiom in new window + toast</option>
                         </select>
                       </label>
                     </div>
@@ -635,154 +808,288 @@
           </header>
 
           <div class="appearance-stack">
-            <section class="settings-panel appearance-panel appearance-quick-buy-panel" data-quick-buy-slot="1">
-              <div class="appearance-quick-buy-row">
-                <div class="appearance-quick-buy-summary">
-                  <h3>Main Quick Buy Button</h3>
-                  <p class="muted">Customize the main Trench Tools quick-buy button colors on supported sites.</p>
+            <section class="settings-panel appearance-panel appearance-quick-buy-panel appearance-axiom-quick-buy-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>Axiom Quick Buy Button</h3>
+                  <p class="muted">Customize Axiom quick-buy button colors.</p>
                 </div>
-                <div class="appearance-quick-buy-controls-area">
-                  <div class="appearance-quick-buy-controls">
-                    <div class="appearance-quick-buy-field">
-                      <button
-                        id="appearance-quick-buy-1-background-swatch"
-                        type="button"
-                        class="appearance-quick-buy-swatch"
-                        data-quick-buy-field="backgroundColor"
-                        data-quick-buy-slot="1"
-                        aria-label="Main Quick Buy Button background color"
-                        aria-haspopup="dialog"
-                      ></button>
-                      <span class="appearance-quick-buy-field-label">Background Color</span>
+              </div>
+              <div class="appearance-quick-buy-stack">
+                <div class="appearance-quick-buy-item" data-quick-buy-slot="1">
+                  <div class="appearance-quick-buy-row">
+                    <div class="appearance-quick-buy-summary">
+                      <h4>Main Button</h4>
+                      <p class="muted">Used by the primary Axiom quick-buy button.</p>
                     </div>
-                    <div class="appearance-quick-buy-field">
-                      <button
-                        id="appearance-quick-buy-1-color-swatch"
-                        type="button"
-                        class="appearance-quick-buy-swatch"
-                        data-quick-buy-field="color"
-                        data-quick-buy-slot="1"
-                        aria-label="Main Quick Buy Button text color"
-                        aria-haspopup="dialog"
-                      ></button>
-                      <span class="appearance-quick-buy-field-label">Text Color</span>
-                    </div>
-                    <div class="appearance-quick-buy-field">
-                      <button
-                        id="appearance-quick-buy-1-border-swatch"
-                        type="button"
-                        class="appearance-quick-buy-swatch"
-                        data-quick-buy-field="borderColor"
-                        data-quick-buy-slot="1"
-                        aria-label="Main Quick Buy Button border color"
-                        aria-haspopup="dialog"
-                      ></button>
-                      <span class="appearance-quick-buy-field-label">Border Color</span>
-                    </div>
-                    <button
-                      id="appearance-quick-buy-1-reset"
-                      type="button"
-                      class="secondary-button appearance-quick-buy-reset"
-                      data-quick-buy-slot="1"
-                    >
-                      Reset to default
-                    </button>
-                  </div>
-                  <div class="appearance-quick-buy-preview-panel" data-quick-buy-slot="1">
-                    <div class="appearance-quick-buy-preview-card">
-                      <div class="appearance-quick-buy-preview-rows">
-                        <div class="appearance-quick-buy-preview-row"></div>
-                        <div class="appearance-quick-buy-preview-row"></div>
-                        <div class="appearance-quick-buy-preview-row"></div>
+                    <div class="appearance-quick-buy-controls-area">
+                      <div class="appearance-quick-buy-controls">
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-quick-buy-1-background-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="backgroundColor"
+                            data-quick-buy-slot="1"
+                            aria-label="Main Quick Buy Button background color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Background Color</span>
+                        </div>
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-quick-buy-1-color-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="color"
+                            data-quick-buy-slot="1"
+                            aria-label="Main Quick Buy Button text color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Text Color</span>
+                        </div>
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-quick-buy-1-border-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="borderColor"
+                            data-quick-buy-slot="1"
+                            aria-label="Main Quick Buy Button border color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Border Color</span>
+                        </div>
+                        <button
+                          id="appearance-quick-buy-1-reset"
+                          type="button"
+                          class="secondary-button appearance-quick-buy-reset"
+                          data-quick-buy-slot="1"
+                        >
+                          Reset to default
+                        </button>
                       </div>
-                      <button
-                        id="appearance-quick-buy-1-preview-button"
-                        type="button"
-                        class="appearance-quick-buy-preview-button"
-                        data-quick-buy-slot="1"
-                        aria-label="Main Quick Buy Button preview"
-                      >
-                        <span class="appearance-quick-buy-preview-logo" aria-hidden="true"></span>
-                        <span class="appearance-quick-buy-preview-amount">1.0</span>
-                      </button>
+                      <div class="appearance-quick-buy-preview-panel" data-quick-buy-slot="1">
+                        <div class="appearance-quick-buy-preview-card">
+                          <div class="appearance-quick-buy-preview-rows">
+                            <div class="appearance-quick-buy-preview-row"></div>
+                            <div class="appearance-quick-buy-preview-row"></div>
+                            <div class="appearance-quick-buy-preview-row"></div>
+                          </div>
+                          <button
+                            id="appearance-quick-buy-1-preview-button"
+                            type="button"
+                            class="appearance-quick-buy-preview-button"
+                            data-quick-buy-slot="1"
+                            aria-label="Main Quick Buy Button preview"
+                          >
+                            <span class="appearance-quick-buy-preview-logo" aria-hidden="true"></span>
+                            <span class="appearance-quick-buy-preview-amount">1.0</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="appearance-quick-buy-item" data-quick-buy-slot="2">
+                  <div class="appearance-quick-buy-row">
+                    <div class="appearance-quick-buy-summary">
+                      <h4>2nd Button</h4>
+                      <p class="muted">Used by the optional 2nd Axiom quick-buy button.</p>
+                    </div>
+                    <div class="appearance-quick-buy-controls-area">
+                      <div class="appearance-quick-buy-controls">
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-quick-buy-2-background-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="backgroundColor"
+                            data-quick-buy-slot="2"
+                            aria-label="2nd Quick Buy Button background color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Background Color</span>
+                        </div>
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-quick-buy-2-color-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="color"
+                            data-quick-buy-slot="2"
+                            aria-label="2nd Quick Buy Button text color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Text Color</span>
+                        </div>
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-quick-buy-2-border-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="borderColor"
+                            data-quick-buy-slot="2"
+                            aria-label="2nd Quick Buy Button border color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Border Color</span>
+                        </div>
+                        <button
+                          id="appearance-quick-buy-2-reset"
+                          type="button"
+                          class="secondary-button appearance-quick-buy-reset"
+                          data-quick-buy-slot="2"
+                        >
+                          Reset to default
+                        </button>
+                      </div>
+                      <div class="appearance-quick-buy-preview-panel" data-quick-buy-slot="2">
+                        <div class="appearance-quick-buy-preview-card">
+                          <div class="appearance-quick-buy-preview-rows">
+                            <div class="appearance-quick-buy-preview-row"></div>
+                            <div class="appearance-quick-buy-preview-row"></div>
+                            <div class="appearance-quick-buy-preview-row"></div>
+                          </div>
+                          <button
+                            id="appearance-quick-buy-2-preview-button"
+                            type="button"
+                            class="appearance-quick-buy-preview-button"
+                            data-quick-buy-slot="2"
+                            aria-label="2nd Quick Buy Button preview"
+                          >
+                            <span class="appearance-quick-buy-preview-logo" aria-hidden="true"></span>
+                            <span class="appearance-quick-buy-preview-amount">2.0</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="appearance-quick-buy-item" data-axiom-button-design="list">
+                  <div class="appearance-quick-buy-row">
+                    <div class="appearance-quick-buy-summary">
+                      <h4>Watchlist / Wallet Tracker</h4>
+                      <p class="muted">Shared by Axiom Watchlist and Wallet Tracker quick-buy buttons.</p>
+                    </div>
+                    <div class="appearance-quick-buy-controls-area">
+                      <div class="appearance-quick-buy-controls">
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-axiom-list-background-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="backgroundColor"
+                            data-axiom-button-design="list"
+                            aria-label="Watchlist and Wallet Tracker button background color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Background Color</span>
+                        </div>
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-axiom-list-color-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="color"
+                            data-axiom-button-design="list"
+                            aria-label="Watchlist and Wallet Tracker button text color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Text Color</span>
+                        </div>
+                        <div class="appearance-quick-buy-field">
+                          <button
+                            id="appearance-axiom-list-border-swatch"
+                            type="button"
+                            class="appearance-quick-buy-swatch"
+                            data-quick-buy-field="borderColor"
+                            data-axiom-button-design="list"
+                            aria-label="Watchlist and Wallet Tracker button border color"
+                            aria-haspopup="dialog"
+                          ></button>
+                          <span class="appearance-quick-buy-field-label">Border Color</span>
+                        </div>
+                        <button
+                          id="appearance-axiom-list-reset"
+                          type="button"
+                          class="secondary-button appearance-quick-buy-reset"
+                          data-axiom-button-design="list"
+                        >
+                          Reset to default
+                        </button>
+                      </div>
+                      <div class="appearance-quick-buy-preview-panel" data-axiom-button-design="list">
+                        <div class="appearance-quick-buy-preview-card">
+                          <div class="appearance-quick-buy-preview-rows">
+                            <div class="appearance-quick-buy-preview-row"></div>
+                            <div class="appearance-quick-buy-preview-row"></div>
+                            <div class="appearance-quick-buy-preview-row"></div>
+                          </div>
+                          <button
+                            id="appearance-axiom-list-preview-button"
+                            type="button"
+                            class="appearance-quick-buy-preview-button"
+                            data-axiom-button-design="list"
+                            aria-label="Watchlist and Wallet Tracker button preview"
+                          >
+                            <span class="appearance-quick-buy-preview-logo" aria-hidden="true"></span>
+                            <span class="appearance-quick-buy-preview-amount">1.0</span>
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>
               </div>
             </section>
 
-            <section class="settings-panel appearance-panel appearance-quick-buy-panel" data-quick-buy-slot="2">
-              <div class="appearance-quick-buy-row">
-                <div class="appearance-quick-buy-summary">
-                  <h3>2nd Quick Buy Button</h3>
-                  <p class="muted">Customize the 2nd Trench Tools quick-buy button colors. Uses the default design until customized.</p>
+            <section class="settings-panel appearance-panel appearance-platform-scale-panel">
+              <div class="panel-heading">
+                <div>
+                  <h3>J7 / X Button Scale</h3>
+                  <p class="muted">Resize injected J7 Tracker and X buttons without changing Axiom quick-buy colors.</p>
                 </div>
-                <div class="appearance-quick-buy-controls-area">
-                  <div class="appearance-quick-buy-controls">
-                    <div class="appearance-quick-buy-field">
-                      <button
-                        id="appearance-quick-buy-2-background-swatch"
-                        type="button"
-                        class="appearance-quick-buy-swatch"
-                        data-quick-buy-field="backgroundColor"
-                        data-quick-buy-slot="2"
-                        aria-label="2nd Quick Buy Button background color"
-                        aria-haspopup="dialog"
-                      ></button>
-                      <span class="appearance-quick-buy-field-label">Background Color</span>
-                    </div>
-                    <div class="appearance-quick-buy-field">
-                      <button
-                        id="appearance-quick-buy-2-color-swatch"
-                        type="button"
-                        class="appearance-quick-buy-swatch"
-                        data-quick-buy-field="color"
-                        data-quick-buy-slot="2"
-                        aria-label="2nd Quick Buy Button text color"
-                        aria-haspopup="dialog"
-                      ></button>
-                      <span class="appearance-quick-buy-field-label">Text Color</span>
-                    </div>
-                    <div class="appearance-quick-buy-field">
-                      <button
-                        id="appearance-quick-buy-2-border-swatch"
-                        type="button"
-                        class="appearance-quick-buy-swatch"
-                        data-quick-buy-field="borderColor"
-                        data-quick-buy-slot="2"
-                        aria-label="2nd Quick Buy Button border color"
-                        aria-haspopup="dialog"
-                      ></button>
-                      <span class="appearance-quick-buy-field-label">Border Color</span>
-                    </div>
-                    <button
-                      id="appearance-quick-buy-2-reset"
-                      type="button"
-                      class="secondary-button appearance-quick-buy-reset"
-                      data-quick-buy-slot="2"
-                    >
-                      Reset to default
-                    </button>
+              </div>
+              <div class="appearance-platform-scale-stack">
+                <div class="appearance-platform-scale-row" data-platform-scale-row="j7">
+                  <div class="appearance-platform-scale-copy">
+                    <span class="appearance-platform-scale-title">J7 Tracker</span>
+                    <span id="appearance-platform-scale-j7-value" class="muted appearance-platform-scale-value">100%</span>
                   </div>
-                  <div class="appearance-quick-buy-preview-panel" data-quick-buy-slot="2">
-                    <div class="appearance-quick-buy-preview-card">
-                      <div class="appearance-quick-buy-preview-rows">
-                        <div class="appearance-quick-buy-preview-row"></div>
-                        <div class="appearance-quick-buy-preview-row"></div>
-                        <div class="appearance-quick-buy-preview-row"></div>
-                      </div>
-                      <button
-                        id="appearance-quick-buy-2-preview-button"
-                        type="button"
-                        class="appearance-quick-buy-preview-button"
-                        data-quick-buy-slot="2"
-                        aria-label="2nd Quick Buy Button preview"
-                      >
-                        <span class="appearance-quick-buy-preview-logo" aria-hidden="true"></span>
-                        <span class="appearance-quick-buy-preview-amount">2.0</span>
-                      </button>
-                    </div>
+                  <input id="appearance-platform-scale-j7-slider" type="range" min="0.75" max="1.5" step="0.05" value="1" />
+                  <button id="appearance-platform-scale-j7-preview" type="button" class="appearance-platform-scale-preview">Deploy</button>
+                  <button id="appearance-platform-scale-j7-reset" type="button" class="secondary-button appearance-platform-scale-reset">Reset</button>
+                </div>
+                <div class="appearance-platform-scale-row" data-platform-scale-row="x">
+                  <div class="appearance-platform-scale-copy">
+                    <span class="appearance-platform-scale-title">X</span>
+                    <span id="appearance-platform-scale-x-value" class="muted appearance-platform-scale-value">100%</span>
                   </div>
+                  <input id="appearance-platform-scale-x-slider" type="range" min="0.75" max="1.5" step="0.05" value="1" />
+                  <button id="appearance-platform-scale-x-preview" type="button" class="appearance-platform-scale-preview">Deploy</button>
+                  <button id="appearance-platform-scale-x-reset" type="button" class="secondary-button appearance-platform-scale-reset">Reset</button>
+                </div>
+              </div>
+              <div class="appearance-platform-design-stack">
+                <div class="appearance-platform-design-row">
+                  <div class="appearance-platform-scale-copy">
+                    <span class="appearance-platform-scale-title">Action Buttons</span>
+                    <span class="muted appearance-platform-scale-value">Shared by J7 and X Deploy, Panel, and Vamp buttons.</span>
+                  </div>
+                  <div class="appearance-platform-design-controls">
+                    <button id="appearance-platform-action-background-swatch" type="button" class="appearance-quick-buy-swatch" aria-label="J7 and X action button background color" aria-haspopup="dialog"></button>
+                    <button id="appearance-platform-action-color-swatch" type="button" class="appearance-quick-buy-swatch" aria-label="J7 and X action button text color" aria-haspopup="dialog"></button>
+                    <button id="appearance-platform-action-border-swatch" type="button" class="appearance-quick-buy-swatch" aria-label="J7 and X action button border color" aria-haspopup="dialog"></button>
+                  </div>
+                  <div class="appearance-platform-action-preview-group" aria-label="J7 and X action button preview">
+                    <button type="button" class="appearance-platform-scale-preview" data-platform-action-preview="deploy">Deploy</button>
+                    <button type="button" class="appearance-platform-scale-preview" data-platform-action-preview="panel">Panel</button>
+                    <button type="button" class="appearance-platform-scale-preview" data-platform-action-preview="vamp">Vamp</button>
+                  </div>
+                  <button id="appearance-platform-action-reset" type="button" class="secondary-button appearance-platform-scale-reset">Reset</button>
                 </div>
               </div>
             </section>

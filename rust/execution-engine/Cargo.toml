@@ -1,6 +1,6 @@
 [package]
 name = "execution-engine"
-version = "1.1.6"
+version = "1.1.7"
 edition = "2024"
 license.workspace = true
 default-run = "execution-engine"

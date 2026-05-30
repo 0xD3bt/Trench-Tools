@@ -247,6 +247,66 @@ html.boot-pending .boot-overlay {
   }
 }
 
+.launchdeck-auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--overlay-scrim);
+  backdrop-filter: blur(18px);
+}
+
+.launchdeck-auth-card {
+  width: min(420px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: var(--surface-glass);
+  box-shadow: var(--modal-shadow);
+}
+
+.launchdeck-auth-logo {
+  width: 180px;
+  height: auto;
+  justify-self: center;
+}
+
+.launchdeck-auth-card h1 {
+  margin: 0;
+  font: 800 22px/1.1 var(--font-display);
+  text-align: center;
+}
+
+.launchdeck-auth-card p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.launchdeck-auth-card label {
+  display: grid;
+  gap: 7px;
+}
+
+.launchdeck-auth-remember {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.launchdeck-auth-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .output-hidden #output-section {
   display: none !important;
 }

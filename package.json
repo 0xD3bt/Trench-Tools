@@ -1,6 +1,6 @@
 {
   "name": "launchdeck",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "private": true,
   "license": "AGPL-3.0-only",
   "description": "Production-grade Solana launch deck for Pump, Bonk, and Bags-style launch flows.",

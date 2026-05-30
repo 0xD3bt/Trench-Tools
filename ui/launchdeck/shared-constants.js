@@ -32,4 +32,31 @@
     if (!Number.isFinite(bps) || bps <= 0) return 0;
     return Math.floor((gross * bps) / 10_000);
   };
+
+  if (!global.TrenchNumericInput) {
+    function normalizeUnsignedDecimalInput(value, options = {}) {
+      const raw = String(value ?? "").trim().replace(/\s+/g, "");
+      if (!raw) return "";
+      const suffixMatch = options.allowSuffix === true ? raw.match(/[kmbtKMBT]$/) : null;
+      const suffix = suffixMatch ? suffixMatch[0].toLowerCase() : "";
+      const body = suffix ? raw.slice(0, -1) : raw;
+      if (!/^[\d.,]+$/.test(body)) return "";
+      const dotCount = (body.match(/\./g) || []).length;
+      const commaCount = (body.match(/,/g) || []).length;
+      if (dotCount && commaCount) return "";
+      if (dotCount > 1 || commaCount > 1) return "";
+      if (commaCount === 1 && dotCount === 0 && /^\d{1,3},\d{3}$/.test(body) && !body.startsWith("0,")) return "";
+      const normalized = body.replace(",", ".");
+      if (normalized === ".") return "";
+      const prefixed = normalized.startsWith(".") ? `0${normalized}` : normalized;
+      if (!/^\d+(?:\.\d*)?$/.test(prefixed)) return "";
+      const [whole, fractional] = prefixed.split(".");
+      const maxDecimals = Number.isInteger(options.maxDecimals) ? options.maxDecimals : null;
+      if (maxDecimals != null && String(fractional || "").length > maxDecimals) return "";
+      const cleanWhole = whole.replace(/^0+(?=\d)/, "") || "0";
+      return prefixed.includes(".") ? `${cleanWhole}.${fractional ?? ""}${suffix}` : `${cleanWhole}${suffix}`;
+    }
+
+    global.TrenchNumericInput = { normalizeUnsignedDecimalInput };
+  }
 })(typeof window !== "undefined" ? window : globalThis);

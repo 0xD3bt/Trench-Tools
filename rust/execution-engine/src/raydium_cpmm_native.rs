@@ -20,8 +20,8 @@ use spl_token::instruction::{
 };
 
 use crate::{
-    extension_api::{MevMode, TradeSettlementAsset, TradeSide},
-    provider_tip::pick_tip_account_for_provider,
+    extension_api::{TradeSettlementAsset, TradeSide, jitodontfront_enabled_for_provider},
+    provider_tip::{pick_tip_account_for_provider, provider_required_tip_lamports},
     rpc_client::{
         CompiledTransaction, fetch_account_data, fetch_account_owner_and_data,
         fetch_minimum_balance_for_rent_exemption,
@@ -50,9 +50,6 @@ const SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const RAYDIUM_CPMM_BUY_COMPUTE_UNIT_LIMIT: u32 = 340_000;
 const RAYDIUM_CPMM_SELL_COMPUTE_UNIT_LIMIT: u32 = 340_000;
 const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
-const HELIUS_SENDER_MIN_TIP_LAMPORTS: u64 = 200_000;
-const HELLO_MOON_MIN_TIP_LAMPORTS: u64 = 1_000_000;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RaydiumCpmmPoolState {
     pub pool_id: Pubkey,
@@ -1140,7 +1137,7 @@ async fn finalize_raydium_cpmm_transaction(
         } else {
             (None, None)
         };
-    if matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure) {
+    if jitodontfront_enabled_for_provider(&request.policy.provider, &request.policy.mev_mode) {
         apply_jitodontfront(&mut instructions, &owner_pubkey)?;
     }
     instructions.push(build_uniqueness_memo_instruction(label)?);
@@ -1299,7 +1296,12 @@ fn apply_jitodontfront(instructions: &mut Vec<Instruction>, payer: &Pubkey) -> R
     instruction
         .accounts
         .push(AccountMeta::new_readonly(account, false));
-    instructions.insert(0, instruction);
+    let compute_budget = parse_pubkey(COMPUTE_BUDGET_PROGRAM_ID, "compute budget program")?;
+    let insert_index = instructions
+        .iter()
+        .take_while(|instruction| instruction.program_id == compute_budget)
+        .count();
+    instructions.insert(insert_index, instruction);
     Ok(())
 }
 
@@ -1313,14 +1315,7 @@ fn configured_tip_account() -> Result<Option<Pubkey>, String> {
 }
 
 fn provider_min_tip_lamports(provider: &str) -> u64 {
-    let normalized = provider.trim().to_ascii_lowercase();
-    if normalized.contains("helius-sender") {
-        HELIUS_SENDER_MIN_TIP_LAMPORTS
-    } else if normalized.contains("hello-moon") || normalized.contains("hellomoon") {
-        HELLO_MOON_MIN_TIP_LAMPORTS
-    } else {
-        0
-    }
+    provider_required_tip_lamports(provider).unwrap_or(0)
 }
 
 fn priority_fee_sol_to_micro_lamports(value: &str) -> Result<u64, String> {
@@ -1529,5 +1524,48 @@ mod tests {
 
         let error = validate_cpmm_token_programs(&pool, &mint).expect_err("unsupported program");
         assert!(error.contains("Token-2022 CPMM routes are not enabled"));
+    }
+
+    #[test]
+    fn jito_inline_tip_uses_provider_minimum() {
+        let payer = Pubkey::new_unique();
+        let (_instruction, lamports, account) = resolve_inline_tip(&payer, "jito-bundle", "0")
+            .expect("tip")
+            .expect("tip");
+
+        assert_eq!(
+            lamports,
+            provider_required_tip_lamports("jito-bundle").unwrap()
+        );
+        assert!(!account.is_empty());
+    }
+
+    #[test]
+    fn jitodontfront_is_inserted_after_compute_budget_instructions() {
+        let payer = Pubkey::new_unique();
+        let swap = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![AccountMeta::new(Pubkey::new_unique(), false)],
+            data: vec![1],
+        };
+        let mut instructions = vec![
+            build_compute_unit_limit_instruction(100_000).expect("compute budget"),
+            swap.clone(),
+        ];
+
+        apply_jitodontfront(&mut instructions, &payer).expect("jitodontfront");
+
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(
+            instructions[0].program_id,
+            parse_pubkey(COMPUTE_BUDGET_PROGRAM_ID, "compute budget").unwrap()
+        );
+        assert_eq!(instructions[2], swap);
+        assert!(
+            instructions[1]
+                .accounts
+                .iter()
+                .any(|account| account.pubkey.to_string() == JITODONTFRONT_ACCOUNT)
+        );
     }
 }

@@ -11,7 +11,7 @@ use std::{
 };
 use uuid::Uuid;
 
-use crate::paths;
+use crate::{fs_utils, paths};
 
 const LIVE_LOG_LIMIT: usize = 100;
 const ERROR_LOG_DEFAULT_LIMIT: usize = 250;
@@ -59,7 +59,9 @@ fn append_error_entry(entry: &AppLogEntry) {
     let path = error_log_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
+        fs_utils::restrict_dir_permissions(parent);
     }
+    let file_already_exists = path.exists();
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
@@ -67,6 +69,9 @@ fn append_error_entry(entry: &AppLogEntry) {
         return;
     };
     let _ = writeln!(file, "{line}");
+    if !file_already_exists {
+        fs_utils::restrict_file_permissions(&error_log_path());
+    }
 }
 
 fn record_entry(level: &str, source: &str, message: impl Into<String>, context: Option<Value>) {

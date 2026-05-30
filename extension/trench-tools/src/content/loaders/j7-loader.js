@@ -392,11 +392,17 @@
     scheduleReconnectFallback();
     const backgroundRpc = await loadModule("src/shared/background-rpc.js");
     const runtimeMode = await loadModule("src/shared/runtime-mode.js");
+    const numericInput = await loadModule("src/shared/numeric-input-module.js");
     const tradePreferences = await loadModule("src/shared/trade-preferences.js");
+    const siteFeatures = await loadModule("src/shared/site-features.js");
+    const appearance = await loadModule("src/shared/appearance.js");
     const launchdeckShell = await loadModule("src/content/launchdeck-shell.js");
     window.__trenchToolsContentModules = {
       callBackground: backgroundRpc.callBackground,
+      numericInput,
       tradePreferences,
+      siteFeatures,
+      appearance,
       createLaunchdeckShellController: launchdeckShell.createLaunchdeckShellController,
       isEeOnlyTrenchToolsMode: runtimeMode.isEeOnlyTrenchToolsMode,
       isLdOnlyTrenchToolsMode: runtimeMode.isLdOnlyTrenchToolsMode

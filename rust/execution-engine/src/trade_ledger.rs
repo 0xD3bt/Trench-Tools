@@ -45,6 +45,7 @@ pub enum StoredEntryPreference {
 pub enum PlatformTag {
     Axiom,
     J7,
+    X,
     Unknown,
 }
 
@@ -1169,6 +1170,7 @@ pub fn platform_tag_from_label(label: Option<&str>) -> PlatformTag {
     {
         "axiom" => PlatformTag::Axiom,
         "j7" | "j7tracker" => PlatformTag::J7,
+        "x" | "twitter" => PlatformTag::X,
         _ => PlatformTag::Unknown,
     }
 }

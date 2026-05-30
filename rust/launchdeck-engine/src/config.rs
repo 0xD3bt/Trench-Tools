@@ -838,8 +838,11 @@ fn mev_mode_enables_hellomoon_protect(mode: &str) -> bool {
     )
 }
 
-fn mev_mode_enables_jitodontfront(mode: &str) -> bool {
+fn mev_mode_enables_jitodontfront(provider: &str, mode: &str) -> bool {
     matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "hellomoon" | "jito-bundle"
+    ) && matches!(
         mode.trim().to_ascii_lowercase().as_str(),
         "reduced" | "secure"
     )
@@ -1801,6 +1804,24 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         &["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"],
         "helius-sender",
     )?;
+    let execution_buy_provider = parse_choice(
+        &raw.execution.buyProvider,
+        "execution.buyProvider",
+        &["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"],
+        "helius-sender",
+    )?;
+    let execution_sell_provider = parse_choice(
+        &raw.execution.sellProvider,
+        "execution.sellProvider",
+        &["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"],
+        "helius-sender",
+    )?;
+    let execution_jitodontfront =
+        mev_mode_enables_jitodontfront(&execution_provider, &creation_mev_mode);
+    let execution_buy_jitodontfront =
+        mev_mode_enables_jitodontfront(&execution_buy_provider, &buy_mev_mode);
+    let execution_sell_jitodontfront =
+        mev_mode_enables_jitodontfront(&execution_sell_provider, &sell_mev_mode);
     // All supported send paths either require skip preflight (Sender / Hello Moon), use bundle APIs
     // without Solana RPC preflight (Jito), or use standard-rpc fanout which sets skip in TransportPlan.
     // Keep execution.skipPreflight true so reports and follow jobs stay consistent.
@@ -1926,7 +1947,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             },
             mevProtect: mev_mode_enables_hellomoon_protect(&creation_mev_mode),
             mevMode: creation_mev_mode.clone(),
-            jitodontfront: mev_mode_enables_jitodontfront(&creation_mev_mode),
+            jitodontfront: execution_jitodontfront,
             autoGas: parse_bool(&raw.execution.autoGas, true),
             autoMode: if is_blank(&raw.execution.autoMode) {
                 "launchAuto".to_string()
@@ -1937,12 +1958,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             tipSol: raw.execution.tipSol.trim().to_string(),
             maxPriorityFeeSol: raw.execution.maxPriorityFeeSol.trim().to_string(),
             maxTipSol: raw.execution.maxTipSol.trim().to_string(),
-            buyProvider: parse_choice(
-                &raw.execution.buyProvider,
-                "execution.buyProvider",
-                &["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"],
-                "helius-sender",
-            )?,
+            buyProvider: execution_buy_provider.clone(),
             buyEndpointProfile: if is_blank(&raw.execution.buyEndpointProfile) {
                 String::new()
             } else {
@@ -1955,7 +1971,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             },
             buyMevProtect: mev_mode_enables_hellomoon_protect(&buy_mev_mode),
             buyMevMode: buy_mev_mode.clone(),
-            buyJitodontfront: mev_mode_enables_jitodontfront(&buy_mev_mode),
+            buyJitodontfront: execution_buy_jitodontfront,
             buyAutoGas: parse_bool(&raw.execution.buyAutoGas, true),
             buyAutoMode: if is_blank(&raw.execution.buyAutoMode) {
                 "buyAuto".to_string()
@@ -1974,12 +1990,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             } else {
                 raw.execution.sellAutoMode.trim().to_string()
             },
-            sellProvider: parse_choice(
-                &raw.execution.sellProvider,
-                "execution.sellProvider",
-                &["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"],
-                "helius-sender",
-            )?,
+            sellProvider: execution_sell_provider.clone(),
             sellEndpointProfile: if is_blank(&raw.execution.sellEndpointProfile) {
                 String::new()
             } else {
@@ -1992,7 +2003,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             },
             sellMevProtect: mev_mode_enables_hellomoon_protect(&sell_mev_mode),
             sellMevMode: sell_mev_mode.clone(),
-            sellJitodontfront: mev_mode_enables_jitodontfront(&sell_mev_mode),
+            sellJitodontfront: execution_sell_jitodontfront,
             sellPriorityFeeSol: raw.execution.sellPriorityFeeSol.trim().to_string(),
             sellTipSol: raw.execution.sellTipSol.trim().to_string(),
             sellSlippagePercent: raw.execution.sellSlippagePercent.trim().to_string(),
@@ -2583,6 +2594,8 @@ mod tests {
     fn hellomoon_mev_modes_normalize_to_expected_flags() {
         let mut raw = sample_raw_config();
         raw.execution.provider = "hellomoon".to_string();
+        raw.execution.buyProvider = "hellomoon".to_string();
+        raw.execution.sellProvider = "hellomoon".to_string();
         raw.tx.jitoTipLamports = Some(json!(1_000_000));
         raw.execution.mevMode = Some(json!("off"));
         raw.execution.buyMevMode = Some(json!("reduced"));
@@ -2601,6 +2614,26 @@ mod tests {
         assert_eq!(normalized.execution.sellMevMode, "secure");
         assert!(normalized.execution.sellMevProtect);
         assert!(normalized.execution.sellJitodontfront);
+    }
+
+    #[test]
+    fn non_jito_provider_mev_modes_do_not_enable_jitodontfront() {
+        let mut raw = sample_raw_config();
+        raw.execution.provider = "helius-sender".to_string();
+        raw.execution.buyProvider = "helius-sender".to_string();
+        raw.execution.sellProvider = "standard-rpc".to_string();
+        raw.execution.mevMode = Some(json!("secure"));
+        raw.execution.buyMevMode = Some(json!("reduced"));
+        raw.execution.sellMevMode = Some(json!("secure"));
+
+        let normalized = normalize_raw_config(raw).expect("config should normalize");
+
+        assert!(normalized.execution.mevProtect);
+        assert!(!normalized.execution.jitodontfront);
+        assert!(normalized.execution.buyMevProtect);
+        assert!(!normalized.execution.buyJitodontfront);
+        assert!(normalized.execution.sellMevProtect);
+        assert!(!normalized.execution.sellJitodontfront);
     }
 
     #[test]

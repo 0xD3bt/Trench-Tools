@@ -24,8 +24,8 @@ use spl_token::instruction::{
 
 use crate::{
     bonk_execution_support::build_trusted_raydium_clmm_swap_exact_in,
-    extension_api::{MevMode, TradeSettlementAsset, TradeSide},
-    provider_tip::pick_tip_account_for_provider,
+    extension_api::{TradeSettlementAsset, TradeSide, jitodontfront_enabled_for_provider},
+    provider_tip::{pick_tip_account_for_provider, provider_required_tip_lamports},
     rpc_client::{
         CompiledTransaction, configured_rpc_url, fetch_account_owner_and_data,
         fetch_token_balance_via_ata_immediate, rpc_request_with_client, shared_rpc_http_client,
@@ -53,8 +53,6 @@ const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 const SPL_TOKEN_ACCOUNT_LEN: u64 = 165;
 const TEMP_WSOL_RENT_LAMPORTS: u64 = 2_039_280;
 const STABLE_SWAP_COMPUTE_UNITS: u32 = 360_000;
-const HELIUS_SENDER_MIN_TIP_LAMPORTS: u64 = 200_000;
-const HELLO_MOON_MIN_TIP_LAMPORTS: u64 = 1_000_000;
 const JITODONTFRONT_ACCOUNT: &str = "jitodontfront111111111111111111111111111111";
 const TRUSTED_STABLE_DEFAULT_SLIPPAGE_CAP_BPS: u64 = 100;
 const TRUSTED_STABLE_MAX_SLIPPAGE_CAP_BPS: u64 = 500;
@@ -508,7 +506,7 @@ pub async fn compile_trusted_stable_trade(
         } else {
             (None, None)
         };
-    if matches!(request.policy.mev_mode, MevMode::Reduced | MevMode::Secure) {
+    if jitodontfront_enabled_for_provider(&request.policy.provider, &request.policy.mev_mode) {
         apply_jitodontfront(&mut instructions, &owner)?;
     }
 
@@ -1124,11 +1122,7 @@ fn resolve_inline_tip(
 }
 
 fn provider_min_tip_lamports(provider: &str) -> u64 {
-    match provider.trim() {
-        "helius-sender" => HELIUS_SENDER_MIN_TIP_LAMPORTS,
-        "hellomoon" => HELLO_MOON_MIN_TIP_LAMPORTS,
-        _ => 0,
-    }
+    provider_required_tip_lamports(provider).unwrap_or(0)
 }
 
 fn configured_tip_account() -> Result<Option<Pubkey>, String> {
@@ -1158,7 +1152,12 @@ fn apply_jitodontfront(instructions: &mut Vec<Instruction>, payer: &Pubkey) -> R
     instruction
         .accounts
         .push(AccountMeta::new_readonly(dontfront, false));
-    instructions.insert(0, instruction);
+    let compute_budget = compute_budget_program_id()?;
+    let insert_index = instructions
+        .iter()
+        .take_while(|instruction| instruction.program_id == compute_budget)
+        .count();
+    instructions.insert(insert_index, instruction);
     Ok(())
 }
 
@@ -1384,11 +1383,28 @@ mod tests {
             .expect("tip")
             .expect("tip");
 
-        assert_eq!(lamports, HELLO_MOON_MIN_TIP_LAMPORTS);
+        assert_eq!(
+            lamports,
+            provider_required_tip_lamports("hellomoon").unwrap()
+        );
         assert!(account.starts_with("moon"));
         assert_eq!(instruction.program_id, solana_system_interface::program::ID);
         assert_eq!(instruction.accounts[0].pubkey, payer);
         assert_eq!(instruction.accounts[1].pubkey.to_string(), account);
+    }
+
+    #[test]
+    fn jito_inline_tip_uses_provider_minimum() {
+        let payer = Pubkey::new_unique();
+        let (_instruction, lamports, account) = resolve_inline_tip(&payer, "jito-bundle", "0")
+            .expect("tip")
+            .expect("tip");
+
+        assert_eq!(
+            lamports,
+            provider_required_tip_lamports("jito-bundle").unwrap()
+        );
+        assert!(!account.is_empty());
     }
 
     #[test]
@@ -1400,19 +1416,24 @@ mod tests {
             data: vec![1, 2, 3],
         };
         let original_swap = swap.clone();
-        let mut instructions = vec![swap];
+        let compute_budget = compute_unit_limit_instruction(100_000).expect("compute budget");
+        let mut instructions = vec![compute_budget, swap];
 
         apply_jitodontfront(&mut instructions, &payer).expect("jitodontfront");
         apply_jitodontfront(&mut instructions, &payer).expect("idempotent jitodontfront");
 
-        assert_eq!(instructions.len(), 2);
-        assert_eq!(instructions[1], original_swap);
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(instructions[2], original_swap);
         assert_eq!(
             instructions[0].program_id,
+            compute_budget_program_id().unwrap()
+        );
+        assert_eq!(
+            instructions[1].program_id,
             solana_system_interface::program::ID
         );
         assert!(
-            instructions[0]
+            instructions[1]
                 .accounts
                 .iter()
                 .any(|account| account.pubkey.to_string() == JITODONTFRONT_ACCOUNT)

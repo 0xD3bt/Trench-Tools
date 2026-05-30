@@ -657,10 +657,83 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
     let temp_path = path.with_extension("tmp");
     fs::write(&temp_path, contents)
         .map_err(|error| format!("Failed to write {}: {error}", temp_path.display()))?;
-    fs::rename(&temp_path, path)
-        .map_err(|error| format!("Failed to replace {}: {error}", path.display()))?;
+    restrict_file_permissions(&temp_path);
+    replace_with_temp(&temp_path, path)?;
+    restrict_file_permissions(path);
     Ok(())
 }
+
+fn replace_with_temp(temp_path: &Path, path: &Path) -> Result<(), String> {
+    fs::rename(temp_path, path).map_err(|error| {
+        let _ = fs::remove_file(temp_path);
+        format!("Failed to replace {}: {error}", path.display())
+    })
+}
+
+#[cfg(unix)]
+fn restrict_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        eprintln!(
+            "[execution-engine][shared-config] failed to restrict file permissions on {}: {error}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(windows)]
+fn restrict_file_permissions(path: &Path) {
+    restrict_windows_path_permissions(path);
+}
+
+#[cfg(windows)]
+fn restrict_windows_path_permissions(path: &Path) {
+    let Some(user) = current_windows_user() else {
+        return;
+    };
+    let grant = format!("{user}:F");
+    match std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(grant)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "[execution-engine][shared-config] failed to restrict Windows ACLs on {}: {}",
+                path.display(),
+                stderr.trim()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "[execution-engine][shared-config] failed to invoke icacls for {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn current_windows_user() -> Option<String> {
+    let username = std::env::var("USERNAME").ok()?.trim().to_string();
+    if username.is_empty() {
+        return None;
+    }
+    let domain = std::env::var("USERDOMAIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Some(match domain {
+        Some(domain) => format!("{domain}\\{username}"),
+        None => username,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restrict_file_permissions(_path: &Path) {}
 
 fn modified_unix_ms(path: &Path) -> Option<u128> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
@@ -688,10 +761,10 @@ fn trimmed_or_empty(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_env_updates, join_wallet_secret_and_name, next_wallet_env_key,
+        apply_env_updates, atomic_write, join_wallet_secret_and_name, next_wallet_env_key,
         split_wallet_secret_and_name, wallet_slot_label,
     };
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, fs};
 
     #[test]
     fn splits_wallet_secret_and_label() {
@@ -741,5 +814,23 @@ mod tests {
         assert!(updated.contains("SOLANA_RPC_URL=https://rpc.example"));
         assert!(updated.contains("HELLO=world"));
         assert!(!updated.contains("USER_REGION=EU"));
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_env_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "execution-shared-config-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join(".env");
+
+        atomic_write(&path, b"FIRST=value\n").expect("initial write");
+        atomic_write(&path, b"SECOND=value\n").expect("replacement write");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read env"),
+            "SECOND=value\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

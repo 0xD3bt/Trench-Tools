@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Trench Tools",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "Trade, deploy and snipe through your own infrastructure. Same workflow, same interfaces - without the platform fee tax.",
   "icons": {
     "16": "assets/trench-tools-favicon.png",
@@ -68,6 +68,15 @@
         "src/content/loaders/j7-loader.js"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://x.com/*"
+      ],
+      "js": [
+        "src/content/loaders/x-loader.js"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "action": {
@@ -85,7 +94,8 @@
       "matches": [
         "https://axiom.trade/*",
         "https://backup.axiom.trade/*",
-        "https://j7tracker.io/*"
+        "https://j7tracker.io/*",
+        "https://x.com/*"
       ],
       "resources": [
         "assets/trench-tools-favicon.png",
@@ -95,6 +105,7 @@
         "assets/confirmed-icon.png",
         "assets/fail-icon.png",
         "assets/vamp-icon.png",
+        "assets/Axiom-logo.jpg",
         "assets/dexscreener-icon.png",
         "assets/fuel-icon.png",
         "assets/lighting-icon.png",
@@ -125,10 +136,16 @@
         "src/content/launchdeck-shell.js",
         "src/content/platforms/axiom.js",
         "src/content/platforms/j7.js",
+        "src/content/platforms/x.js",
         "src/content/platforms/axiom-override.js",
         "src/shared/background-rpc.js",
         "src/shared/runtime-mode.js",
+        "src/shared/numeric-input.js",
+        "src/shared/numeric-input-module.js",
         "src/shared/trade-preferences.js",
+        "src/shared/constants.js",
+        "src/shared/site-features.js",
+        "src/shared/appearance.js",
         "src/shared/storage-migrations.js",
         "src/panel/index.html",
         "src/panel/index.js",

@@ -17,6 +17,8 @@ export const AXIOM_POST_DEPLOY_ACTIONS = Object.freeze([
   "open_window_toast"
 ]);
 export const AXIOM_POST_DEPLOY_DESTINATIONS = Object.freeze(["axiom"]);
+export const AXIOM_AFTER_BUY_ACTIONS = Object.freeze(["nothing", "open_tab", "open_window"]);
+export const PLATFORM_AFTER_BUY_ACTIONS = Object.freeze(["toast", "open_axiom_tab", "open_axiom_window"]);
 
 function normalizePulseVampMode(value, fallback = "prefill") {
   const mode = String(value || "").trim().toLowerCase();
@@ -72,6 +74,16 @@ function normalizeAxiomPostDeployDestination(value, fallback = "axiom") {
   return AXIOM_POST_DEPLOY_DESTINATIONS.includes(destination) ? destination : fallback;
 }
 
+function normalizeAxiomAfterBuyAction(value, fallback = "nothing") {
+  const action = String(value || "").trim().toLowerCase();
+  return AXIOM_AFTER_BUY_ACTIONS.includes(action) ? action : fallback;
+}
+
+function normalizePlatformAfterBuyAction(value, fallback = "toast") {
+  const action = String(value || "").trim().toLowerCase();
+  return PLATFORM_AFTER_BUY_ACTIONS.includes(action) ? action : fallback;
+}
+
 export function defaultSiteFeatures() {
   return {
     axiom: {
@@ -91,6 +103,8 @@ export function defaultSiteFeatures() {
       dexScreenerIconMode: "both",
       postDeployAction: "close_modal_toast",
       postDeployDestination: "axiom",
+      afterBuyAction: "nothing",
+      afterListBuyAction: "nothing",
       walletTracker: true,
       watchlist: true
     },
@@ -99,10 +113,23 @@ export function defaultSiteFeatures() {
       contractQuickBuy: true,
       contractQuickPanel: true,
       contractVamp: true,
+      contractAxiom: true,
       cardLaunchdeck: true,
       hideNativeCardActions: false,
       postDeployAction: "close_modal_toast",
-      postDeployDestination: "axiom"
+      postDeployDestination: "axiom",
+      afterBuyAction: "toast"
+    },
+    x: {
+      enabled: false,
+      addressQuickBuy: true,
+      addressQuickPanel: true,
+      addressVamp: true,
+      addressAxiom: true,
+      tweetDeploy: true,
+      postDeployAction: "close_modal_toast",
+      postDeployDestination: "axiom",
+      afterBuyAction: "toast"
     }
   };
 }
@@ -147,6 +174,14 @@ export function normalizeSiteFeatures(value) {
         value?.axiom?.postDeployDestination,
         defaults.axiom.postDeployDestination
       ),
+      afterBuyAction: normalizeAxiomAfterBuyAction(
+        value?.axiom?.afterBuyAction,
+        defaults.axiom.afterBuyAction
+      ),
+      afterListBuyAction: normalizeAxiomAfterBuyAction(
+        value?.axiom?.afterListBuyAction,
+        defaults.axiom.afterListBuyAction
+      ),
       walletTracker: value?.axiom?.walletTracker ?? defaults.axiom.walletTracker,
       watchlist: value?.axiom?.watchlist ?? defaults.axiom.watchlist
     },
@@ -157,6 +192,7 @@ export function normalizeSiteFeatures(value) {
       contractQuickBuy: value?.j7?.contractQuickBuy ?? defaults.j7.contractQuickBuy,
       contractQuickPanel: value?.j7?.contractQuickPanel ?? defaults.j7.contractQuickPanel,
       contractVamp: value?.j7?.contractVamp ?? defaults.j7.contractVamp,
+      contractAxiom: value?.j7?.contractAxiom ?? defaults.j7.contractAxiom,
       cardLaunchdeck: value?.j7?.cardLaunchdeck ?? defaults.j7.cardLaunchdeck,
       hideNativeCardActions: value?.j7?.hideNativeCardActions ?? defaults.j7.hideNativeCardActions,
       postDeployAction: normalizeAxiomPostDeployAction(
@@ -166,6 +202,32 @@ export function normalizeSiteFeatures(value) {
       postDeployDestination: normalizeAxiomPostDeployDestination(
         value?.j7?.postDeployDestination,
         defaults.j7.postDeployDestination
+      ),
+      afterBuyAction: normalizePlatformAfterBuyAction(
+        value?.j7?.afterBuyAction,
+        defaults.j7.afterBuyAction
+      )
+    },
+    x: {
+      ...defaults.x,
+      ...(value?.x || {}),
+      enabled: value?.x?.enabled ?? defaults.x.enabled,
+      addressQuickBuy: value?.x?.addressQuickBuy ?? defaults.x.addressQuickBuy,
+      addressQuickPanel: value?.x?.addressQuickPanel ?? defaults.x.addressQuickPanel,
+      addressVamp: value?.x?.addressVamp ?? defaults.x.addressVamp,
+      addressAxiom: value?.x?.addressAxiom ?? defaults.x.addressAxiom,
+      tweetDeploy: value?.x?.tweetDeploy ?? defaults.x.tweetDeploy,
+      postDeployAction: normalizeAxiomPostDeployAction(
+        value?.x?.postDeployAction,
+        defaults.x.postDeployAction
+      ),
+      postDeployDestination: normalizeAxiomPostDeployDestination(
+        value?.x?.postDeployDestination,
+        defaults.x.postDeployDestination
+      ),
+      afterBuyAction: normalizePlatformAfterBuyAction(
+        value?.x?.afterBuyAction,
+        defaults.x.afterBuyAction
       )
     }
   };

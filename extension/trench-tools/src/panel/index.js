@@ -1,3 +1,5 @@
+import { normalizeUnsignedDecimalInput } from "../shared/numeric-input-module.js";
+
 const CHANNEL_OUT = "trench-tools-panel";
 const CHANNEL_IN = "trench-tools-content";
 const EXPECTED_PARENT_ORIGIN = (() => {
@@ -626,13 +628,7 @@ function sanitizeCustomNumericValue(value) {
 }
 
 function normalizedCustomNumericValue(value) {
-  const normalized = sanitizeCustomNumericValue(value).replace(/,/g, ".");
-  const firstDotIndex = normalized.indexOf(".");
-  if (firstDotIndex < 0) {
-    return normalized;
-  }
-  return normalized.slice(0, firstDotIndex + 1)
-    + normalized.slice(firstDotIndex + 1).replace(/\./g, "");
+  return normalizeUnsignedDecimalInput(value);
 }
 
 let inputValidationNoticeTimer = null;

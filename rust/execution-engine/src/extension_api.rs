@@ -1762,6 +1762,8 @@ pub enum Platform {
     Axiom,
     #[serde(rename = "j7")]
     J7,
+    #[serde(rename = "x")]
+    X,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1841,6 +1843,13 @@ pub enum MevMode {
     Reduced,
     #[serde(rename = "secure")]
     Secure,
+}
+
+pub fn jitodontfront_enabled_for_provider(provider: &str, mode: &MevMode) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "hellomoon" | "jito-bundle"
+    ) && matches!(mode, MevMode::Reduced | MevMode::Secure)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4401,6 +4410,7 @@ async fn resolve_token(
             match request.platform {
                 Platform::Axiom => "axiom",
                 Platform::J7 => "j7",
+                Platform::X => "x",
             }
             .to_string(),
         ),
@@ -14786,7 +14796,7 @@ fn build_bootstrap_response(engine: &StoredEngineState) -> BootstrapResponse {
         launchpads: launchpad_registry(),
         strategies: strategy_registry(),
         capabilities: ExtensionCapabilities {
-            platforms: vec![Platform::Axiom, Platform::J7],
+            platforms: vec![Platform::Axiom, Platform::J7, Platform::X],
             supports_batch_preview: true,
             supports_batch_status: true,
             supports_resource_editing: true,

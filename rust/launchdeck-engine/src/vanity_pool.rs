@@ -453,7 +453,7 @@ struct LockGuard {
 
 impl LockGuard {
     fn acquire(root: &Path, launchpad: VanityLaunchpad) -> Result<Self, String> {
-        fs::create_dir_all(root).map_err(|error| {
+        crate::fs_utils::create_private_dir_all(root).map_err(|error| {
             format!(
                 "Failed to create vanity directory {}: {error}",
                 root.display()
@@ -463,6 +463,7 @@ impl LockGuard {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 let _ = writeln!(file, "pid={}", std::process::id());
+                crate::fs_utils::restrict_file_permissions(&path);
                 Ok(Self { path })
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -808,19 +809,25 @@ fn append_state_record_at(
     launchpad: VanityLaunchpad,
     record: &VanityStateRecord,
 ) -> Result<(), String> {
-    fs::create_dir_all(root).map_err(|error| {
+    crate::fs_utils::create_private_dir_all(root).map_err(|error| {
         format!(
             "Failed to create vanity directory {}: {error}",
             root.display()
         )
     })?;
+    let path = used_path_at(root, launchpad);
+    let file_already_exists = path.exists();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(used_path_at(root, launchpad))
+        .open(&path)
         .map_err(|error| format!("Failed to open vanity used state: {error}"))?;
     let line = serde_json::to_string(record).map_err(|error| error.to_string())?;
-    writeln!(file, "{line}").map_err(|error| format!("Failed to append vanity state: {error}"))
+    writeln!(file, "{line}").map_err(|error| format!("Failed to append vanity state: {error}"))?;
+    if !file_already_exists {
+        crate::fs_utils::restrict_file_permissions(&path);
+    }
+    Ok(())
 }
 
 fn compact_active_file_at(
@@ -851,19 +858,13 @@ fn compact_active_file_at(
     if had_trailing_newline && !next.is_empty() {
         next.push('\n');
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, next).map_err(|error| {
-        format!(
-            "Failed to write compacted vanity queue {}: {error}",
-            tmp.display()
-        )
-    })?;
-    fs::rename(&tmp, &path).map_err(|error| {
+    crate::fs_utils::atomic_write(&path, next.as_bytes()).map_err(|error| {
         format!(
             "Failed to replace compacted vanity queue {}: {error}",
             path.display()
         )
-    })
+    })?;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -907,7 +908,7 @@ async fn recover_stale_reservations(root: &Path, rpc_url: &str) -> Result<(), St
 }
 
 fn ensure_templates_at(root: &Path) -> Result<(), String> {
-    fs::create_dir_all(root).map_err(|error| {
+    crate::fs_utils::create_private_dir_all(root).map_err(|error| {
         format!(
             "Failed to create vanity directory {}: {error}",
             root.display()
@@ -924,6 +925,7 @@ fn ensure_templates_at(root: &Path) -> Result<(), String> {
                 path.display()
             )
         })?;
+        crate::fs_utils::restrict_file_permissions(&path);
     }
     Ok(())
 }

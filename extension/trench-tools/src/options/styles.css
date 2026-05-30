@@ -730,6 +730,31 @@ button.resource-chip {
   background: var(--surface-soft);
 }
 
+.site-platform-icon-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #000000;
+  object-fit: initial;
+}
+
+.site-platform-icon-x-logo {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+  filter: invert(1);
+}
+
+.site-platform-icon-letter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 700;
+  object-fit: initial;
+}
+
 .site-platform-meta h3 {
   font-size: 14px;
   line-height: 1.2;
@@ -863,6 +888,23 @@ button.resource-chip {
 }
 
 .site-feature-grid-three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.site-feature-grid-compact {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.site-feature-grid-compact .site-feature-chip {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: max-content;
+  min-height: 36px;
+  padding: 8px 10px;
+}
+
+.site-feature-grid-axiom-after {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
@@ -3361,6 +3403,23 @@ body.wallet-drag-active .wallet-card {
   padding: 18px 20px;
 }
 
+.appearance-quick-buy-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.appearance-quick-buy-item {
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+
+.appearance-quick-buy-item:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
 .appearance-quick-buy-row {
   display: grid;
   grid-template-columns: minmax(0, 4fr) minmax(0, 8fr);
@@ -3368,7 +3427,7 @@ body.wallet-drag-active .wallet-card {
   align-items: stretch;
 }
 
-.appearance-quick-buy-summary h3 {
+.appearance-quick-buy-summary h4 {
   margin: 0;
   font-size: 16px;
   font-weight: 600;
@@ -3522,12 +3581,121 @@ body.wallet-drag-active .wallet-card {
   -webkit-mask-size: contain;
 }
 
+.appearance-platform-scale-panel {
+  padding: 18px 20px;
+}
+
+.appearance-platform-scale-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.appearance-platform-design-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+
+.appearance-platform-scale-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(180px, 2fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+
+.appearance-platform-design-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(180px, 1.4fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+
+.appearance-platform-design-controls {
+  display: grid;
+  grid-template-columns: repeat(3, 72px);
+  gap: 8px;
+  align-items: center;
+}
+
+.appearance-platform-action-preview-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.appearance-platform-action-preview-group .appearance-platform-scale-preview {
+  min-width: 0;
+}
+
+.appearance-platform-scale-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.appearance-platform-scale-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.appearance-platform-scale-value {
+  font-size: 12px;
+}
+
+.appearance-platform-scale-preview {
+  height: 26px;
+  min-width: 74px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 7px;
+  background: #000000;
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: default;
+}
+
+.appearance-platform-scale-reset {
+  min-height: 32px;
+  padding: 0 12px;
+}
+
 @media (max-width: 880px) {
   .appearance-quick-buy-row {
     grid-template-columns: 1fr;
   }
   .appearance-quick-buy-controls-area {
     grid-template-columns: 1fr;
+  }
+  .appearance-platform-scale-row {
+    grid-template-columns: 1fr;
+  }
+  .appearance-platform-design-row {
+    grid-template-columns: 1fr;
+  }
+  .appearance-platform-design-controls {
+    grid-template-columns: repeat(3, minmax(0, 72px));
+  }
+  .appearance-platform-action-preview-group {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 }
 
@@ -3992,6 +4160,10 @@ body.wallet-drag-active .wallet-card {
 
   .site-feature-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .site-feature-grid.site-feature-grid-axiom-after {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .token-create-row {

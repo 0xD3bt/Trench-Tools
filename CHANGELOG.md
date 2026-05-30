@@ -7,6 +7,38 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [1.1.7] - 2026-05-23
+
+### Added
+
+- Browser extension: added X platform support with Solana address quick buy, manual panel, Vamp, tweet-card LaunchDeck Deploy buttons, per-site enablement controls, and X trade/deploy attribution in the execution engine.
+- Browser extension and LaunchDeck: X Deploy can prefill the clicked post URL and import visible media, video thumbnails, link-card images, and profile/avatar images from the clicked post's visible thread context while keeping X-imported images session-only until explicitly saved, cropped, or deployed with.
+- Browser extension: added J7/X appearance controls for per-platform button scale plus a shared Deploy/Panel/Vamp action-button color design.
+- Browser extension: added Axiom Watchlist/Wallet Tracker button design controls alongside the Axiom quick-buy appearance settings.
+- Browser extension: added configurable after-buy actions for Axiom Pulse, Axiom Watchlist/Wallet Tracker, J7, and X, including opening the bought coin on Axiom after the first confirmed wallet.
+- Browser extension: added optional Axiom logo buttons after J7 and X contract-address controls so users can resolve and open the coin on Axiom directly.
+
+### Changed
+
+- Trench Tools, LaunchDeck, the extension, and the execution engine now report the same `1.1.7` patch version.
+- Browser extension: Options site settings now include X, refreshed J7/X action controls, clearer after-action dropdown copy, compact address-control rows, and the new X logo asset.
+- Browser extension: Axiom quick-buy appearance controls were consolidated into one "Axiom Quick Buy Button" section, separate from the J7/X button scale and action-design controls.
+- Browser extension: LaunchDeck's embedded and standalone token metadata limits now treat Pump symbols as 13 characters.
+
+### Fixed
+
+- Execution engine and LaunchDeck: `jitodontfront` is now limited to Jito bundle and Hello Moon execution paths instead of all reduced/secure MEV providers.
+- Execution engine: Jito bundle inline tips are now minimum-enforced consistently across Pump, Raydium AMM v4, Raydium CPMM, Raydium LaunchLab, and trusted stable swap routes.
+- Execution engine: `jitodontfront` instructions are now inserted after leading compute-budget instructions for deterministic transaction ordering across native routes.
+- Execution engine and LaunchDeck: local config/state writes now replace existing files without deleting the destination first, preserving safer overwrite behavior on Windows and Unix.
+- LaunchDeck: vanity queue compaction now uses the shared atomic write path and private file/directory permissions for local vanity state.
+- Browser extension: pending execution toasts are cleaned up more reliably across route changes, and stale trade continuations no longer surface on the wrong token page.
+- Browser extension: Axiom token-detail wallet selection now updates optimistically without overriding newer wallet preference changes, and wallet rows support both pointer and click activation.
+- Browser extension: X manual wallet panels now request balance data for wallet dropdowns instead of showing zeroed balances.
+- Browser extension: X image extraction now requests higher-quality X media/profile variants where available and avoids persisting imported images before the user explicitly chooses one.
+- Browser extension and LaunchDeck: X LaunchDeck overlays use the smaller embedded panel sizing and no longer force the larger scroll-heavy shell behavior.
+- LaunchDeck: removed duplicate helper declarations in the embedded and standalone LaunchDeck apps that could break syntax checks.
+
 ## [1.1.6] - 2026-05-22
 
 ### Changed

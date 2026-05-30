@@ -103,11 +103,22 @@
       return String(getNamedValue("automaticDevSellMarketCapThreshold") || "").trim();
     }
 
+    function stripMarketCapThousandsCommas(value) {
+      const raw = String(value ?? "").trim().replace(/\s+/g, "");
+      const suffixMatch = raw.match(/[kmbt]$/i);
+      const suffix = suffixMatch ? suffixMatch[0] : "";
+      const body = suffix ? raw.slice(0, -suffix.length) : raw;
+      if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(body)) {
+        return `${body.replace(/,/g, "")}${suffix}`;
+      }
+      return raw;
+    }
+
     function parseMarketCapThreshold(value) {
-      const normalized = String(value || "")
-        .trim()
-        .toLowerCase()
-        .replace(/,/g, "");
+      const prepared = stripMarketCapThousandsCommas(value);
+      const normalized = window.TrenchNumericInput?.normalizeUnsignedDecimalInput
+        ? window.TrenchNumericInput.normalizeUnsignedDecimalInput(prepared, { allowSuffix: true, maxDecimals: 6 })
+        : prepared.toLowerCase();
       if (!normalized) return null;
       const match = normalized.match(/^(\d+(?:\.\d+)?)([kmbt])?$/i);
       if (!match) return null;
@@ -294,28 +305,24 @@
     }
 
     function normalizePercentInput(value) {
-      const raw = String(value || "").replace(/,/g, ".").trim();
-      if (!raw) return "";
-      const sanitized = raw.replace(/[^\d.]/g, "");
-      const [whole = "", fractional = ""] = sanitized.split(".");
-      const safeWhole = whole.replace(/^0+(?=\d)/, "") || (whole ? "0" : "");
-      return fractional !== undefined && sanitized.includes(".")
-        ? `${safeWhole || "0"}.${fractional.slice(0, 2)}`
-        : safeWhole;
+      return window.TrenchNumericInput?.normalizeUnsignedDecimalInput
+        ? window.TrenchNumericInput.normalizeUnsignedDecimalInput(value, { maxDecimals: 2 })
+        : String(value || "").trim();
     }
 
     function normalizeSellPercent(value) {
-      const numeric = Number(normalizePercentInput(value) || 0);
-      if (!Number.isFinite(numeric) || numeric <= 0) return "";
-      return String(Math.max(1, Math.min(100, numeric)));
+      const normalized = normalizePercentInput(value);
+      const numeric = Number(normalized || 0);
+      if (!Number.isInteger(numeric) || numeric <= 0 || numeric > 100) return "";
+      return String(numeric);
     }
 
     function getSniperSellPercentError(value) {
       const raw = normalizePercentInput(value);
       if (!raw) return "Sell % is required.";
       const numeric = Number(raw);
-      if (!Number.isFinite(numeric) || numeric <= 0 || numeric > 100) {
-        return "Sell % must be 1-100.";
+      if (!Number.isInteger(numeric) || numeric <= 0 || numeric > 100) {
+        return "Sell % must be a whole number from 1-100.";
       }
       return "";
     }
@@ -385,8 +392,10 @@
       const normalized = normalizePercentInput(value);
       if (normalized.endsWith(".")) return normalized;
       const numeric = Number(normalized || 0);
-      if (!Number.isFinite(numeric) || numeric <= 0) return "100";
-      return String(Math.max(1, Math.min(100, numeric)));
+      if (!Number.isInteger(numeric) || numeric <= 0 || numeric > 100) {
+        return String(value || "").trim();
+      }
+      return String(numeric);
     }
 
     function renderSniperAutosellRows(rowsOverride) {
@@ -503,12 +512,12 @@
 
     function syncUI() {
       const enabled = isNamedChecked("automaticDevSellEnabled");
-      const rawPercentText = normalizePercentInput(getNamedValue("automaticDevSellPercent")) || "100";
+      const storedPercentText = String(getNamedValue("automaticDevSellPercent") || "").trim();
+      const rawPercentText = normalizePercentInput(storedPercentText) || (storedPercentText ? "" : "100");
       const rawPercent = Number(rawPercentText);
-      const clampedPercent = Math.max(1, Math.min(100, Number.isFinite(rawPercent) ? rawPercent : 100));
-      const percent = rawPercentText.endsWith(".") && Number.isFinite(rawPercent) && rawPercent >= 1 && rawPercent <= 100
+      const percent = Number.isInteger(rawPercent) && rawPercent >= 1 && rawPercent <= 100
         ? rawPercentText
-        : String(clampedPercent);
+        : "";
       const triggerFamily = getTriggerFamily();
       const triggerMode = getTriggerMode();
       const delayMs = String(getDelayMs());
@@ -517,7 +526,7 @@
       const marketCapThreshold = getMarketCapThreshold();
       const marketCapTimeoutInputValue = getMarketCapTimeoutInputValue();
       const marketCapTimeoutAction = getMarketCapTimeoutAction();
-      if (enabled && getNamedValue("automaticDevSellPercent") !== percent) {
+      if (enabled && percent && getNamedValue("automaticDevSellPercent") !== percent) {
         setNamedValue("automaticDevSellPercent", percent);
       }
       if (getNamedValue("automaticDevSellTriggerMode") !== triggerMode) {
@@ -599,11 +608,11 @@
         button.title = getBlockOffsetDescription(offsetValue);
       });
       if (autoSellPercentSlider) {
-        autoSellPercentSlider.value = percent;
+        autoSellPercentSlider.value = percent || "100";
         autoSellPercentSlider.disabled = !enabled;
       }
       if (autoSellPercentInput) {
-        autoSellPercentInput.value = percent;
+        autoSellPercentInput.value = getNamedValue("automaticDevSellPercent") || percent;
         autoSellPercentInput.disabled = !enabled;
       }
       if (autoSellDelayValue) autoSellDelayValue.textContent = formatSliderValue(delayMs, "ms", 0);
@@ -648,8 +657,9 @@
       if (autoSellEnabledInput) {
         autoSellEnabledInput.addEventListener("change", () => {
           if (autoSellEnabledInput.checked) {
-            const currentPercent = Number(normalizePercentInput(getNamedValue("automaticDevSellPercent")) || "0");
-            if (!Number.isFinite(currentPercent) || currentPercent <= 0) {
+            const currentRawPercent = String(getNamedValue("automaticDevSellPercent") || "").trim();
+            const currentPercent = Number(normalizePercentInput(currentRawPercent) || "0");
+            if (!currentRawPercent && (!Number.isInteger(currentPercent) || currentPercent <= 0)) {
               setNamedValue("automaticDevSellPercent", "100");
             }
           }
