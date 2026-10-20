@@ -6,6 +6,7 @@ Current default recommendation:
 
 - start with `Helius Sender`
 - use `Hello Moon` when you want a strong alternate low-latency path
+- use `OrbitFlare Apex` for extension trade presets when you have an Apex API key
 
 `Standard RPC` and `Jito Bundle` still have code paths, but they are not currently recommended in setup docs while they are being re-tested. See [Deferred Providers](#deferred-providers).
 
@@ -84,6 +85,44 @@ Advanced overrides:
 - `HELLOMOON_MEV_PROTECT`
 
 Hello Moon does not expose the exact same metro map as Helius. Unsupported metros are mapped to the closest Hello Moon endpoints the provider exposes.
+
+## OrbitFlare Apex
+
+Use this as a low-latency send path for extension trade presets (buy and sell). LaunchDeck launches do not route through Apex yet.
+
+What it does:
+
+- sends each transaction over a persistent QUIC connection through the official [`orbitflare-apex`](https://crates.io/crates/orbitflare-apex) client; the API key derives a client certificate and never crosses the wire
+- forwards to the upcoming leaders over staked validator connections, Jito and direct TPU
+- requires an inline tip of at least `0.001 SOL` to one of Apex's tip accounts; the engine picks one for you
+- applies MEV protection (skips leaders on OrbitFlare's Shield blocklist) when the preset's MEV mode is not `off`
+
+Requirements:
+
+- OrbitFlare Apex API key from [apex.orbitflare.com](https://apex.orbitflare.com)
+
+Config:
+
+```bash
+APEX_API_KEY=YOUR_APEX_API_KEY
+USER_REGION=eu
+```
+
+Region mapping:
+
+- `global`: `global.apex.orbitflare.com`, which resolves to the nearest endpoint
+- `us`: New York and Salt Lake City; `ewr` maps to New York
+- `eu`: Frankfurt, Amsterdam and London
+- `asia`: Singapore and Tokyo; `sg` maps to Singapore
+- `slc`, `lon`, `fra`, `ams`, `tyo`: the matching endpoint
+
+Advanced overrides:
+
+- `USER_REGION_APEX`
+- `APEX_QUIC_ENDPOINT`
+- `APEX_MEV_PROTECT` (warmed connections only; trades follow the preset's MEV mode)
+
+See the [Apex documentation](https://docs.orbitflare.com/apex) for tiers and protocol details.
 
 ## Region Notes
 

@@ -17,6 +17,7 @@ These are the values most users may need.
 - `WARM_RPC_URL` - best-effort warm/cache RPC for compatible background reads. When set, those reads can move off `SOLANA_RPC_URL`. Execution, confirmations, visible balances, and quotes stay on `SOLANA_RPC_URL`.
 - `WARM_WS_URL` - best-effort websocket for warm probes or non-authoritative observers. When set, those probes can move off `SOLANA_WS_URL`. Live visible subscriptions and confirmations stay on `SOLANA_WS_URL`.
 - `HELLOMOON_API_KEY` - optional Hello Moon Lunar Lander API key.
+- `APEX_API_KEY` - optional OrbitFlare Apex API key, for extension trade presets.
 - `BAGS_API_KEY` - optional Bags API key for Bags launchpad flows.
 - `LAUNCHDECK_METADATA_UPLOAD_PROVIDER` - recommended: set `pinata` to use Pinata for Pump/Bonk metadata uploads. Blank/default uses the launchpad's native metadata flow.
 - `PINATA_JWT` - required when metadata provider is `pinata`. The Pinata free tier is enough for normal use; create a free account at [pinata.cloud](https://pinata.cloud/), create an API key, and copy the JWT.
@@ -44,11 +45,14 @@ Most users should leave these blank because the launcher sets safe defaults.
 
 - `USER_REGION_HELIUS_SENDER` - Helius Sender-specific region override. Blank uses `USER_REGION`.
 - `USER_REGION_HELLOMOON` - Hello Moon-specific region override. Blank uses `USER_REGION`.
+- `USER_REGION_APEX` - OrbitFlare Apex-specific region override. Blank uses `USER_REGION`.
 - `USER_REGION_JITO_BUNDLE` - Jito-specific region override. Deferred provider path.
 - `HELIUS_SENDER_ENDPOINT` - explicit Helius Sender endpoint. Blank keeps region fanout.
 - `HELIUS_SENDER_BASE_URL` - alternate Helius Sender base URL. Usually blank.
 - `HELLOMOON_QUIC_ENDPOINT` - explicit Hello Moon QUIC endpoint in `host:port` format. Blank keeps region routing.
 - `HELLOMOON_MEV_PROTECT` - enables Hello Moon QUIC MEV protection when set to `1`, `true`, `yes`, or `on`.
+- `APEX_QUIC_ENDPOINT` - explicit OrbitFlare Apex QUIC endpoint in `host:port` format. Blank keeps region routing.
+- `APEX_MEV_PROTECT` - enables OrbitFlare Apex MEV protection on warmed connections when set to `1`, `true`, `yes`, or `on`. Trades follow the preset's MEV mode.
 - `JITO_BUNDLE_BASE_URLS`, `JITO_SEND_BUNDLE_ENDPOINT`, `JITO_BUNDLE_STATUS_ENDPOINT` - Jito bundle endpoints. Deferred provider path; not recommended in setup guides until re-tested.
 
 ## Provider / Launchpad Integrations

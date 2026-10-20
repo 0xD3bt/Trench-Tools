@@ -413,11 +413,12 @@ function buildAppearanceAxiomListButtonElements() {
 const PROVIDER_LABELS = {
   "helius-sender": "Helius Sender",
   hellomoon: "Hello Moon",
+  apex: "OrbitFlare Apex",
   "standard-rpc": "Standard RPC",
   "jito-bundle": "Jito Bundle"
 };
 
-const EXTENSION_APP_ROUTE_PROVIDERS = new Set(["helius-sender", "hellomoon"]);
+const EXTENSION_APP_ROUTE_PROVIDERS = new Set(["helius-sender", "hellomoon", "apex"]);
 
 function selectableExtensionRouteProvider(provider, fallback = "helius-sender") {
   const normalized = String(provider || "").trim().toLowerCase();
@@ -426,11 +427,13 @@ function selectableExtensionRouteProvider(provider, fallback = "helius-sender") 
 
 // Mirrors the per-provider fee floors from the LaunchDeck settings domain:
 // Helius Sender requires a minimum 0.0002 SOL tip, Jito requires 1000 lamports
-// (0.000001 SOL), Hello Moon requires 0.001 SOL, and all three require a non-zero priority fee. Standard
-// RPC has no tip at all and no minimum.
+// (0.000001 SOL), Hello Moon requires 0.001 SOL, and all three require a non-zero priority fee.
+// OrbitFlare Apex requires a 0.001 SOL tip but no priority fee. Standard RPC has no tip at all and
+// no minimum.
 const PROVIDER_FEE_REQUIREMENTS = {
   "helius-sender": { minTipSol: 0.0002, priorityRequired: true, tipApplicable: true },
   hellomoon: { minTipSol: 0.001, priorityRequired: true, tipApplicable: true },
+  apex: { minTipSol: 0.001, priorityRequired: false, tipApplicable: true },
   "jito-bundle": { minTipSol: 0.000001, priorityRequired: true, tipApplicable: true },
   "standard-rpc": { minTipSol: 0, priorityRequired: true, tipApplicable: false }
 };
@@ -4265,10 +4268,10 @@ function closePresetModal() {
   elements.presetModal.classList.add("hidden");
 }
 
-// Only Hello Moon actually consumes MEV-protection flags; every other route
-// ignores them. The select is hidden when the chosen provider doesn't support
+// Only Hello Moon and OrbitFlare Apex consume MEV-protection flags; every other
+// route ignores them. The select is hidden when the chosen provider doesn't support
 // it and the stored value is coerced back to "off" on save.
-const MEV_CAPABLE_PROVIDERS = new Set(["hellomoon"]);
+const MEV_CAPABLE_PROVIDERS = new Set(["hellomoon", "apex"]);
 
 function providerSupportsMev(provider) {
   return MEV_CAPABLE_PROVIDERS.has(String(provider || "").trim().toLowerCase());

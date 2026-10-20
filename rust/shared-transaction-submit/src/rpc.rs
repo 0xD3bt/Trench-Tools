@@ -23,6 +23,8 @@ use crate::transport::{
     prefers_helius_transaction_subscribe_path, resolved_helius_transaction_subscribe_ws_url,
 };
 
+pub(crate) mod apex;
+
 const SIGNATURE_CONFIRMATION_RPC_POLL_INTERVAL_MS: u64 = 400;
 const HELIUS_SIGNATURE_STATUS_RECONCILE_INTERVAL_MS: u64 = 550;
 const SYSTEM_PROGRAM_ID_STR: &str = "11111111111111111111111111111111";
@@ -4955,6 +4957,36 @@ pub async fn send_transactions_for_transport(
                 },
             ))
         }
+        "apex-quic" => {
+            let (mut results, mut warnings, submit_ms) = apex::submit_transactions_apex_quic(
+                rpc_url,
+                &transport_plan.apexQuicEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+                transport_plan.apexMevProtect,
+            )
+            .await?;
+            let (confirm_warnings, confirm_ms) = confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                transport_watch_endpoint(transport_plan),
+                &mut results,
+                commitment,
+                track_send_block_height,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
+            )
+            .await?;
+            warnings.extend(confirm_warnings);
+            Ok((
+                results,
+                warnings,
+                SendTimingBreakdown {
+                    submit_ms,
+                    confirm_ms,
+                },
+            ))
+        }
         "helius-sender" => {
             let (mut results, mut warnings, submit_ms) = submit_transactions_helius_sender(
                 rpc_url,
@@ -5060,6 +5092,17 @@ pub async fn submit_transactions_for_transport(
             )
             .await
         }
+        "apex-quic" => {
+            apex::submit_transactions_apex_quic(
+                rpc_url,
+                &transport_plan.apexQuicEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+                transport_plan.apexMevProtect,
+            )
+            .await
+        }
         "helius-sender" => {
             submit_transactions_helius_sender(
                 rpc_url,
@@ -5126,6 +5169,17 @@ pub async fn submit_independent_transactions_for_transport(
             )
             .await
         }
+        "apex-quic" => {
+            apex::submit_transactions_apex_quic_parallel(
+                rpc_url,
+                &transport_plan.apexQuicEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+                transport_plan.apexMevProtect,
+            )
+            .await
+        }
         "helius-sender" => {
             submit_transactions_helius_sender_parallel(
                 rpc_url,
@@ -5183,6 +5237,18 @@ pub async fn confirm_submitted_transactions_for_transport(
             .await
         }
         "hellomoon-quic" => {
+            confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                transport_watch_endpoint(transport_plan),
+                submitted,
+                commitment,
+                track_send_block_height,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
+            )
+            .await
+        }
+        "apex-quic" => {
             confirm_transactions_with_websocket_fallback(
                 rpc_url,
                 transport_watch_endpoint(transport_plan),

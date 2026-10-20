@@ -194,6 +194,12 @@ If Hello Moon fails:
 - confirm your account has Lunar Lander access
 - try the closest supported region
 
+If OrbitFlare Apex fails:
+
+- confirm `APEX_API_KEY` is set
+- confirm the preset tip is at least 0.001 SOL
+- try the closest region or `global`
+
 `Standard RPC` and `Jito Bundle` are deferred provider paths while they are being re-tested. Do not use them as first-run defaults.
 
 ## Axiom Does Not Show Trench Tools

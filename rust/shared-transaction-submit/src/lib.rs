@@ -36,6 +36,17 @@ pub async fn prewarm_hellomoon_quic_endpoint(
     .await
 }
 
+pub async fn prewarm_apex_quic_endpoint(
+    endpoint: &str,
+    mev_protect: bool,
+    environment: &TransportEnvironment,
+) -> Result<(), String> {
+    transport::with_transport_environment(environment.clone(), async move {
+        rpc::apex::prewarm_apex_quic_endpoint(endpoint, mev_protect).await
+    })
+    .await
+}
+
 pub async fn prewarm_hellomoon_bundle_endpoint(
     endpoint: &str,
     environment: &TransportEnvironment,

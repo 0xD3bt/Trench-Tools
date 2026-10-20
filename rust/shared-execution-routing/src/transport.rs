@@ -29,6 +29,17 @@ const DEFAULT_HELLOMOON_REGIONAL_QUIC_ENDPOINTS: [(&str, &str); 5] = [
 ];
 const DEFAULT_HELLOMOON_GLOBAL_BUNDLE_ENDPOINT: &str =
     "http://lunar-lander.hellomoon.io/sendBundle";
+const DEFAULT_APEX_GLOBAL_QUIC_ENDPOINT: &str = "global.apex.orbitflare.com:7001";
+const DEFAULT_APEX_REGIONAL_QUIC_ENDPOINTS: [(&str, &str); 8] = [
+    ("nyc", "nyc.apex.orbitflare.com:7001"),
+    ("slc", "slc.apex.orbitflare.com:7001"),
+    ("lon", "lon.apex.orbitflare.com:7001"),
+    ("fra", "fra.apex.orbitflare.com:7001"),
+    ("ams", "ams.apex.orbitflare.com:7001"),
+    ("dub", "dub.apex.orbitflare.com:7001"),
+    ("sgp", "sgp.apex.orbitflare.com:7001"),
+    ("tyo", "tyo.apex.orbitflare.com:7001"),
+];
 const DEFAULT_JITO_BUNDLE_BASE_URLS: [&str; 9] = [
     "https://ny.mainnet.block-engine.jito.wtf",
     "https://frankfurt.mainnet.block-engine.jito.wtf",
@@ -46,6 +57,7 @@ const DEFAULT_ENDPOINT_PROFILE: &str = "global";
 pub struct ProviderRegionConfig {
     pub helius_sender: String,
     pub hellomoon: String,
+    pub apex: String,
     pub jito_bundle: String,
 }
 
@@ -63,6 +75,9 @@ pub struct TransportEnvironment {
     pub hellomoon_api_key: Option<String>,
     pub hellomoon_mev_protect: bool,
     pub hellomoon_quic_endpoint: Option<String>,
+    pub apex_api_key: Option<String>,
+    pub apex_mev_protect: bool,
+    pub apex_quic_endpoint: Option<String>,
     pub jito_send_bundle_endpoint: Option<String>,
     pub jito_bundle_status_endpoint: Option<String>,
     pub jito_bundle_base_urls: Vec<String>,
@@ -110,6 +125,14 @@ pub struct TransportPlan {
     pub helloMoonBundleEndpoint: Option<String>,
     #[serde(default)]
     pub helloMoonBundleEndpoints: Vec<String>,
+    #[serde(default)]
+    pub apexApiKeyConfigured: bool,
+    #[serde(default)]
+    pub apexMevProtect: bool,
+    #[serde(default)]
+    pub apexQuicEndpoint: Option<String>,
+    #[serde(default)]
+    pub apexQuicEndpoints: Vec<String>,
     pub heliusSenderEndpoint: Option<String>,
     pub heliusSenderEndpoints: Vec<String>,
     pub watchEndpoint: Option<String>,
@@ -151,6 +174,7 @@ pub fn default_endpoint_profile_for_provider(
     let provider_region = match normalize_provider(provider).as_str() {
         "helius-sender" => environment.provider_regions.helius_sender.as_str(),
         "hellomoon" => environment.provider_regions.hellomoon.as_str(),
+        "apex" => environment.provider_regions.apex.as_str(),
         "jito-bundle" => environment.provider_regions.jito_bundle.as_str(),
         _ => "",
     };
@@ -211,6 +235,24 @@ pub fn hellomoon_api_key_configured(environment: &TransportEnvironment) -> bool 
 fn configured_hellomoon_quic_override(environment: &TransportEnvironment) -> Option<String> {
     environment
         .hellomoon_quic_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub fn apex_api_key_configured(environment: &TransportEnvironment) -> bool {
+    environment
+        .apex_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+}
+
+fn configured_apex_quic_override(environment: &TransportEnvironment) -> Option<String> {
+    environment
+        .apex_quic_endpoint
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -342,6 +384,64 @@ pub fn configured_hellomoon_bundle_endpoints_for_profile(
     }
     if endpoints.is_empty() {
         vec![DEFAULT_HELLOMOON_GLOBAL_BUNDLE_ENDPOINT.to_string()]
+    } else {
+        endpoints
+    }
+}
+
+fn apex_profile_tokens(endpoint_profile: &str, environment: &TransportEnvironment) -> Vec<String> {
+    let resolved = normalize_endpoint_profile("apex", endpoint_profile, environment);
+    let map_token = |token: &str| -> &'static [&'static str] {
+        match token {
+            "us" => &["nyc", "slc"],
+            "eu" => &["fra", "ams", "lon"],
+            "asia" => &["sgp", "tyo"],
+            "ewr" => &["nyc"],
+            "sg" => &["sgp"],
+            "slc" => &["slc"],
+            "lon" => &["lon"],
+            "fra" => &["fra"],
+            "ams" => &["ams"],
+            "tyo" => &["tyo"],
+            _ => &["global"],
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    for token in resolved
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        for mapped in map_token(token) {
+            if !out.iter().any(|existing| existing == mapped) {
+                out.push((*mapped).to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push("global".to_string());
+    }
+    out
+}
+
+pub fn configured_apex_quic_endpoints_for_profile(
+    environment: &TransportEnvironment,
+    endpoint_profile: &str,
+) -> Vec<String> {
+    if let Some(override_endpoint) = configured_apex_quic_override(environment) {
+        return vec![override_endpoint];
+    }
+    let profile_tokens = apex_profile_tokens(endpoint_profile, environment);
+    if profile_tokens.iter().any(|token| token == "global") {
+        return vec![DEFAULT_APEX_GLOBAL_QUIC_ENDPOINT.to_string()];
+    }
+    let endpoints: Vec<String> = DEFAULT_APEX_REGIONAL_QUIC_ENDPOINTS
+        .iter()
+        .filter(|(name, _)| profile_tokens.iter().any(|token| token == name))
+        .map(|(_, endpoint)| endpoint.to_string())
+        .collect();
+    if endpoints.is_empty() {
+        vec![DEFAULT_APEX_GLOBAL_QUIC_ENDPOINT.to_string()]
     } else {
         endpoints
     }
@@ -567,6 +667,7 @@ pub fn transport_type(input: &ExecutionTransportInput, _transaction_count: usize
                 "hellomoon-quic".to_string()
             }
         }
+        "apex" => "apex-quic".to_string(),
         "jito-bundle" => "jito-bundle".to_string(),
         _ => "standard-rpc-fanout".to_string(),
     }
@@ -607,6 +708,11 @@ pub fn build_transport_plan(
     };
     let hello_moon_bundle_endpoints = if transport == "hellomoon-bundle" {
         configured_hellomoon_bundle_endpoints_for_profile(environment, &resolved_endpoint_profile)
+    } else {
+        vec![]
+    };
+    let apex_quic_endpoints = if transport == "apex-quic" {
+        configured_apex_quic_endpoints_for_profile(environment, &resolved_endpoint_profile)
     } else {
         vec![]
     };
@@ -669,6 +775,22 @@ pub fn build_transport_plan(
             ));
         }
     }
+    if resolved == "apex" {
+        if !input.skip_preflight {
+            warnings.push(
+                "OrbitFlare Apex sends without preflight and expects skipPreflight=true."
+                    .to_string(),
+            );
+        }
+        if !apex_api_key_configured(environment) {
+            warnings.push("OrbitFlare Apex requires APEX_API_KEY.".to_string());
+        }
+        if let Some(override_endpoint) = configured_apex_quic_override(environment) {
+            warnings.push(format!(
+                "APEX_QUIC_ENDPOINT override is active ({override_endpoint}); endpoint profile fanout is bypassed."
+            ));
+        }
+    }
 
     TransportPlan {
         requestedProvider: requested,
@@ -682,7 +804,7 @@ pub fn build_transport_plan(
         supportsBundle: meta.supportsBundle,
         requiresInlineTip: matches!(
             transport.as_str(),
-            "helius-sender" | "hellomoon-quic" | "hellomoon-bundle"
+            "helius-sender" | "hellomoon-quic" | "hellomoon-bundle" | "apex-quic"
         ),
         requiresPriorityFee: matches!(
             transport.as_str(),
@@ -694,12 +816,17 @@ pub fn build_transport_plan(
             "helius-sender"
                 | "hellomoon-quic"
                 | "hellomoon-bundle"
+                | "apex-quic"
                 | "standard-rpc-fanout"
                 | "jito-bundle"
         ) || input.skip_preflight,
         maxRetries: if matches!(
             transport.as_str(),
-            "helius-sender" | "hellomoon-quic" | "hellomoon-bundle" | "standard-rpc-fanout"
+            "helius-sender"
+                | "hellomoon-quic"
+                | "hellomoon-bundle"
+                | "apex-quic"
+                | "standard-rpc-fanout"
         ) {
             0
         } else {
@@ -720,6 +847,10 @@ pub fn build_transport_plan(
             None
         },
         helloMoonBundleEndpoints: hello_moon_bundle_endpoints,
+        apexApiKeyConfigured: apex_api_key_configured(environment),
+        apexMevProtect: transport == "apex-quic" && input.mev_protect,
+        apexQuicEndpoint: apex_quic_endpoints.first().cloned(),
+        apexQuicEndpoints: apex_quic_endpoints,
         heliusSenderEndpoint: if transport == "helius-sender" {
             helius_sender_endpoints.first().cloned()
         } else {
@@ -730,5 +861,120 @@ pub fn build_transport_plan(
         watchEndpoints: watch_endpoints,
         jitoBundleEndpoints: jito_bundle_endpoints,
         warnings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apex_input(endpoint_profile: &str) -> ExecutionTransportInput {
+        ExecutionTransportInput {
+            provider: "apex".to_string(),
+            endpoint_profile: endpoint_profile.to_string(),
+            mev_protect: true,
+            mev_mode: "reduced".to_string(),
+            skip_preflight: true,
+        }
+    }
+
+    fn apex_environment() -> TransportEnvironment {
+        TransportEnvironment {
+            apex_api_key: Some("test-key".to_string()),
+            ..TransportEnvironment::default()
+        }
+    }
+
+    #[test]
+    fn apex_plan_is_single_quic_with_inline_tip() {
+        let plan = build_transport_plan(&apex_input("global"), 1, &apex_environment());
+        assert_eq!(plan.transportType, "apex-quic");
+        assert_eq!(plan.executionClass, "single");
+        assert!(plan.requiresInlineTip);
+        assert!(plan.skipPreflight);
+        assert_eq!(plan.maxRetries, 0);
+        assert!(plan.apexApiKeyConfigured);
+        assert!(plan.apexMevProtect);
+        assert!(!plan.supportsBundle);
+        assert_eq!(
+            plan.apexQuicEndpoints,
+            vec!["global.apex.orbitflare.com:7001".to_string()]
+        );
+        assert!(plan.helloMoonQuicEndpoints.is_empty());
+    }
+
+    #[test]
+    fn apex_maps_region_groups_and_metros() {
+        let environment = apex_environment();
+        let endpoints =
+            |profile: &str| configured_apex_quic_endpoints_for_profile(&environment, profile);
+        assert_eq!(
+            endpoints("eu"),
+            vec![
+                "lon.apex.orbitflare.com:7001",
+                "fra.apex.orbitflare.com:7001",
+                "ams.apex.orbitflare.com:7001"
+            ]
+        );
+        assert_eq!(
+            endpoints("us"),
+            vec![
+                "nyc.apex.orbitflare.com:7001",
+                "slc.apex.orbitflare.com:7001"
+            ]
+        );
+        assert_eq!(
+            endpoints("asia"),
+            vec![
+                "sgp.apex.orbitflare.com:7001",
+                "tyo.apex.orbitflare.com:7001"
+            ]
+        );
+        assert_eq!(endpoints("ewr"), vec!["nyc.apex.orbitflare.com:7001"]);
+        assert_eq!(endpoints("sg"), vec!["sgp.apex.orbitflare.com:7001"]);
+        assert_eq!(
+            endpoints("fra,tyo"),
+            vec![
+                "fra.apex.orbitflare.com:7001",
+                "tyo.apex.orbitflare.com:7001"
+            ]
+        );
+    }
+
+    #[test]
+    fn apex_endpoint_override_bypasses_profiles() {
+        let environment = TransportEnvironment {
+            apex_quic_endpoint: Some("10.0.0.1:7001".to_string()),
+            ..apex_environment()
+        };
+        let plan = build_transport_plan(&apex_input("eu"), 1, &environment);
+        assert_eq!(plan.apexQuicEndpoints, vec!["10.0.0.1:7001".to_string()]);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("APEX_QUIC_ENDPOINT"))
+        );
+    }
+
+    #[test]
+    fn apex_without_key_warns() {
+        let plan = build_transport_plan(&apex_input("global"), 1, &TransportEnvironment::default());
+        assert!(!plan.apexApiKeyConfigured);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("APEX_API_KEY"))
+        );
+    }
+
+    #[test]
+    fn apex_mev_protect_off_when_not_requested() {
+        let input = ExecutionTransportInput {
+            mev_protect: false,
+            ..apex_input("global")
+        };
+        let plan = build_transport_plan(&input, 2, &apex_environment());
+        assert!(!plan.apexMevProtect);
+        assert_eq!(plan.executionClass, "sequential");
     }
 }

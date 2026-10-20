@@ -43,6 +43,10 @@ pub struct TransportPlan {
     pub hello_moon_quic_endpoints: Vec<String>,
     pub hello_moon_bundle_endpoint: Option<String>,
     pub hello_moon_bundle_endpoints: Vec<String>,
+    pub apex_api_key_configured: bool,
+    pub apex_mev_protect: bool,
+    pub apex_quic_endpoint: Option<String>,
+    pub apex_quic_endpoints: Vec<String>,
     pub helius_sender_endpoint: Option<String>,
     pub helius_sender_endpoints: Vec<String>,
     pub watch_endpoint: Option<String>,
@@ -95,6 +99,12 @@ fn transport_environment() -> TransportEnvironment {
                 "EXECUTION_ENGINE_USER_REGION",
                 "USER_REGION",
             ]),
+            apex: first_non_empty_env(&[
+                "EXECUTION_ENGINE_APEX_REGION",
+                "USER_REGION_APEX",
+                "EXECUTION_ENGINE_USER_REGION",
+                "USER_REGION",
+            ]),
             jito_bundle: first_non_empty_env(&[
                 "EXECUTION_ENGINE_JITO_BUNDLE_REGION",
                 "USER_REGION_JITO_BUNDLE",
@@ -124,6 +134,12 @@ fn transport_environment() -> TransportEnvironment {
             "EXECUTION_ENGINE_HELLOMOON_QUIC_ENDPOINT",
             "HELLOMOON_QUIC_ENDPOINT",
             "LUNAR_LANDER_QUIC_ENDPOINT",
+        ]),
+        apex_api_key: optional_env(&["APEX_API_KEY"]),
+        apex_mev_protect: parse_env_bool_flag(&first_non_empty_env(&["APEX_MEV_PROTECT"]), false),
+        apex_quic_endpoint: optional_env(&[
+            "EXECUTION_ENGINE_APEX_QUIC_ENDPOINT",
+            "APEX_QUIC_ENDPOINT",
         ]),
         jito_send_bundle_endpoint: optional_env(&["JITO_SEND_BUNDLE_ENDPOINT"]),
         jito_bundle_status_endpoint: optional_env(&["JITO_BUNDLE_STATUS_ENDPOINT"]),
@@ -177,6 +193,10 @@ fn shared_plan_to_local(
         hello_moon_quic_endpoints: plan.helloMoonQuicEndpoints,
         hello_moon_bundle_endpoint: plan.helloMoonBundleEndpoint,
         hello_moon_bundle_endpoints: plan.helloMoonBundleEndpoints,
+        apex_api_key_configured: plan.apexApiKeyConfigured,
+        apex_mev_protect: plan.apexMevProtect,
+        apex_quic_endpoint: plan.apexQuicEndpoint,
+        apex_quic_endpoints: plan.apexQuicEndpoints,
         helius_sender_endpoint: plan.heliusSenderEndpoint,
         helius_sender_endpoints: plan.heliusSenderEndpoints,
         watch_endpoint: plan.watchEndpoint,
@@ -212,6 +232,12 @@ pub fn configured_provider_region(provider: &str) -> String {
         "hellomoon" => first_non_empty_env(&[
             "EXECUTION_ENGINE_HELLOMOON_REGION",
             "USER_REGION_HELLOMOON",
+            "EXECUTION_ENGINE_USER_REGION",
+            "USER_REGION",
+        ]),
+        "apex" => first_non_empty_env(&[
+            "EXECUTION_ENGINE_APEX_REGION",
+            "USER_REGION_APEX",
             "EXECUTION_ENGINE_USER_REGION",
             "USER_REGION",
         ]),
@@ -298,6 +324,17 @@ pub fn configured_jito_bundle_endpoints_for_profile(
 
 pub fn configured_hellomoon_mev_protect() -> bool {
     transport_environment().hellomoon_mev_protect
+}
+
+pub fn configured_apex_quic_endpoints_for_profile(endpoint_profile: &str) -> Vec<String> {
+    shared_execution_routing::transport::configured_apex_quic_endpoints_for_profile(
+        &transport_environment(),
+        endpoint_profile,
+    )
+}
+
+pub fn configured_apex_mev_protect() -> bool {
+    transport_environment().apex_mev_protect
 }
 
 pub fn configured_enable_helius_transaction_subscribe() -> bool {

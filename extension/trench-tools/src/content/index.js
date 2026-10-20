@@ -911,7 +911,7 @@ const isLdOnlyTrenchToolsMode =
     };
   }
 
-  const EXTENSION_APP_ROUTE_PROVIDERS = new Set(["helius-sender", "hellomoon"]);
+  const EXTENSION_APP_ROUTE_PROVIDERS = new Set(["helius-sender", "hellomoon", "apex"]);
 
   function explicitPresetProviderIsSupported(provider) {
     const normalized = String(provider || "").trim().toLowerCase();

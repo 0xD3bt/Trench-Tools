@@ -109,6 +109,10 @@ pub fn shared_transport_plan(
         helloMoonQuicEndpoints: plan.helloMoonQuicEndpoints.clone(),
         helloMoonBundleEndpoint: plan.helloMoonBundleEndpoint.clone(),
         helloMoonBundleEndpoints: plan.helloMoonBundleEndpoints.clone(),
+        apexApiKeyConfigured: false,
+        apexMevProtect: false,
+        apexQuicEndpoint: None,
+        apexQuicEndpoints: vec![],
         heliusSenderEndpoint: plan.heliusSenderEndpoint.clone(),
         heliusSenderEndpoints: plan.heliusSenderEndpoints.clone(),
         watchEndpoint: plan.watchEndpoint.clone(),
@@ -187,6 +191,7 @@ pub fn transport_environment_snapshot() -> TransportEnvironment {
         provider_regions: ProviderRegionConfig {
             helius_sender: configured_provider_region("helius-sender"),
             hellomoon: configured_provider_region("hellomoon"),
+            apex: String::new(),
             jito_bundle: configured_provider_region("jito-bundle"),
         },
         standard_rpc_submit_endpoints: configured_standard_rpc_submit_endpoints(),
@@ -202,6 +207,9 @@ pub fn transport_environment_snapshot() -> TransportEnvironment {
             "HELLOMOON_QUIC_ENDPOINT",
             "LUNAR_LANDER_QUIC_ENDPOINT",
         ]),
+        apex_api_key: None,
+        apex_mev_protect: false,
+        apex_quic_endpoint: None,
         jito_send_bundle_endpoint: optional_env(&["JITO_SEND_BUNDLE_ENDPOINT"]),
         jito_bundle_status_endpoint: optional_env(&["JITO_BUNDLE_STATUS_ENDPOINT"]),
         jito_bundle_base_urls: first_non_empty_env(&["JITO_BUNDLE_BASE_URLS"])

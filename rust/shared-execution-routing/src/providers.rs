@@ -49,6 +49,15 @@ pub fn provider_registry() -> Vec<ProviderMeta> {
             supportsEndpointProfiles: true,
         },
         ProviderMeta {
+            id: "apex",
+            label: "OrbitFlare Apex",
+            verified: true,
+            supportsSingle: true,
+            supportsSequential: true,
+            supportsBundle: false,
+            supportsEndpointProfiles: true,
+        },
+        ProviderMeta {
             id: "jito-bundle",
             label: "Jito Bundle",
             verified: true,
@@ -72,6 +81,7 @@ pub fn provider_registry() -> Vec<ProviderMeta> {
 pub fn provider_availability_registry(
     solana_rpc_configured: bool,
     hellomoon_api_key_configured: bool,
+    apex_api_key_configured: bool,
 ) -> BTreeMap<String, ProviderAvailability> {
     provider_registry()
         .into_iter()
@@ -88,6 +98,14 @@ pub fn provider_availability_registry(
                 "hellomoon" if !solana_rpc_configured => (
                     true,
                     "Hello Moon QUIC is configured, but SOLANA_RPC_URL is still recommended for confirmations; Shyft is a good pairing here.".to_string(),
+                ),
+                "apex" if !apex_api_key_configured => (
+                    false,
+                    "Set APEX_API_KEY to enable OrbitFlare Apex submission.".to_string(),
+                ),
+                "apex" if !solana_rpc_configured => (
+                    true,
+                    "OrbitFlare Apex is configured, but SOLANA_RPC_URL is still recommended for confirmations.".to_string(),
                 ),
                 _ => (true, String::new()),
             };

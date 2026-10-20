@@ -47,10 +47,24 @@ pub const HELLOMOON_TIP_ACCOUNTS: [&str; 10] = [
     "moonZ6u9E2fgk6eWd82621eLPHt9zuJuYECXAYjMY1C",
 ];
 
+pub const APEX_TIP_ACCOUNTS: [&str; 10] = [
+    "APeX2oLtjYehgTMUCA971L8htM7tGNqsXHDz5NrivhhX",
+    "APeXAKT6spXSmU3uRv2MoEgQ7ckhAS4nexTgaxwLEfJ9",
+    "APeXB4mu1X7BSjwyPtiNUnKyhvc4wrq5SKEdmnPKWR95",
+    "APeXJTSGoxLWmwb9o1tiiEL5RXVUakazYgjLmZdDc2Ef",
+    "APeXUUaKFfPXjPxKHEdwCsJ4BfTuGg4qnVQyJE9K37PU",
+    "APeXVWXKDRAAujckMjmMsV61a4DQiXa98MPUAkL46sim",
+    "APeXW6PKFZRDz7WXBBybBMcoJaQo97UtLa5TAQnchNBY",
+    "APeXZuKaKuqouyfU8fFL1woeWvSEVFkY4EMrmkvbfhhD",
+    "APeXbYdbmrYWsastf6GurexGe3dwnuWKLD2mcsDoEuBU",
+    "APeXn29deoxpsZz6r7n63Ymmv2skBr3WhKYLB1mB2fR7",
+];
+
 pub fn provider_tip_accounts(provider: &str) -> &'static [&'static str] {
     match provider.trim() {
         "helius-sender" => &HELIUS_SENDER_TIP_ACCOUNTS,
         "hellomoon" => &HELLOMOON_TIP_ACCOUNTS,
+        "apex" => &APEX_TIP_ACCOUNTS,
         "jito-bundle" => &JITO_TIP_ACCOUNTS,
         _ => &[],
     }
@@ -86,6 +100,7 @@ pub fn all_known_tip_accounts() -> impl Iterator<Item = &'static str> {
         .chain(HELIUS_SENDER_ALT_REJECTED_TIP_ACCOUNTS.iter().copied())
         .chain(JITO_TIP_ACCOUNTS.iter().copied())
         .chain(HELLOMOON_TIP_ACCOUNTS.iter().copied())
+        .chain(APEX_TIP_ACCOUNTS.iter().copied())
 }
 
 pub fn provider_required_tip_lamports(provider: &str) -> Option<u64> {
@@ -93,13 +108,14 @@ pub fn provider_required_tip_lamports(provider: &str) -> Option<u64> {
         "helius-sender" => Some(200_000),
         "jito-bundle" => Some(1_000),
         "hellomoon" => Some(1_000_000),
+        "apex" => Some(1_000_000),
         _ => None,
     }
 }
 
 pub fn provider_min_tip_sol_label(provider: &str) -> &'static str {
     match provider.trim() {
-        "hellomoon" => "0.001",
+        "hellomoon" | "apex" => "0.001",
         "jito-bundle" => "0.000001",
         _ => "0.0002",
     }
@@ -113,12 +129,13 @@ mod tests {
     fn provider_tip_accounts_expose_full_pools() {
         assert_eq!(provider_tip_accounts("helius-sender").len(), 1);
         assert_eq!(provider_tip_accounts("hellomoon").len(), 10);
+        assert_eq!(provider_tip_accounts("apex").len(), 10);
         assert_eq!(provider_tip_accounts("jito-bundle").len(), 8);
     }
 
     #[test]
     fn tip_picker_only_returns_configured_accounts() {
-        for provider in ["helius-sender", "hellomoon", "jito-bundle"] {
+        for provider in ["helius-sender", "hellomoon", "apex", "jito-bundle"] {
             let accounts = provider_tip_accounts(provider);
             for _ in 0..32 {
                 let picked = pick_tip_account_for_provider(provider);

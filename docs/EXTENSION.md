@@ -300,7 +300,7 @@ For a basic execution-engine preset:
 
 1. Click `Add engine preset`.
 2. Set buy amounts and sell percentages.
-3. Pick the provider you want to test first (`Helius Sender` or `Hello Moon`).
+3. Pick the provider you want to test first (`Helius Sender`, `Hello Moon` or `OrbitFlare Apex`).
 4. Set slippage, fee/tip behavior, and Auto Fee settings.
 5. Save.
 

@@ -35,6 +35,20 @@ pub fn configured_hellomoon_api_key() -> String {
         .unwrap_or_default()
 }
 
+pub fn configured_apex_api_key() -> String {
+    TRANSPORT_ENVIRONMENT
+        .try_with(|environment| {
+            environment
+                .apex_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
 pub fn configured_watch_endpoints_for_provider(
     provider: &str,
     endpoint_profile: &str,

@@ -13,7 +13,7 @@ use shared_extension_runtime::{
     },
 };
 use shared_transaction_submit::{
-    JitoWarmResult, prewarm_helius_transaction_subscribe_endpoint,
+    JitoWarmResult, prewarm_apex_quic_endpoint, prewarm_helius_transaction_subscribe_endpoint,
     prewarm_hellomoon_bundle_endpoint, prewarm_hellomoon_quic_endpoint,
     prewarm_jito_bundle_endpoint, prewarm_watch_websocket_endpoint, record_warm_rpc_failure,
     record_warm_rpc_success, reserve_warm_rpc_call, warm_rpc_cooldown_remaining_ms,
@@ -26,6 +26,7 @@ use crate::rpc_client::{
     configured_rpc_url, configured_warm_rpc_url, rpc_request_with_client, shared_rpc_http_client,
 };
 use crate::transport::{
+    configured_apex_mev_protect, configured_apex_quic_endpoints_for_profile,
     configured_enable_helius_transaction_subscribe, configured_helius_sender_endpoints_for_profile,
     configured_hellomoon_bundle_endpoints_for_profile, configured_hellomoon_mev_protect,
     configured_hellomoon_quic_endpoints_for_profile, configured_jito_bundle_endpoints_for_profile,
@@ -509,7 +510,7 @@ fn push_unique_string(values: &mut Vec<String>, candidate: &str) {
 fn normalize_warm_provider(provider: &str) -> Option<String> {
     let normalized = provider.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "helius-sender" | "hellomoon" | "standard-rpc" | "jito-bundle" => Some(normalized),
+        "helius-sender" | "hellomoon" | "apex" | "standard-rpc" | "jito-bundle" => Some(normalized),
         _ => None,
     }
 }
@@ -1078,6 +1079,30 @@ async fn collect_endpoint_warm_attempts(
                     } else {
                         "Hello Moon QUIC"
                     },
+                    endpoint,
+                    result,
+                ));
+            }
+        }
+    }
+    if routes.iter().any(|route| route.provider == "apex") {
+        let mut seen = HashSet::new();
+        let mev_protect = configured_apex_mev_protect();
+        for route in routes.iter().filter(|route| route.provider == "apex") {
+            for endpoint in configured_apex_quic_endpoints_for_profile(&route.endpoint_profile) {
+                if !seen.insert(endpoint.clone()) {
+                    continue;
+                }
+                let endpoint_target = endpoint.clone();
+                let environment = transport_environment.clone();
+                let result = warm_attempt_result(async move {
+                    prewarm_apex_quic_endpoint(&endpoint_target, mev_protect, &environment).await
+                })
+                .await;
+                attempts.push(build_warm_target_attempt(
+                    "endpoint",
+                    Some("apex"),
+                    "OrbitFlare Apex",
                     endpoint,
                     result,
                 ));

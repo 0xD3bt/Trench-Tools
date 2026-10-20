@@ -924,6 +924,7 @@ fn transport_endpoint_summary(plan: &TransportPlan) -> String {
     let endpoints = match plan.transport_type.as_str() {
         "hellomoon-quic" => &plan.hello_moon_quic_endpoints,
         "hellomoon-bundle" => &plan.hello_moon_bundle_endpoints,
+        "apex-quic" => &plan.apex_quic_endpoints,
         "helius-sender" => &plan.helius_sender_endpoints,
         "standard-rpc" => &plan.standard_rpc_submit_endpoints,
         _ => return "-".to_string(),

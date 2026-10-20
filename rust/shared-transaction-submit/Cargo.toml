@@ -20,6 +20,8 @@ tokio = { workspace = true }
 shared-execution-routing = { path = "../shared-execution-routing" }
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
 lunar-lander-quic-client = { git = "https://github.com/hellomoon-io/lunar-lander-quic-client-rs" }
+orbitflare-apex = "0.1.2"
+bytes = "1"
 
 [dev-dependencies]
 axum = { workspace = true }

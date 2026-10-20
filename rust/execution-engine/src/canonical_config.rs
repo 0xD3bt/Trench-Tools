@@ -517,6 +517,7 @@ fn default_provider(provider: &str) -> String {
     match provider.trim().to_ascii_lowercase().as_str() {
         "helius" | "helius-sender" => "helius-sender".to_string(),
         "hellomoon" => "hellomoon".to_string(),
+        "apex" => "apex".to_string(),
         "jito" | "jito-bundle" => "jito-bundle".to_string(),
         _ => "standard-rpc".to_string(),
     }

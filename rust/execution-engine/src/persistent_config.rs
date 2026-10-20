@@ -144,7 +144,7 @@ fn normalize_provider(provider: &str, fallback: &str) -> String {
     }
     let migrated = legacy_provider_alias(&normalized);
     match migrated.as_str() {
-        "helius-sender" | "hellomoon" | "standard-rpc" | "jito-bundle" => migrated,
+        "helius-sender" | "hellomoon" | "apex" | "standard-rpc" | "jito-bundle" => migrated,
         _ => fallback.to_string(),
     }
 }

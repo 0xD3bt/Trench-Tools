@@ -181,7 +181,7 @@ pub fn provider_uses_auto_fee_priority(
     action: &str,
 ) -> bool {
     match provider.trim() {
-        "standard-rpc" | "helius-sender" | "hellomoon" => true,
+        "standard-rpc" | "helius-sender" | "hellomoon" | "apex" => true,
         "jito-bundle" => action != "creation" || execution_class != "bundle",
         _ => true,
     }
@@ -191,7 +191,7 @@ pub fn provider_uses_auto_fee_tip(provider: &str, action: &str) -> bool {
     let _ = action;
     matches!(
         provider.trim(),
-        "helius-sender" | "hellomoon" | "jito-bundle"
+        "helius-sender" | "hellomoon" | "apex" | "jito-bundle"
     )
 }
 
@@ -521,6 +521,26 @@ mod tests {
             "sell"
         ));
         assert!(provider_uses_auto_fee_tip("hellomoon", "sell"));
+    }
+
+    #[test]
+    fn apex_auto_fee_policy_uses_priority_and_tip() {
+        for action in ["buy", "sell"] {
+            assert!(provider_uses_auto_fee_priority("apex", "single", action));
+            assert!(provider_uses_auto_fee_tip("apex", action));
+        }
+    }
+
+    #[test]
+    fn clamp_auto_fee_tip_raises_apex_to_minimum() {
+        assert_eq!(
+            clamp_auto_fee_tip_to_provider_minimum(0, "apex", None, "Buy").unwrap(),
+            1_000_000
+        );
+        assert_eq!(
+            clamp_auto_fee_tip_to_provider_minimum(2_000_000, "apex", None, "Sell").unwrap(),
+            2_000_000
+        );
     }
 
     #[test]

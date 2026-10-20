@@ -416,6 +416,7 @@ Fill the starter values:
 - `TRENCH_TOOL_FEE` only if you want to turn the voluntary fee off or increase it
 - `WARM_RPC_URL` moves compatible warm/cache traffic off the primary RPC
 - `HELLOMOON_API_KEY` only if using Hello Moon
+- `APEX_API_KEY` only if using OrbitFlare Apex
 - `BAGS_API_KEY` only if using Bags launchpad flows
 - `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata` and `PINATA_JWT` for the recommended Pump/Bonk metadata upload path
 

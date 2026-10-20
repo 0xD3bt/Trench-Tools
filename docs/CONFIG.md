@@ -50,6 +50,7 @@ USER_REGION=
 WARM_RPC_URL=
 WARM_WS_URL=
 HELLOMOON_API_KEY=
+APEX_API_KEY=
 BAGS_API_KEY=
 LAUNCHDECK_METADATA_UPLOAD_PROVIDER=
 PINATA_JWT=
@@ -126,9 +127,9 @@ Practical guidance:
 - US: use `ewr` with a New York / Newark VPS for the default east-side endpoints. Use `slc` with a Salt Lake City VPS if you are farther west and want the Salt Lake provider endpoint. Avoid broad `us` when you care about predictable latency, because it spans a wide region.
 - Asia: use `sg` or `tyo` when you know which side you are closer to; `asia` spans far-apart endpoints.
 
-Helius Sender supports exact metro routing where those metros exist. Hello Moon maps unsupported metros to the closest endpoints it exposes. For example, Hello Moon does not expose every Helius metro one-to-one.
+Helius Sender supports exact metro routing where those metros exist. Hello Moon maps unsupported metros to the closest endpoints it exposes. For example, Hello Moon does not expose every Helius metro one-to-one. OrbitFlare Apex has an endpoint for every metro; `ewr` maps to New York and `sg` to Singapore.
 
-Provider-specific overrides (`USER_REGION_HELIUS_SENDER`, `USER_REGION_HELLOMOON`, `USER_REGION_JITO_BUNDLE`) live in [.env.advanced](../.env.advanced). Most users should not set them.
+Provider-specific overrides (`USER_REGION_HELIUS_SENDER`, `USER_REGION_HELLOMOON`, `USER_REGION_APEX`, `USER_REGION_JITO_BUNDLE`) live in [.env.advanced](../.env.advanced). Most users should not set them.
 
 ## Warmup And Keep-warm
 
@@ -141,7 +142,7 @@ Trench Tools separates:
 
 In practice:
 
-- `Helius Sender` or `Hello Moon` handle the low-latency send path.
+- `Helius Sender` or `Hello Moon` handle the low-latency send path. `OrbitFlare Apex` is also available for extension trade presets.
 - `SOLANA_RPC_URL` handles reads, confirmations, and general runtime RPC behavior.
 - `SOLANA_WS_URL` handles realtime watchers.
 - `WARM_RPC_URL` handles compatible best-effort startup/keep-warm probes and low-priority sampled state reads.

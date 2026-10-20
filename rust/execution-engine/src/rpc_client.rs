@@ -1018,7 +1018,7 @@ pub async fn submit_independent_transactions_for_transport(
 ) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
     if matches!(
         transport_plan.transport_type.as_str(),
-        "hellomoon-quic" | "hellomoon-bundle" | "jito-bundle"
+        "hellomoon-quic" | "hellomoon-bundle" | "apex-quic" | "jito-bundle"
     ) {
         let shared_plan = map_transport_plan(transport_plan);
         let shared_transactions = transactions
@@ -1081,7 +1081,7 @@ pub async fn confirm_submitted_transactions_for_transport(
 ) -> Result<(Vec<String>, u128), String> {
     if matches!(
         transport_plan.transport_type.as_str(),
-        "hellomoon-quic" | "hellomoon-bundle" | "jito-bundle"
+        "hellomoon-quic" | "hellomoon-bundle" | "apex-quic" | "jito-bundle"
     ) {
         let shared_plan = map_transport_plan(transport_plan);
         let mut shared_submitted = submitted
